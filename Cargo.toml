@@ -1,0 +1,27 @@
+[package]
+name = "sdk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tracing = "0.1.44"
+thiserror = "2.0.18"
+xdg = "3.0.0"
+include_dir = "0.7.4"
+chrono = "0.4.43"
+mockall = "0.14.0"
+uuid = { version = "1.20.0", features = ["serde", "v7"] }
+
+sea-query = {version = "1.0.0-rc.30", features = ["derive", "backend-sqlite"], default-features = false}
+sea-query-rusqlite = {version = "0.8.0-rc.15", features = ["with-chrono", "with-uuid"], default-features = false}
+rusqlite_migration = {version = "2", features = ["from-directory"] }
+rusqlite = {version = "0", features = ["bundled"] }
+file_type = "0.8.11"
+sha2 = "0.10.9"
+hex-literal = "1.1.0"
+hayro = {version = "0.5.0", features = ["embed-fonts"]}
+vello_cpu = "0.0.6"
+readonly = "0.2.13"
+lopdf = "0.39.0"
+
+
