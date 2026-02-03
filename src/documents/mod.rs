@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use storage::SqliteStorage;
 use uuid::Uuid;
 
-pub static AUTHORIZED_MIME_TYPES: &'static [&'static str] = &["application/pdf"];
+pub static AUTHORIZED_MIME_TYPES: &[&str] = &["application/pdf"];
 
 #[enum_def]
 #[derive(Debug, PartialEq, Serialize)]
