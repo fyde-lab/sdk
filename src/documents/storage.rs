@@ -56,6 +56,7 @@ pub struct GetAllCmd<'a> {
 pub trait Storage: Send + Sync {
     fn save(&self, document: &Document) -> Result<(), Error>;
     fn get_all<'a>(&self, cmd: &'a GetAllCmd<'a>) -> Result<Vec<Metadata>, Error>;
+    fn get_by_id(&self, doc_id: &Uuid) -> Result<Metadata, Error>;
     fn get_preview(&self, doc_id: &Uuid) -> Result<Box<[u8]>, Error>;
     fn get_content(&self, doc_id: &Uuid) -> Result<Box<[u8]>, Error>;
 }
@@ -138,6 +139,31 @@ impl Storage for SqliteStorage {
         }
 
         Ok(result)
+    }
+
+    fn get_by_id(&self, doc_id: &Uuid) -> Result<Metadata, Error> {
+        let mut query = Query::select();
+
+        query
+            .columns([
+                DocumentIden::Id,
+                DocumentIden::Name,
+                DocumentIden::Checksum,
+                DocumentIden::DetectedType,
+                DocumentIden::Transcript,
+                DocumentIden::Size,
+                DocumentIden::CreatedAt,
+            ])
+            .from(DocumentIden::Table)
+            .and_where(Expr::col(DocumentIden::Id).eq(doc_id.as_bytes().as_ref()));
+
+        let (sql, values) = query.build_rusqlite(SqliteQueryBuilder);
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(sql.as_str())?;
+
+        let res = stmt.query_one(&*values.as_params(), |row| Ok(Metadata::from(row)))?;
+
+        Ok(res)
     }
 
     fn get_preview(&self, doc_id: &Uuid) -> Result<Box<[u8]>, Error> {
