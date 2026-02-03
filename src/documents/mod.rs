@@ -6,6 +6,7 @@ pub use service::{GetAllCmd, Service};
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use sea_query::enum_def;
+use serde::Serialize;
 use std::boxed::Box;
 use std::sync::Mutex;
 use storage::SqliteStorage;
@@ -14,7 +15,7 @@ use uuid::Uuid;
 pub static AUTHORIZED_MIME_TYPES: &'static [&'static str] = &["application/pdf"];
 
 #[enum_def]
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
 #[readonly::make]
 pub struct Metadata {
     pub id: Uuid,
@@ -27,7 +28,7 @@ pub struct Metadata {
 }
 
 #[enum_def]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Serialize)]
 #[readonly::make]
 pub struct Document {
     pub metadata: Metadata,
