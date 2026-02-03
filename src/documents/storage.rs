@@ -121,7 +121,7 @@ impl Storage for SqliteStorage {
             ])
             .from(DocumentIden::Table)
             .order_by(DocumentIden::Id, Order::Asc)
-            .limit(cmd.limit as u64);
+            .limit(cmd.limit);
 
         if let Some(after_id) = cmd.after_id {
             query.and_where(Expr::col(DocumentIden::Id).gt(after_id.into_bytes().as_slice()));
@@ -179,7 +179,7 @@ impl Storage for SqliteStorage {
         let mut stmt = conn.prepare_cached(sql.as_str())?;
 
         let res = stmt.query_one(&*values.as_params(), |f| {
-            Ok(f.get(DocumentIden::FilePreview.unquoted())?)
+            f.get(DocumentIden::FilePreview.unquoted())
         })?;
 
         Ok(res)
@@ -198,7 +198,7 @@ impl Storage for SqliteStorage {
         let mut stmt = conn.prepare_cached(sql.as_str())?;
 
         let res = stmt.query_one(&*values.as_params(), |f| {
-            Ok(f.get(DocumentIden::FileContent.unquoted())?)
+            f.get(DocumentIden::FileContent.unquoted())
         })?;
 
         Ok(res)

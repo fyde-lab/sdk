@@ -12,7 +12,7 @@ fn run_integration_tests() {
     let file_path = Path::new("./fixtures/basic-text.pdf");
 
     // Check the save content
-    let saved = sdk.documents.save_file_from_path(&file_path).unwrap();
+    let saved = sdk.documents.save_file_from_path(file_path).unwrap();
     assert_eq!("basic-text.pdf", saved.metadata.name);
     assert_eq!(
         "382ac9ea60bb0ba40c9eb0815f4ec7f60e248fc136d3055c411d09709e1b9b31",
@@ -38,14 +38,14 @@ fn run_integration_tests() {
         .unwrap();
 
     assert_eq!(1, docs.len());
-    assert_eq!(saved.metadata, *docs.get(0).unwrap());
+    assert_eq!(&saved.metadata, docs.first().unwrap());
 
     // Check get_preview
-    let preview = sdk.documents.get_preview(docs.get(0).unwrap()).unwrap();
+    let preview = sdk.documents.get_preview(docs.first().unwrap()).unwrap();
     assert_eq!(saved.file_preview, preview);
 
     // Check get_content
-    let content = sdk.documents.get_content(docs.get(0).unwrap()).unwrap();
+    let content = sdk.documents.get_content(docs.first().unwrap()).unwrap();
     assert_eq!(saved.file_content, content);
 
     // Check get_by_id

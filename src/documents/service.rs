@@ -36,13 +36,13 @@ pub trait Service: Send + Sync {
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("failed to access a file: {0}")]
-    FileAccessError(#[from] io::Error),
+    FileAccess(#[from] io::Error),
 
     #[error("invalid file format detected: {file_type}")]
     InvalidFileFormat { file_type: String },
 
     #[error("storage failure: {0}")]
-    StorageError(#[from] storage::Error),
+    Storage(#[from] storage::Error),
 
     #[error("the saved size is different than the one fetched")]
     InvalidSize(),
@@ -51,7 +51,7 @@ pub enum Error {
     PathIsDir(),
 
     #[error("failed to extract the text from the pdf: {0}")]
-    ExtractTextError(#[source] lopdf::Error),
+    ExtractText(#[source] lopdf::Error),
 }
 
 pub struct GetAllCmd<'a> {
@@ -79,8 +79,8 @@ impl Service for Svc {
             return Err(Error::PathIsDir());
         }
 
-        let mut file = File::open(path).map_err(Error::FileAccessError)?;
-        let file_metadatas = file.metadata().map_err(Error::FileAccessError)?;
+        let mut file = File::open(path).map_err(Error::FileAccess)?;
+        let file_metadatas = file.metadata().map_err(Error::FileAccess)?;
 
         let mut file_content = Vec::with_capacity(file_metadatas.size() as usize);
         let _ = file.read_to_end(&mut file_content)?;
@@ -107,14 +107,13 @@ impl Service for Svc {
 
         let transcript: String;
         {
-            let doc = lopdf::Document::load_mem(&file_content.clone())
-                .map_err(Error::ExtractTextError)?;
+            let doc = lopdf::Document::load_mem(&file_content).map_err(Error::ExtractText)?;
 
             let pages = doc.get_pages();
             let page_numbers: Vec<u32> = pages.keys().cloned().collect();
             transcript = doc
                 .extract_text(&page_numbers)
-                .map_err(Error::ExtractTextError)?;
+                .map_err(Error::ExtractText)?;
         }
 
         let file_type = FileType::from_bytes(&file_content)
@@ -125,9 +124,9 @@ impl Service for Svc {
             })?;
 
         if !AUTHORIZED_MIME_TYPES.contains(file_type) {
-            Error::InvalidFileFormat {
+            return Err(Error::InvalidFileFormat {
                 file_type: file_type.to_string(),
-            };
+            });
         }
 
         if file_content.len() != file_metadatas.size() as usize {
@@ -163,7 +162,7 @@ impl Service for Svc {
                 after_id: cmd.after.map(|v| &v.id),
                 limit: cmd.limit.unwrap_or(DEFAULTLIMIT).min(MAX_LIMIT),
             })
-            .map_err(Error::StorageError)
+            .map_err(Error::Storage)
     }
 
     fn get_preview(&self, meta: &Metadata) -> Result<Box<[u8]>, Error> {
