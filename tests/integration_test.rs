@@ -47,4 +47,8 @@ fn run_integration_tests() {
     // Check get_content
     let content = sdk.documents.get_content(docs.get(0).unwrap()).unwrap();
     assert_eq!(saved.file_content, content);
+
+    // Check get_by_id
+    let res = sdk.documents.get_by_id(&saved.metadata.id).unwrap();
+    assert_eq!(saved.metadata, res);
 }

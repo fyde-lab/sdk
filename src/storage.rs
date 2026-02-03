@@ -49,5 +49,5 @@ pub fn init(storage_type: &StorageType) -> Result<Connection, Error> {
 
 #[test]
 fn migrations_test() {
-    assert!(MIGRATIONS.validate().is_ok());
+    MIGRATIONS.validate().unwrap()
 }

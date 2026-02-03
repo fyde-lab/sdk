@@ -28,6 +28,7 @@ const SCALE: f32 = 1.0;
 pub trait Service: Send + Sync {
     fn save_file_from_path(&self, path: &Path) -> Result<Document, Error>;
     fn get_all<'a>(&self, cmd: &GetAllCmd<'a>) -> Result<Vec<Metadata>, Error>;
+    fn get_by_id(&self, doc_id: &Uuid) -> Result<Metadata, Error>;
     fn get_preview(&self, meta: &Metadata) -> Result<Box<[u8]>, Error>;
     fn get_content(&self, meta: &Metadata) -> Result<Box<[u8]>, Error>;
 }
@@ -171,6 +172,10 @@ impl Service for Svc {
 
     fn get_content(&self, meta: &Metadata) -> Result<Box<[u8]>, Error> {
         Ok(self.storage.get_content(&meta.id)?)
+    }
+
+    fn get_by_id(&self, doc_id: &Uuid) -> Result<Metadata, Error> {
+        Ok(self.storage.get_by_id(doc_id)?)
     }
 }
 
