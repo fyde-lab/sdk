@@ -41,11 +41,11 @@ fn run_integration_tests() {
     assert_eq!(&saved.metadata, docs.first().unwrap());
 
     // Check get_preview
-    let preview = sdk.documents.get_preview(docs.first().unwrap()).unwrap();
+    let preview = sdk.documents.get_preview(&saved.metadata.id).unwrap();
     assert_eq!(saved.file_preview, preview);
 
     // Check get_content
-    let content = sdk.documents.get_content(docs.first().unwrap()).unwrap();
+    let content = sdk.documents.get_content(&saved.metadata.id).unwrap();
     assert_eq!(saved.file_content, content);
 
     // Check get_by_id
