@@ -20,12 +20,20 @@ pub enum Error {
     WebSocket(#[from] WsError),
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("messagepack encoding error: {0}")]
+    MessagePackEncode(#[from] rmp_serde::encode::Error),
+    #[error("messagepack decoding error: {0}")]
+    MessagePackDecode(#[from] rmp_serde::decode::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("xdg base directories error: {0}")]
     Xdg(#[from] xdg::BaseDirectoriesError),
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("encryption error: {0}")]
+    Encryption(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

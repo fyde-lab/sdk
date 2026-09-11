@@ -1,7 +1,12 @@
-use serde::Deserialize;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::Result;
+
+use super::crypto;
+use super::http_client::HttpClient;
 
 /// A file, as returned by [`DocumentsClient::fetch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,63 +27,75 @@ pub struct DocumentMeta {
     pub created_at: i64,
 }
 
-#[derive(Deserialize)]
-struct SaveResponse {
-    id: Uuid,
+/// Cleartext metadata encrypted under the document's DEK before upload.
+#[derive(Serialize)]
+struct DocumentMetadata {
+    name: String,
+    content_type: String,
+    created_at: i64,
+    size: u64,
 }
 
 /// A client for the fyde server's documents service, used to save, fetch,
 /// and list files over HTTP.
 pub struct DocumentsClient {
-    http: reqwest::Client,
-    base_url: url::Url,
+    http: HttpClient,
 }
 
 impl DocumentsClient {
     /// Creates a client for the documents service at the given `http://` or
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`).
     pub fn new(base_url: impl AsRef<str>) -> Result<Self> {
-        let mut base_url = url::Url::parse(base_url.as_ref())?;
-        // Ensure the base has a trailing slash so `Url::join` appends rather
-        // than replaces the last path segment.
-        if !base_url.path().ends_with('/') {
-            base_url.set_path(&format!("{}/", base_url.path()));
-        }
-
         Ok(Self {
-            http: reqwest::Client::new(),
-            base_url,
+            http: HttpClient::new(base_url)?,
         })
     }
 
-    /// Saves `content` as a new document and returns its generated id.
+    /// Encrypts `content` and its metadata, then uploads them as a new
+    /// document, returning its generated id.
+    ///
+    /// This follows an envelope encryption scheme: a fresh, random data
+    /// encryption key (DEK) is generated for the document, used to encrypt
+    /// both `content` and its metadata (name, content type, creation time,
+    /// size) with AES-256-GCM, and is itself wrapped under a
+    /// key-encryption-key before being sent alongside the ciphertext. Only
+    /// the wrapped DEK and ciphertexts ever leave this process.
     pub async fn save(
         &self,
         name: impl Into<String>,
         content_type: impl Into<String>,
         content: impl Into<Vec<u8>>,
     ) -> Result<Uuid> {
+        let name = name.into();
+        let content_type = content_type.into();
+        let content = content.into();
+
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let metadata = DocumentMetadata {
+            name,
+            content_type,
+            created_at,
+            size: content.len() as u64,
+        };
+        let metadata_json = serde_json::to_vec(&metadata)?;
+
+        let (encrypted_content, wrapped_dek, encrypted_metadata) =
+            crypto::encrypt_document(&content, &metadata_json)?;
+
         let response = self
             .http
-            .post(self.base_url.join("documents")?)
-            .header("x-file-name", name.into())
-            .header(reqwest::header::CONTENT_TYPE, content_type.into())
-            .body(content.into())
-            .send()
-            .await?
-            .error_for_status()?;
-
-        let response: SaveResponse = response.json().await?;
+            .upload_document(encrypted_content, wrapped_dek, encrypted_metadata)
+            .await?;
         Ok(response.id)
     }
 
     /// Fetches a document's content by id, or `None` if it doesn't exist.
     pub async fn fetch(&self, id: Uuid) -> Result<Option<Document>> {
-        let response = self
-            .http
-            .get(self.base_url.join(&format!("documents/{id}"))?)
-            .send()
-            .await?;
+        let response = self.http.get(&format!("documents/{id}")).await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -110,12 +127,7 @@ impl DocumentsClient {
 
     /// Lists the metadata of every stored document, without file content.
     pub async fn list(&self) -> Result<Vec<DocumentMeta>> {
-        let response = self
-            .http
-            .get(self.base_url.join("documents")?)
-            .send()
-            .await?
-            .error_for_status()?;
+        let response = self.http.get("documents").await?.error_for_status()?;
 
         let documents = response.json().await?;
         Ok(documents)
