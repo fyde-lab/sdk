@@ -31,3 +31,22 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// A connection to a fyde server.
+pub struct Client {
+    documents: DocumentsClient,
+}
+
+impl Client {
+    /// Connects to a fyde server's documents service at the given `http://`
+    /// or `https://` base URL (e.g. `http://127.0.0.1:8080`).
+    pub async fn connect(documents_url: impl AsRef<str>) -> Result<Self> {
+        let documents = DocumentsClient::new(documents_url).await?;
+        Ok(Self { documents })
+    }
+
+    /// Returns a mutable reference to the client's documents service.
+    pub fn documents(&mut self) -> &mut DocumentsClient {
+        &mut self.documents
+    }
+}
