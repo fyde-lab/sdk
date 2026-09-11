@@ -1,4 +1,5 @@
 mod documents;
+mod sqlite;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
@@ -7,6 +8,7 @@ use tokio_tungstenite::{
 };
 
 pub use documents::{Document, DocumentMeta, DocumentsClient};
+pub use sqlite::SqliteClient;
 pub use tokio_tungstenite::tungstenite::Error as WsError;
 pub use url::Url;
 
@@ -18,6 +20,12 @@ pub enum Error {
     WebSocket(#[from] WsError),
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("xdg base directories error: {0}")]
+    Xdg(#[from] xdg::BaseDirectoriesError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
