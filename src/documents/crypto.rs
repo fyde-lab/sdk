@@ -56,6 +56,39 @@ fn aead_encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Decrypts a `nonce || ciphertext_with_tag` blob produced by
+/// [`aead_encrypt`] under `key`.
+fn aead_decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>> {
+    if blob.len() < NONCE_LEN {
+        return Err(Error::Encryption("ciphertext too short".into()));
+    }
+    let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
+    let nonce_bytes: [u8; NONCE_LEN] = nonce_bytes
+        .try_into()
+        .expect("split_at(NONCE_LEN) guarantees this length");
+    let nonce = Nonce::from(nonce_bytes);
+
+    let cipher = Aes256Gcm::new(key.into());
+    cipher
+        .decrypt(&nonce, ciphertext)
+        .map_err(|_| Error::Encryption("failed to decrypt data".into()))
+}
+
+/// Unwraps a DEK that was wrapped under the (temporary, hard-coded) KEK by
+/// [`encrypt_document`].
+pub(super) fn unwrap_dek(wrapped_dek: &[u8]) -> Result<[u8; KEY_LEN]> {
+    let kek = derive_temporary_kek();
+    let dek = aead_decrypt(&kek, wrapped_dek)?;
+    dek.try_into()
+        .map_err(|_| Error::Encryption("unwrapped DEK has an invalid length".into()))
+}
+
+/// Decrypts `blob` (as produced by [`encrypt_document`]) under an
+/// already-unwrapped `dek`.
+pub(super) fn decrypt_with_dek(dek: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>> {
+    aead_decrypt(dek, blob)
+}
+
 /// Encrypts a document for upload using envelope encryption:
 ///
 /// 1. Generates a fresh, random DEK.

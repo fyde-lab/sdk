@@ -1,5 +1,5 @@
 mod crypto;
-mod http_client;
+mod grpc_client;
 mod service;
 
 pub use service::{Document, DocumentMeta, DocumentsClient};

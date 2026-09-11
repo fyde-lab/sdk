@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::Result;
 
 use super::crypto;
-use super::http_client::HttpClient;
+use super::grpc_client::{DocumentMeta as ProtoDocumentMeta, GrpcClient};
 
 /// A file, as returned by [`DocumentsClient::fetch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,7 +19,7 @@ pub struct Document {
 
 /// A document's metadata, without its file content, as returned by
 /// [`DocumentsClient::list`].
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentMeta {
     pub id: Uuid,
     pub name: String,
@@ -27,27 +27,29 @@ pub struct DocumentMeta {
     pub created_at: i64,
 }
 
-/// Cleartext metadata encrypted under the document's DEK before upload.
-#[derive(Serialize)]
+/// Cleartext metadata encrypted under the document's DEK before upload, and
+/// decrypted back out of it on fetch/list.
+#[derive(Serialize, Deserialize)]
 struct DocumentMetadata {
     name: String,
     content_type: String,
     created_at: i64,
+    #[allow(dead_code)]
     size: u64,
 }
 
 /// A client for the fyde server's documents service, used to save, fetch,
-/// and list files over HTTP.
+/// and list files over gRPC.
 pub struct DocumentsClient {
-    http: HttpClient,
+    grpc: GrpcClient,
 }
 
 impl DocumentsClient {
     /// Creates a client for the documents service at the given `http://` or
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`).
-    pub fn new(base_url: impl AsRef<str>) -> Result<Self> {
+    pub async fn new(base_url: impl AsRef<str>) -> Result<Self> {
         Ok(Self {
-            http: HttpClient::new(base_url)?,
+            grpc: GrpcClient::new(base_url).await?,
         })
     }
 
@@ -61,7 +63,7 @@ impl DocumentsClient {
     /// key-encryption-key before being sent alongside the ciphertext. Only
     /// the wrapped DEK and ciphertexts ever leave this process.
     pub async fn save(
-        &self,
+        &mut self,
         name: impl Into<String>,
         content_type: impl Into<String>,
         content: impl Into<Vec<u8>>,
@@ -86,60 +88,64 @@ impl DocumentsClient {
         let (encrypted_content, wrapped_dek, encrypted_metadata) =
             crypto::encrypt_document(&content, &metadata_json)?;
 
-        let response = self
-            .http
-            .upload_document(encrypted_content, wrapped_dek, encrypted_metadata)
-            .await?;
-        Ok(response.id)
+        self.grpc
+            .save_document(encrypted_content, wrapped_dek, encrypted_metadata)
+            .await
     }
 
     /// Fetches a document's content by id, or `None` if it doesn't exist.
-    pub async fn fetch(&self, id: Uuid) -> Result<Option<Document>> {
-        let response = self.http.get(&format!("documents/{id}")).await?;
-
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
+    pub async fn fetch(&mut self, id: Uuid) -> Result<Option<Document>> {
+        // The server stores documents as blind, opaque ciphertext: fetching
+        // a document's content doesn't hand back its DEK or metadata, so
+        // those are looked up (and decrypted) via `list` first.
+        let Some(proto_meta) = self.find_meta(id).await? else {
             return Ok(None);
-        }
-        let response = response.error_for_status()?;
+        };
+        let Some(encrypted_content) = self.grpc.fetch_document(id).await? else {
+            return Ok(None);
+        };
 
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        let name = response
-            .headers()
-            .get(reqwest::header::CONTENT_DISPOSITION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_filename)
-            .unwrap_or_default();
+        let dek = crypto::unwrap_dek(&proto_meta.dek)?;
+        let metadata_json = crypto::decrypt_with_dek(&dek, &proto_meta.metadatas)?;
+        let metadata: DocumentMetadata = serde_json::from_slice(&metadata_json)?;
 
-        let content = response.bytes().await?.to_vec();
+        let content = crypto::decrypt_with_dek(&dek, &encrypted_content)?;
 
         Ok(Some(Document {
             id,
-            name,
-            content_type,
+            name: metadata.name,
+            content_type: metadata.content_type,
             content,
         }))
     }
 
     /// Lists the metadata of every stored document, without file content.
-    pub async fn list(&self) -> Result<Vec<DocumentMeta>> {
-        let response = self.http.get("documents").await?.error_for_status()?;
+    pub async fn list(&mut self) -> Result<Vec<DocumentMeta>> {
+        let documents = self.grpc.list_documents().await?;
 
-        let documents = response.json().await?;
-        Ok(documents)
+        documents
+            .into_iter()
+            .map(|proto_meta| {
+                let id = Uuid::parse_str(&proto_meta.id)?;
+                let dek = crypto::unwrap_dek(&proto_meta.dek)?;
+                let metadata_json = crypto::decrypt_with_dek(&dek, &proto_meta.metadatas)?;
+                let metadata: DocumentMetadata = serde_json::from_slice(&metadata_json)?;
+
+                Ok(DocumentMeta {
+                    id,
+                    name: metadata.name,
+                    content_type: metadata.content_type,
+                    created_at: metadata.created_at,
+                })
+            })
+            .collect()
     }
-}
 
-/// Extracts the quoted `filename` parameter from a `Content-Disposition`
-/// header value, e.g. `attachment; filename="hello.txt"` -> `hello.txt`.
-fn parse_filename(content_disposition: &str) -> Option<String> {
-    content_disposition
-        .split(';')
-        .map(str::trim)
-        .find_map(|part| part.strip_prefix("filename="))
-        .map(|name| name.trim_matches('"').to_string())
+    /// Finds a single document's still-encrypted metadata by id.
+    async fn find_meta(&mut self, id: Uuid) -> Result<Option<ProtoDocumentMeta>> {
+        let documents = self.grpc.list_documents().await?;
+        Ok(documents
+            .into_iter()
+            .find(|proto_meta| proto_meta.id == id.to_string()))
+    }
 }

@@ -18,8 +18,14 @@ pub enum Error {
     InvalidUrl(#[from] url::ParseError),
     #[error("websocket error: {0}")]
     WebSocket(#[from] WsError),
-    #[error("http error: {0}")]
-    Http(#[from] reqwest::Error),
+    #[error("grpc transport error: {0}")]
+    GrpcTransport(#[from] tonic::transport::Error),
+    #[error("grpc error: {0}")]
+    Grpc(#[from] tonic::Status),
+    #[error("invalid grpc endpoint: {0}")]
+    InvalidEndpoint(String),
+    #[error("invalid uuid: {0}")]
+    InvalidUuid(#[from] uuid::Error),
     #[error("messagepack encoding error: {0}")]
     MessagePackEncode(#[from] rmp_serde::encode::Error),
     #[error("messagepack decoding error: {0}")]
