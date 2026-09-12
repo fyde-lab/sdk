@@ -1,6 +1,10 @@
+mod changelog;
 mod documents;
 mod sqlite;
 
+pub use changelog::{
+    ChangelogClient, ChangelogEvent, ChangelogSubscription, EventType, EventsSincePage,
+};
 pub use documents::{Document, DocumentMeta, DocumentsClient};
 pub use sqlite::SqliteClient;
 
@@ -28,25 +32,40 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("encryption error: {0}")]
     Encryption(String),
+    #[error("invalid changelog event: {0}")]
+    InvalidChangelogEvent(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A connection to a fyde server.
 pub struct Client {
+    changelog: ChangelogClient,
     documents: DocumentsClient,
 }
 
 impl Client {
-    /// Connects to a fyde server's documents service at the given `http://`
-    /// or `https://` base URL (e.g. `http://127.0.0.1:8080`).
-    pub async fn connect(documents_url: impl AsRef<str>) -> Result<Self> {
-        let documents = DocumentsClient::new(documents_url).await?;
-        Ok(Self { documents })
+    /// Connects to a fyde server at the given `http://` or `https://` base
+    /// URL (e.g. `http://127.0.0.1:8080`).
+    pub async fn connect(url: impl AsRef<str>) -> Result<Self> {
+        let url = url.as_ref();
+
+        let changelog = ChangelogClient::new(url).await?;
+        let documents = DocumentsClient::new(url).await?;
+
+        Ok(Self {
+            changelog,
+            documents,
+        })
     }
 
     /// Returns a mutable reference to the client's documents service.
     pub fn documents(&mut self) -> &mut DocumentsClient {
         &mut self.documents
+    }
+
+    /// Returns a mutable reference to the client's changelog service.
+    pub fn changelog(&mut self) -> &mut ChangelogClient {
+        &mut self.changelog
     }
 }
