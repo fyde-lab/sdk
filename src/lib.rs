@@ -2,9 +2,7 @@ mod changelog;
 mod documents;
 mod sqlite;
 
-pub use changelog::{
-    ChangelogClient, ChangelogEvent, ChangelogSubscription, EventType, EventsSincePage,
-};
+pub use changelog::{ChangelogClient, SqliteStorage, Storage};
 pub use documents::{Document, DocumentMeta, DocumentsClient};
 pub use sqlite::SqliteClient;
 
@@ -26,6 +24,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("database migration error: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("xdg base directories error: {0}")]
     Xdg(#[from] xdg::BaseDirectoriesError),
     #[error("json error: {0}")]
@@ -40,7 +40,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// A connection to a fyde server.
 pub struct Client {
-    changelog: ChangelogClient,
+    changelog: ChangelogClient<SqliteStorage>,
     documents: DocumentsClient,
 }
 
@@ -50,7 +50,10 @@ impl Client {
     pub async fn connect(url: impl AsRef<str>) -> Result<Self> {
         let url = url.as_ref();
 
-        let changelog = ChangelogClient::new(url).await?;
+        let sqlite = SqliteClient::connect().await?;
+        let storage = SqliteStorage::new(sqlite.pool().clone());
+
+        let changelog = ChangelogClient::new(url, storage).await?;
         let documents = DocumentsClient::new(url).await?;
 
         Ok(Self {
@@ -65,7 +68,7 @@ impl Client {
     }
 
     /// Returns a mutable reference to the client's changelog service.
-    pub fn changelog(&mut self) -> &mut ChangelogClient {
+    pub fn changelog(&mut self) -> &mut ChangelogClient<SqliteStorage> {
         &mut self.changelog
     }
 }

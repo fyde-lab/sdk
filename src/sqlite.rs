@@ -37,6 +37,8 @@ impl SqliteClient {
             .await
             .map_err(Error::Database)?;
 
+        sqlx::migrate!().run(&pool).await.map_err(Error::Migrate)?;
+
         Ok(Self { pool })
     }
 

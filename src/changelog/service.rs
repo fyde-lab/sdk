@@ -6,6 +6,7 @@ use crate::{Error, Result};
 use super::grpc_client::{
     ChangelogEvent as ProtoChangelogEvent, EventType as ProtoEventType, GrpcClient,
 };
+use super::storage::Storage;
 
 /// The kind of write recorded by a [`ChangelogEvent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,24 +88,28 @@ impl ChangelogSubscription {
 }
 
 /// A client for the fyde server's changelog service, used to subscribe to
-/// document write events over gRPC.
-pub struct ChangelogClient {
+/// document write events over gRPC. Generic over the [`Storage`]
+/// implementation used by [`Self::run_job`] to persist its cursor.
+pub struct ChangelogClient<S: Storage> {
     grpc: GrpcClient,
+    storage: S,
 }
 
-impl ChangelogClient {
+impl<S: Storage> ChangelogClient<S> {
     /// Creates a client for the changelog service at the given `http://` or
-    /// `https://` base URL (e.g. `http://127.0.0.1:8080`).
-    pub async fn new(base_url: impl AsRef<str>) -> Result<Self> {
+    /// `https://` base URL (e.g. `http://127.0.0.1:8080`), using `storage`
+    /// to persist [`Self::run_job`]'s cursor.
+    pub async fn new(base_url: impl AsRef<str>, storage: S) -> Result<Self> {
         Ok(Self {
             grpc: GrpcClient::new(base_url).await?,
+            storage,
         })
     }
 
     /// Opens a subscription streaming a [`ChangelogEvent`] every time a new
     /// entry is recorded, starting from the moment the call is made (it
     /// does not replay past entries).
-    pub async fn watch(&mut self) -> Result<ChangelogSubscription> {
+    async fn watch(&mut self) -> Result<ChangelogSubscription> {
         let stream = self.grpc.watch_events().await?;
         Ok(ChangelogSubscription { stream })
     }
@@ -115,7 +120,7 @@ impl ChangelogClient {
     ///
     /// Paginate by repeatedly calling this with the previous page's
     /// `next_offset` until the returned page is empty.
-    pub async fn list_since(&mut self, offset: i64, limit: i32) -> Result<EventsSincePage> {
+    async fn list_since(&mut self, offset: i64, limit: i32) -> Result<EventsSincePage> {
         let page = self.grpc.list_events_since(offset, limit).await?;
 
         let events = page
@@ -128,5 +133,23 @@ impl ChangelogClient {
             events,
             next_offset: page.next_offset,
         })
+    }
+
+    /// Runs a sync job that watches for live changelog events and, for each
+    /// one received, catches up via [`Self::list_since`] starting from the
+    /// offset persisted in `storage`, advancing that offset afterwards.
+    ///
+    /// Runs until the server closes the watch stream or an error occurs.
+    pub async fn run_job(&mut self) -> Result<()> {
+        let mut subscription = self.watch().await?;
+
+        while subscription.next().await?.is_some() {
+            let offset = self.storage.read_offset().await?;
+            let page = self.list_since(offset, 0).await?;
+
+            self.storage.write_offset(page.next_offset).await?;
+        }
+
+        Ok(())
     }
 }
