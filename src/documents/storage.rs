@@ -1,0 +1,18 @@
+use uuid::Uuid;
+
+use crate::Result;
+
+/// Persists documents saved locally, unencrypted, by
+/// [`super::DocumentsClient::save`]. Implementations are injected into
+/// [`super::DocumentsClient`] at construction.
+pub trait Storage: Send + Sync {
+    /// Persists a document as-is, unencrypted.
+    fn save_document(
+        &self,
+        id: Uuid,
+        name: &str,
+        content_type: &str,
+        content: &[u8],
+        created_at: i64,
+    ) -> impl Future<Output = Result<()>> + Send;
+}

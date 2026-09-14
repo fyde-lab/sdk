@@ -2,8 +2,13 @@ mod changelog;
 mod documents;
 mod sqlite;
 
-pub use changelog::{ChangelogClient, SqliteStorage, Storage};
-pub use documents::{Document, DocumentMeta, DocumentsClient};
+pub use changelog::{
+    ChangelogClient, SqliteStorage as ChangelogSqliteStorage, Storage as ChangelogStorage,
+};
+pub use documents::{
+    Document, DocumentMeta, DocumentsClient, SqliteStorage as DocumentsSqliteStorage,
+    Storage as DocumentsStorage,
+};
 pub use sqlite::SqliteClient;
 
 #[derive(Debug, thiserror::Error)]
@@ -40,8 +45,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// A connection to a fyde server.
 pub struct Client {
-    changelog: ChangelogClient<SqliteStorage>,
-    documents: DocumentsClient,
+    changelog: ChangelogClient<ChangelogSqliteStorage>,
+    documents: DocumentsClient<DocumentsSqliteStorage>,
 }
 
 impl Client {
@@ -51,10 +56,11 @@ impl Client {
         let url = url.as_ref();
 
         let sqlite = SqliteClient::connect().await?;
-        let storage = SqliteStorage::new(sqlite.pool().clone());
+        let changelog_storage = ChangelogSqliteStorage::new(sqlite.pool().clone());
+        let documents_storage = DocumentsSqliteStorage::new(sqlite.pool().clone());
 
-        let changelog = ChangelogClient::new(url, storage).await?;
-        let documents = DocumentsClient::new(url).await?;
+        let changelog = ChangelogClient::new(url, changelog_storage).await?;
+        let documents = DocumentsClient::new(url, documents_storage).await?;
 
         Ok(Self {
             changelog,
@@ -63,12 +69,12 @@ impl Client {
     }
 
     /// Returns a mutable reference to the client's documents service.
-    pub fn documents(&mut self) -> &mut DocumentsClient {
+    pub fn documents(&mut self) -> &mut DocumentsClient<DocumentsSqliteStorage> {
         &mut self.documents
     }
 
     /// Returns a mutable reference to the client's changelog service.
-    pub fn changelog(&mut self) -> &mut ChangelogClient<SqliteStorage> {
+    pub fn changelog(&mut self) -> &mut ChangelogClient<ChangelogSqliteStorage> {
         &mut self.changelog
     }
 }
