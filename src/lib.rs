@@ -69,7 +69,7 @@ impl Client {
     }
 
     /// Returns a reference to the client's documents service.
-    pub fn documents(&self) -> &DocumentsClient<DocumentsSqliteStorage> {
+    pub fn documents(&self) -> &DocumentsClient<impl documents::Storage> {
         &self.documents
     }
 
