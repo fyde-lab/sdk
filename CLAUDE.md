@@ -20,11 +20,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Documents service (`src/documents/`)
 
-Layered in three pieces, each only aware of the layer below it:
+Layered in three pieces, each only aware of the layer below it, following the same `mod.rs`/`service.rs` split as `../server`'s domain modules:
 
-- `grpc_client.rs` — thin gRPC transport (`GrpcClient`). Knows nothing about documents semantics; just sends proto requests and returns raw proto responses. Generated protobuf bindings are compiled from `../api-protos/documents.proto` by `build.rs` (via `tonic-prost-build`) and included with `tonic::include_proto!("documents")`.
+- `mod.rs` — public domain types (`Document`, `NewDocument`) and the `Service` trait (`save`/`upload`/`fetch`), the business-level API other code depends on. Trait methods take `&self` (not `&mut self`) so implementations can be shared behind `Arc<dyn Service>`.
+- `grpc_client.rs` — thin gRPC transport (`GrpcClient`). Knows nothing about documents semantics; just sends proto requests and returns raw proto responses. Methods take `&self`, cloning the underlying tonic `Channel` per call (cheap, safe to use concurrently) since the generated client's RPC methods require `&mut self`. Generated protobuf bindings are compiled from `../api-protos/documents.proto` by `build.rs` (via `tonic-prost-build`) and included with `tonic::include_proto!("documents")`.
 - `crypto.rs` — envelope encryption primitives (AES-256-GCM). Generates a fresh per-document data encryption key (DEK), encrypts content and metadata under it, and wraps the DEK under a key-encryption-key (KEK) before anything leaves the process. The server only ever stores/returns ciphertext and a wrapped DEK — it cannot read document content or metadata (name, content type, etc.).
-- `service.rs` — public `DocumentsClient` API (`save`/`upload`/`fetch`), which composes the crypto and gRPC layers. `fetch` is a single round-trip: the server's `FetchDocument` RPC returns an `EncryptedDocument` (ciphertext content, wrapped DEK, and encrypted metadata together), so no separate lookup is needed to decrypt it. There is no listing RPC — `ListDocuments` was removed from `documents.proto`.
+- `service.rs` — `DocumentsClient`, the default `Service` implementation, which composes the crypto and gRPC layers and delegates local, unencrypted persistence to an injected `Storage`. `fetch` is a single round-trip: the server's `FetchDocument` RPC returns an `EncryptedDocument` (ciphertext content, wrapped DEK, and encrypted metadata together), so no separate lookup is needed to decrypt it. There is no listing RPC — `ListDocuments` was removed from `documents.proto`.
 
 **Known temporary state**: `crypto.rs` derives its KEK from a hard-coded placeholder secret (`TEMP_HARDCODED_KEK_SECRET`), explicitly marked in a doc comment as needing replacement with a real KMS/HSM/secrets-manager-sourced key before handling real data. Don't remove that comment when touching this file unless the underlying issue is actually fixed.
 

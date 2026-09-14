@@ -543,6 +543,7 @@ name = "fyde-sdk"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "async-trait",
  "prost",
  "rand",
  "rmp-serde",

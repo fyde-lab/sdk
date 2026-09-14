@@ -38,13 +38,17 @@ impl GrpcClient {
     /// wrapped data encryption key (`dek`), and encrypted `metadatas`.
     /// Returns the generated document id.
     pub async fn upload_document(
-        &mut self,
+        &self,
         content: Vec<u8>,
         dek: Vec<u8>,
         metadatas: Vec<u8>,
     ) -> Result<Uuid> {
+        // The generated client's RPC methods take `&mut self`, but the
+        // underlying `Channel` is cheap to clone and safe to use
+        // concurrently, so we clone it per call to expose `&self` here.
         let response = self
             .client
+            .clone()
             .upload_document(UploadDocumentRequest {
                 content,
                 dek,
@@ -57,10 +61,10 @@ impl GrpcClient {
 
     /// Fetches a document's encrypted content, wrapped DEK, and encrypted
     /// metadata by id, or `None` if it doesn't exist.
-    pub async fn fetch_document(&mut self, id: Uuid) -> Result<Option<EncryptedDocument>> {
+    pub async fn fetch_document(&self, id: Uuid) -> Result<Option<EncryptedDocument>> {
         let request = FetchDocumentRequest { id: id.to_string() };
 
-        match self.client.fetch_document(request).await {
+        match self.client.clone().fetch_document(request).await {
             Ok(response) => Ok(response.into_inner().document),
             Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
             Err(status) => Err(status.into()),

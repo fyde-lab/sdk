@@ -6,8 +6,8 @@ pub use changelog::{
     ChangelogClient, SqliteStorage as ChangelogSqliteStorage, Storage as ChangelogStorage,
 };
 pub use documents::{
-    Document, DocumentsClient, SqliteStorage as DocumentsSqliteStorage,
-    Storage as DocumentsStorage,
+    Document, DocumentsClient, NewDocument, Service as DocumentsService,
+    SqliteStorage as DocumentsSqliteStorage, Storage as DocumentsStorage,
 };
 pub use sqlite::SqliteClient;
 
@@ -68,9 +68,9 @@ impl Client {
         })
     }
 
-    /// Returns a mutable reference to the client's documents service.
-    pub fn documents(&mut self) -> &mut DocumentsClient<DocumentsSqliteStorage> {
-        &mut self.documents
+    /// Returns a reference to the client's documents service.
+    pub fn documents(&self) -> &DocumentsClient<DocumentsSqliteStorage> {
+        &self.documents
     }
 
     /// Returns a mutable reference to the client's changelog service.

@@ -1,5 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -8,15 +9,7 @@ use crate::Result;
 use super::crypto;
 use super::grpc_client::GrpcClient;
 use super::storage::Storage;
-
-/// A file, as returned by [`DocumentsClient::fetch`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Document {
-    pub id: Uuid,
-    pub name: String,
-    pub content_type: String,
-    pub content: Vec<u8>,
-}
+use super::{Document, NewDocument, Service};
 
 /// Cleartext metadata encrypted under the document's DEK before upload, and
 /// decrypted back out of it on fetch.
@@ -29,10 +22,10 @@ struct DocumentEncryptedMetadata {
     size: u64,
 }
 
-/// A client for the fyde server's documents service, used to upload and
-/// fetch files over gRPC, as well as to save documents locally. Generic
-/// over the [`Storage`] implementation used by [`Self::save`] to persist
-/// documents.
+/// The default [`Service`] implementation: talks to the fyde server's
+/// documents service over gRPC, and delegates local, unencrypted persistence
+/// to an injected [`Storage`]. Generic over the [`Storage`] implementation
+/// used by [`Service::save`].
 pub struct DocumentsClient<S: Storage> {
     grpc: GrpcClient,
     storage: S,
@@ -41,26 +34,19 @@ pub struct DocumentsClient<S: Storage> {
 impl<S: Storage> DocumentsClient<S> {
     /// Creates a client for the documents service at the given `http://` or
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`), using `storage`
-    /// to persist documents saved via [`Self::save`].
+    /// to persist documents saved via [`Service::save`].
     pub async fn new(base_url: impl AsRef<str>, storage: S) -> Result<Self> {
         Ok(Self {
             grpc: GrpcClient::new(base_url).await?,
             storage,
         })
     }
+}
 
-    /// Saves `content` and its metadata as-is, unencrypted, in local
-    /// storage, returning its generated id.
-    pub async fn save(
-        &mut self,
-        name: impl Into<String>,
-        content_type: impl Into<String>,
-        content: impl Into<Vec<u8>>,
-    ) -> Result<Uuid> {
+#[async_trait]
+impl<S: Storage> Service for DocumentsClient<S> {
+    async fn save(&self, document: NewDocument) -> Result<Uuid> {
         let id = Uuid::new_v4();
-        let name = name.into();
-        let content_type = content_type.into();
-        let content = content.into();
 
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -68,54 +54,50 @@ impl<S: Storage> DocumentsClient<S> {
             .as_secs() as i64;
 
         self.storage
-            .save_document(id, &name, &content_type, &content, created_at)
+            .save_document(
+                id,
+                &document.name,
+                &document.content_type,
+                &document.content,
+                created_at,
+            )
             .await?;
 
         Ok(id)
     }
 
-    /// Encrypts `content` and its metadata, then uploads them as a new
+    /// Encrypts `document` and its metadata, then uploads them as a new
     /// document to the server, returning its generated id.
     ///
     /// This follows an envelope encryption scheme: a fresh, random data
     /// encryption key (DEK) is generated for the document, used to encrypt
-    /// both `content` and its metadata (name, content type, creation time,
+    /// both its content and metadata (name, content type, creation time,
     /// size) with AES-256-GCM, and is itself wrapped under a
     /// key-encryption-key before being sent alongside the ciphertext. Only
     /// the wrapped DEK and ciphertexts ever leave this process.
-    pub async fn upload(
-        &mut self,
-        name: impl Into<String>,
-        content_type: impl Into<String>,
-        content: impl Into<Vec<u8>>,
-    ) -> Result<Uuid> {
-        let name = name.into();
-        let content_type = content_type.into();
-        let content = content.into();
-
+    async fn upload(&self, document: NewDocument) -> Result<Uuid> {
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
 
         let metadata = DocumentEncryptedMetadata {
-            name,
-            content_type,
+            name: document.name,
+            content_type: document.content_type,
             created_at,
-            size: content.len() as u64,
+            size: document.content.len() as u64,
         };
         let metadata_json = serde_json::to_vec(&metadata)?;
 
         let (encrypted_content, wrapped_dek, encrypted_metadata) =
-            crypto::encrypt_document(&content, &metadata_json)?;
+            crypto::encrypt_document(&document.content, &metadata_json)?;
 
         self.grpc
             .upload_document(encrypted_content, wrapped_dek, encrypted_metadata)
             .await
     }
 
-    /// Fetches a document's content by id, or `None` if it doesn't exist.
-    pub async fn fetch(&mut self, id: Uuid) -> Result<Option<Document>> {
+    async fn fetch(&self, id: Uuid) -> Result<Option<Document>> {
         let Some(encrypted) = self.grpc.fetch_document(id).await? else {
             return Ok(None);
         };
