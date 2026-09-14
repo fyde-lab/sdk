@@ -112,3 +112,45 @@ pub(super) fn encrypt_document(
 
     Ok((encrypted_content, wrapped_dek, encrypted_metadata))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypt_document_roundtrips_through_unwrap_dek_and_decrypt_with_dek() {
+        let content = b"some document content";
+        let metadata = br#"{"name":"doc.txt"}"#;
+
+        let (encrypted_content, wrapped_dek, encrypted_metadata) =
+            encrypt_document(content, metadata).unwrap();
+
+        let dek = unwrap_dek(&wrapped_dek).unwrap();
+
+        let decrypted_content = decrypt_with_dek(&dek, &encrypted_content).unwrap();
+        let decrypted_metadata = decrypt_with_dek(&dek, &encrypted_metadata).unwrap();
+
+        assert_eq!(decrypted_content, content);
+        assert_eq!(decrypted_metadata, metadata);
+    }
+
+    #[test]
+    fn unwrap_dek_rejects_a_wrapped_dek_tampered_with_after_wrapping() {
+        let (_, mut wrapped_dek, _) = encrypt_document(b"content", b"metadata").unwrap();
+        let last = wrapped_dek.len() - 1;
+        wrapped_dek[last] ^= 0xff;
+
+        assert!(unwrap_dek(&wrapped_dek).is_err());
+    }
+
+    #[test]
+    fn decrypt_with_dek_rejects_ciphertext_tampered_with_after_encryption() {
+        let (mut encrypted_content, wrapped_dek, _) =
+            encrypt_document(b"content", b"metadata").unwrap();
+        let dek = unwrap_dek(&wrapped_dek).unwrap();
+        let last = encrypted_content.len() - 1;
+        encrypted_content[last] ^= 0xff;
+
+        assert!(decrypt_with_dek(&dek, &encrypted_content).is_err());
+    }
+}

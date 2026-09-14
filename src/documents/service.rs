@@ -134,3 +134,31 @@ impl<S: Storage> DocumentsClient<S> {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn document_encrypted_metadata_roundtrips_through_json_and_crypto() {
+        let metadata = DocumentEncryptedMetadata {
+            name: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            created_at: 1_700_000_000,
+            size: 4,
+        };
+        let metadata_json = serde_json::to_vec(&metadata).unwrap();
+
+        let (_, wrapped_dek, encrypted_metadata) =
+            crypto::encrypt_document(b"body", &metadata_json).unwrap();
+
+        let dek = crypto::unwrap_dek(&wrapped_dek).unwrap();
+        let decrypted_json = crypto::decrypt_with_dek(&dek, &encrypted_metadata).unwrap();
+        let decrypted: DocumentEncryptedMetadata = serde_json::from_slice(&decrypted_json).unwrap();
+
+        assert_eq!(decrypted.name, metadata.name);
+        assert_eq!(decrypted.content_type, metadata.content_type);
+        assert_eq!(decrypted.created_at, metadata.created_at);
+        assert_eq!(decrypted.size, metadata.size);
+    }
+}
