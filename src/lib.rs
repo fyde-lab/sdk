@@ -6,7 +6,7 @@ pub use changelog::{
     ChangelogClient, SqliteStorage as ChangelogSqliteStorage, Storage as ChangelogStorage,
 };
 pub use documents::{
-    Document, DocumentMeta, DocumentsClient, SqliteStorage as DocumentsSqliteStorage,
+    Document, DocumentsClient, SqliteStorage as DocumentsSqliteStorage,
     Storage as DocumentsStorage,
 };
 pub use sqlite::SqliteClient;

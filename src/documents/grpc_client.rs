@@ -9,10 +9,10 @@ mod proto {
     tonic::include_proto!("documents");
 }
 
-pub(super) use proto::DocumentMeta;
+pub(super) use proto::EncryptedDocument;
 
 use proto::documents_client::DocumentsClient;
-use proto::{FetchDocumentRequest, ListDocumentsRequest, SaveDocumentRequest};
+use proto::{FetchDocumentRequest, UploadDocumentRequest};
 
 /// A thin gRPC transport for talking to the fyde server's documents
 /// service. Knows nothing about documents themselves; just sends requests
@@ -37,7 +37,7 @@ impl GrpcClient {
     /// Uploads an encrypted document, sending its ciphertext `content`,
     /// wrapped data encryption key (`dek`), and encrypted `metadatas`.
     /// Returns the generated document id.
-    pub async fn save_document(
+    pub async fn upload_document(
         &mut self,
         content: Vec<u8>,
         dek: Vec<u8>,
@@ -45,7 +45,7 @@ impl GrpcClient {
     ) -> Result<Uuid> {
         let response = self
             .client
-            .save_document(SaveDocumentRequest {
+            .upload_document(UploadDocumentRequest {
                 content,
                 dek,
                 metadatas,
@@ -55,26 +55,15 @@ impl GrpcClient {
         Ok(Uuid::parse_str(&response.into_inner().id)?)
     }
 
-    /// Fetches a document's encrypted content by id, or `None` if it
-    /// doesn't exist.
-    pub async fn fetch_document(&mut self, id: Uuid) -> Result<Option<Vec<u8>>> {
+    /// Fetches a document's encrypted content, wrapped DEK, and encrypted
+    /// metadata by id, or `None` if it doesn't exist.
+    pub async fn fetch_document(&mut self, id: Uuid) -> Result<Option<EncryptedDocument>> {
         let request = FetchDocumentRequest { id: id.to_string() };
 
         match self.client.fetch_document(request).await {
-            Ok(response) => Ok(Some(response.into_inner().content)),
+            Ok(response) => Ok(response.into_inner().document),
             Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
             Err(status) => Err(status.into()),
         }
-    }
-
-    /// Lists the metadata of every stored document, still encrypted, along
-    /// with each document's wrapped DEK.
-    pub async fn list_documents(&mut self) -> Result<Vec<DocumentMeta>> {
-        let response = self
-            .client
-            .list_documents(ListDocumentsRequest {})
-            .await?;
-
-        Ok(response.into_inner().documents)
     }
 }
