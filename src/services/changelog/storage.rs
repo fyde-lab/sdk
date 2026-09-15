@@ -1,7 +1,7 @@
 use crate::Result;
 
 /// Persists and retrieves the local cursor into the server's changelog, so
-/// [`super::ChangelogClient::run_job`] can resume from where it left off.
+/// [`super::Service::consume`] can resume from where it left off.
 /// Implementations are injected into [`super::ChangelogClient`] at
 /// construction.
 pub trait Storage: Send + Sync {
