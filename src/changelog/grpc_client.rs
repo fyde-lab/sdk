@@ -42,17 +42,25 @@ impl GrpcClient {
 
     /// Opens a stream of `ChangelogEvent`s, starting from the moment the
     /// call is made (it does not replay past entries).
-    pub async fn watch_events(&mut self) -> Result<Streaming<ChangelogEvent>> {
-        let response = self.client.watch_events(WatchEventsRequest {}).await?;
+    pub async fn watch_events(&self) -> Result<Streaming<ChangelogEvent>> {
+        // The generated client's RPC methods take `&mut self`, but the
+        // underlying `Channel` is cheap to clone and safe to use
+        // concurrently, so we clone it per call to expose `&self` here.
+        let response = self
+            .client
+            .clone()
+            .watch_events(WatchEventsRequest {})
+            .await?;
         Ok(response.into_inner())
     }
 
     /// Lists entries recorded after `offset`, oldest first, one page at a
     /// time. An `offset` of 0 means "from the beginning of the changelog". A
     /// `limit` of 0 selects a server-side default.
-    pub async fn list_events_since(&mut self, offset: i64, limit: i32) -> Result<EventsSincePage> {
+    pub async fn list_events_since(&self, offset: i64, limit: i32) -> Result<EventsSincePage> {
         let response = self
             .client
+            .clone()
             .list_events_since(ListEventsSinceRequest { offset, limit })
             .await?
             .into_inner();

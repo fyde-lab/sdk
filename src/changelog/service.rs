@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use tonic::Streaming;
 use uuid::Uuid;
 
@@ -7,6 +8,7 @@ use super::grpc_client::{
     ChangelogEvent as ProtoChangelogEvent, EventType as ProtoEventType, GrpcClient,
 };
 use super::storage::Storage;
+use super::Service;
 
 /// The kind of write recorded by a [`ChangelogEvent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +111,7 @@ impl<S: Storage> ChangelogClient<S> {
     /// Opens a subscription streaming a [`ChangelogEvent`] every time a new
     /// entry is recorded, starting from the moment the call is made (it
     /// does not replay past entries).
-    async fn watch(&mut self) -> Result<ChangelogSubscription> {
+    async fn watch(&self) -> Result<ChangelogSubscription> {
         let stream = self.grpc.watch_events().await?;
         Ok(ChangelogSubscription { stream })
     }
@@ -120,7 +122,7 @@ impl<S: Storage> ChangelogClient<S> {
     ///
     /// Paginate by repeatedly calling this with the previous page's
     /// `next_offset` until the returned page is empty.
-    async fn list_since(&mut self, offset: i64, limit: i32) -> Result<EventsSincePage> {
+    async fn list_since(&self, offset: i64, limit: i32) -> Result<EventsSincePage> {
         let page = self.grpc.list_events_since(offset, limit).await?;
 
         let events = page
@@ -134,13 +136,16 @@ impl<S: Storage> ChangelogClient<S> {
             next_offset: page.next_offset,
         })
     }
+}
 
+#[async_trait]
+impl<S: Storage> Service for ChangelogClient<S> {
     /// Runs a sync job that watches for live changelog events and, for each
     /// one received, catches up via [`Self::list_since`] starting from the
     /// offset persisted in `storage`, advancing that offset afterwards.
     ///
     /// Runs until the server closes the watch stream or an error occurs.
-    pub async fn run_job(&mut self) -> Result<()> {
+    async fn run_job(&self) -> Result<()> {
         let mut subscription = self.watch().await?;
 
         while subscription.next().await?.is_some() {

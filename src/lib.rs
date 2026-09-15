@@ -4,7 +4,8 @@ mod documents;
 mod sql;
 
 pub use changelog::{
-    ChangelogClient, SqliteStorage as ChangelogSqliteStorage, Storage as ChangelogStorage,
+    ChangelogClient, Service as ChangelogService, SqliteStorage as ChangelogSqliteStorage,
+    Storage as ChangelogStorage,
 };
 pub use documents::{
     Document, DocumentsClient, NewDocument, Service as DocumentsService,
@@ -70,8 +71,8 @@ impl Client {
         &self.documents
     }
 
-    /// Returns a mutable reference to the client's changelog service.
-    pub fn changelog(&mut self) -> &mut ChangelogClient<ChangelogSqliteStorage> {
-        &mut self.changelog
+    /// Returns a reference to the client's changelog service.
+    pub fn changelog(&self) -> &ChangelogClient<impl changelog::Storage> {
+        &self.changelog
     }
 }

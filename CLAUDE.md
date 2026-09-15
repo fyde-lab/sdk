@@ -16,7 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-`Client` (`src/lib.rs`) is the SDK entry point: `Client::connect(documents_url)` opens a gRPC connection and exposes service-specific sub-clients (currently `documents()` → `&mut DocumentsClient`). As more server services are added, they should follow the same pattern: a submodule under `src/`, wired into `Client`.
+`Client` (`src/lib.rs`) is the SDK entry point: `Client::connect(url)` opens a gRPC connection and exposes service-specific sub-clients (`documents()` → `&DocumentsClient`, `changelog()` → `&ChangelogClient`). As more server services are added, they should follow the same pattern: a submodule under `src/`, wired into `Client`.
 
 ### Documents service (`src/documents/`)
 
@@ -28,6 +28,14 @@ Layered in three pieces, each only aware of the layer below it, following the sa
 - `service.rs` — `DocumentsClient`, the default `Service` implementation, which composes the crypto and gRPC layers and delegates local, unencrypted persistence to an injected `Storage`. `fetch` is a single round-trip: the server's `FetchDocument` RPC returns an `EncryptedDocument` (ciphertext content, wrapped DEK, and encrypted metadata together), so no separate lookup is needed to decrypt it. There is no listing RPC — `ListDocuments` was removed from `documents.proto`.
 
 **Known temporary state**: `crypto.rs` derives its KEK from a hard-coded placeholder secret (`TEMP_HARDCODED_KEK_SECRET`), explicitly marked in a doc comment as needing replacement with a real KMS/HSM/secrets-manager-sourced key before handling real data. Don't remove that comment when touching this file unless the underlying issue is actually fixed.
+
+### Changelog service (`src/changelog/`)
+
+Same three-piece layering as documents:
+
+- `mod.rs` — the `Service` trait (`run_job`), `&self` for the same `Arc<dyn Service>`-sharing reason as `documents::Service`.
+- `grpc_client.rs` — thin gRPC transport (`GrpcClient`), also `&self`-per-call via cloning the generated client's `Channel`. Generated bindings come from `../api-protos/changelog.proto`.
+- `service.rs` — `ChangelogClient`, the default `Service` implementation. `run_job` opens a `WatchEvents` subscription and, for every event it receives, pages through `ListEventsSince` starting from the cursor persisted in an injected `Storage`, advancing that cursor after each page. `watch`/`list_since` are private inherent helpers, not part of the trait, since nothing outside `run_job` calls them.
 
 ### SQLite client (`src/lib/sql/sqlite.rs`)
 
