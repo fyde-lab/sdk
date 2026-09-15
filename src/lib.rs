@@ -21,10 +21,6 @@ pub enum Error {
     InvalidEndpoint(String),
     #[error("invalid uuid: {0}")]
     InvalidUuid(#[from] uuid::Error),
-    #[error("messagepack encoding error: {0}")]
-    MessagePackEncode(#[from] rmp_serde::encode::Error),
-    #[error("messagepack decoding error: {0}")]
-    MessagePackDecode(#[from] rmp_serde::decode::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("database error: {0}")]
