@@ -1,6 +1,7 @@
 mod changelog;
 mod documents;
-mod sqlite;
+#[path = "lib/sql/mod.rs"]
+mod sql;
 
 pub use changelog::{
     ChangelogClient, SqliteStorage as ChangelogSqliteStorage, Storage as ChangelogStorage,
@@ -9,7 +10,7 @@ pub use documents::{
     Document, DocumentsClient, NewDocument, Service as DocumentsService,
     SqliteStorage as DocumentsSqliteStorage, Storage as DocumentsStorage,
 };
-pub use sqlite::SqliteClient;
+pub use sql::SqliteClient;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
