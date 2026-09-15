@@ -1,13 +1,12 @@
-mod changelog;
-mod documents;
+mod services;
 #[path = "lib/sql/mod.rs"]
 mod sql;
 
-pub use changelog::{
+pub use services::changelog::{
     ChangelogClient, Service as ChangelogService, SqliteStorage as ChangelogSqliteStorage,
     Storage as ChangelogStorage,
 };
-pub use documents::{
+pub use services::documents::{
     Document, DocumentsClient, NewDocument, Service as DocumentsService,
     SqliteStorage as DocumentsSqliteStorage, Storage as DocumentsStorage,
 };
@@ -67,12 +66,12 @@ impl Client {
     }
 
     /// Returns a reference to the client's documents service.
-    pub fn documents(&self) -> &DocumentsClient<impl documents::Storage> {
+    pub fn documents(&self) -> &DocumentsClient<impl services::documents::Storage> {
         &self.documents
     }
 
     /// Returns a reference to the client's changelog service.
-    pub fn changelog(&self) -> &ChangelogClient<impl changelog::Storage> {
+    pub fn changelog(&self) -> &ChangelogClient<impl services::changelog::Storage> {
         &self.changelog
     }
 }

@@ -16,9 +16,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-`Client` (`src/lib.rs`) is the SDK entry point: `Client::connect(url)` opens a gRPC connection and exposes service-specific sub-clients (`documents()` → `&DocumentsClient`, `changelog()` → `&ChangelogClient`). As more server services are added, they should follow the same pattern: a submodule under `src/`, wired into `Client`.
+`Client` (`src/lib.rs`) is the SDK entry point: `Client::connect(url)` opens a gRPC connection and exposes service-specific sub-clients (`documents()` → `&DocumentsClient`, `changelog()` → `&ChangelogClient`). As more server services are added, they should follow the same pattern: a submodule under `src/services/`, wired into `Client`.
 
-### Documents service (`src/documents/`)
+### Documents service (`src/services/documents/`)
 
 Layered in three pieces, each only aware of the layer below it, following the same `mod.rs`/`service.rs` split as `../server`'s domain modules:
 
@@ -29,7 +29,7 @@ Layered in three pieces, each only aware of the layer below it, following the sa
 
 **Known temporary state**: `crypto.rs` derives its KEK from a hard-coded placeholder secret (`TEMP_HARDCODED_KEK_SECRET`), explicitly marked in a doc comment as needing replacement with a real KMS/HSM/secrets-manager-sourced key before handling real data. Don't remove that comment when touching this file unless the underlying issue is actually fixed.
 
-### Changelog service (`src/changelog/`)
+### Changelog service (`src/services/changelog/`)
 
 Same three-piece layering as documents:
 
