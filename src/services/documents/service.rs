@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::Result;
 
 use super::crypto;
-use super::grpc_client::{GrpcClient, TonicGrpcClient};
+use super::grpc_client::{FydeClient, GrpcClient};
 use super::storage::Storage;
 use super::{Document, NewDocument, Service};
 
@@ -28,7 +28,7 @@ struct DocumentEncryptedMetadata {
 /// used to cache documents fetched via [`Service::fetch`] and
 /// [`Service::fetch_many`].
 pub struct DocumentsClient<S: Storage> {
-    grpc: Box<dyn GrpcClient>,
+    grpc: Box<dyn FydeClient>,
     storage: S,
 }
 
@@ -39,16 +39,16 @@ impl<S: Storage> DocumentsClient<S> {
     /// [`Service::fetch_many`].
     pub async fn new(base_url: impl AsRef<str>, storage: S) -> Result<Self> {
         Ok(Self {
-            grpc: Box::new(TonicGrpcClient::new(base_url).await?),
+            grpc: Box::new(GrpcClient::new(base_url).await?),
             storage,
         })
     }
 
-    /// Creates a client from an already-constructed [`GrpcClient`], for
-    /// testing against a [`super::grpc_client::MockGrpcClient`] instead of a
+    /// Creates a client from an already-constructed [`FydeClient`], for
+    /// testing against a [`super::grpc_client::MockFydeClient`] instead of a
     /// live server.
     #[cfg(test)]
-    fn with_grpc(grpc: impl GrpcClient + 'static, storage: S) -> Self {
+    fn with_grpc(grpc: impl FydeClient + 'static, storage: S) -> Self {
         Self {
             grpc: Box::new(grpc),
             storage,
@@ -157,7 +157,7 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::super::SqliteStorage;
-    use super::super::grpc_client::{EncryptedDocument, MockGrpcClient};
+    use super::super::grpc_client::{EncryptedDocument, MockFydeClient};
     use super::*;
 
     #[test]
@@ -213,7 +213,7 @@ mod tests {
 
         let id = Uuid::new_v4();
 
-        let mut mock_grpc = MockGrpcClient::new();
+        let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_fetch_document()
             .withf(move |fetched_id| *fetched_id == id)
@@ -244,7 +244,7 @@ mod tests {
     async fn upload_sends_encrypted_content_to_grpc() {
         let expected_id = Uuid::new_v4();
 
-        let mut mock_grpc = MockGrpcClient::new();
+        let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_upload_document()
             // The plaintext content must never reach the transport layer.

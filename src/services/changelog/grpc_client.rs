@@ -17,25 +17,25 @@ pub(super) use proto::{ChangelogEvent, EventType};
 use proto::changelog_client::ChangelogClient;
 use proto::{ListEventsSinceRequest, WatchEventsRequest};
 
-/// A page of changelog events, as returned by [`GrpcClient::list_events_since`].
+/// A page of changelog events, as returned by [`FydeClient::list_events_since`].
 pub(super) struct EventsSincePage {
     pub events: Vec<ChangelogEvent>,
     pub next_offset: i64,
 }
 
 /// A stream of raw changelog events as received from the server, opened by
-/// [`GrpcClient::watch_events`].
+/// [`FydeClient::watch_events`].
 pub(super) type EventStream =
     BoxStream<'static, std::result::Result<ChangelogEvent, tonic::Status>>;
 
 /// A gRPC transport for talking to the fyde server's changelog service.
 /// Knows nothing about changelog events themselves beyond the raw proto
 /// types; just opens the stream and hands back raw responses. Abstracted as
-/// a trait so callers can be tested against [`MockGrpcClient`] instead of a
+/// a trait so callers can be tested against [`MockFydeClient`] instead of a
 /// live server.
 #[cfg_attr(test, automock)]
 #[async_trait]
-pub(super) trait GrpcClient: Send + Sync {
+pub(super) trait FydeClient: Send + Sync {
     /// Opens a stream of `ChangelogEvent`s, starting from the moment the
     /// call is made (it does not replay past entries).
     async fn watch_events(&self) -> Result<EventStream>;
@@ -46,12 +46,12 @@ pub(super) trait GrpcClient: Send + Sync {
     async fn list_events_since(&self, offset: i64, limit: i32) -> Result<EventsSincePage>;
 }
 
-/// The production [`GrpcClient`], backed by a real tonic connection.
-pub(super) struct TonicGrpcClient {
+/// The production [`FydeClient`] implementation, backed by a real tonic connection.
+pub(super) struct GrpcClient {
     client: ChangelogClient<Channel>,
 }
 
-impl TonicGrpcClient {
+impl GrpcClient {
     /// Connects to the changelog service at the given `http://` or
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`).
     pub async fn new(base_url: impl AsRef<str>) -> Result<Self> {
@@ -66,7 +66,7 @@ impl TonicGrpcClient {
 }
 
 #[async_trait]
-impl GrpcClient for TonicGrpcClient {
+impl FydeClient for GrpcClient {
     async fn watch_events(&self) -> Result<EventStream> {
         // The generated client's RPC methods take `&mut self`, but the
         // underlying `Channel` is cheap to clone and safe to use

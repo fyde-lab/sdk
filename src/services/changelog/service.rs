@@ -9,8 +9,8 @@ use crate::{Error, Result};
 
 use super::Service;
 use super::grpc_client::{
-    ChangelogEvent as ProtoChangelogEvent, EventStream, EventType as ProtoEventType, GrpcClient,
-    TonicGrpcClient,
+    ChangelogEvent as ProtoChangelogEvent, EventStream, EventType as ProtoEventType, FydeClient,
+    GrpcClient,
 };
 use super::storage::Storage;
 
@@ -100,7 +100,7 @@ impl ChangelogSubscription {
 /// [`Service::consume`] also fetches and caches every document referenced by
 /// the events it encounters, via an injected documents [`DocumentsService`].
 pub struct ChangelogClient<S: Storage> {
-    grpc: Box<dyn GrpcClient>,
+    grpc: Box<dyn FydeClient>,
     storage: S,
     documents: Arc<dyn DocumentsService>,
 }
@@ -116,18 +116,18 @@ impl<S: Storage> ChangelogClient<S> {
         documents: Arc<dyn DocumentsService>,
     ) -> Result<Self> {
         Ok(Self {
-            grpc: Box::new(TonicGrpcClient::new(base_url).await?),
+            grpc: Box::new(GrpcClient::new(base_url).await?),
             storage,
             documents,
         })
     }
 
-    /// Creates a client from an already-constructed [`GrpcClient`], for
-    /// testing against a [`super::grpc_client::MockGrpcClient`] instead of a
+    /// Creates a client from an already-constructed [`FydeClient`], for
+    /// testing against a [`super::grpc_client::MockFydeClient`] instead of a
     /// live server.
     #[cfg(test)]
     fn with_grpc(
-        grpc: impl GrpcClient + 'static,
+        grpc: impl FydeClient + 'static,
         storage: S,
         documents: Arc<dyn DocumentsService>,
     ) -> Self {
@@ -241,7 +241,7 @@ mod tests {
 
     use futures::StreamExt as _;
 
-    use super::super::grpc_client::{EventsSincePage as GrpcEventsSincePage, MockGrpcClient};
+    use super::super::grpc_client::{EventsSincePage as GrpcEventsSincePage, MockFydeClient};
     use super::*;
     use crate::services::documents::{Document, NewDocument};
 
@@ -299,7 +299,7 @@ mod tests {
     async fn list_since_converts_proto_events_into_domain_events() {
         let document_id = Uuid::new_v4();
 
-        let mut mock_grpc = MockGrpcClient::new();
+        let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_list_events_since()
             .withf(|offset, limit| *offset == 42 && *limit == 10)
@@ -329,7 +329,7 @@ mod tests {
     async fn catch_up_pages_through_events_and_advances_the_offset() {
         let document_id = Uuid::new_v4();
 
-        let mut mock_grpc = MockGrpcClient::new();
+        let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_list_events_since()
             .withf(|offset, _| *offset == 0)
@@ -369,7 +369,7 @@ mod tests {
     async fn consume_catches_up_then_reacts_to_live_events() {
         let document_id = Uuid::new_v4();
 
-        let mut mock_grpc = MockGrpcClient::new();
+        let mut mock_grpc = MockFydeClient::new();
         // Nothing to catch up on.
         mock_grpc
             .expect_list_events_since()

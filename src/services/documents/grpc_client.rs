@@ -20,10 +20,10 @@ use proto::{FetchDocumentRequest, FetchDocumentsRequest, UploadDocumentRequest};
 /// A gRPC transport for talking to the fyde server's documents service.
 /// Knows nothing about documents themselves; just sends requests and hands
 /// back raw responses. Abstracted as a trait so callers can be tested
-/// against [`MockGrpcClient`] instead of a live server.
+/// against [`MockFydeClient`] instead of a live server.
 #[cfg_attr(test, automock)]
 #[async_trait]
-pub(super) trait GrpcClient: Send + Sync {
+pub(super) trait FydeClient: Send + Sync {
     /// Uploads an encrypted document, sending its ciphertext `content`,
     /// wrapped data encryption key (`dek`), and encrypted `metadatas`.
     /// Returns the generated document id.
@@ -44,12 +44,12 @@ pub(super) trait GrpcClient: Send + Sync {
     async fn fetch_documents(&self, ids: &[Uuid]) -> Result<Vec<EncryptedDocument>>;
 }
 
-/// The production [`GrpcClient`], backed by a real tonic connection.
-pub(super) struct TonicGrpcClient {
+/// The production [`FydeClient`] implementation, backed by a real tonic connection.
+pub(super) struct GrpcClient {
     client: DocumentsClient<Channel>,
 }
 
-impl TonicGrpcClient {
+impl GrpcClient {
     /// Connects to the documents service at the given `http://` or
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`).
     pub async fn new(base_url: impl AsRef<str>) -> Result<Self> {
@@ -64,7 +64,7 @@ impl TonicGrpcClient {
 }
 
 #[async_trait]
-impl GrpcClient for TonicGrpcClient {
+impl FydeClient for GrpcClient {
     async fn upload_document(
         &self,
         content: Vec<u8>,
