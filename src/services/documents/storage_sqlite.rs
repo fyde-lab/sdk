@@ -62,3 +62,76 @@ impl Storage for SqliteStorage {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+
+    async fn setup() -> SqliteStorage {
+        // A single connection, so all queries in a test hit the same
+        // in-memory database rather than each getting its own.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        SqliteStorage::new(pool)
+    }
+
+    #[tokio::test]
+    async fn get_document_returns_none_when_missing() {
+        let storage = setup().await;
+
+        let result = storage.get_document(Uuid::new_v4()).await.unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn get_document_returns_a_previously_saved_document() {
+        let storage = setup().await;
+        let id = Uuid::new_v4();
+
+        storage
+            .save_document(id, "report.pdf", "application/pdf", b"hello", 1_700_000_000)
+            .await
+            .unwrap();
+
+        let document = storage.get_document(id).await.unwrap().unwrap();
+
+        assert_eq!(
+            document,
+            Document {
+                id,
+                name: "report.pdf".to_string(),
+                content_type: "application/pdf".to_string(),
+                content: b"hello".to_vec(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn save_document_does_not_affect_other_documents() {
+        let storage = setup().await;
+        let (id1, id2) = (Uuid::new_v4(), Uuid::new_v4());
+
+        storage
+            .save_document(id1, "one.txt", "text/plain", b"one", 1_700_000_000)
+            .await
+            .unwrap();
+        storage
+            .save_document(id2, "two.txt", "text/plain", b"two", 1_700_000_001)
+            .await
+            .unwrap();
+
+        let document = storage.get_document(id1).await.unwrap().unwrap();
+
+        assert_eq!(document.name, "one.txt");
+        assert_eq!(document.content, b"one");
+    }
+}
