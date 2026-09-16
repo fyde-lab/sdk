@@ -33,9 +33,9 @@ Layered in three pieces, each only aware of the layer below it, following the sa
 
 Same three-piece layering as documents:
 
-- `mod.rs` — the `Service` trait (`run_job`), `&self` for the same `Arc<dyn Service>`-sharing reason as `documents::Service`.
+- `mod.rs` — the `Service` trait (`consume`), `&self` for the same `Arc<dyn Service>`-sharing reason as `documents::Service`. `consume` takes a boxed `FnMut(ChangelogEvent) + Send` callback (not a generic parameter) so the trait stays object-safe for `Arc<dyn Service>`.
 - `grpc_client.rs` — thin gRPC transport (`GrpcClient`), also `&self`-per-call via cloning the generated client's `Channel`. Generated bindings come from `../api-protos/changelog.proto`.
-- `service.rs` — `ChangelogClient`, the default `Service` implementation. `run_job` opens a `WatchEvents` subscription and, for every event it receives, pages through `ListEventsSince` starting from the cursor persisted in an injected `Storage`, advancing that cursor after each page. `watch`/`list_since` are private inherent helpers, not part of the trait, since nothing outside `run_job` calls them.
+- `service.rs` — `ChangelogClient`, the default `Service` implementation. `consume` opens a `WatchEvents` subscription and, for every event it receives, pages through `ListEventsSince` starting from the cursor persisted in an injected `Storage`, advancing that cursor after each page; the callback is invoked once per event during both the initial catch-up and the live subscription. `list_since` and the private `catch_up` helper are inherent methods, not part of the trait, since nothing outside `consume` calls them.
 
 ### SQLite client (`src/lib/sql/sqlite.rs`)
 

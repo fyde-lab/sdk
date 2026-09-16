@@ -110,13 +110,18 @@ impl<S: Storage> ChangelogClient<S> {
 
     /// Catches up on every entry recorded since the offset persisted in
     /// `storage`, advancing that offset as it goes, until none remain.
-    async fn catch_up(&self) -> Result<()> {
+    /// Invokes `callback` once for each event encountered.
+    async fn catch_up(&self, callback: &mut (dyn FnMut(ChangelogEvent) + Send)) -> Result<()> {
         loop {
             let offset = self.storage.read_offset().await?;
             let page = self.list_since(offset, 0).await?;
 
             if page.events.is_empty() {
                 break;
+            }
+
+            for event in page.events {
+                callback(event);
             }
 
             self.storage.write_offset(page.next_offset).await?;
@@ -156,9 +161,12 @@ impl<S: Storage> Service for ChangelogClient<S> {
     /// replay past entries), and for each one received, catches up again via
     /// [`Self::list_since`], advancing the persisted offset afterwards.
     ///
+    /// `callback` is invoked once for every event encountered, during both
+    /// the initial catch-up and the live subscription.
+    ///
     /// Runs until the server closes the watch stream or an error occurs.
-    async fn consume(&self) -> Result<()> {
-        self.catch_up().await?;
+    async fn consume(&self, mut callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
+        self.catch_up(&mut *callback).await?;
 
         let stream = self.grpc.watch_events().await?;
         let mut subscription = ChangelogSubscription { stream };
@@ -166,6 +174,10 @@ impl<S: Storage> Service for ChangelogClient<S> {
         while subscription.next().await?.is_some() {
             let offset = self.storage.read_offset().await?;
             let page = self.list_since(offset, 0).await?;
+
+            for event in page.events {
+                callback(event);
+            }
 
             self.storage.write_offset(page.next_offset).await?;
         }
