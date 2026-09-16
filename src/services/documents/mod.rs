@@ -45,6 +45,11 @@ pub trait Service: Send + Sync {
     /// Fetches a document's content by id, or `None` if it doesn't exist.
     async fn fetch(&self, id: Uuid) -> Result<Option<Document>>;
 
+    /// Fetches a document previously saved via [`Service::save`] from local
+    /// storage, or `None` if it doesn't exist. Unlike [`Service::fetch`],
+    /// this does not talk to the server.
+    async fn get(&self, id: Uuid) -> Result<Option<Document>>;
+
     /// Fetches multiple documents' content by id in a single call. Ids that
     /// don't exist are omitted from the result.
     async fn fetch_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>>;

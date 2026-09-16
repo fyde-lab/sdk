@@ -1,9 +1,10 @@
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use crate::{Error, Result};
 
 use super::storage::Storage;
+use super::Document;
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
 /// `documents` table).
@@ -40,5 +41,24 @@ impl Storage for SqliteStorage {
         .map_err(Error::Database)?;
 
         Ok(())
+    }
+
+    async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
+        let row = sqlx::query("SELECT name, content_type, content FROM documents WHERE id = ?1")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(Error::Database)?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(Document {
+            id,
+            name: row.get("name"),
+            content_type: row.get("content_type"),
+            content: row.get("content"),
+        }))
     }
 }

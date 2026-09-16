@@ -116,6 +116,10 @@ impl<S: Storage> Service for DocumentsClient<S> {
         }))
     }
 
+    async fn get(&self, id: Uuid) -> Result<Option<Document>> {
+        self.storage.get_document(id).await
+    }
+
     /// Fetches and decrypts multiple documents by id in a single round
     /// trip. Ids that don't exist are omitted from the result.
     async fn fetch_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>> {
