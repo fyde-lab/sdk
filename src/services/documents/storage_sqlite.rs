@@ -54,6 +54,32 @@ impl Storage for SqliteStorage {
             content: row.get("content"),
         }))
     }
+
+    async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
+        let rows = sqlx::query(
+            "SELECT id, name, content_type, content FROM documents
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?1 OFFSET ?2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(Error::Database)?;
+
+        rows.into_iter()
+            .map(|row| {
+                let id: String = row.get("id");
+
+                Ok(Document {
+                    id: Uuid::parse_str(&id)?,
+                    name: row.get("name"),
+                    content_type: row.get("content_type"),
+                    content: row.get("content"),
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -150,5 +176,58 @@ mod tests {
 
         assert_eq!(document.name, "one.txt");
         assert_eq!(document.content, b"one");
+    }
+
+    async fn save_documents(storage: &SqliteStorage, names: &[&str]) {
+        for (i, name) in names.iter().enumerate() {
+            storage
+                .save_document(
+                    &Document {
+                        id: Uuid::new_v4(),
+                        name: name.to_string(),
+                        content_type: "text/plain".to_string(),
+                        content: Vec::new(),
+                    },
+                    1_700_000_000 + i as i64,
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn list_documents_returns_at_most_limit_oldest_first() {
+        let storage = setup().await;
+        save_documents(&storage, &["one", "two", "three"]).await;
+
+        let page = storage.list_documents(0, 2).await.unwrap();
+
+        assert_eq!(
+            page.into_iter().map(|d| d.name).collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_documents_skips_offset() {
+        let storage = setup().await;
+        save_documents(&storage, &["one", "two", "three"]).await;
+
+        let page = storage.list_documents(1, 2).await.unwrap();
+
+        assert_eq!(
+            page.into_iter().map(|d| d.name).collect::<Vec<_>>(),
+            vec!["two", "three"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_documents_returns_empty_when_offset_past_the_end() {
+        let storage = setup().await;
+        save_documents(&storage, &["one"]).await;
+
+        let page = storage.list_documents(5, 2).await.unwrap();
+
+        assert_eq!(page, Vec::new());
     }
 }

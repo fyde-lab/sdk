@@ -284,6 +284,10 @@ mod tests {
         async fn download_many(&self, _ids: Vec<Uuid>) -> Result<Vec<Document>> {
             Ok(Vec::new())
         }
+
+        async fn list(&self, _offset: i64, _limit: i64) -> Result<Vec<Document>> {
+            Ok(Vec::new())
+        }
     }
 
     fn proto_event(offset: i64, document_id: Uuid) -> ProtoChangelogEvent {

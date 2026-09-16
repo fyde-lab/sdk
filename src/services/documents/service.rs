@@ -118,6 +118,10 @@ impl<S: Storage> Service for DocumentsClient<S> {
         self.storage.get_document(id).await
     }
 
+    async fn list(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
+        self.storage.list_documents(offset, limit).await
+    }
+
     /// Fetches and decrypts multiple documents by id in a single round
     /// trip. Ids that don't exist are omitted from the result.
     async fn download_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>> {

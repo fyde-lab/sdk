@@ -49,6 +49,14 @@ pub trait Service: Send + Sync {
     /// Fetches multiple documents' content by id in a single call. Ids that
     /// don't exist are omitted from the result.
     async fn download_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>>;
+
+    /// Lists documents previously cached in local storage, oldest first,
+    /// one page at a time. Like [`Service::get`], this does not talk to the
+    /// server.
+    ///
+    /// Paginate by repeatedly incrementing `offset` by the returned page's
+    /// length until it comes back shorter than `limit`.
+    async fn list(&self, offset: i64, limit: i64) -> Result<Vec<Document>>;
 }
 
 /// Initializes the documents service: connects to the fyde server at
