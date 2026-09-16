@@ -2,6 +2,8 @@ mod services;
 #[path = "lib/sql/mod.rs"]
 mod sql;
 
+use std::sync::Arc;
+
 pub use services::changelog::{
     ChangelogClient, Service as ChangelogService, SqliteStorage as ChangelogSqliteStorage,
     Storage as ChangelogStorage,
@@ -43,7 +45,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A connection to a fyde server.
 pub struct Client {
     changelog: ChangelogClient<ChangelogSqliteStorage>,
-    documents: DocumentsClient<DocumentsSqliteStorage>,
+    documents: Arc<DocumentsClient<DocumentsSqliteStorage>>,
 }
 
 impl Client {
@@ -56,8 +58,8 @@ impl Client {
         let changelog_storage = ChangelogSqliteStorage::new(sqlite.pool().clone());
         let documents_storage = DocumentsSqliteStorage::new(sqlite.pool().clone());
 
-        let changelog = ChangelogClient::new(url, changelog_storage).await?;
-        let documents = DocumentsClient::new(url, documents_storage).await?;
+        let documents = Arc::new(DocumentsClient::new(url, documents_storage).await?);
+        let changelog = ChangelogClient::new(url, changelog_storage, documents.clone()).await?;
 
         Ok(Self {
             changelog,

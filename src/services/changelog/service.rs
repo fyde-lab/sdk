@@ -1,7 +1,10 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use tonic::Streaming;
 use uuid::Uuid;
 
+use crate::services::documents::Service as DocumentsService;
 use crate::{Error, Result};
 
 use super::grpc_client::{
@@ -92,20 +95,44 @@ impl ChangelogSubscription {
 /// A client for the fyde server's changelog service, used to subscribe to
 /// document write events over gRPC. Generic over the [`Storage`]
 /// implementation used by [`Service::consume`] to persist its cursor.
+/// [`Service::consume`] also fetches and caches every document referenced by
+/// the events it encounters, via an injected documents [`DocumentsService`].
 pub struct ChangelogClient<S: Storage> {
     grpc: GrpcClient,
     storage: S,
+    documents: Arc<dyn DocumentsService>,
 }
 
 impl<S: Storage> ChangelogClient<S> {
     /// Creates a client for the changelog service at the given `http://` or
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`), using `storage`
-    /// to persist [`Service::consume`]'s cursor.
-    pub async fn new(base_url: impl AsRef<str>, storage: S) -> Result<Self> {
+    /// to persist [`Service::consume`]'s cursor, and `documents` to fetch and
+    /// cache the documents referenced by encountered events.
+    pub async fn new(
+        base_url: impl AsRef<str>,
+        storage: S,
+        documents: Arc<dyn DocumentsService>,
+    ) -> Result<Self> {
         Ok(Self {
             grpc: GrpcClient::new(base_url).await?,
             storage,
+            documents,
         })
+    }
+
+    /// Fetches and caches every document referenced by `events` via
+    /// [`DocumentsService::fetch_many`], skipping the call entirely when
+    /// `events` is empty.
+    async fn fetch_documents(&self, events: &[ChangelogEvent]) -> Result<()> {
+        let ids: Vec<Uuid> = events.iter().map(|event| event.document_id).collect();
+
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        self.documents.fetch_many(ids).await?;
+
+        Ok(())
     }
 
     /// Catches up on every entry recorded since the offset persisted in
@@ -119,6 +146,8 @@ impl<S: Storage> ChangelogClient<S> {
             if page.events.is_empty() {
                 break;
             }
+
+            self.fetch_documents(&page.events).await?;
 
             for event in page.events {
                 callback(event);
@@ -174,6 +203,8 @@ impl<S: Storage> Service for ChangelogClient<S> {
         while subscription.next().await?.is_some() {
             let offset = self.storage.read_offset().await?;
             let page = self.list_since(offset, 0).await?;
+
+            self.fetch_documents(&page.events).await?;
 
             for event in page.events {
                 callback(event);
