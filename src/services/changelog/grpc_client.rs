@@ -1,4 +1,7 @@
-use tonic::Streaming;
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+#[cfg(test)]
+use mockall::automock;
 use tonic::transport::Channel;
 
 use crate::{Error, Result};
@@ -20,14 +23,35 @@ pub(super) struct EventsSincePage {
     pub next_offset: i64,
 }
 
-/// A thin gRPC transport for talking to the fyde server's changelog
-/// service. Knows nothing about changelog events themselves beyond the raw
-/// proto types; just opens the stream and hands back raw responses.
-pub(super) struct GrpcClient {
+/// A stream of raw changelog events as received from the server, opened by
+/// [`GrpcClient::watch_events`].
+pub(super) type EventStream =
+    BoxStream<'static, std::result::Result<ChangelogEvent, tonic::Status>>;
+
+/// A gRPC transport for talking to the fyde server's changelog service.
+/// Knows nothing about changelog events themselves beyond the raw proto
+/// types; just opens the stream and hands back raw responses. Abstracted as
+/// a trait so callers can be tested against [`MockGrpcClient`] instead of a
+/// live server.
+#[cfg_attr(test, automock)]
+#[async_trait]
+pub(super) trait GrpcClient: Send + Sync {
+    /// Opens a stream of `ChangelogEvent`s, starting from the moment the
+    /// call is made (it does not replay past entries).
+    async fn watch_events(&self) -> Result<EventStream>;
+
+    /// Lists entries recorded after `offset`, oldest first, one page at a
+    /// time. An `offset` of 0 means "from the beginning of the changelog". A
+    /// `limit` of 0 selects a server-side default.
+    async fn list_events_since(&self, offset: i64, limit: i32) -> Result<EventsSincePage>;
+}
+
+/// The production [`GrpcClient`], backed by a real tonic connection.
+pub(super) struct TonicGrpcClient {
     client: ChangelogClient<Channel>,
 }
 
-impl GrpcClient {
+impl TonicGrpcClient {
     /// Connects to the changelog service at the given `http://` or
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`).
     pub async fn new(base_url: impl AsRef<str>) -> Result<Self> {
@@ -39,10 +63,11 @@ impl GrpcClient {
             client: ChangelogClient::new(channel),
         })
     }
+}
 
-    /// Opens a stream of `ChangelogEvent`s, starting from the moment the
-    /// call is made (it does not replay past entries).
-    pub async fn watch_events(&self) -> Result<Streaming<ChangelogEvent>> {
+#[async_trait]
+impl GrpcClient for TonicGrpcClient {
+    async fn watch_events(&self) -> Result<EventStream> {
         // The generated client's RPC methods take `&mut self`, but the
         // underlying `Channel` is cheap to clone and safe to use
         // concurrently, so we clone it per call to expose `&self` here.
@@ -51,13 +76,10 @@ impl GrpcClient {
             .clone()
             .watch_events(WatchEventsRequest {})
             .await?;
-        Ok(response.into_inner())
+        Ok(Box::pin(response.into_inner()))
     }
 
-    /// Lists entries recorded after `offset`, oldest first, one page at a
-    /// time. An `offset` of 0 means "from the beginning of the changelog". A
-    /// `limit` of 0 selects a server-side default.
-    pub async fn list_events_since(&self, offset: i64, limit: i32) -> Result<EventsSincePage> {
+    async fn list_events_since(&self, offset: i64, limit: i32) -> Result<EventsSincePage> {
         let response = self
             .client
             .clone()

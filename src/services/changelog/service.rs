@@ -1,17 +1,18 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tonic::Streaming;
+use futures::StreamExt;
 use uuid::Uuid;
 
 use crate::services::documents::Service as DocumentsService;
 use crate::{Error, Result};
 
+use super::Service;
 use super::grpc_client::{
-    ChangelogEvent as ProtoChangelogEvent, EventType as ProtoEventType, GrpcClient,
+    ChangelogEvent as ProtoChangelogEvent, EventStream, EventType as ProtoEventType, GrpcClient,
+    TonicGrpcClient,
 };
 use super::storage::Storage;
-use super::Service;
 
 /// The kind of write recorded by a [`ChangelogEvent`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,15 +79,16 @@ pub struct EventsSincePage {
 /// recorded from the moment the subscription was opened; it does not replay
 /// past entries.
 pub struct ChangelogSubscription {
-    stream: Streaming<ProtoChangelogEvent>,
+    stream: EventStream,
 }
 
 impl ChangelogSubscription {
     /// Waits for and returns the next event, or `None` once the server
     /// closes the stream.
     pub async fn next(&mut self) -> Result<Option<ChangelogEvent>> {
-        match self.stream.message().await? {
-            Some(proto_event) => Ok(Some(proto_event.try_into()?)),
+        match self.stream.next().await {
+            Some(Ok(proto_event)) => Ok(Some(proto_event.try_into()?)),
+            Some(Err(status)) => Err(status.into()),
             None => Ok(None),
         }
     }
@@ -98,7 +100,7 @@ impl ChangelogSubscription {
 /// [`Service::consume`] also fetches and caches every document referenced by
 /// the events it encounters, via an injected documents [`DocumentsService`].
 pub struct ChangelogClient<S: Storage> {
-    grpc: GrpcClient,
+    grpc: Box<dyn GrpcClient>,
     storage: S,
     documents: Arc<dyn DocumentsService>,
 }
@@ -114,10 +116,26 @@ impl<S: Storage> ChangelogClient<S> {
         documents: Arc<dyn DocumentsService>,
     ) -> Result<Self> {
         Ok(Self {
-            grpc: GrpcClient::new(base_url).await?,
+            grpc: Box::new(TonicGrpcClient::new(base_url).await?),
             storage,
             documents,
         })
+    }
+
+    /// Creates a client from an already-constructed [`GrpcClient`], for
+    /// testing against a [`super::grpc_client::MockGrpcClient`] instead of a
+    /// live server.
+    #[cfg(test)]
+    fn with_grpc(
+        grpc: impl GrpcClient + 'static,
+        storage: S,
+        documents: Arc<dyn DocumentsService>,
+    ) -> Self {
+        Self {
+            grpc: Box::new(grpc),
+            storage,
+            documents,
+        }
     }
 
     /// Fetches and caches every document referenced by `events` via
@@ -214,5 +232,188 @@ impl<S: Storage> Service for ChangelogClient<S> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use futures::StreamExt as _;
+
+    use super::super::grpc_client::{EventsSincePage as GrpcEventsSincePage, MockGrpcClient};
+    use super::*;
+    use crate::services::documents::{Document, NewDocument};
+
+    /// A [`Storage`] backed by an in-memory cursor, for tests that don't
+    /// need to touch SQLite.
+    #[derive(Default)]
+    struct InMemoryStorage {
+        offset: AtomicI64,
+    }
+
+    impl Storage for InMemoryStorage {
+        async fn read_offset(&self) -> Result<i64> {
+            Ok(self.offset.load(Ordering::SeqCst))
+        }
+
+        async fn write_offset(&self, offset: i64) -> Result<()> {
+            self.offset.store(offset, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A [`DocumentsService`] that does nothing, for tests that only care
+    /// about changelog behavior.
+    struct NoopDocuments;
+
+    #[async_trait]
+    impl DocumentsService for NoopDocuments {
+        async fn upload(&self, _document: NewDocument) -> Result<Uuid> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn fetch(&self, _id: Uuid) -> Result<Option<Document>> {
+            Ok(None)
+        }
+
+        async fn get(&self, _id: Uuid) -> Result<Option<Document>> {
+            Ok(None)
+        }
+
+        async fn fetch_many(&self, _ids: Vec<Uuid>) -> Result<Vec<Document>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn proto_event(offset: i64, document_id: Uuid) -> ProtoChangelogEvent {
+        ProtoChangelogEvent {
+            offset,
+            document_id: document_id.to_string(),
+            event_type: ProtoEventType::Created as i32,
+            created_at: 1_700_000_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_since_converts_proto_events_into_domain_events() {
+        let document_id = Uuid::new_v4();
+
+        let mut mock_grpc = MockGrpcClient::new();
+        mock_grpc
+            .expect_list_events_since()
+            .withf(|offset, limit| *offset == 42 && *limit == 10)
+            .returning(move |_, _| {
+                Ok(GrpcEventsSincePage {
+                    events: vec![proto_event(43, document_id)],
+                    next_offset: 43,
+                })
+            });
+
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            InMemoryStorage::default(),
+            Arc::new(NoopDocuments),
+        );
+
+        let page = client.list_since(42, 10).await.unwrap();
+
+        assert_eq!(page.next_offset, 43);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].offset, 43);
+        assert_eq!(page.events[0].document_id, document_id);
+        assert_eq!(page.events[0].event_type, EventType::Created);
+    }
+
+    #[tokio::test]
+    async fn catch_up_pages_through_events_and_advances_the_offset() {
+        let document_id = Uuid::new_v4();
+
+        let mut mock_grpc = MockGrpcClient::new();
+        mock_grpc
+            .expect_list_events_since()
+            .withf(|offset, _| *offset == 0)
+            .returning(move |_, _| {
+                Ok(GrpcEventsSincePage {
+                    events: vec![proto_event(1, document_id)],
+                    next_offset: 1,
+                })
+            });
+        mock_grpc
+            .expect_list_events_since()
+            .withf(|offset, _| *offset == 1)
+            .returning(|_, _| {
+                Ok(GrpcEventsSincePage {
+                    events: vec![],
+                    next_offset: 1,
+                })
+            });
+
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            InMemoryStorage::default(),
+            Arc::new(NoopDocuments),
+        );
+
+        let mut received = Vec::new();
+        client
+            .catch_up(&mut |event| received.push(event))
+            .await
+            .unwrap();
+
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].document_id, document_id);
+    }
+
+    #[tokio::test]
+    async fn consume_catches_up_then_reacts_to_live_events() {
+        let document_id = Uuid::new_v4();
+
+        let mut mock_grpc = MockGrpcClient::new();
+        // Nothing to catch up on.
+        mock_grpc
+            .expect_list_events_since()
+            .withf(|offset, _| *offset == 0)
+            .times(1)
+            .returning(|_, _| {
+                Ok(GrpcEventsSincePage {
+                    events: vec![],
+                    next_offset: 0,
+                })
+            });
+        // One live notification, then the stream closes.
+        mock_grpc.expect_watch_events().times(1).returning(move || {
+            Ok(futures::stream::iter(vec![Ok(proto_event(1, document_id))]).boxed())
+        });
+        // Catching up after the live notification finds the new event.
+        mock_grpc
+            .expect_list_events_since()
+            .withf(|offset, _| *offset == 0)
+            .times(1)
+            .returning(move |_, _| {
+                Ok(GrpcEventsSincePage {
+                    events: vec![proto_event(1, document_id)],
+                    next_offset: 1,
+                })
+            });
+
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            InMemoryStorage::default(),
+            Arc::new(NoopDocuments),
+        );
+
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received_in_callback = received.clone();
+        client
+            .consume(Box::new(move |event| {
+                received_in_callback.lock().unwrap().push(event);
+            }))
+            .await
+            .unwrap();
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].document_id, document_id);
     }
 }

@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::Result;
 
 use super::crypto;
-use super::grpc_client::GrpcClient;
+use super::grpc_client::{GrpcClient, TonicGrpcClient};
 use super::storage::Storage;
 use super::{Document, NewDocument, Service};
 
@@ -28,7 +28,7 @@ struct DocumentEncryptedMetadata {
 /// used to cache documents fetched via [`Service::fetch`] and
 /// [`Service::fetch_many`].
 pub struct DocumentsClient<S: Storage> {
-    grpc: GrpcClient,
+    grpc: Box<dyn GrpcClient>,
     storage: S,
 }
 
@@ -39,9 +39,20 @@ impl<S: Storage> DocumentsClient<S> {
     /// [`Service::fetch_many`].
     pub async fn new(base_url: impl AsRef<str>, storage: S) -> Result<Self> {
         Ok(Self {
-            grpc: GrpcClient::new(base_url).await?,
+            grpc: Box::new(TonicGrpcClient::new(base_url).await?),
             storage,
         })
+    }
+
+    /// Creates a client from an already-constructed [`GrpcClient`], for
+    /// testing against a [`super::grpc_client::MockGrpcClient`] instead of a
+    /// live server.
+    #[cfg(test)]
+    fn with_grpc(grpc: impl GrpcClient + 'static, storage: S) -> Self {
+        Self {
+            grpc: Box::new(grpc),
+            storage,
+        }
     }
 }
 
@@ -143,6 +154,10 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
 #[cfg(test)]
 mod tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::super::SqliteStorage;
+    use super::super::grpc_client::{EncryptedDocument, MockGrpcClient};
     use super::*;
 
     #[test]
@@ -166,5 +181,87 @@ mod tests {
         assert_eq!(decrypted.content_type, metadata.content_type);
         assert_eq!(decrypted.created_at, metadata.created_at);
         assert_eq!(decrypted.size, metadata.size);
+    }
+
+    async fn setup_storage() -> SqliteStorage {
+        // A single connection, so all queries in a test hit the same
+        // in-memory database rather than each getting its own.
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
+
+        SqliteStorage::new(pool)
+    }
+
+    #[tokio::test]
+    async fn fetch_decrypts_and_caches_the_document() {
+        let content = b"hello world".to_vec();
+        let metadata = DocumentEncryptedMetadata {
+            name: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            created_at: 1_700_000_000,
+            size: content.len() as u64,
+        };
+        let metadata_json = serde_json::to_vec(&metadata).unwrap();
+
+        let (encrypted_content, wrapped_dek, encrypted_metadata) =
+            crypto::encrypt_document(&content, &metadata_json).unwrap();
+
+        let id = Uuid::new_v4();
+
+        let mut mock_grpc = MockGrpcClient::new();
+        mock_grpc
+            .expect_fetch_document()
+            .withf(move |fetched_id| *fetched_id == id)
+            .returning(move |_| {
+                Ok(Some(EncryptedDocument {
+                    id: id.to_string(),
+                    content: encrypted_content.clone(),
+                    dek: wrapped_dek.clone(),
+                    metadatas: encrypted_metadata.clone(),
+                }))
+            });
+
+        let client = DocumentsClient::with_grpc(mock_grpc, setup_storage().await);
+
+        let document = client.fetch(id).await.unwrap().unwrap();
+
+        assert_eq!(document.id, id);
+        assert_eq!(document.name, "report.pdf");
+        assert_eq!(document.content_type, "application/pdf");
+        assert_eq!(document.content, content);
+
+        // fetch() should have cached the document locally.
+        let cached = client.get(id).await.unwrap().unwrap();
+        assert_eq!(cached, document);
+    }
+
+    #[tokio::test]
+    async fn upload_sends_encrypted_content_to_grpc() {
+        let expected_id = Uuid::new_v4();
+
+        let mut mock_grpc = MockGrpcClient::new();
+        mock_grpc
+            .expect_upload_document()
+            // The plaintext content must never reach the transport layer.
+            .withf(|content, _dek, _metadatas| content != b"hello world")
+            .returning(move |_, _, _| Ok(expected_id));
+
+        let client = DocumentsClient::with_grpc(mock_grpc, setup_storage().await);
+
+        let id = client
+            .upload(NewDocument {
+                name: "report.pdf".to_string(),
+                content_type: "application/pdf".to_string(),
+                content: b"hello world".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(id, expected_id);
     }
 }

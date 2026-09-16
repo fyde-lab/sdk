@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
     SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
 use crate::{Error, Result};

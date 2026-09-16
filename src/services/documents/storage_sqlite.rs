@@ -3,8 +3,8 @@ use uuid::Uuid;
 
 use crate::{Error, Result};
 
-use super::storage::Storage;
 use super::Document;
+use super::storage::Storage;
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
 /// `documents` table).
