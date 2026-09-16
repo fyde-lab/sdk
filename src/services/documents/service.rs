@@ -115,6 +115,32 @@ impl<S: Storage> Service for DocumentsClient<S> {
             content,
         }))
     }
+
+    /// Fetches and decrypts multiple documents by id in a single round
+    /// trip. Ids that don't exist are omitted from the result.
+    async fn fetch_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>> {
+        let encrypted_documents = self.grpc.fetch_documents(&ids).await?;
+
+        encrypted_documents
+            .into_iter()
+            .map(|encrypted| {
+                let id = Uuid::parse_str(&encrypted.id)?;
+
+                let dek = crypto::unwrap_dek(&encrypted.dek)?;
+                let metadata_json = crypto::decrypt_with_dek(&dek, &encrypted.metadatas)?;
+                let metadata: DocumentEncryptedMetadata = serde_json::from_slice(&metadata_json)?;
+
+                let content = crypto::decrypt_with_dek(&dek, &encrypted.content)?;
+
+                Ok(Document {
+                    id,
+                    name: metadata.name,
+                    content_type: metadata.content_type,
+                    content,
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]

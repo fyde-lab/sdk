@@ -44,4 +44,8 @@ pub trait Service: Send + Sync {
 
     /// Fetches a document's content by id, or `None` if it doesn't exist.
     async fn fetch(&self, id: Uuid) -> Result<Option<Document>>;
+
+    /// Fetches multiple documents' content by id in a single call. Ids that
+    /// don't exist are omitted from the result.
+    async fn fetch_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>>;
 }

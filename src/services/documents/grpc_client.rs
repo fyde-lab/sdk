@@ -12,7 +12,7 @@ mod proto {
 pub(super) use proto::EncryptedDocument;
 
 use proto::documents_client::DocumentsClient;
-use proto::{FetchDocumentRequest, UploadDocumentRequest};
+use proto::{FetchDocumentRequest, FetchDocumentsRequest, UploadDocumentRequest};
 
 /// A thin gRPC transport for talking to the fyde server's documents
 /// service. Knows nothing about documents themselves; just sends requests
@@ -69,5 +69,18 @@ impl GrpcClient {
             Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
             Err(status) => Err(status.into()),
         }
+    }
+
+    /// Fetches multiple documents' encrypted content, wrapped DEKs, and
+    /// encrypted metadata by id in a single call. Ids that don't exist are
+    /// omitted from the result.
+    pub async fn fetch_documents(&self, ids: &[Uuid]) -> Result<Vec<EncryptedDocument>> {
+        let request = FetchDocumentsRequest {
+            ids: ids.iter().map(Uuid::to_string).collect(),
+        };
+
+        let response = self.client.clone().fetch_documents(request).await?;
+
+        Ok(response.into_inner().documents)
     }
 }
