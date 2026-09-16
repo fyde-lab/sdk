@@ -3,12 +3,14 @@ mod service;
 mod storage;
 mod storage_sqlite;
 
-pub use service::{ChangelogClient, ChangelogEvent};
-pub use storage::Storage;
-pub use storage_sqlite::SqliteStorage;
+pub use service::ChangelogEvent;
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use sqlx::SqlitePool;
 
+use super::documents::Service as DocumentsService;
 use crate::Result;
 
 /// Subscribes to the fyde server's changelog, keeping a local cursor
@@ -28,4 +30,19 @@ pub trait Service: Send + Sync {
     ///
     /// Runs until the server closes the watch stream or an error occurs.
     async fn consume(&self, callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()>;
+}
+
+/// Initializes the changelog service: connects to the fyde server at
+/// `base_url`, wires up local SQLite-backed cursor persistence (via `pool`),
+/// and uses `documents` to fetch and cache the documents referenced by
+/// consumed events.
+pub(crate) async fn init(
+    base_url: impl AsRef<str>,
+    pool: SqlitePool,
+    documents: Arc<dyn DocumentsService>,
+) -> Result<Arc<dyn Service>> {
+    let storage = storage_sqlite::SqliteStorage::new(pool);
+    let client = service::ChangelogClient::new(base_url, storage, documents).await?;
+
+    Ok(Arc::new(client))
 }

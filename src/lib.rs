@@ -4,15 +4,10 @@ mod sql;
 
 use std::sync::Arc;
 
-pub use services::changelog::{
-    ChangelogClient, Service as ChangelogService, SqliteStorage as ChangelogSqliteStorage,
-    Storage as ChangelogStorage,
-};
-pub use services::documents::{
-    Document, DocumentsClient, NewDocument, Service as DocumentsService,
-    SqliteStorage as DocumentsSqliteStorage, Storage as DocumentsStorage,
-};
-pub use sql::SqliteClient;
+pub use services::changelog::{ChangelogEvent, Service as ChangelogService};
+pub use services::documents::{Document, NewDocument, Service as DocumentsService};
+
+use sql::SqliteClient;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -44,8 +39,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// A connection to a fyde server.
 pub struct Client {
-    changelog: ChangelogClient<ChangelogSqliteStorage>,
-    documents: Arc<DocumentsClient<DocumentsSqliteStorage>>,
+    changelog: Arc<dyn ChangelogService>,
+    documents: Arc<dyn DocumentsService>,
 }
 
 impl Client {
@@ -55,11 +50,10 @@ impl Client {
         let url = url.as_ref();
 
         let sqlite = SqliteClient::connect().await?;
-        let changelog_storage = ChangelogSqliteStorage::new(sqlite.pool().clone());
-        let documents_storage = DocumentsSqliteStorage::new(sqlite.pool().clone());
 
-        let documents = Arc::new(DocumentsClient::new(url, documents_storage).await?);
-        let changelog = ChangelogClient::new(url, changelog_storage, documents.clone()).await?;
+        let documents = services::documents::init(url, sqlite.pool().clone()).await?;
+        let changelog =
+            services::changelog::init(url, sqlite.pool().clone(), documents.clone()).await?;
 
         Ok(Self {
             changelog,
@@ -68,12 +62,12 @@ impl Client {
     }
 
     /// Returns a reference to the client's documents service.
-    pub fn documents(&self) -> &DocumentsClient<impl services::documents::Storage> {
-        &self.documents
+    pub fn documents(&self) -> &dyn DocumentsService {
+        self.documents.as_ref()
     }
 
     /// Returns a reference to the client's changelog service.
-    pub fn changelog(&self) -> &ChangelogClient<impl services::changelog::Storage> {
-        &self.changelog
+    pub fn changelog(&self) -> &dyn ChangelogService {
+        self.changelog.as_ref()
     }
 }

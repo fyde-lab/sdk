@@ -8,12 +8,12 @@ use super::storage::Storage;
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
 /// `documents` table).
-pub struct SqliteStorage {
+pub(super) struct SqliteStorage {
     pool: SqlitePool,
 }
 
 impl SqliteStorage {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub(super) fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 }

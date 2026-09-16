@@ -99,7 +99,7 @@ impl ChangelogSubscription {
 /// implementation used by [`Service::consume`] to persist its cursor.
 /// [`Service::consume`] also fetches and caches every document referenced by
 /// the events it encounters, via an injected documents [`DocumentsService`].
-pub struct ChangelogClient<S: Storage> {
+pub(super) struct ChangelogClient<S: Storage> {
     grpc: Box<dyn FydeClient>,
     storage: S,
     documents: Arc<dyn DocumentsService>,
@@ -110,7 +110,7 @@ impl<S: Storage> ChangelogClient<S> {
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`), using `storage`
     /// to persist [`Service::consume`]'s cursor, and `documents` to fetch and
     /// cache the documents referenced by encountered events.
-    pub async fn new(
+    pub(super) async fn new(
         base_url: impl AsRef<str>,
         storage: S,
         documents: Arc<dyn DocumentsService>,

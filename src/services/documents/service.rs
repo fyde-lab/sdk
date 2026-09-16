@@ -27,7 +27,7 @@ struct DocumentEncryptedMetadata {
 /// to an injected [`Storage`]. Generic over the [`Storage`] implementation
 /// used to cache documents fetched via [`Service::fetch`] and
 /// [`Service::fetch_many`].
-pub struct DocumentsClient<S: Storage> {
+pub(super) struct DocumentsClient<S: Storage> {
     grpc: Box<dyn FydeClient>,
     storage: S,
 }
@@ -37,7 +37,7 @@ impl<S: Storage> DocumentsClient<S> {
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`), using `storage`
     /// to cache documents fetched via [`Service::fetch`] and
     /// [`Service::fetch_many`].
-    pub async fn new(base_url: impl AsRef<str>, storage: S) -> Result<Self> {
+    pub(super) async fn new(base_url: impl AsRef<str>, storage: S) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(base_url).await?),
             storage,
@@ -156,8 +156,8 @@ impl<S: Storage> Service for DocumentsClient<S> {
 mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use super::super::SqliteStorage;
     use super::super::grpc_client::{EncryptedDocument, MockFydeClient};
+    use super::super::storage_sqlite::SqliteStorage;
     use super::*;
 
     #[test]

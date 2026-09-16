@@ -8,7 +8,7 @@ use super::Document;
 /// [`super::DocumentsClient::fetch`] and [`super::DocumentsClient::fetch_many`].
 /// Implementations are injected into [`super::DocumentsClient`] at
 /// construction.
-pub trait Storage: Send + Sync {
+pub(super) trait Storage: Send + Sync {
     /// Persists a document as-is, unencrypted.
     fn save_document(
         &self,

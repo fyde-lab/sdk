@@ -4,11 +4,10 @@ mod service;
 mod storage;
 mod storage_sqlite;
 
-pub use service::DocumentsClient;
-pub use storage::Storage;
-pub use storage_sqlite::SqliteStorage;
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::Result;
@@ -50,4 +49,14 @@ pub trait Service: Send + Sync {
     /// Fetches multiple documents' content by id in a single call. Ids that
     /// don't exist are omitted from the result.
     async fn fetch_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>>;
+}
+
+/// Initializes the documents service: connects to the fyde server at
+/// `base_url`, and wires up local SQLite-backed caching (via `pool`) of
+/// documents fetched from it.
+pub(crate) async fn init(base_url: impl AsRef<str>, pool: SqlitePool) -> Result<Arc<dyn Service>> {
+    let storage = storage_sqlite::SqliteStorage::new(pool);
+    let client = service::DocumentsClient::new(base_url, storage).await?;
+
+    Ok(Arc::new(client))
 }
