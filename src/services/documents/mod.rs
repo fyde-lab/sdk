@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use crate::Result;
+use crate::{ErrorContext as _, Result};
 
 /// A file, as returned by [`Service::download`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +64,9 @@ pub trait Service: Send + Sync {
 /// documents fetched from it.
 pub(crate) async fn init(base_url: impl AsRef<str>, pool: SqlitePool) -> Result<Arc<dyn Service>> {
     let storage = storage_sqlite::SqliteStorage::new(pool);
-    let client = service::DocumentsClient::new(base_url, storage).await?;
+    let client = service::DocumentsClient::new(base_url, storage)
+        .await
+        .context("failed to create documents client")?;
 
     Ok(Arc::new(client))
 }

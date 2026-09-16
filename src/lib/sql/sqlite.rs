@@ -5,7 +5,7 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
-use crate::{Error, Result};
+use crate::{Error, ErrorContext as _, Result};
 
 /// A local SQLite database used by the SDK to persist data on disk.
 ///
@@ -20,7 +20,8 @@ impl SqliteClient {
     /// Opens the local SQLite database, creating its containing directory
     /// and the database file if they don't already exist.
     pub async fn connect() -> Result<Self> {
-        Self::connect_at(local_database_path()?).await
+        let path = local_database_path().context("failed to resolve local database path")?;
+        Self::connect_at(path).await
     }
 
     async fn connect_at(path: PathBuf) -> Result<Self> {
@@ -35,9 +36,12 @@ impl SqliteClient {
             .max_connections(1)
             .connect_with(options)
             .await
-            .map_err(Error::Database)?;
+            .context("failed to connect to local database")?;
 
-        sqlx::migrate!().run(&pool).await.map_err(Error::Migrate)?;
+        sqlx::migrate!()
+            .run(&pool)
+            .await
+            .context("failed to run local database migrations")?;
 
         Ok(Self { pool })
     }
@@ -51,7 +55,8 @@ impl SqliteClient {
 /// Resolves the path to the local database file per the XDG Base Directory
 /// Specification, creating its parent directory if needed.
 fn local_database_path() -> Result<PathBuf> {
-    let dirs = xdg::BaseDirectories::with_prefix("fyde").map_err(Error::Xdg)?;
+    let dirs = xdg::BaseDirectories::with_prefix("fyde")
+        .context("failed to resolve XDG base directories")?;
     dirs.place_data_file("fyde.db").map_err(Error::Io)
 }
 

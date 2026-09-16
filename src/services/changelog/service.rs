@@ -5,7 +5,7 @@ use futures::StreamExt;
 use uuid::Uuid;
 
 use crate::services::documents::Service as DocumentsService;
-use crate::{Error, Result};
+use crate::{Error, ErrorContext as _, Result};
 
 use super::Service;
 use super::grpc_client::{
@@ -57,8 +57,18 @@ impl TryFrom<ProtoChangelogEvent> for ChangelogEvent {
 
         Ok(Self {
             offset: proto.offset,
-            document_id: Uuid::parse_str(&proto.document_id)?,
-            event_type: event_type.try_into()?,
+            document_id: Uuid::parse_str(&proto.document_id).with_context(|| {
+                format!(
+                    "invalid document id in changelog event: {}",
+                    proto.document_id
+                )
+            })?,
+            event_type: EventType::try_from(event_type).with_context(|| {
+                format!(
+                    "invalid event type in changelog event at offset {}",
+                    proto.offset
+                )
+            })?,
             created_at: proto.created_at,
         })
     }
@@ -87,7 +97,10 @@ impl ChangelogSubscription {
     /// closes the stream.
     pub async fn next(&mut self) -> Result<Option<ChangelogEvent>> {
         match self.stream.next().await {
-            Some(Ok(proto_event)) => Ok(Some(proto_event.try_into()?)),
+            Some(Ok(proto_event)) => Ok(Some(
+                ChangelogEvent::try_from(proto_event)
+                    .context("received an invalid changelog event")?,
+            )),
             Some(Err(status)) => Err(status.into()),
             None => Ok(None),
         }
@@ -116,7 +129,11 @@ impl<S: Storage> ChangelogClient<S> {
         documents: Arc<dyn DocumentsService>,
     ) -> Result<Self> {
         Ok(Self {
-            grpc: Box::new(GrpcClient::new(base_url).await?),
+            grpc: Box::new(
+                GrpcClient::new(base_url)
+                    .await
+                    .context("failed to create changelog grpc client")?,
+            ),
             storage,
             documents,
         })
@@ -148,7 +165,10 @@ impl<S: Storage> ChangelogClient<S> {
             return Ok(());
         }
 
-        self.documents.download_many(ids).await?;
+        self.documents
+            .download_many(ids)
+            .await
+            .context("failed to download documents referenced by changelog events")?;
 
         Ok(())
     }
@@ -158,20 +178,36 @@ impl<S: Storage> ChangelogClient<S> {
     /// Invokes `callback` once for each event encountered.
     async fn catch_up(&self, callback: &mut (dyn FnMut(ChangelogEvent) + Send)) -> Result<()> {
         loop {
-            let offset = self.storage.read_offset().await?;
-            let page = self.list_since(offset, 0).await?;
+            let offset = self
+                .storage
+                .read_offset()
+                .await
+                .context("failed to read changelog cursor")?;
+            let page = self.list_since(offset, 0).await.with_context(|| {
+                format!("failed to list changelog events since offset {offset}")
+            })?;
 
             if page.events.is_empty() {
                 break;
             }
 
-            self.fetch_documents(&page.events).await?;
+            self.fetch_documents(&page.events)
+                .await
+                .context("failed to fetch documents for changelog catch-up")?;
 
             for event in page.events {
                 callback(event);
             }
 
-            self.storage.write_offset(page.next_offset).await?;
+            self.storage
+                .write_offset(page.next_offset)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to persist changelog cursor at offset {}",
+                        page.next_offset
+                    )
+                })?;
         }
 
         Ok(())
@@ -184,13 +220,20 @@ impl<S: Storage> ChangelogClient<S> {
     /// Paginate by repeatedly calling this with the previous page's
     /// `next_offset` until the returned page is empty.
     async fn list_since(&self, offset: i64, limit: i32) -> Result<EventsSincePage> {
-        let page = self.grpc.list_events_since(offset, limit).await?;
+        let page = self
+            .grpc
+            .list_events_since(offset, limit)
+            .await
+            .with_context(|| {
+                format!("failed to list changelog events from server since offset {offset}")
+            })?;
 
         let events = page
             .events
             .into_iter()
             .map(ChangelogEvent::try_from)
-            .collect::<Result<_>>()?;
+            .collect::<Result<_>>()
+            .context("failed to convert changelog events from server")?;
 
         Ok(EventsSincePage {
             events,
@@ -213,22 +256,49 @@ impl<S: Storage> Service for ChangelogClient<S> {
     ///
     /// Runs until the server closes the watch stream or an error occurs.
     async fn consume(&self, mut callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
-        self.catch_up(&mut *callback).await?;
+        self.catch_up(&mut *callback)
+            .await
+            .context("failed to catch up on changelog before subscribing")?;
 
-        let stream = self.grpc.watch_events().await?;
+        let stream = self
+            .grpc
+            .watch_events()
+            .await
+            .context("failed to open changelog watch stream")?;
         let mut subscription = ChangelogSubscription { stream };
 
-        while subscription.next().await?.is_some() {
-            let offset = self.storage.read_offset().await?;
-            let page = self.list_since(offset, 0).await?;
+        while subscription
+            .next()
+            .await
+            .context("failed to read next changelog event")?
+            .is_some()
+        {
+            let offset = self
+                .storage
+                .read_offset()
+                .await
+                .context("failed to read changelog cursor")?;
+            let page = self.list_since(offset, 0).await.with_context(|| {
+                format!("failed to list changelog events since offset {offset}")
+            })?;
 
-            self.fetch_documents(&page.events).await?;
+            self.fetch_documents(&page.events)
+                .await
+                .context("failed to fetch documents for changelog catch-up")?;
 
             for event in page.events {
                 callback(event);
             }
 
-            self.storage.write_offset(page.next_offset).await?;
+            self.storage
+                .write_offset(page.next_offset)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to persist changelog cursor at offset {}",
+                        page.next_offset
+                    )
+                })?;
         }
 
         Ok(())

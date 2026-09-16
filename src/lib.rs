@@ -33,9 +33,43 @@ pub enum Error {
     Encryption(String),
     #[error("invalid changelog event: {0}")]
     InvalidChangelogEvent(String),
+    #[error("{message}: {source}")]
+    Context {
+        message: String,
+        #[source]
+        source: Box<Error>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Attaches a human-readable message to a fallible operation's error,
+/// preserving the original error as its source. Used throughout the crate
+/// so every `?` site reports what it was trying to do, not just the bare
+/// underlying error.
+pub(crate) trait ErrorContext<T> {
+    fn context(self, message: &str) -> Result<T>;
+    fn with_context<F: FnOnce() -> String>(self, f: F) -> Result<T>;
+}
+
+impl<T, E> ErrorContext<T> for std::result::Result<T, E>
+where
+    E: Into<Error>,
+{
+    fn context(self, message: &str) -> Result<T> {
+        self.map_err(|err| Error::Context {
+            message: message.to_string(),
+            source: Box::new(err.into()),
+        })
+    }
+
+    fn with_context<F: FnOnce() -> String>(self, f: F) -> Result<T> {
+        self.map_err(|err| Error::Context {
+            message: f(),
+            source: Box::new(err.into()),
+        })
+    }
+}
 
 /// A connection to a fyde server.
 pub struct Client {
@@ -49,11 +83,16 @@ impl Client {
     pub async fn connect(url: impl AsRef<str>) -> Result<Self> {
         let url = url.as_ref();
 
-        let sqlite = SqliteClient::connect().await?;
+        let sqlite = SqliteClient::connect()
+            .await
+            .context("failed to open local database")?;
 
-        let documents = services::documents::init(url, sqlite.pool().clone()).await?;
-        let changelog =
-            services::changelog::init(url, sqlite.pool().clone(), documents.clone()).await?;
+        let documents = services::documents::init(url, sqlite.pool().clone())
+            .await
+            .context("failed to initialize documents service")?;
+        let changelog = services::changelog::init(url, sqlite.pool().clone(), documents.clone())
+            .await
+            .context("failed to initialize changelog service")?;
 
         Ok(Self {
             changelog,

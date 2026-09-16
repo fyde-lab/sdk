@@ -4,7 +4,7 @@ use mockall::automock;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
-use crate::{Error, Result};
+use crate::{Error, ErrorContext as _, Result};
 
 /// Generated protobuf/gRPC bindings for the `documents` service, compiled
 /// from `../api-protos/documents.proto` by `build.rs`.
@@ -55,7 +55,10 @@ impl GrpcClient {
     pub async fn new(base_url: impl AsRef<str>) -> Result<Self> {
         let endpoint = Channel::from_shared(base_url.as_ref().to_string())
             .map_err(|err| Error::InvalidEndpoint(err.to_string()))?;
-        let channel = endpoint.connect().await?;
+        let channel = endpoint
+            .connect()
+            .await
+            .context("failed to connect to documents grpc endpoint")?;
 
         Ok(Self {
             client: DocumentsClient::new(channel),
@@ -82,9 +85,10 @@ impl FydeClient for GrpcClient {
                 dek,
                 metadatas,
             })
-            .await?;
+            .await
+            .context("failed to upload document")?;
 
-        Ok(Uuid::parse_str(&response.into_inner().id)?)
+        Uuid::parse_str(&response.into_inner().id).context("invalid document id returned by server")
     }
 
     async fn fetch_document(&self, id: Uuid) -> Result<Option<EncryptedDocument>> {
@@ -102,7 +106,12 @@ impl FydeClient for GrpcClient {
             ids: ids.iter().map(Uuid::to_string).collect(),
         };
 
-        let response = self.client.clone().fetch_documents(request).await?;
+        let response = self
+            .client
+            .clone()
+            .fetch_documents(request)
+            .await
+            .context("failed to fetch documents")?;
 
         Ok(response.into_inner().documents)
     }

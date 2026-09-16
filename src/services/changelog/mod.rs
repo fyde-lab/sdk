@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 
 use super::documents::Service as DocumentsService;
-use crate::Result;
+use crate::{ErrorContext as _, Result};
 
 /// Subscribes to the fyde server's changelog, keeping a local cursor
 /// persisted via an injected [`Storage`] up to date. Trait methods take
@@ -42,7 +42,9 @@ pub(crate) async fn init(
     documents: Arc<dyn DocumentsService>,
 ) -> Result<Arc<dyn Service>> {
     let storage = storage_sqlite::SqliteStorage::new(pool);
-    let client = service::ChangelogClient::new(base_url, storage, documents).await?;
+    let client = service::ChangelogClient::new(base_url, storage, documents)
+        .await
+        .context("failed to create changelog client")?;
 
     Ok(Arc::new(client))
 }

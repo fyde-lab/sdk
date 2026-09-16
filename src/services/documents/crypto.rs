@@ -3,7 +3,7 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 
-use crate::{Error, Result};
+use crate::{Error, ErrorContext as _, Result};
 
 /// Length in bytes of an AES-256 key (DEK or KEK).
 pub(super) const KEY_LEN: usize = 32;
@@ -78,7 +78,7 @@ fn aead_decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>> {
 /// [`encrypt_document`].
 pub(super) fn unwrap_dek(wrapped_dek: &[u8]) -> Result<[u8; KEY_LEN]> {
     let kek = derive_temporary_kek();
-    let dek = aead_decrypt(&kek, wrapped_dek)?;
+    let dek = aead_decrypt(&kek, wrapped_dek).context("failed to unwrap DEK")?;
     dek.try_into()
         .map_err(|_| Error::Encryption("unwrapped DEK has an invalid length".into()))
 }
@@ -104,11 +104,13 @@ pub(super) fn encrypt_document(
 ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let dek = generate_dek();
 
-    let encrypted_content = aead_encrypt(&dek, content)?;
-    let encrypted_metadata = aead_encrypt(&dek, metadata)?;
+    let encrypted_content =
+        aead_encrypt(&dek, content).context("failed to encrypt document content")?;
+    let encrypted_metadata =
+        aead_encrypt(&dek, metadata).context("failed to encrypt document metadata")?;
 
     let kek = derive_temporary_kek();
-    let wrapped_dek = aead_encrypt(&kek, &dek)?;
+    let wrapped_dek = aead_encrypt(&kek, &dek).context("failed to wrap document DEK")?;
 
     Ok((encrypted_content, wrapped_dek, encrypted_metadata))
 }

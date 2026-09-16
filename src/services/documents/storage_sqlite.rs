@@ -1,7 +1,7 @@
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
-use crate::{Error, Result};
+use crate::{ErrorContext as _, Result};
 
 use super::Document;
 use super::storage::Storage;
@@ -31,7 +31,7 @@ impl Storage for SqliteStorage {
         .bind(created_at)
         .execute(&self.pool)
         .await
-        .map_err(Error::Database)?;
+        .with_context(|| format!("failed to save document {} to local database", document.id))?;
 
         Ok(())
     }
@@ -41,7 +41,7 @@ impl Storage for SqliteStorage {
             .bind(id.to_string())
             .fetch_optional(&self.pool)
             .await
-            .map_err(Error::Database)?;
+            .with_context(|| format!("failed to fetch document {id} from local database"))?;
 
         let Some(row) = row else {
             return Ok(None);
@@ -65,14 +65,15 @@ impl Storage for SqliteStorage {
         .bind(offset)
         .fetch_all(&self.pool)
         .await
-        .map_err(Error::Database)?;
+        .with_context(|| format!("failed to list documents at offset {offset}"))?;
 
         rows.into_iter()
             .map(|row| {
                 let id: String = row.get("id");
 
                 Ok(Document {
-                    id: Uuid::parse_str(&id)?,
+                    id: Uuid::parse_str(&id)
+                        .with_context(|| format!("invalid document id in local database: {id}"))?,
                     name: row.get("name"),
                     content_type: row.get("content_type"),
                     content: row.get("content"),

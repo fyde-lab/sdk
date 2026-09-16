@@ -4,7 +4,7 @@ use futures::stream::BoxStream;
 use mockall::automock;
 use tonic::transport::Channel;
 
-use crate::{Error, Result};
+use crate::{Error, ErrorContext as _, Result};
 
 /// Generated protobuf/gRPC bindings for the `changelog` service, compiled
 /// from `../api-protos/changelog.proto` by `build.rs`.
@@ -57,7 +57,10 @@ impl GrpcClient {
     pub async fn new(base_url: impl AsRef<str>) -> Result<Self> {
         let endpoint = Channel::from_shared(base_url.as_ref().to_string())
             .map_err(|err| Error::InvalidEndpoint(err.to_string()))?;
-        let channel = endpoint.connect().await?;
+        let channel = endpoint
+            .connect()
+            .await
+            .context("failed to connect to changelog grpc endpoint")?;
 
         Ok(Self {
             client: ChangelogClient::new(channel),
@@ -75,7 +78,8 @@ impl FydeClient for GrpcClient {
             .client
             .clone()
             .watch_events(WatchEventsRequest {})
-            .await?;
+            .await
+            .context("failed to open changelog watch stream")?;
         Ok(Box::pin(response.into_inner()))
     }
 
@@ -84,7 +88,8 @@ impl FydeClient for GrpcClient {
             .client
             .clone()
             .list_events_since(ListEventsSinceRequest { offset, limit })
-            .await?
+            .await
+            .with_context(|| format!("failed to list changelog events since offset {offset}"))?
             .into_inner();
 
         Ok(EventsSincePage {

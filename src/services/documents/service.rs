@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::Result;
+use crate::{ErrorContext as _, Result};
 
 use super::crypto;
 use super::grpc_client::{FydeClient, GrpcClient};
@@ -39,7 +39,11 @@ impl<S: Storage> DocumentsClient<S> {
     /// [`Service::download_many`].
     pub(super) async fn new(base_url: impl AsRef<str>, storage: S) -> Result<Self> {
         Ok(Self {
-            grpc: Box::new(GrpcClient::new(base_url).await?),
+            grpc: Box::new(
+                GrpcClient::new(base_url)
+                    .await
+                    .context("failed to create documents grpc client")?,
+            ),
             storage,
         })
     }
@@ -79,10 +83,12 @@ impl<S: Storage> Service for DocumentsClient<S> {
             created_at,
             size: document.content.len() as u64,
         };
-        let metadata_json = serde_json::to_vec(&metadata)?;
+        let metadata_json =
+            serde_json::to_vec(&metadata).context("failed to serialize document metadata")?;
 
         let (encrypted_content, wrapped_dek, encrypted_metadata) =
-            crypto::encrypt_document(&document.content, &metadata_json)?;
+            crypto::encrypt_document(&document.content, &metadata_json)
+                .context("failed to encrypt document")?;
 
         self.grpc
             .upload_document(encrypted_content, wrapped_dek, encrypted_metadata)
@@ -90,15 +96,24 @@ impl<S: Storage> Service for DocumentsClient<S> {
     }
 
     async fn download(&self, id: Uuid) -> Result<Option<Document>> {
-        let Some(encrypted) = self.grpc.fetch_document(id).await? else {
+        let Some(encrypted) = self
+            .grpc
+            .fetch_document(id)
+            .await
+            .with_context(|| format!("failed to fetch document {id}"))?
+        else {
             return Ok(None);
         };
 
-        let dek = crypto::unwrap_dek(&encrypted.dek)?;
-        let metadata_json = crypto::decrypt_with_dek(&dek, &encrypted.metadatas)?;
-        let metadata: DocumentEncryptedMetadata = serde_json::from_slice(&metadata_json)?;
+        let dek = crypto::unwrap_dek(&encrypted.dek)
+            .with_context(|| format!("failed to unwrap DEK for document {id}"))?;
+        let metadata_json = crypto::decrypt_with_dek(&dek, &encrypted.metadatas)
+            .with_context(|| format!("failed to decrypt metadata for document {id}"))?;
+        let metadata: DocumentEncryptedMetadata = serde_json::from_slice(&metadata_json)
+            .with_context(|| format!("failed to deserialize metadata for document {id}"))?;
 
-        let content = crypto::decrypt_with_dek(&dek, &encrypted.content)?;
+        let content = crypto::decrypt_with_dek(&dek, &encrypted.content)
+            .with_context(|| format!("failed to decrypt content for document {id}"))?;
 
         let document = Document {
             id,
@@ -109,7 +124,8 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
         self.storage
             .save_document(&document, metadata.created_at)
-            .await?;
+            .await
+            .with_context(|| format!("failed to cache document {id} locally"))?;
 
         Ok(Some(document))
     }
@@ -125,18 +141,28 @@ impl<S: Storage> Service for DocumentsClient<S> {
     /// Fetches and decrypts multiple documents by id in a single round
     /// trip. Ids that don't exist are omitted from the result.
     async fn download_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>> {
-        let encrypted_documents = self.grpc.fetch_documents(&ids).await?;
+        let encrypted_documents = self
+            .grpc
+            .fetch_documents(&ids)
+            .await
+            .context("failed to fetch documents")?;
 
         let mut documents = Vec::with_capacity(encrypted_documents.len());
 
         for encrypted in encrypted_documents {
-            let id = Uuid::parse_str(&encrypted.id)?;
+            let id = Uuid::parse_str(&encrypted.id).with_context(|| {
+                format!("invalid document id returned by server: {}", encrypted.id)
+            })?;
 
-            let dek = crypto::unwrap_dek(&encrypted.dek)?;
-            let metadata_json = crypto::decrypt_with_dek(&dek, &encrypted.metadatas)?;
-            let metadata: DocumentEncryptedMetadata = serde_json::from_slice(&metadata_json)?;
+            let dek = crypto::unwrap_dek(&encrypted.dek)
+                .with_context(|| format!("failed to unwrap DEK for document {id}"))?;
+            let metadata_json = crypto::decrypt_with_dek(&dek, &encrypted.metadatas)
+                .with_context(|| format!("failed to decrypt metadata for document {id}"))?;
+            let metadata: DocumentEncryptedMetadata = serde_json::from_slice(&metadata_json)
+                .with_context(|| format!("failed to deserialize metadata for document {id}"))?;
 
-            let content = crypto::decrypt_with_dek(&dek, &encrypted.content)?;
+            let content = crypto::decrypt_with_dek(&dek, &encrypted.content)
+                .with_context(|| format!("failed to decrypt content for document {id}"))?;
 
             let document = Document {
                 id,
@@ -147,7 +173,8 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
             self.storage
                 .save_document(&document, metadata.created_at)
-                .await?;
+                .await
+                .with_context(|| format!("failed to cache document {id} locally"))?;
 
             documents.push(document);
         }

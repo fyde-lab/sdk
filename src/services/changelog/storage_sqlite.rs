@@ -1,6 +1,6 @@
 use sqlx::SqlitePool;
 
-use crate::{Error, Result};
+use crate::{ErrorContext as _, Result};
 
 use super::storage::Storage;
 
@@ -22,7 +22,7 @@ impl Storage for SqliteStorage {
             sqlx::query_scalar("SELECT offset FROM changelog_offset WHERE id = 0")
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(Error::Database)?;
+                .context("failed to read changelog offset from local database")?;
 
         Ok(offset.unwrap_or(0))
     }
@@ -35,7 +35,7 @@ impl Storage for SqliteStorage {
         .bind(offset)
         .execute(&self.pool)
         .await
-        .map_err(Error::Database)?;
+        .with_context(|| format!("failed to write changelog offset {offset} to local database"))?;
 
         Ok(())
     }
