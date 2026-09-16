@@ -12,7 +12,7 @@ use super::storage::Storage;
 use super::{Document, NewDocument, Service};
 
 /// Cleartext metadata encrypted under the document's DEK before upload, and
-/// decrypted back out of it on fetch.
+/// decrypted back out of it on download.
 #[derive(Serialize, Deserialize)]
 struct DocumentEncryptedMetadata {
     name: String,
@@ -25,8 +25,8 @@ struct DocumentEncryptedMetadata {
 /// The default [`Service`] implementation: talks to the fyde server's
 /// documents service over gRPC, and delegates local, unencrypted persistence
 /// to an injected [`Storage`]. Generic over the [`Storage`] implementation
-/// used to cache documents fetched via [`Service::fetch`] and
-/// [`Service::fetch_many`].
+/// used to cache documents fetched via [`Service::download`] and
+/// [`Service::download_many`].
 pub(super) struct DocumentsClient<S: Storage> {
     grpc: Box<dyn FydeClient>,
     storage: S,
@@ -35,8 +35,8 @@ pub(super) struct DocumentsClient<S: Storage> {
 impl<S: Storage> DocumentsClient<S> {
     /// Creates a client for the documents service at the given `http://` or
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`), using `storage`
-    /// to cache documents fetched via [`Service::fetch`] and
-    /// [`Service::fetch_many`].
+    /// to cache documents fetched via [`Service::download`] and
+    /// [`Service::download_many`].
     pub(super) async fn new(base_url: impl AsRef<str>, storage: S) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(base_url).await?),
@@ -89,7 +89,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .await
     }
 
-    async fn fetch(&self, id: Uuid) -> Result<Option<Document>> {
+    async fn download(&self, id: Uuid) -> Result<Option<Document>> {
         let Some(encrypted) = self.grpc.fetch_document(id).await? else {
             return Ok(None);
         };
@@ -120,7 +120,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
     /// Fetches and decrypts multiple documents by id in a single round
     /// trip. Ids that don't exist are omitted from the result.
-    async fn fetch_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>> {
+    async fn download_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>> {
         let encrypted_documents = self.grpc.fetch_documents(&ids).await?;
 
         let mut documents = Vec::with_capacity(encrypted_documents.len());
@@ -198,7 +198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_decrypts_and_caches_the_document() {
+    async fn download_decrypts_and_caches_the_document() {
         let content = b"hello world".to_vec();
         let metadata = DocumentEncryptedMetadata {
             name: "report.pdf".to_string(),
@@ -228,14 +228,14 @@ mod tests {
 
         let client = DocumentsClient::with_grpc(mock_grpc, setup_storage().await);
 
-        let document = client.fetch(id).await.unwrap().unwrap();
+        let document = client.download(id).await.unwrap().unwrap();
 
         assert_eq!(document.id, id);
         assert_eq!(document.name, "report.pdf");
         assert_eq!(document.content_type, "application/pdf");
         assert_eq!(document.content, content);
 
-        // fetch() should have cached the document locally.
+        // download() should have cached the document locally.
         let cached = client.get(id).await.unwrap().unwrap();
         assert_eq!(cached, document);
     }

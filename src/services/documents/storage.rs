@@ -5,7 +5,7 @@ use crate::Result;
 use super::Document;
 
 /// Caches documents fetched from the server, unencrypted, by
-/// [`super::DocumentsClient::fetch`] and [`super::DocumentsClient::fetch_many`].
+/// [`super::DocumentsClient::download`] and [`super::DocumentsClient::download_many`].
 /// Implementations are injected into [`super::DocumentsClient`] at
 /// construction.
 pub(super) trait Storage: Send + Sync {

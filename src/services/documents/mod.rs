@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::Result;
 
-/// A file, as returned by [`Service::fetch`].
+/// A file, as returned by [`Service::download`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
     pub id: Uuid,
@@ -38,17 +38,17 @@ pub trait Service: Send + Sync {
     async fn upload(&self, document: NewDocument) -> Result<Uuid>;
 
     /// Fetches a document's content by id, or `None` if it doesn't exist.
-    async fn fetch(&self, id: Uuid) -> Result<Option<Document>>;
+    async fn download(&self, id: Uuid) -> Result<Option<Document>>;
 
     /// Fetches a document previously cached in local storage by
-    /// [`Service::fetch`] or [`Service::fetch_many`], or `None` if it
-    /// doesn't exist. Unlike [`Service::fetch`], this does not talk to the
+    /// [`Service::download`] or [`Service::download_many`], or `None` if it
+    /// doesn't exist. Unlike [`Service::download`], this does not talk to the
     /// server.
     async fn get(&self, id: Uuid) -> Result<Option<Document>>;
 
     /// Fetches multiple documents' content by id in a single call. Ids that
     /// don't exist are omitted from the result.
-    async fn fetch_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>>;
+    async fn download_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>>;
 }
 
 /// Initializes the documents service: connects to the fyde server at

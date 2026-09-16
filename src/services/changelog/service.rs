@@ -139,7 +139,7 @@ impl<S: Storage> ChangelogClient<S> {
     }
 
     /// Fetches and caches every document referenced by `events` via
-    /// [`DocumentsService::fetch_many`], skipping the call entirely when
+    /// [`DocumentsService::download_many`], skipping the call entirely when
     /// `events` is empty.
     async fn fetch_documents(&self, events: &[ChangelogEvent]) -> Result<()> {
         let ids: Vec<Uuid> = events.iter().map(|event| event.document_id).collect();
@@ -148,7 +148,7 @@ impl<S: Storage> ChangelogClient<S> {
             return Ok(());
         }
 
-        self.documents.fetch_many(ids).await?;
+        self.documents.download_many(ids).await?;
 
         Ok(())
     }
@@ -273,7 +273,7 @@ mod tests {
             unimplemented!("not used by these tests")
         }
 
-        async fn fetch(&self, _id: Uuid) -> Result<Option<Document>> {
+        async fn download(&self, _id: Uuid) -> Result<Option<Document>> {
             Ok(None)
         }
 
@@ -281,7 +281,7 @@ mod tests {
             Ok(None)
         }
 
-        async fn fetch_many(&self, _ids: Vec<Uuid>) -> Result<Vec<Document>> {
+        async fn download_many(&self, _ids: Vec<Uuid>) -> Result<Vec<Document>> {
             Ok(Vec::new())
         }
     }
