@@ -107,12 +107,18 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
         let content = crypto::decrypt_with_dek(&dek, &encrypted.content)?;
 
-        Ok(Some(Document {
+        let document = Document {
             id,
             name: metadata.name,
             content_type: metadata.content_type,
             content,
-        }))
+        };
+
+        self.storage
+            .save_document(&document, metadata.created_at)
+            .await?;
+
+        Ok(Some(document))
     }
 
     async fn get(&self, id: Uuid) -> Result<Option<Document>> {
@@ -124,25 +130,32 @@ impl<S: Storage> Service for DocumentsClient<S> {
     async fn fetch_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>> {
         let encrypted_documents = self.grpc.fetch_documents(&ids).await?;
 
-        encrypted_documents
-            .into_iter()
-            .map(|encrypted| {
-                let id = Uuid::parse_str(&encrypted.id)?;
+        let mut documents = Vec::with_capacity(encrypted_documents.len());
 
-                let dek = crypto::unwrap_dek(&encrypted.dek)?;
-                let metadata_json = crypto::decrypt_with_dek(&dek, &encrypted.metadatas)?;
-                let metadata: DocumentEncryptedMetadata = serde_json::from_slice(&metadata_json)?;
+        for encrypted in encrypted_documents {
+            let id = Uuid::parse_str(&encrypted.id)?;
 
-                let content = crypto::decrypt_with_dek(&dek, &encrypted.content)?;
+            let dek = crypto::unwrap_dek(&encrypted.dek)?;
+            let metadata_json = crypto::decrypt_with_dek(&dek, &encrypted.metadatas)?;
+            let metadata: DocumentEncryptedMetadata = serde_json::from_slice(&metadata_json)?;
 
-                Ok(Document {
-                    id,
-                    name: metadata.name,
-                    content_type: metadata.content_type,
-                    content,
-                })
-            })
-            .collect()
+            let content = crypto::decrypt_with_dek(&dek, &encrypted.content)?;
+
+            let document = Document {
+                id,
+                name: metadata.name,
+                content_type: metadata.content_type,
+                content,
+            };
+
+            self.storage
+                .save_document(&document, metadata.created_at)
+                .await?;
+
+            documents.push(document);
+        }
+
+        Ok(documents)
     }
 }
 
