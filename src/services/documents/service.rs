@@ -53,15 +53,14 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        self.storage
-            .save_document(
-                id,
-                &document.name,
-                &document.content_type,
-                &document.content,
-                created_at,
-            )
-            .await?;
+        let document = Document {
+            id,
+            name: document.name,
+            content_type: document.content_type,
+            content: document.content,
+        };
+
+        self.storage.save_document(&document, created_at).await?;
 
         Ok(id)
     }

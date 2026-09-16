@@ -11,10 +11,7 @@ pub trait Storage: Send + Sync {
     /// Persists a document as-is, unencrypted.
     fn save_document(
         &self,
-        id: Uuid,
-        name: &str,
-        content_type: &str,
-        content: &[u8],
+        document: &Document,
         created_at: i64,
     ) -> impl Future<Output = Result<()>> + Send;
 

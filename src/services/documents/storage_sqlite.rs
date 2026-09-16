@@ -19,22 +19,15 @@ impl SqliteStorage {
 }
 
 impl Storage for SqliteStorage {
-    async fn save_document(
-        &self,
-        id: Uuid,
-        name: &str,
-        content_type: &str,
-        content: &[u8],
-        created_at: i64,
-    ) -> Result<()> {
+    async fn save_document(&self, document: &Document, created_at: i64) -> Result<()> {
         sqlx::query(
             "INSERT INTO documents (id, name, content_type, content, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
         )
-        .bind(id.to_string())
-        .bind(name)
-        .bind(content_type)
-        .bind(content)
+        .bind(document.id.to_string())
+        .bind(&document.name)
+        .bind(&document.content_type)
+        .bind(&document.content)
         .bind(created_at)
         .execute(&self.pool)
         .await
@@ -98,7 +91,15 @@ mod tests {
         let id = Uuid::new_v4();
 
         storage
-            .save_document(id, "report.pdf", "application/pdf", b"hello", 1_700_000_000)
+            .save_document(
+                &Document {
+                    id,
+                    name: "report.pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    content: b"hello".to_vec(),
+                },
+                1_700_000_000,
+            )
             .await
             .unwrap();
 
@@ -121,11 +122,27 @@ mod tests {
         let (id1, id2) = (Uuid::new_v4(), Uuid::new_v4());
 
         storage
-            .save_document(id1, "one.txt", "text/plain", b"one", 1_700_000_000)
+            .save_document(
+                &Document {
+                    id: id1,
+                    name: "one.txt".to_string(),
+                    content_type: "text/plain".to_string(),
+                    content: b"one".to_vec(),
+                },
+                1_700_000_000,
+            )
             .await
             .unwrap();
         storage
-            .save_document(id2, "two.txt", "text/plain", b"two", 1_700_000_001)
+            .save_document(
+                &Document {
+                    id: id2,
+                    name: "two.txt".to_string(),
+                    content_type: "text/plain".to_string(),
+                    content: b"two".to_vec(),
+                },
+                1_700_000_001,
+            )
             .await
             .unwrap();
 
