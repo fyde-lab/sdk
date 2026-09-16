@@ -25,7 +25,8 @@ struct DocumentEncryptedMetadata {
 /// The default [`Service`] implementation: talks to the fyde server's
 /// documents service over gRPC, and delegates local, unencrypted persistence
 /// to an injected [`Storage`]. Generic over the [`Storage`] implementation
-/// used by [`Service::save`].
+/// used to cache documents fetched via [`Service::fetch`] and
+/// [`Service::fetch_many`].
 pub struct DocumentsClient<S: Storage> {
     grpc: GrpcClient,
     storage: S,
@@ -34,7 +35,8 @@ pub struct DocumentsClient<S: Storage> {
 impl<S: Storage> DocumentsClient<S> {
     /// Creates a client for the documents service at the given `http://` or
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`), using `storage`
-    /// to persist documents saved via [`Service::save`].
+    /// to cache documents fetched via [`Service::fetch`] and
+    /// [`Service::fetch_many`].
     pub async fn new(base_url: impl AsRef<str>, storage: S) -> Result<Self> {
         Ok(Self {
             grpc: GrpcClient::new(base_url).await?,
@@ -45,26 +47,6 @@ impl<S: Storage> DocumentsClient<S> {
 
 #[async_trait]
 impl<S: Storage> Service for DocumentsClient<S> {
-    async fn save(&self, document: NewDocument) -> Result<Uuid> {
-        let id = Uuid::new_v4();
-
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let document = Document {
-            id,
-            name: document.name,
-            content_type: document.content_type,
-            content: document.content,
-        };
-
-        self.storage.save_document(&document, created_at).await?;
-
-        Ok(id)
-    }
-
     /// Encrypts `document` and its metadata, then uploads them as a new
     /// document to the server, returning its generated id.
     ///

@@ -22,7 +22,7 @@ pub struct Document {
     pub content: Vec<u8>,
 }
 
-/// A file to be persisted by [`Service::save`] or [`Service::upload`].
+/// A file to be persisted by [`Service::upload`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewDocument {
     pub name: String,
@@ -34,10 +34,6 @@ pub struct NewDocument {
 /// encrypted on the fyde server.
 #[async_trait]
 pub trait Service: Send + Sync {
-    /// Saves `document` as-is, unencrypted, in local storage, returning its
-    /// generated id.
-    async fn save(&self, document: NewDocument) -> Result<Uuid>;
-
     /// Encrypts `document` and uploads it to the server, returning its
     /// generated id.
     async fn upload(&self, document: NewDocument) -> Result<Uuid>;
@@ -45,9 +41,10 @@ pub trait Service: Send + Sync {
     /// Fetches a document's content by id, or `None` if it doesn't exist.
     async fn fetch(&self, id: Uuid) -> Result<Option<Document>>;
 
-    /// Fetches a document previously saved via [`Service::save`] from local
-    /// storage, or `None` if it doesn't exist. Unlike [`Service::fetch`],
-    /// this does not talk to the server.
+    /// Fetches a document previously cached in local storage by
+    /// [`Service::fetch`] or [`Service::fetch_many`], or `None` if it
+    /// doesn't exist. Unlike [`Service::fetch`], this does not talk to the
+    /// server.
     async fn get(&self, id: Uuid) -> Result<Option<Document>>;
 
     /// Fetches multiple documents' content by id in a single call. Ids that

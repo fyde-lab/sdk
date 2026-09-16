@@ -4,9 +4,10 @@ use crate::Result;
 
 use super::Document;
 
-/// Persists documents saved locally, unencrypted, by
-/// [`super::DocumentsClient::save`]. Implementations are injected into
-/// [`super::DocumentsClient`] at construction.
+/// Caches documents fetched from the server, unencrypted, by
+/// [`super::DocumentsClient::fetch`] and [`super::DocumentsClient::fetch_many`].
+/// Implementations are injected into [`super::DocumentsClient`] at
+/// construction.
 pub trait Storage: Send + Sync {
     /// Persists a document as-is, unencrypted.
     fn save_document(
