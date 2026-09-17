@@ -29,6 +29,10 @@ pub enum Error {
     Xdg(#[from] xdg::BaseDirectoriesError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("pdf error: {0}")]
+    Pdf(#[from] lopdf::Error),
+    #[error("unsupported document content type {0:?}: only application/pdf is supported")]
+    UnsupportedContentType(String),
     #[error("encryption error: {0}")]
     Encryption(String),
     #[error("invalid changelog event: {0}")]

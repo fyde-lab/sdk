@@ -3,6 +3,7 @@ mod grpc_client;
 mod service;
 mod storage;
 mod storage_sqlite;
+mod transcript;
 
 use std::sync::Arc;
 
@@ -22,6 +23,9 @@ pub struct Metadata {
     pub created_at: i64,
     pub size: u64,
     pub checksum: String,
+    /// Plaintext transcript of the document's PDF text content, extracted
+    /// on upload.
+    pub transcript: String,
 }
 
 /// A file, as returned by [`Service::download`].
@@ -46,6 +50,9 @@ pub struct NewDocument {
 pub trait Service: Send + Sync {
     /// Encrypts `document` and uploads it to the server, returning its
     /// generated id.
+    ///
+    /// Only `application/pdf` content is accepted; anything else is
+    /// rejected with [`crate::Error::UnsupportedContentType`].
     async fn upload(&self, document: NewDocument) -> Result<Uuid>;
 
     /// Fetches a document's content by id, or `None` if it doesn't exist.

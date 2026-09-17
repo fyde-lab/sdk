@@ -4,12 +4,15 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{ErrorContext as _, Result};
+use crate::{Error, ErrorContext as _, Result};
 
 use super::crypto;
 use super::grpc_client::{FydeClient, GrpcClient};
 use super::storage::Storage;
-use super::{Document, Metadata, NewDocument, Service};
+use super::{Document, Metadata, NewDocument, Service, transcript};
+
+/// The only content type [`Service::upload`] currently accepts.
+pub(super) const PDF_CONTENT_TYPE: &str = "application/pdf";
 
 /// The default [`Service`] implementation: talks to the fyde server's
 /// documents service over gRPC, and delegates local, unencrypted persistence
@@ -61,6 +64,10 @@ impl<S: Storage> Service for DocumentsClient<S> {
     /// key-encryption-key before being sent alongside the ciphertext. Only
     /// the wrapped DEK and ciphertexts ever leave this process.
     async fn upload(&self, document: NewDocument) -> Result<Uuid> {
+        if document.content_type != PDF_CONTENT_TYPE {
+            return Err(Error::UnsupportedContentType(document.content_type));
+        }
+
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -68,6 +75,9 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
         let mut hasher = Sha256::new();
         hasher.update(&document.content);
+
+        let doc_transcript = transcript::extract(&document.content)
+            .context("failed to extract document transcript")?;
 
         let metadata = Metadata {
             name: document.name,
@@ -79,6 +89,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect(),
+            transcript: doc_transcript,
         };
         let metadata_json =
             serde_json::to_vec(&metadata).context("failed to serialize document metadata")?;
@@ -194,6 +205,7 @@ mod tests {
             created_at: 1_700_000_000,
             size: 4,
             checksum: "checksum-value".to_string(),
+            transcript: "some transcript text".to_string(),
         };
         let metadata_json = serde_json::to_vec(&metadata).unwrap();
 
@@ -209,6 +221,7 @@ mod tests {
         assert_eq!(decrypted.created_at, metadata.created_at);
         assert_eq!(decrypted.size, metadata.size);
         assert_eq!(decrypted.checksum, metadata.checksum);
+        assert_eq!(decrypted.transcript, metadata.transcript);
     }
 
     async fn setup_storage() -> SqliteStorage {
@@ -234,6 +247,7 @@ mod tests {
             created_at: 1_700_000_000,
             size: content.len() as u64,
             checksum: "checksum-value".to_string(),
+            transcript: String::new(),
         };
         let metadata_json = serde_json::to_vec(&metadata).unwrap();
 
@@ -272,13 +286,14 @@ mod tests {
 
     #[tokio::test]
     async fn upload_sends_encrypted_content_to_grpc() {
+        let pdf = super::super::transcript::tests::build_pdf("hello world");
         let expected_id = Uuid::new_v4();
 
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_upload_document()
             // The plaintext content must never reach the transport layer.
-            .withf(|content, _dek, _metadatas| content != b"hello world")
+            .withf(move |content, _dek, _metadatas| *content != pdf)
             .returning(move |_, _, _| Ok(expected_id));
 
         let client = DocumentsClient::with_grpc(mock_grpc, setup_storage().await);
@@ -287,11 +302,53 @@ mod tests {
             .upload(NewDocument {
                 name: "report.pdf".to_string(),
                 content_type: "application/pdf".to_string(),
-                content: b"hello world".to_vec(),
+                content: super::super::transcript::tests::build_pdf("hello world"),
             })
             .await
             .unwrap();
 
         assert_eq!(id, expected_id);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_non_pdf_content_types() {
+        let client = DocumentsClient::with_grpc(MockFydeClient::new(), setup_storage().await);
+
+        let result = client
+            .upload(NewDocument {
+                name: "notes.txt".to_string(),
+                content_type: "text/plain".to_string(),
+                content: b"hello world".to_vec(),
+            })
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn upload_embeds_a_pdf_transcript_in_the_encrypted_metadata() {
+        let pdf = super::super::transcript::tests::build_pdf("Hello World!");
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_upload_document()
+            .withf(move |_content, wrapped_dek, encrypted_metadatas| {
+                let dek = crypto::unwrap_dek(wrapped_dek).unwrap();
+                let metadata_json = crypto::decrypt_with_dek(&dek, encrypted_metadatas).unwrap();
+                let metadata: Metadata = serde_json::from_slice(&metadata_json).unwrap();
+                metadata.transcript == "Hello World!\n"
+            })
+            .returning(|_, _, _| Ok(Uuid::new_v4()));
+
+        let client = DocumentsClient::with_grpc(mock_grpc, setup_storage().await);
+
+        client
+            .upload(NewDocument {
+                name: "report.pdf".to_string(),
+                content_type: "application/pdf".to_string(),
+                content: pdf,
+            })
+            .await
+            .unwrap();
     }
 }
