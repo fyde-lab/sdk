@@ -19,7 +19,7 @@ impl SqliteStorage {
 }
 
 impl Storage for SqliteStorage {
-    async fn save_document(&self, document: &Document, created_at: i64) -> Result<()> {
+    async fn save_document(&self, document: &Document) -> Result<()> {
         sqlx::query(
             "INSERT INTO documents (id, name, content_type, content, checksum, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -29,7 +29,7 @@ impl Storage for SqliteStorage {
         .bind(&document.metadata.content_type)
         .bind(&document.content)
         .bind(&document.metadata.checksum)
-        .bind(created_at)
+        .bind(document.metadata.created_at)
         .execute(&self.pool)
         .await
         .with_context(|| format!("failed to save document {} to local database", document.id))?;
@@ -134,20 +134,17 @@ mod tests {
         let id = Uuid::new_v4();
 
         storage
-            .save_document(
-                &Document {
-                    id,
-                    content: b"hello".to_vec(),
-                    metadata: Metadata {
-                        name: "report.pdf".to_string(),
-                        content_type: "application/pdf".to_string(),
-                        created_at: 1_700_000_000,
-                        size: 5,
-                        checksum: "deadbeef".to_string(),
-                    },
+            .save_document(&Document {
+                id,
+                content: b"hello".to_vec(),
+                metadata: Metadata {
+                    name: "report.pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    created_at: 1_700_000_000,
+                    size: 5,
+                    checksum: "deadbeef".to_string(),
                 },
-                1_700_000_000,
-            )
+            })
             .await
             .unwrap();
 
@@ -175,37 +172,31 @@ mod tests {
         let (id1, id2) = (Uuid::new_v4(), Uuid::new_v4());
 
         storage
-            .save_document(
-                &Document {
-                    id: id1,
-                    content: b"one".to_vec(),
-                    metadata: Metadata {
-                        name: "one.txt".to_string(),
-                        content_type: "text/plain".to_string(),
-                        created_at: 1_700_000_000,
-                        size: 3,
-                        checksum: "checksum-one".to_string(),
-                    },
+            .save_document(&Document {
+                id: id1,
+                content: b"one".to_vec(),
+                metadata: Metadata {
+                    name: "one.txt".to_string(),
+                    content_type: "text/plain".to_string(),
+                    created_at: 1_700_000_000,
+                    size: 3,
+                    checksum: "checksum-one".to_string(),
                 },
-                1_700_000_000,
-            )
+            })
             .await
             .unwrap();
         storage
-            .save_document(
-                &Document {
-                    id: id2,
-                    content: b"two".to_vec(),
-                    metadata: Metadata {
-                        name: "two.txt".to_string(),
-                        content_type: "text/plain".to_string(),
-                        created_at: 1_700_000_001,
-                        size: 3,
-                        checksum: "checksum-two".to_string(),
-                    },
+            .save_document(&Document {
+                id: id2,
+                content: b"two".to_vec(),
+                metadata: Metadata {
+                    name: "two.txt".to_string(),
+                    content_type: "text/plain".to_string(),
+                    created_at: 1_700_000_001,
+                    size: 3,
+                    checksum: "checksum-two".to_string(),
                 },
-                1_700_000_001,
-            )
+            })
             .await
             .unwrap();
 
@@ -218,20 +209,17 @@ mod tests {
     async fn save_documents(storage: &SqliteStorage, names: &[&str]) {
         for (i, name) in names.iter().enumerate() {
             storage
-                .save_document(
-                    &Document {
-                        id: Uuid::new_v4(),
-                        content: Vec::new(),
-                        metadata: Metadata {
-                            name: name.to_string(),
-                            content_type: "text/plain".to_string(),
-                            created_at: 1_700_000_000 + i as i64,
-                            size: 0,
-                            checksum: String::new(),
-                        },
+                .save_document(&Document {
+                    id: Uuid::new_v4(),
+                    content: Vec::new(),
+                    metadata: Metadata {
+                        name: name.to_string(),
+                        content_type: "text/plain".to_string(),
+                        created_at: 1_700_000_000 + i as i64,
+                        size: 0,
+                        checksum: String::new(),
                     },
-                    1_700_000_000 + i as i64,
-                )
+                })
                 .await
                 .unwrap();
         }

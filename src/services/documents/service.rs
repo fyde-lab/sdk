@@ -119,7 +119,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
         };
 
         self.storage
-            .save_document(&document, document.metadata.created_at)
+            .save_document(&document)
             .await
             .with_context(|| format!("failed to cache document {id} locally"))?;
 
@@ -167,7 +167,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
             };
 
             self.storage
-                .save_document(&document, document.metadata.created_at)
+                .save_document(&document)
                 .await
                 .with_context(|| format!("failed to cache document {id} locally"))?;
 

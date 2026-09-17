@@ -10,11 +10,7 @@ use super::Document;
 /// construction.
 pub(super) trait Storage: Send + Sync {
     /// Persists a document as-is, unencrypted.
-    fn save_document(
-        &self,
-        document: &Document,
-        created_at: i64,
-    ) -> impl Future<Output = Result<()>> + Send;
+    fn save_document(&self, document: &Document) -> impl Future<Output = Result<()>> + Send;
 
     /// Fetches a document previously saved locally by [`Self::save_document`],
     /// or `None` if it doesn't exist.
