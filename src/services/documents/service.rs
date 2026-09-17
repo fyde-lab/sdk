@@ -1,7 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -10,19 +9,7 @@ use crate::{ErrorContext as _, Result};
 use super::crypto;
 use super::grpc_client::{FydeClient, GrpcClient};
 use super::storage::Storage;
-use super::{Document, NewDocument, Service};
-
-/// Cleartext metadata encrypted under the document's DEK before upload, and
-/// decrypted back out of it on download.
-#[derive(Serialize, Deserialize)]
-struct DocumentEncryptedMetadata {
-    name: String,
-    content_type: String,
-    created_at: i64,
-    #[allow(dead_code)]
-    size: u64,
-    checksum: String,
-}
+use super::{Document, Metadata, NewDocument, Service};
 
 /// The default [`Service`] implementation: talks to the fyde server's
 /// documents service over gRPC, and delegates local, unencrypted persistence
@@ -82,7 +69,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
         let mut hasher = Sha256::new();
         hasher.update(&document.content);
 
-        let metadata = DocumentEncryptedMetadata {
+        let metadata = Metadata {
             name: document.name,
             content_type: document.content_type,
             created_at,
@@ -119,7 +106,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .with_context(|| format!("failed to unwrap DEK for document {id}"))?;
         let metadata_json = crypto::decrypt_with_dek(&dek, &encrypted.metadatas)
             .with_context(|| format!("failed to decrypt metadata for document {id}"))?;
-        let metadata: DocumentEncryptedMetadata = serde_json::from_slice(&metadata_json)
+        let metadata: Metadata = serde_json::from_slice(&metadata_json)
             .with_context(|| format!("failed to deserialize metadata for document {id}"))?;
 
         let content = crypto::decrypt_with_dek(&dek, &encrypted.content)
@@ -127,14 +114,12 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
         let document = Document {
             id,
-            name: metadata.name,
-            content_type: metadata.content_type,
             content,
-            checksum: metadata.checksum,
+            metadata,
         };
 
         self.storage
-            .save_document(&document, metadata.created_at)
+            .save_document(&document, document.metadata.created_at)
             .await
             .with_context(|| format!("failed to cache document {id} locally"))?;
 
@@ -169,7 +154,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
                 .with_context(|| format!("failed to unwrap DEK for document {id}"))?;
             let metadata_json = crypto::decrypt_with_dek(&dek, &encrypted.metadatas)
                 .with_context(|| format!("failed to decrypt metadata for document {id}"))?;
-            let metadata: DocumentEncryptedMetadata = serde_json::from_slice(&metadata_json)
+            let metadata: Metadata = serde_json::from_slice(&metadata_json)
                 .with_context(|| format!("failed to deserialize metadata for document {id}"))?;
 
             let content = crypto::decrypt_with_dek(&dek, &encrypted.content)
@@ -177,14 +162,12 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
             let document = Document {
                 id,
-                name: metadata.name,
-                content_type: metadata.content_type,
                 content,
-                checksum: metadata.checksum,
+                metadata,
             };
 
             self.storage
-                .save_document(&document, metadata.created_at)
+                .save_document(&document, document.metadata.created_at)
                 .await
                 .with_context(|| format!("failed to cache document {id} locally"))?;
 
@@ -204,8 +187,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn document_encrypted_metadata_roundtrips_through_json_and_crypto() {
-        let metadata = DocumentEncryptedMetadata {
+    fn metadata_roundtrips_through_json_and_crypto() {
+        let metadata = Metadata {
             name: "report.pdf".to_string(),
             content_type: "application/pdf".to_string(),
             created_at: 1_700_000_000,
@@ -219,7 +202,7 @@ mod tests {
 
         let dek = crypto::unwrap_dek(&wrapped_dek).unwrap();
         let decrypted_json = crypto::decrypt_with_dek(&dek, &encrypted_metadata).unwrap();
-        let decrypted: DocumentEncryptedMetadata = serde_json::from_slice(&decrypted_json).unwrap();
+        let decrypted: Metadata = serde_json::from_slice(&decrypted_json).unwrap();
 
         assert_eq!(decrypted.name, metadata.name);
         assert_eq!(decrypted.content_type, metadata.content_type);
@@ -245,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn download_decrypts_and_caches_the_document() {
         let content = b"hello world".to_vec();
-        let metadata = DocumentEncryptedMetadata {
+        let metadata = Metadata {
             name: "report.pdf".to_string(),
             content_type: "application/pdf".to_string(),
             created_at: 1_700_000_000,
@@ -277,10 +260,10 @@ mod tests {
         let document = client.download(id).await.unwrap().unwrap();
 
         assert_eq!(document.id, id);
-        assert_eq!(document.name, "report.pdf");
-        assert_eq!(document.content_type, "application/pdf");
+        assert_eq!(document.metadata.name, "report.pdf");
+        assert_eq!(document.metadata.content_type, "application/pdf");
         assert_eq!(document.content, content);
-        assert_eq!(document.checksum, "checksum-value");
+        assert_eq!(document.metadata.checksum, "checksum-value");
 
         // download() should have cached the document locally.
         let cached = client.get(id).await.unwrap().unwrap();

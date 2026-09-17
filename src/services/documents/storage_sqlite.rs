@@ -3,8 +3,8 @@ use uuid::Uuid;
 
 use crate::{ErrorContext as _, Result};
 
-use super::Document;
 use super::storage::Storage;
+use super::{Document, Metadata};
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
 /// `documents` table).
@@ -25,10 +25,10 @@ impl Storage for SqliteStorage {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind(document.id.to_string())
-        .bind(&document.name)
-        .bind(&document.content_type)
+        .bind(&document.metadata.name)
+        .bind(&document.metadata.content_type)
         .bind(&document.content)
-        .bind(&document.checksum)
+        .bind(&document.metadata.checksum)
         .bind(created_at)
         .execute(&self.pool)
         .await
@@ -39,7 +39,7 @@ impl Storage for SqliteStorage {
 
     async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
         let row = sqlx::query(
-            "SELECT name, content_type, content, checksum FROM documents WHERE id = ?1",
+            "SELECT name, content_type, content, checksum, created_at FROM documents WHERE id = ?1",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -50,18 +50,24 @@ impl Storage for SqliteStorage {
             return Ok(None);
         };
 
+        let content: Vec<u8> = row.get("content");
+
         Ok(Some(Document {
             id,
-            name: row.get("name"),
-            content_type: row.get("content_type"),
-            content: row.get("content"),
-            checksum: row.get("checksum"),
+            metadata: Metadata {
+                name: row.get("name"),
+                content_type: row.get("content_type"),
+                created_at: row.get("created_at"),
+                size: content.len() as u64,
+                checksum: row.get("checksum"),
+            },
+            content,
         }))
     }
 
     async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
         let rows = sqlx::query(
-            "SELECT id, name, content_type, content, checksum FROM documents
+            "SELECT id, name, content_type, content, checksum, created_at FROM documents
              ORDER BY created_at ASC, id ASC
              LIMIT ?1 OFFSET ?2",
         )
@@ -74,14 +80,19 @@ impl Storage for SqliteStorage {
         rows.into_iter()
             .map(|row| {
                 let id: String = row.get("id");
+                let content: Vec<u8> = row.get("content");
 
                 Ok(Document {
                     id: Uuid::parse_str(&id)
                         .with_context(|| format!("invalid document id in local database: {id}"))?,
-                    name: row.get("name"),
-                    content_type: row.get("content_type"),
-                    content: row.get("content"),
-                    checksum: row.get("checksum"),
+                    metadata: Metadata {
+                        name: row.get("name"),
+                        content_type: row.get("content_type"),
+                        created_at: row.get("created_at"),
+                        size: content.len() as u64,
+                        checksum: row.get("checksum"),
+                    },
+                    content,
                 })
             })
             .collect()
@@ -126,10 +137,14 @@ mod tests {
             .save_document(
                 &Document {
                     id,
-                    name: "report.pdf".to_string(),
-                    content_type: "application/pdf".to_string(),
                     content: b"hello".to_vec(),
-                    checksum: "deadbeef".to_string(),
+                    metadata: Metadata {
+                        name: "report.pdf".to_string(),
+                        content_type: "application/pdf".to_string(),
+                        created_at: 1_700_000_000,
+                        size: 5,
+                        checksum: "deadbeef".to_string(),
+                    },
                 },
                 1_700_000_000,
             )
@@ -142,10 +157,14 @@ mod tests {
             document,
             Document {
                 id,
-                name: "report.pdf".to_string(),
-                content_type: "application/pdf".to_string(),
                 content: b"hello".to_vec(),
-                checksum: "deadbeef".to_string(),
+                metadata: Metadata {
+                    name: "report.pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    created_at: 1_700_000_000,
+                    size: 5,
+                    checksum: "deadbeef".to_string(),
+                },
             }
         );
     }
@@ -159,10 +178,14 @@ mod tests {
             .save_document(
                 &Document {
                     id: id1,
-                    name: "one.txt".to_string(),
-                    content_type: "text/plain".to_string(),
                     content: b"one".to_vec(),
-                    checksum: "checksum-one".to_string(),
+                    metadata: Metadata {
+                        name: "one.txt".to_string(),
+                        content_type: "text/plain".to_string(),
+                        created_at: 1_700_000_000,
+                        size: 3,
+                        checksum: "checksum-one".to_string(),
+                    },
                 },
                 1_700_000_000,
             )
@@ -172,10 +195,14 @@ mod tests {
             .save_document(
                 &Document {
                     id: id2,
-                    name: "two.txt".to_string(),
-                    content_type: "text/plain".to_string(),
                     content: b"two".to_vec(),
-                    checksum: "checksum-two".to_string(),
+                    metadata: Metadata {
+                        name: "two.txt".to_string(),
+                        content_type: "text/plain".to_string(),
+                        created_at: 1_700_000_001,
+                        size: 3,
+                        checksum: "checksum-two".to_string(),
+                    },
                 },
                 1_700_000_001,
             )
@@ -184,7 +211,7 @@ mod tests {
 
         let document = storage.get_document(id1).await.unwrap().unwrap();
 
-        assert_eq!(document.name, "one.txt");
+        assert_eq!(document.metadata.name, "one.txt");
         assert_eq!(document.content, b"one");
     }
 
@@ -194,10 +221,14 @@ mod tests {
                 .save_document(
                     &Document {
                         id: Uuid::new_v4(),
-                        name: name.to_string(),
-                        content_type: "text/plain".to_string(),
                         content: Vec::new(),
-                        checksum: String::new(),
+                        metadata: Metadata {
+                            name: name.to_string(),
+                            content_type: "text/plain".to_string(),
+                            created_at: 1_700_000_000 + i as i64,
+                            size: 0,
+                            checksum: String::new(),
+                        },
                     },
                     1_700_000_000 + i as i64,
                 )
@@ -214,7 +245,9 @@ mod tests {
         let page = storage.list_documents(0, 2).await.unwrap();
 
         assert_eq!(
-            page.into_iter().map(|d| d.name).collect::<Vec<_>>(),
+            page.into_iter()
+                .map(|d| d.metadata.name)
+                .collect::<Vec<_>>(),
             vec!["one", "two"]
         );
     }
@@ -227,7 +260,9 @@ mod tests {
         let page = storage.list_documents(1, 2).await.unwrap();
 
         assert_eq!(
-            page.into_iter().map(|d| d.name).collect::<Vec<_>>(),
+            page.into_iter()
+                .map(|d| d.metadata.name)
+                .collect::<Vec<_>>(),
             vec!["two", "three"]
         );
     }

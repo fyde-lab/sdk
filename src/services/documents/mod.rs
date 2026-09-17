@@ -7,19 +7,29 @@ mod storage_sqlite;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::{ErrorContext as _, Result};
 
+/// Cleartext metadata encrypted under a document's DEK before upload, and
+/// decrypted back out of it on download.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Metadata {
+    pub name: String,
+    pub content_type: String,
+    pub created_at: i64,
+    pub size: u64,
+    pub checksum: String,
+}
+
 /// A file, as returned by [`Service::download`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
     pub id: Uuid,
-    pub name: String,
-    pub content_type: String,
     pub content: Vec<u8>,
-    pub checksum: String,
+    pub metadata: Metadata,
 }
 
 /// A file to be persisted by [`Service::upload`].
