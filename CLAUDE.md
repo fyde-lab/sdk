@@ -44,3 +44,5 @@ Same three-piece layering as documents:
 ### Errors
 
 All fallible SDK operations return the crate-wide `Result<T> = Result<T, Error>` (`src/lib.rs`). `Error` is a single enum covering every failure domain (gRPC transport/status, UUID parsing, I/O, sqlx, XDG, JSON, encryption) via `thiserror` `#[from]` conversions — add new variants there rather than introducing per-module error types.
+
+**Every error must be wrapped with a context message before it's returned** — never a bare `?` with no explanation of what was being attempted. Use the crate-wide `ErrorContext` trait (`src/lib.rs`) at each fallible site: `.context("failed to open local database")` or `.with_context(|| format!("failed to write changelog offset {offset}"))`. This wraps the error in `Error::Context { message, source }`, preserving the original as `#[source]`. See `src/lib/sql/sqlite.rs` for examples.
