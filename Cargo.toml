@@ -28,3 +28,4 @@ tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
 mockall = "0.15.0"
+tempfile = "3.14.0"

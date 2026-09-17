@@ -5,7 +5,7 @@ mod sql;
 use std::sync::Arc;
 
 pub use services::changelog::{ChangelogEvent, Service as ChangelogService};
-pub use services::documents::{Document, NewDocument, Service as DocumentsService};
+pub use services::documents::{Document, Service as DocumentsService};
 
 use sql::SqliteClient;
 
@@ -31,8 +31,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("pdf error: {0}")]
     Pdf(#[from] lopdf::Error),
-    #[error("unsupported document content type {0:?}: only application/pdf is supported")]
-    UnsupportedContentType(String),
+    #[error("unsupported document extension {0:?}: only .pdf is supported")]
+    UnsupportedDocumentExtension(String),
     #[error("encryption error: {0}")]
     Encryption(String),
     #[error("invalid changelog event: {0}")]

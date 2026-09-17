@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -9,7 +10,7 @@ use crate::{Error, ErrorContext as _, Result};
 use super::crypto;
 use super::grpc_client::{FydeClient, GrpcClient};
 use super::storage::Storage;
-use super::{Document, Metadata, NewDocument, Service, transcript};
+use super::{Document, Metadata, Service, transcript};
 
 /// The only content type [`Service::upload`] currently accepts.
 pub(super) const PDF_CONTENT_TYPE: &str = "application/pdf";
@@ -54,8 +55,9 @@ impl<S: Storage> DocumentsClient<S> {
 
 #[async_trait]
 impl<S: Storage> Service for DocumentsClient<S> {
-    /// Encrypts `document` and its metadata, then uploads them as a new
-    /// document to the server, returning its generated id.
+    /// Reads the PDF file at `path`, encrypts it and its metadata, then
+    /// uploads them as a new document to the server, returning its
+    /// generated id.
     ///
     /// This follows an envelope encryption scheme: a fresh, random data
     /// encryption key (DEK) is generated for the document, used to encrypt
@@ -63,10 +65,25 @@ impl<S: Storage> Service for DocumentsClient<S> {
     /// size) with AES-256-GCM, and is itself wrapped under a
     /// key-encryption-key before being sent alongside the ciphertext. Only
     /// the wrapped DEK and ciphertexts ever leave this process.
-    async fn upload(&self, document: NewDocument) -> Result<Uuid> {
-        if document.content_type != PDF_CONTENT_TYPE {
-            return Err(Error::UnsupportedContentType(document.content_type));
+    async fn upload(&self, path: &Path) -> Result<Uuid> {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if extension != "pdf" {
+            return Err(Error::UnsupportedDocumentExtension(extension));
         }
+
+        let content = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("failed to read document at {}", path.display()))?;
+
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
 
         let created_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -74,16 +91,16 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .as_secs() as i64;
 
         let mut hasher = Sha256::new();
-        hasher.update(&document.content);
+        hasher.update(&content);
 
-        let doc_transcript = transcript::extract(&document.content)
-            .context("failed to extract document transcript")?;
+        let doc_transcript =
+            transcript::extract(&content).context("failed to extract document transcript")?;
 
         let metadata = Metadata {
-            name: document.name,
-            content_type: document.content_type,
+            name,
+            content_type: PDF_CONTENT_TYPE.to_string(),
             created_at,
-            size: document.content.len() as u64,
+            size: content.len() as u64,
             checksum: hasher
                 .finalize()
                 .iter()
@@ -95,7 +112,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
             serde_json::to_vec(&metadata).context("failed to serialize document metadata")?;
 
         let (encrypted_content, wrapped_dek, encrypted_metadata) =
-            crypto::encrypt_document(&document.content, &metadata_json)
+            crypto::encrypt_document(&content, &metadata_json)
                 .context("failed to encrypt document")?;
 
         self.grpc
@@ -191,11 +208,25 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use sqlx::sqlite::SqlitePoolOptions;
+    use tempfile::NamedTempFile;
 
     use super::super::grpc_client::{EncryptedDocument, MockFydeClient};
     use super::super::storage_sqlite::SqliteStorage;
     use super::*;
+
+    /// Writes `content` to a temporary file with the given `extension`, for
+    /// tests that need a real path to pass to [`Service::upload`].
+    fn write_temp_file(extension: &str, content: &[u8]) -> NamedTempFile {
+        let mut file = tempfile::Builder::new()
+            .suffix(&format!(".{extension}"))
+            .tempfile()
+            .unwrap();
+        file.write_all(content).unwrap();
+        file
+    }
 
     #[test]
     fn metadata_roundtrips_through_json_and_crypto() {
@@ -287,6 +318,7 @@ mod tests {
     #[tokio::test]
     async fn upload_sends_encrypted_content_to_grpc() {
         let pdf = super::super::transcript::tests::build_pdf("hello world");
+        let file = write_temp_file("pdf", &pdf);
         let expected_id = Uuid::new_v4();
 
         let mut mock_grpc = MockFydeClient::new();
@@ -298,29 +330,17 @@ mod tests {
 
         let client = DocumentsClient::with_grpc(mock_grpc, setup_storage().await);
 
-        let id = client
-            .upload(NewDocument {
-                name: "report.pdf".to_string(),
-                content_type: "application/pdf".to_string(),
-                content: super::super::transcript::tests::build_pdf("hello world"),
-            })
-            .await
-            .unwrap();
+        let id = client.upload(file.path()).await.unwrap();
 
         assert_eq!(id, expected_id);
     }
 
     #[tokio::test]
-    async fn upload_rejects_non_pdf_content_types() {
+    async fn upload_rejects_non_pdf_extensions() {
+        let file = write_temp_file("txt", b"hello world");
         let client = DocumentsClient::with_grpc(MockFydeClient::new(), setup_storage().await);
 
-        let result = client
-            .upload(NewDocument {
-                name: "notes.txt".to_string(),
-                content_type: "text/plain".to_string(),
-                content: b"hello world".to_vec(),
-            })
-            .await;
+        let result = client.upload(file.path()).await;
 
         assert!(result.is_err());
     }
@@ -328,6 +348,7 @@ mod tests {
     #[tokio::test]
     async fn upload_embeds_a_pdf_transcript_in_the_encrypted_metadata() {
         let pdf = super::super::transcript::tests::build_pdf("Hello World!");
+        let file = write_temp_file("pdf", &pdf);
 
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
@@ -342,13 +363,6 @@ mod tests {
 
         let client = DocumentsClient::with_grpc(mock_grpc, setup_storage().await);
 
-        client
-            .upload(NewDocument {
-                name: "report.pdf".to_string(),
-                content_type: "application/pdf".to_string(),
-                content: pdf,
-            })
-            .await
-            .unwrap();
+        client.upload(file.path()).await.unwrap();
     }
 }

@@ -5,6 +5,7 @@ mod storage;
 mod storage_sqlite;
 mod transcript;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -36,24 +37,17 @@ pub struct Document {
     pub metadata: Metadata,
 }
 
-/// A file to be persisted by [`Service::upload`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewDocument {
-    pub name: String,
-    pub content_type: String,
-    pub content: Vec<u8>,
-}
-
 /// Saves and fetches documents, either unencrypted in local storage or
 /// encrypted on the fyde server.
 #[async_trait]
 pub trait Service: Send + Sync {
-    /// Encrypts `document` and uploads it to the server, returning its
-    /// generated id.
+    /// Reads the file at `path`, encrypts it and its metadata, then uploads
+    /// it as a new document to the server, returning its generated id.
     ///
-    /// Only `application/pdf` content is accepted; anything else is
-    /// rejected with [`crate::Error::UnsupportedContentType`].
-    async fn upload(&self, document: NewDocument) -> Result<Uuid>;
+    /// The file type is determined from `path`'s extension; only `.pdf` is
+    /// currently accepted, anything else is rejected with
+    /// [`crate::Error::UnsupportedDocumentExtension`].
+    async fn upload(&self, path: &Path) -> Result<Uuid>;
 
     /// Fetches a document's content by id, or `None` if it doesn't exist.
     async fn download(&self, id: Uuid) -> Result<Option<Document>>;

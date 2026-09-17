@@ -311,9 +311,11 @@ mod tests {
 
     use futures::StreamExt as _;
 
+    use std::path::Path;
+
     use super::super::grpc_client::{EventsSincePage as GrpcEventsSincePage, MockFydeClient};
     use super::*;
-    use crate::services::documents::{Document, NewDocument};
+    use crate::services::documents::Document;
 
     /// A [`Storage`] backed by an in-memory cursor, for tests that don't
     /// need to touch SQLite.
@@ -339,7 +341,7 @@ mod tests {
 
     #[async_trait]
     impl DocumentsService for NoopDocuments {
-        async fn upload(&self, _document: NewDocument) -> Result<Uuid> {
+        async fn upload(&self, _path: &Path) -> Result<Uuid> {
             unimplemented!("not used by these tests")
         }
 
