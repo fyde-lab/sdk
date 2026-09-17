@@ -2,6 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{ErrorContext as _, Result};
@@ -20,6 +21,7 @@ struct DocumentEncryptedMetadata {
     created_at: i64,
     #[allow(dead_code)]
     size: u64,
+    checksum: String,
 }
 
 /// The default [`Service`] implementation: talks to the fyde server's
@@ -77,11 +79,19 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .unwrap_or_default()
             .as_secs() as i64;
 
+        let mut hasher = Sha256::new();
+        hasher.update(&document.content);
+
         let metadata = DocumentEncryptedMetadata {
             name: document.name,
             content_type: document.content_type,
             created_at,
             size: document.content.len() as u64,
+            checksum: hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
         };
         let metadata_json =
             serde_json::to_vec(&metadata).context("failed to serialize document metadata")?;
@@ -120,6 +130,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
             name: metadata.name,
             content_type: metadata.content_type,
             content,
+            checksum: metadata.checksum,
         };
 
         self.storage
@@ -169,6 +180,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
                 name: metadata.name,
                 content_type: metadata.content_type,
                 content,
+                checksum: metadata.checksum,
             };
 
             self.storage
@@ -198,6 +210,7 @@ mod tests {
             content_type: "application/pdf".to_string(),
             created_at: 1_700_000_000,
             size: 4,
+            checksum: "checksum-value".to_string(),
         };
         let metadata_json = serde_json::to_vec(&metadata).unwrap();
 
@@ -212,6 +225,7 @@ mod tests {
         assert_eq!(decrypted.content_type, metadata.content_type);
         assert_eq!(decrypted.created_at, metadata.created_at);
         assert_eq!(decrypted.size, metadata.size);
+        assert_eq!(decrypted.checksum, metadata.checksum);
     }
 
     async fn setup_storage() -> SqliteStorage {
@@ -236,6 +250,7 @@ mod tests {
             content_type: "application/pdf".to_string(),
             created_at: 1_700_000_000,
             size: content.len() as u64,
+            checksum: "checksum-value".to_string(),
         };
         let metadata_json = serde_json::to_vec(&metadata).unwrap();
 
@@ -265,6 +280,7 @@ mod tests {
         assert_eq!(document.name, "report.pdf");
         assert_eq!(document.content_type, "application/pdf");
         assert_eq!(document.content, content);
+        assert_eq!(document.checksum, "checksum-value");
 
         // download() should have cached the document locally.
         let cached = client.get(id).await.unwrap().unwrap();

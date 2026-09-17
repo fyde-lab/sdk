@@ -21,13 +21,14 @@ impl SqliteStorage {
 impl Storage for SqliteStorage {
     async fn save_document(&self, document: &Document, created_at: i64) -> Result<()> {
         sqlx::query(
-            "INSERT INTO documents (id, name, content_type, content, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO documents (id, name, content_type, content, checksum, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind(document.id.to_string())
         .bind(&document.name)
         .bind(&document.content_type)
         .bind(&document.content)
+        .bind(&document.checksum)
         .bind(created_at)
         .execute(&self.pool)
         .await
@@ -37,11 +38,13 @@ impl Storage for SqliteStorage {
     }
 
     async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
-        let row = sqlx::query("SELECT name, content_type, content FROM documents WHERE id = ?1")
-            .bind(id.to_string())
-            .fetch_optional(&self.pool)
-            .await
-            .with_context(|| format!("failed to fetch document {id} from local database"))?;
+        let row = sqlx::query(
+            "SELECT name, content_type, content, checksum FROM documents WHERE id = ?1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("failed to fetch document {id} from local database"))?;
 
         let Some(row) = row else {
             return Ok(None);
@@ -52,12 +55,13 @@ impl Storage for SqliteStorage {
             name: row.get("name"),
             content_type: row.get("content_type"),
             content: row.get("content"),
+            checksum: row.get("checksum"),
         }))
     }
 
     async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
         let rows = sqlx::query(
-            "SELECT id, name, content_type, content FROM documents
+            "SELECT id, name, content_type, content, checksum FROM documents
              ORDER BY created_at ASC, id ASC
              LIMIT ?1 OFFSET ?2",
         )
@@ -77,6 +81,7 @@ impl Storage for SqliteStorage {
                     name: row.get("name"),
                     content_type: row.get("content_type"),
                     content: row.get("content"),
+                    checksum: row.get("checksum"),
                 })
             })
             .collect()
@@ -124,6 +129,7 @@ mod tests {
                     name: "report.pdf".to_string(),
                     content_type: "application/pdf".to_string(),
                     content: b"hello".to_vec(),
+                    checksum: "deadbeef".to_string(),
                 },
                 1_700_000_000,
             )
@@ -139,6 +145,7 @@ mod tests {
                 name: "report.pdf".to_string(),
                 content_type: "application/pdf".to_string(),
                 content: b"hello".to_vec(),
+                checksum: "deadbeef".to_string(),
             }
         );
     }
@@ -155,6 +162,7 @@ mod tests {
                     name: "one.txt".to_string(),
                     content_type: "text/plain".to_string(),
                     content: b"one".to_vec(),
+                    checksum: "checksum-one".to_string(),
                 },
                 1_700_000_000,
             )
@@ -167,6 +175,7 @@ mod tests {
                     name: "two.txt".to_string(),
                     content_type: "text/plain".to_string(),
                     content: b"two".to_vec(),
+                    checksum: "checksum-two".to_string(),
                 },
                 1_700_000_001,
             )
@@ -188,6 +197,7 @@ mod tests {
                         name: name.to_string(),
                         content_type: "text/plain".to_string(),
                         content: Vec::new(),
+                        checksum: String::new(),
                     },
                     1_700_000_000 + i as i64,
                 )

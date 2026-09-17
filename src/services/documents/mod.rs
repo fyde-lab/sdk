@@ -19,6 +19,7 @@ pub struct Document {
     pub name: String,
     pub content_type: String,
     pub content: Vec<u8>,
+    pub checksum: String,
 }
 
 /// A file to be persisted by [`Service::upload`].
