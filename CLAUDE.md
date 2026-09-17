@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`fyde-sdk` is a Rust client library (not a binary) for talking to a fyde server. It is one crate in a sibling-project workspace at `../` (alongside `server`, `tui`, and `api-protos`) but is *not* a Cargo workspace member — it's built and versioned standalone. Protobuf/gRPC service definitions consumed by this SDK live in `../api-protos/` and are compiled at build time; `../server` is the corresponding service implementation.
+`fyde-sdk` is a Rust client library (not a binary) for talking to a fyde server. It is one crate in a sibling-project workspace at `../` (alongside `server`, `cli`, and `api-protos`) but is *not* a Cargo workspace member — it's built and versioned standalone. Protobuf/gRPC service definitions consumed by this SDK live in `../api-protos/` and are compiled at build time; `../server` is the corresponding service implementation.
 
 ## Commands
 
