@@ -16,7 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-`Client` (`src/lib.rs`) is the SDK entry point: `Client::connect(url)` opens a gRPC connection and exposes service-specific sub-clients (`documents()` → `&DocumentsClient`, `changelog()` → `&ChangelogClient`). As more server services are added, they should follow the same pattern: a submodule under `src/services/`, wired into `Client`.
+`Client` (`src/lib.rs`) is the SDK entry point, with two constructors: `Client::connect(url)` opens a gRPC connection backed by the local SQLite database in the default XDG data directory, and `Client::connect_memory(url)` does the same but backed by a private in-memory database that only lives for the process's lifetime. Both expose the same service-specific sub-clients (`documents()` → `&DocumentsClient`, `changelog()` → `&ChangelogClient`). As more server services are added, they should follow the same pattern: a submodule under `src/services/`, wired into `Client`.
 
 ### Documents service (`src/services/documents/`)
 

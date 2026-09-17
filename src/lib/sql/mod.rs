@@ -1,3 +1,3 @@
 mod sqlite;
 
-pub use sqlite::SqliteClient;
+pub use sqlite::{IN_MEMORY_DB, SqliteClient};

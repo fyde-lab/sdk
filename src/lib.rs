@@ -82,22 +82,26 @@ impl Client {
     /// URL (e.g. `http://127.0.0.1:8080`), using the default local SQLite
     /// database location (see [`sql::SqliteClient::connect`]).
     pub async fn connect(url: impl AsRef<str>) -> Result<Self> {
-        Self::connect_with_db(url, None).await
+        let sqlite = SqliteClient::connect()
+            .await
+            .context("failed to open local database")?;
+
+        Self::connect_with_sqlite(url, sqlite).await
     }
 
-    /// Connects to a fyde server, like [`Client::connect`], but with
-    /// explicit control over the local SQLite database: `db` is either a
-    /// filesystem path, [`sql::IN_MEMORY_DB`] (`":memory:"`) for a private
-    /// in-memory database, or `None` for the default XDG data directory
-    /// location.
-    pub async fn connect_with_db(url: impl AsRef<str>, db: Option<&str>) -> Result<Self> {
-        let url = url.as_ref();
+    /// Connects to a fyde server, like [`Client::connect`], but backed by a
+    /// private in-memory SQLite database that only lives for the process's
+    /// lifetime, instead of the default XDG data directory location.
+    pub async fn connect_memory(url: impl AsRef<str>) -> Result<Self> {
+        let sqlite = SqliteClient::connect_with(sql::IN_MEMORY_DB)
+            .await
+            .context("failed to open local database")?;
 
-        let sqlite = match db {
-            Some(db) => SqliteClient::connect_with(db).await,
-            None => SqliteClient::connect().await,
-        }
-        .context("failed to open local database")?;
+        Self::connect_with_sqlite(url, sqlite).await
+    }
+
+    async fn connect_with_sqlite(url: impl AsRef<str>, sqlite: SqliteClient) -> Result<Self> {
+        let url = url.as_ref();
 
         let documents = services::documents::init(url, sqlite.pool().clone())
             .await
