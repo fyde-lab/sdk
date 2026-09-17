@@ -79,13 +79,25 @@ pub struct Client {
 
 impl Client {
     /// Connects to a fyde server at the given `http://` or `https://` base
-    /// URL (e.g. `http://127.0.0.1:8080`).
+    /// URL (e.g. `http://127.0.0.1:8080`), using the default local SQLite
+    /// database location (see [`sql::SqliteClient::connect`]).
     pub async fn connect(url: impl AsRef<str>) -> Result<Self> {
+        Self::connect_with_db(url, None).await
+    }
+
+    /// Connects to a fyde server, like [`Client::connect`], but with
+    /// explicit control over the local SQLite database: `db` is either a
+    /// filesystem path, [`sql::IN_MEMORY_DB`] (`":memory:"`) for a private
+    /// in-memory database, or `None` for the default XDG data directory
+    /// location.
+    pub async fn connect_with_db(url: impl AsRef<str>, db: Option<&str>) -> Result<Self> {
         let url = url.as_ref();
 
-        let sqlite = SqliteClient::connect()
-            .await
-            .context("failed to open local database")?;
+        let sqlite = match db {
+            Some(db) => SqliteClient::connect_with(db).await,
+            None => SqliteClient::connect().await,
+        }
+        .context("failed to open local database")?;
 
         let documents = services::documents::init(url, sqlite.pool().clone())
             .await
