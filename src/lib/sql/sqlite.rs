@@ -1,5 +1,8 @@
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
+use fs2::FileExt as _;
 use sqlx::{
     SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
@@ -16,8 +19,19 @@ pub const IN_MEMORY_DB: &str = ":memory:";
 /// The database file lives under the XDG Base Directory Specification's
 /// data directory (`$XDG_DATA_HOME/fyde/fyde.db`, falling back to
 /// `~/.local/share/fyde/fyde.db`), which is created if it doesn't exist.
+///
+/// Opening a file-backed database also takes an OS-level exclusive lock, so
+/// a second process (or a second [`SqliteClient`] in the same process)
+/// pointed at the same database file fails to connect instead of racing
+/// SQLite's own locking.
 pub struct SqliteClient {
     pool: SqlitePool,
+    // Held for the lifetime of the client: an OS-level exclusive lock on a
+    // sibling `.lock` file that keeps a second SDK instance from opening the
+    // same database concurrently. `None` for an in-memory database, which
+    // has no path to lock and is never shared across processes. Dropping
+    // this file releases the lock.
+    _lock: Option<File>,
 }
 
 impl SqliteClient {
@@ -41,20 +55,26 @@ impl SqliteClient {
     }
 
     async fn connect_at(path: PathBuf) -> Result<Self> {
+        let lock = lock_database_file(&path)
+            .with_context(|| format!("failed to lock local database at {}", path.display()))?;
+
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true);
 
-        Self::connect_with_options(options).await
+        Self::connect_with_options(options, Some(lock)).await
     }
 
     async fn connect_in_memory() -> Result<Self> {
         let options = SqliteConnectOptions::new().in_memory(true);
 
-        Self::connect_with_options(options).await
+        Self::connect_with_options(options, None).await
     }
 
-    async fn connect_with_options(options: SqliteConnectOptions) -> Result<Self> {
+    async fn connect_with_options(
+        options: SqliteConnectOptions,
+        lock: Option<File>,
+    ) -> Result<Self> {
         // SQLite only supports a single writer at a time, so a single
         // pooled connection avoids lock-contention errors under concurrent
         // writes. For an in-memory database this also keeps the same
@@ -72,7 +92,7 @@ impl SqliteClient {
             .await
             .context("failed to run local database migrations")?;
 
-        Ok(Self { pool })
+        Ok(Self { pool, _lock: lock })
     }
 
     /// Returns the underlying connection pool.
@@ -89,19 +109,47 @@ fn local_database_path() -> Result<PathBuf> {
     dirs.place_data_file("fyde.db").map_err(Error::Io)
 }
 
+/// Acquires an OS-level exclusive lock on a `.lock` file next to `db_path`,
+/// so a second SDK instance pointed at the same database fails fast instead
+/// of racing SQLite's own locking. A sibling file is used, rather than
+/// locking the database file itself, to stay independent of SQLite's own
+/// (POSIX `fcntl`-based) locking of that file. The returned `File` must be
+/// kept alive for as long as the lock should be held; dropping it releases
+/// the lock.
+fn lock_database_file(db_path: &Path) -> Result<File> {
+    let mut lock_path = db_path.as_os_str().to_owned();
+    lock_path.push(".lock");
+
+    let file = File::create(&lock_path).context("failed to open lock file")?;
+
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(file),
+        Err(err) if err.kind() == ErrorKind::WouldBlock => Err(Error::Context {
+            message: "local database is already in use by another instance".to_string(),
+            source: Box::new(Error::Io(err)),
+        }),
+        Err(err) => Err(err).context("failed to acquire local database lock"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn temp_db_path() -> PathBuf {
+        std::env::temp_dir().join(format!("fyde-sdk-test-{}.db", uuid::Uuid::new_v4()))
+    }
+
     #[tokio::test]
     async fn connects_and_creates_the_database_file() {
-        let path = std::env::temp_dir().join(format!("fyde-sdk-test-{}.db", uuid::Uuid::new_v4()));
+        let path = temp_db_path();
 
         let client = SqliteClient::connect_at(path.clone()).await.unwrap();
         drop(client);
 
         assert!(path.exists());
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(format!("{}.lock", path.display())).unwrap();
     }
 
     #[tokio::test]
@@ -110,6 +158,34 @@ mod tests {
 
         // A no-op query just confirms the pool is actually usable (i.e.
         // migrations ran against it) rather than merely constructed.
-        sqlx::query("SELECT 1").execute(client.pool()).await.unwrap();
+        sqlx::query("SELECT 1")
+            .execute(client.pool())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_a_second_instance_on_the_same_database_file() {
+        let path = temp_db_path();
+
+        let first = SqliteClient::connect_at(path.clone()).await.unwrap();
+
+        let err = match SqliteClient::connect_at(path.clone()).await {
+            Ok(_) => panic!("a second instance must not be able to open the same database"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("already in use by another instance")
+        );
+
+        drop(first);
+
+        // Once the first instance releases the lock, a new one can connect.
+        let second = SqliteClient::connect_at(path.clone()).await.unwrap();
+        drop(second);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(format!("{}.lock", path.display())).unwrap();
     }
 }
