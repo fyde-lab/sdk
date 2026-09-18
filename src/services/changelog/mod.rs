@@ -3,7 +3,7 @@ mod service;
 mod storage;
 mod storage_sqlite;
 
-pub use service::ChangelogEvent;
+pub use service::{ChangelogEvent, EventType};
 
 use std::sync::Arc;
 
