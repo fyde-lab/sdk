@@ -1,6 +1,11 @@
+mod ffi;
 mod services;
 #[path = "lib/sql/mod.rs"]
 mod sql;
+
+uniffi::setup_scaffolding!();
+
+pub use ffi::{FfiError, FydeClient};
 
 use std::sync::Arc;
 
