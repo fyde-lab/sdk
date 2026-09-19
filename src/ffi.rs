@@ -128,8 +128,8 @@ impl From<ChangelogEvent> for FfiChangelogEvent {
     }
 }
 
-/// Callback interface for [`FydeClient::consume_since`], implemented by
-/// foreign (Kotlin/Swift) callers and invoked once per [`FfiChangelogEvent`]
+/// Callback interface for [`FydeClient::consume`], implemented by foreign
+/// (Kotlin/Swift) callers and invoked once per [`FfiChangelogEvent`]
 /// encountered during changelog catch-up and live streaming.
 #[uniffi::export(callback_interface)]
 pub trait ChangelogListener: Send + Sync {
@@ -173,7 +173,7 @@ impl FydeClient {
     }
 
     /// Fetches a document previously cached locally by
-    /// [`FydeClient::consume_since`], or `None` if it doesn't exist. Mirrors
+    /// [`FydeClient::consume`], or `None` if it doesn't exist. Mirrors
     /// [`crate::DocumentsService::get`].
     pub async fn get_document(&self, id: String) -> Result<Option<FfiDocument>, FfiError> {
         let id = parse_uuid(&id)?;
@@ -192,22 +192,16 @@ impl FydeClient {
         Ok(documents.into_iter().map(FfiDocument::from).collect())
     }
 
-    /// Streams and decrypts every changelog event from `offset` onward,
-    /// invoking `listener` once for each (replaying history, then
-    /// continuing with the live tail). Runs until the server closes the
-    /// stream or an error occurs. Mirrors
-    /// [`crate::ChangelogService::consume_since`].
-    pub async fn consume_since(
-        &self,
-        offset: i64,
-        listener: Box<dyn ChangelogListener>,
-    ) -> Result<(), FfiError> {
+    /// Streams and decrypts every changelog event since the last consumed
+    /// offset, invoking `listener` once for each (replaying history, then
+    /// continuing with the live tail). Resumes from the cursor persisted
+    /// locally by a previous call, or from the beginning of the changelog
+    /// if there is none. Runs until the server closes the stream or an
+    /// error occurs. Mirrors [`crate::ChangelogService::consume`].
+    pub async fn consume(&self, listener: Box<dyn ChangelogListener>) -> Result<(), FfiError> {
         self.inner
             .changelog()
-            .consume_since(
-                offset,
-                Box::new(move |event| listener.on_event(event.into())),
-            )
+            .consume(Box::new(move |event| listener.on_event(event.into())))
             .await?;
         Ok(())
     }

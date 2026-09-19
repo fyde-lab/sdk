@@ -42,7 +42,7 @@ pub struct Document {
 
 /// Uploads documents by publishing them as encrypted changelog events, and
 /// reads back documents materialized locally from consumed events (see
-/// [`crate::ChangelogService::consume_since`]) — there is no server-side
+/// [`crate::ChangelogService::consume`]) — there is no server-side
 /// document store to fetch from.
 #[async_trait]
 pub trait Service: Send + Sync {
@@ -56,7 +56,7 @@ pub trait Service: Send + Sync {
     async fn upload(&self, path: &Path) -> Result<Uuid>;
 
     /// Fetches a document previously cached in local storage by
-    /// [`crate::ChangelogService::consume_since`], or `None` if it doesn't
+    /// [`crate::ChangelogService::consume`], or `None` if it doesn't
     /// exist.
     async fn get(&self, id: Uuid) -> Result<Option<Document>>;
 

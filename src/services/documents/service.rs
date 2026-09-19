@@ -124,7 +124,7 @@ mod tests {
 
     /// A [`ChangelogService`] fake recording every event passed to
     /// [`ChangelogService::send`], for tests that don't need a live server.
-    /// `consume_since` is never exercised through `DocumentsClient`.
+    /// `consume` is never exercised through `DocumentsClient`.
     #[derive(Default)]
     struct RecordingChangelog {
         sent: Mutex<Vec<SentEvent>>,
@@ -148,11 +148,7 @@ mod tests {
             Ok(())
         }
 
-        async fn consume_since(
-            &self,
-            _offset: i64,
-            _callback: Box<dyn FnMut(ChangelogEvent) + Send>,
-        ) -> Result<()> {
+        async fn consume(&self, _callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
             unimplemented!("not exercised by these tests")
         }
     }

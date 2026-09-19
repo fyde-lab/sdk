@@ -9,6 +9,7 @@ use crate::{Error, ErrorContext as _, Result};
 use super::Service;
 use super::crypto;
 use super::grpc_client::{ChangelogEvent as ProtoChangelogEvent, FydeClient, GrpcClient};
+use super::storage::OffsetStorage;
 
 /// The kind of write recorded by a [`ChangelogEvent`]. Only [`Self::Created`]
 /// is producible today (there is no update/delete flow yet), but the shape
@@ -57,19 +58,26 @@ impl TryFrom<ProtoChangelogEvent> for ChangelogEvent {
 }
 
 /// A client for the fyde server's changelog service. Generic over the
-/// [`DocumentStorage`] implementation used by [`Service::consume_since`] to
-/// cache documents materialized from consumed events.
-pub(super) struct ChangelogClient<D: DocumentStorage> {
+/// [`DocumentStorage`] implementation used by [`Service::consume`] to cache
+/// documents materialized from consumed events, and the [`OffsetStorage`]
+/// implementation used to track how far the changelog has been consumed.
+pub(super) struct ChangelogClient<D: DocumentStorage, O: OffsetStorage> {
     grpc: Box<dyn FydeClient>,
     document_storage: D,
+    offset_storage: O,
 }
 
-impl<D: DocumentStorage> ChangelogClient<D> {
+impl<D: DocumentStorage, O: OffsetStorage> ChangelogClient<D, O> {
     /// Creates a client for the changelog service at the given `http://` or
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`), using
     /// `document_storage` to cache documents materialized by
-    /// [`Service::consume_since`].
-    pub(super) async fn new(base_url: impl AsRef<str>, document_storage: D) -> Result<Self> {
+    /// [`Service::consume`] and `offset_storage` to track its progress
+    /// through the changelog.
+    pub(super) async fn new(
+        base_url: impl AsRef<str>,
+        document_storage: D,
+        offset_storage: O,
+    ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(
                 GrpcClient::new(base_url)
@@ -77,6 +85,7 @@ impl<D: DocumentStorage> ChangelogClient<D> {
                     .context("failed to create changelog grpc client")?,
             ),
             document_storage,
+            offset_storage,
         })
     }
 
@@ -84,16 +93,17 @@ impl<D: DocumentStorage> ChangelogClient<D> {
     /// testing against a [`super::grpc_client::MockFydeClient`] instead of a
     /// live server.
     #[cfg(test)]
-    fn with_grpc(grpc: impl FydeClient + 'static, document_storage: D) -> Self {
+    fn with_grpc(grpc: impl FydeClient + 'static, document_storage: D, offset_storage: O) -> Self {
         Self {
             grpc: Box::new(grpc),
             document_storage,
+            offset_storage,
         }
     }
 }
 
 #[async_trait]
-impl<D: DocumentStorage> Service for ChangelogClient<D> {
+impl<D: DocumentStorage, O: OffsetStorage> Service for ChangelogClient<D, O> {
     async fn send(
         &self,
         event_type: EventType,
@@ -112,11 +122,13 @@ impl<D: DocumentStorage> Service for ChangelogClient<D> {
         Ok(())
     }
 
-    async fn consume_since(
-        &self,
-        offset: i64,
-        mut callback: Box<dyn FnMut(ChangelogEvent) + Send>,
-    ) -> Result<()> {
+    async fn consume(&self, mut callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
+        let offset = self
+            .offset_storage
+            .get_offset()
+            .await
+            .context("failed to read the local changelog offset")?;
+
         let mut stream = self
             .grpc
             .consume_since(offset)
@@ -140,6 +152,13 @@ impl<D: DocumentStorage> Service for ChangelogClient<D> {
                         format!("failed to cache document {} locally", event.document_id)
                     })?;
             }
+
+            self.offset_storage
+                .save_offset(event.offset + 1)
+                .await
+                .with_context(|| {
+                    format!("failed to persist changelog offset {}", event.offset + 1)
+                })?;
 
             callback(event);
         }
@@ -185,6 +204,25 @@ mod tests {
         }
     }
 
+    /// An in-memory [`OffsetStorage`], for tests that don't need to touch
+    /// SQLite. Starts at offset 0, like a database that's never been
+    /// written to.
+    #[derive(Default)]
+    struct InMemoryOffsetStorage {
+        offset: Mutex<i64>,
+    }
+
+    impl OffsetStorage for InMemoryOffsetStorage {
+        async fn get_offset(&self) -> Result<i64> {
+            Ok(*self.offset.lock().unwrap())
+        }
+
+        async fn save_offset(&self, offset: i64) -> Result<()> {
+            *self.offset.lock().unwrap() = offset;
+            Ok(())
+        }
+    }
+
     fn sample_metadata() -> Metadata {
         Metadata {
             name: "report.pdf".to_string(),
@@ -211,7 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_since_decrypts_events_and_caches_the_document() {
+    async fn consume_decrypts_events_and_caches_the_document() {
         let document_id = Uuid::new_v4();
 
         let mut mock_grpc = MockFydeClient::new();
@@ -222,15 +260,18 @@ mod tests {
                 Ok(futures::stream::iter(vec![Ok(proto_event(1, document_id))]).boxed())
             });
 
-        let client = ChangelogClient::with_grpc(mock_grpc, InMemoryDocumentStorage::default());
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            InMemoryDocumentStorage::default(),
+            InMemoryOffsetStorage::default(),
+        );
 
         let received = std::sync::Arc::new(Mutex::new(Vec::new()));
         let received_in_callback = received.clone();
         client
-            .consume_since(
-                0,
-                Box::new(move |event| received_in_callback.lock().unwrap().push(event)),
-            )
+            .consume(Box::new(move |event| {
+                received_in_callback.lock().unwrap().push(event)
+            }))
             .await
             .unwrap();
 
@@ -251,6 +292,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consume_resumes_from_the_persisted_offset() {
+        let document_id = Uuid::new_v4();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_consume_since()
+            .withf(|offset| *offset == 5)
+            .returning(move |_| {
+                Ok(futures::stream::iter(vec![Ok(proto_event(5, document_id))]).boxed())
+            });
+
+        let offset_storage = InMemoryOffsetStorage::default();
+        offset_storage.save_offset(5).await.unwrap();
+
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            InMemoryDocumentStorage::default(),
+            offset_storage,
+        );
+
+        client.consume(Box::new(|_| {})).await.unwrap();
+
+        assert_eq!(client.offset_storage.get_offset().await.unwrap(), 6);
+    }
+
+    #[tokio::test]
     async fn send_encrypts_the_event_before_it_reaches_the_transport_layer() {
         let document_id = Uuid::new_v4();
 
@@ -267,7 +334,11 @@ mod tests {
             })
             .returning(|_| Ok(1));
 
-        let client = ChangelogClient::with_grpc(mock_grpc, InMemoryDocumentStorage::default());
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            InMemoryDocumentStorage::default(),
+            InMemoryOffsetStorage::default(),
+        );
 
         client
             .send(
