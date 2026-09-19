@@ -89,3 +89,19 @@ impl FydeClient for GrpcClient {
         Ok(Box::pin(response.into_inner()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn new_rejects_a_malformed_base_url() {
+        let result = GrpcClient::new("not a valid uri").await;
+
+        let err = match result {
+            Ok(_) => panic!("a malformed base url must be rejected"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, Error::InvalidEndpoint(_)));
+    }
+}

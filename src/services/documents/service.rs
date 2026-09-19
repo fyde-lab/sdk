@@ -240,4 +240,36 @@ mod tests {
 
         assert_eq!(client.get(id).await.unwrap(), Some(document));
     }
+
+    #[tokio::test]
+    async fn list_pages_through_documents_previously_cached_locally() {
+        let storage = setup_storage().await;
+        for (i, name) in ["one", "two", "three"].iter().enumerate() {
+            storage
+                .save_document(&Document {
+                    id: Uuid::new_v4(),
+                    content: Vec::new(),
+                    metadata: Metadata {
+                        name: name.to_string(),
+                        content_type: PDF_CONTENT_TYPE.to_string(),
+                        created_at: 1_700_000_000 + i as i64,
+                        size: 0,
+                        checksum: String::new(),
+                        transcript: String::new(),
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        let client = DocumentsClient::new(storage, Arc::new(RecordingChangelog::default()));
+
+        let page = client.list(1, 2).await.unwrap();
+
+        assert_eq!(
+            page.into_iter()
+                .map(|document| document.metadata.name)
+                .collect::<Vec<_>>(),
+            vec!["two", "three"]
+        );
+    }
 }

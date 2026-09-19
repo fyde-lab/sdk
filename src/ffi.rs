@@ -212,3 +212,133 @@ impl FydeClient {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::changelog::EventType;
+    use crate::services::documents::Metadata;
+
+    fn metadata() -> Metadata {
+        Metadata {
+            name: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            created_at: 1_700_000_000,
+            size: 4,
+            checksum: "checksum-value".to_string(),
+            transcript: "some text".to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_uuid_accepts_a_canonical_uuid() {
+        let id = Uuid::new_v4();
+
+        assert_eq!(parse_uuid(&id.to_string()).unwrap(), id);
+    }
+
+    #[test]
+    fn parse_uuid_rejects_malformed_input() {
+        assert!(parse_uuid("not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn metadata_conversion_preserves_every_field() {
+        let metadata = metadata();
+
+        let ffi: FfiMetadata = metadata.clone().into();
+
+        assert_eq!(ffi.name, metadata.name);
+        assert_eq!(ffi.content_type, metadata.content_type);
+        assert_eq!(ffi.created_at, metadata.created_at);
+        assert_eq!(ffi.size, metadata.size);
+        assert_eq!(ffi.checksum, metadata.checksum);
+        assert_eq!(ffi.transcript, metadata.transcript);
+    }
+
+    #[test]
+    fn document_conversion_stringifies_the_id() {
+        let document = Document {
+            id: Uuid::new_v4(),
+            content: b"hello".to_vec(),
+            metadata: metadata(),
+        };
+
+        let ffi: FfiDocument = document.clone().into();
+
+        assert_eq!(ffi.id, document.id.to_string());
+        assert_eq!(ffi.content, document.content);
+        assert_eq!(ffi.metadata.name, document.metadata.name);
+    }
+
+    #[test]
+    fn event_type_conversion_maps_every_variant() {
+        assert!(matches!(
+            FfiEventType::from(EventType::Created),
+            FfiEventType::Created
+        ));
+        assert!(matches!(
+            FfiEventType::from(EventType::UpdateMetadata),
+            FfiEventType::UpdateMetadata
+        ));
+        assert!(matches!(
+            FfiEventType::from(EventType::Deleted),
+            FfiEventType::Deleted
+        ));
+    }
+
+    #[test]
+    fn changelog_event_conversion_stringifies_the_document_id_and_preserves_payload() {
+        let document_id = Uuid::new_v4();
+        let event = ChangelogEvent {
+            offset: 7,
+            event_type: EventType::Created,
+            document_id,
+            content: Some(b"body".to_vec()),
+            metadata: Some(metadata()),
+        };
+
+        let ffi: FfiChangelogEvent = event.into();
+
+        assert_eq!(ffi.offset, 7);
+        assert!(matches!(ffi.event_type, FfiEventType::Created));
+        assert_eq!(ffi.document_id, document_id.to_string());
+        assert_eq!(ffi.content, Some(b"body".to_vec()));
+        assert!(ffi.metadata.is_some());
+    }
+
+    #[test]
+    fn changelog_event_conversion_handles_events_with_no_content_or_metadata() {
+        let event = ChangelogEvent {
+            offset: 1,
+            event_type: EventType::Deleted,
+            document_id: Uuid::new_v4(),
+            content: None,
+            metadata: None,
+        };
+
+        let ffi: FfiChangelogEvent = event.into();
+
+        assert_eq!(ffi.content, None);
+        assert!(ffi.metadata.is_none());
+    }
+
+    #[test]
+    fn ffi_error_flattens_the_source_error_to_its_display_message() {
+        let err = Error::UnsupportedDocumentExtension("txt".to_string());
+        let message = err.to_string();
+
+        let ffi_err: FfiError = err.into();
+
+        assert_eq!(ffi_err.to_string(), message);
+    }
+
+    #[test]
+    fn ffi_error_from_uuid_error_carries_a_message() {
+        let uuid_err = Uuid::parse_str("not-a-uuid").unwrap_err();
+
+        let ffi_err: FfiError = uuid_err.into();
+
+        assert!(!ffi_err.to_string().is_empty());
+    }
+}

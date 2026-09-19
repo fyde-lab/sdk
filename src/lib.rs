@@ -135,3 +135,46 @@ impl Client {
         self.changelog.as_ref()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn io_error() -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
+    }
+
+    #[test]
+    fn context_wraps_the_error_with_a_message() {
+        let err = io_error().context("failed to do the thing").unwrap_err();
+
+        assert!(matches!(err, Error::Context { .. }));
+        assert_eq!(err.to_string(), "failed to do the thing: io error: missing");
+    }
+
+    #[test]
+    fn with_context_lazily_builds_the_message() {
+        let err = io_error()
+            .with_context(|| format!("failed at offset {}", 42))
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "failed at offset 42: io error: missing");
+    }
+
+    #[test]
+    fn context_preserves_the_original_error_as_the_source() {
+        use std::error::Error as _;
+
+        let err = io_error().context("failed to do the thing").unwrap_err();
+
+        let source = err.source().expect("context error must carry a source");
+        assert_eq!(source.to_string(), "io error: missing");
+    }
+
+    #[test]
+    fn context_is_a_no_op_on_success() {
+        let ok: std::io::Result<u32> = Ok(42);
+
+        assert_eq!(ok.context("unused").unwrap(), 42);
+    }
+}

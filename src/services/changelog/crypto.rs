@@ -229,4 +229,9 @@ mod tests {
 
         assert!(decrypt_event(&encrypted).is_err());
     }
+
+    #[test]
+    fn decrypt_event_rejects_a_blob_shorter_than_a_wrapped_key() {
+        assert!(decrypt_event(b"too short").is_err());
+    }
 }
