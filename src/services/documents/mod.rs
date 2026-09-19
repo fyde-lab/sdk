@@ -1,9 +1,10 @@
-mod crypto;
-mod grpc_client;
 mod service;
 mod storage;
 mod storage_sqlite;
 mod transcript;
+
+pub(crate) use storage::Storage;
+pub(crate) use storage_sqlite::SqliteStorage;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -13,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use crate::{ErrorContext as _, Result};
+use crate::Result;
+use crate::services::changelog::Service as ChangelogService;
 
 /// Cleartext metadata encrypted under a document's DEK before upload, and
 /// decrypted back out of it on download.
@@ -29,56 +31,47 @@ pub struct Metadata {
     pub transcript: String,
 }
 
-/// A file, as returned by [`Service::download`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A file, as returned by [`Service::get`]/[`Service::list`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Document {
     pub id: Uuid,
+    #[serde(with = "serde_bytes")]
     pub content: Vec<u8>,
     pub metadata: Metadata,
 }
 
-/// Saves and fetches documents, either unencrypted in local storage or
-/// encrypted on the fyde server.
+/// Uploads documents by publishing them as encrypted changelog events, and
+/// reads back documents materialized locally from consumed events (see
+/// [`crate::ChangelogService::consume_since`]) — there is no server-side
+/// document store to fetch from.
 #[async_trait]
 pub trait Service: Send + Sync {
-    /// Reads the file at `path`, encrypts it and its metadata, then uploads
-    /// it as a new document to the server, returning its generated id.
+    /// Reads the file at `path`, encrypts it and its metadata, then
+    /// publishes it as a "created" changelog event, returning its
+    /// generated id.
     ///
     /// The file type is determined from `path`'s extension; only `.pdf` is
     /// currently accepted, anything else is rejected with
     /// [`crate::Error::UnsupportedDocumentExtension`].
     async fn upload(&self, path: &Path) -> Result<Uuid>;
 
-    /// Fetches a document's content by id, or `None` if it doesn't exist.
-    async fn download(&self, id: Uuid) -> Result<Option<Document>>;
-
     /// Fetches a document previously cached in local storage by
-    /// [`Service::download`] or [`Service::download_many`], or `None` if it
-    /// doesn't exist. Unlike [`Service::download`], this does not talk to the
-    /// server.
+    /// [`crate::ChangelogService::consume_since`], or `None` if it doesn't
+    /// exist.
     async fn get(&self, id: Uuid) -> Result<Option<Document>>;
 
-    /// Fetches multiple documents' content by id in a single call. Ids that
-    /// don't exist are omitted from the result.
-    async fn download_many(&self, ids: Vec<Uuid>) -> Result<Vec<Document>>;
-
     /// Lists documents previously cached in local storage, oldest first,
-    /// one page at a time. Like [`Service::get`], this does not talk to the
-    /// server.
+    /// one page at a time.
     ///
     /// Paginate by repeatedly incrementing `offset` by the returned page's
     /// length until it comes back shorter than `limit`.
     async fn list(&self, offset: i64, limit: i64) -> Result<Vec<Document>>;
 }
 
-/// Initializes the documents service: connects to the fyde server at
-/// `base_url`, and wires up local SQLite-backed caching (via `pool`) of
-/// documents fetched from it.
-pub(crate) async fn init(base_url: impl AsRef<str>, pool: SqlitePool) -> Result<Arc<dyn Service>> {
+/// Initializes the documents service: wires up local SQLite-backed caching
+/// (via `pool`) of documents materialized from `changelog`'s consumed
+/// events, and publishes new documents through it.
+pub(crate) fn init(pool: SqlitePool, changelog: Arc<dyn ChangelogService>) -> Arc<dyn Service> {
     let storage = storage_sqlite::SqliteStorage::new(pool);
-    let client = service::DocumentsClient::new(base_url, storage)
-        .await
-        .context("failed to create documents client")?;
-
-    Ok(Arc::new(client))
+    Arc::new(service::DocumentsClient::new(storage, changelog))
 }

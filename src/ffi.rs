@@ -89,7 +89,7 @@ impl From<Document> for FfiDocument {
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
 pub enum FfiEventType {
     Created,
-    Updated,
+    UpdateMetadata,
     Deleted,
 }
 
@@ -97,7 +97,7 @@ impl From<EventType> for FfiEventType {
     fn from(event_type: EventType) -> Self {
         match event_type {
             EventType::Created => FfiEventType::Created,
-            EventType::Updated => FfiEventType::Updated,
+            EventType::UpdateMetadata => FfiEventType::UpdateMetadata,
             EventType::Deleted => FfiEventType::Deleted,
         }
     }
@@ -105,28 +105,31 @@ impl From<EventType> for FfiEventType {
 
 /// A single recorded write against a document, mirroring [`ChangelogEvent`]
 /// across the FFI boundary. `document_id` crosses as a string since UniFFI
-/// has no native UUID type.
+/// has no native UUID type. `content`/`metadata` are `None` for event types
+/// that don't carry them.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiChangelogEvent {
     pub offset: i64,
-    pub document_id: String,
     pub event_type: FfiEventType,
-    pub created_at: i64,
+    pub document_id: String,
+    pub content: Option<Vec<u8>>,
+    pub metadata: Option<FfiMetadata>,
 }
 
 impl From<ChangelogEvent> for FfiChangelogEvent {
     fn from(event: ChangelogEvent) -> Self {
         Self {
             offset: event.offset,
-            document_id: event.document_id.to_string(),
             event_type: event.event_type.into(),
-            created_at: event.created_at,
+            document_id: event.document_id.to_string(),
+            content: event.content,
+            metadata: event.metadata.map(FfiMetadata::from),
         }
     }
 }
 
-/// Callback interface for [`FydeClient::consume`], implemented by foreign
-/// (Kotlin/Swift) callers and invoked once per [`FfiChangelogEvent`]
+/// Callback interface for [`FydeClient::consume_since`], implemented by
+/// foreign (Kotlin/Swift) callers and invoked once per [`FfiChangelogEvent`]
 /// encountered during changelog catch-up and live streaming.
 #[uniffi::export(callback_interface)]
 pub trait ChangelogListener: Send + Sync {
@@ -162,46 +165,24 @@ impl FydeClient {
     }
 
     /// Reads the local file at `path`, encrypts it and its metadata, then
-    /// uploads it as a new document to the server, returning its generated
+    /// publishes it as a "created" changelog event, returning its generated
     /// id. Mirrors [`crate::DocumentsService::upload`].
     pub async fn upload_document(&self, path: String) -> Result<String, FfiError> {
         let id = self.inner.documents().upload(Path::new(&path)).await?;
         Ok(id.to_string())
     }
 
-    /// Fetches a document's content by id from the server, or `None` if it
-    /// doesn't exist. Mirrors [`crate::DocumentsService::download`].
-    pub async fn download_document(&self, id: String) -> Result<Option<FfiDocument>, FfiError> {
-        let id = parse_uuid(&id)?;
-        let document = self.inner.documents().download(id).await?;
-        Ok(document.map(FfiDocument::from))
-    }
-
     /// Fetches a document previously cached locally by
-    /// [`FydeClient::download_document`] or [`FydeClient::download_documents`],
-    /// or `None` if it doesn't exist. Unlike [`FydeClient::download_document`],
-    /// this does not talk to the server. Mirrors [`crate::DocumentsService::get`].
+    /// [`FydeClient::consume_since`], or `None` if it doesn't exist. Mirrors
+    /// [`crate::DocumentsService::get`].
     pub async fn get_document(&self, id: String) -> Result<Option<FfiDocument>, FfiError> {
         let id = parse_uuid(&id)?;
         let document = self.inner.documents().get(id).await?;
         Ok(document.map(FfiDocument::from))
     }
 
-    /// Fetches multiple documents' content by id in a single call. Ids that
-    /// don't exist are omitted from the result. Mirrors
-    /// [`crate::DocumentsService::download_many`].
-    pub async fn download_documents(&self, ids: Vec<String>) -> Result<Vec<FfiDocument>, FfiError> {
-        let ids = ids
-            .iter()
-            .map(|id| parse_uuid(id))
-            .collect::<Result<Vec<_>, _>>()?;
-        let documents = self.inner.documents().download_many(ids).await?;
-        Ok(documents.into_iter().map(FfiDocument::from).collect())
-    }
-
     /// Lists documents previously cached locally, oldest first, one page at
-    /// a time. Like [`FydeClient::get_document`], this does not talk to the
-    /// server. Mirrors [`crate::DocumentsService::list`].
+    /// a time. Mirrors [`crate::DocumentsService::list`].
     pub async fn list_documents(
         &self,
         offset: i64,
@@ -211,14 +192,22 @@ impl FydeClient {
         Ok(documents.into_iter().map(FfiDocument::from).collect())
     }
 
-    /// Subscribes to the server's changelog, invoking `listener` once for
-    /// every event encountered during both catch-up and live streaming.
-    /// Runs until the server closes the stream or an error occurs. Mirrors
-    /// [`crate::ChangelogService::consume`].
-    pub async fn consume(&self, listener: Box<dyn ChangelogListener>) -> Result<(), FfiError> {
+    /// Streams and decrypts every changelog event from `offset` onward,
+    /// invoking `listener` once for each (replaying history, then
+    /// continuing with the live tail). Runs until the server closes the
+    /// stream or an error occurs. Mirrors
+    /// [`crate::ChangelogService::consume_since`].
+    pub async fn consume_since(
+        &self,
+        offset: i64,
+        listener: Box<dyn ChangelogListener>,
+    ) -> Result<(), FfiError> {
         self.inner
             .changelog()
-            .consume(Box::new(move |event| listener.on_event(event.into())))
+            .consume_since(
+                offset,
+                Box::new(move |event| listener.on_event(event.into())),
+            )
             .await?;
         Ok(())
     }

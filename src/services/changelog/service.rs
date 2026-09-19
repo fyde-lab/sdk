@@ -1,141 +1,82 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::services::documents::Service as DocumentsService;
+use crate::services::documents::{Document, Metadata, Storage as DocumentStorage};
 use crate::{Error, ErrorContext as _, Result};
 
 use super::Service;
-use super::grpc_client::{
-    ChangelogEvent as ProtoChangelogEvent, EventStream, EventType as ProtoEventType, FydeClient,
-    GrpcClient,
-};
-use super::storage::Storage;
+use super::crypto;
+use super::grpc_client::{ChangelogEvent as ProtoChangelogEvent, FydeClient, GrpcClient};
 
-/// The kind of write recorded by a [`ChangelogEvent`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The kind of write recorded by a [`ChangelogEvent`]. Only [`Self::Created`]
+/// is producible today (there is no update/delete flow yet), but the shape
+/// is forward-compatible with the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
     Created,
-    Updated,
+    UpdateMetadata,
     Deleted,
 }
 
-impl TryFrom<ProtoEventType> for EventType {
-    type Error = Error;
-
-    fn try_from(value: ProtoEventType) -> Result<Self> {
-        match value {
-            ProtoEventType::Created => Ok(EventType::Created),
-            ProtoEventType::Updated => Ok(EventType::Updated),
-            ProtoEventType::Deleted => Ok(EventType::Deleted),
-            ProtoEventType::Unspecified => Err(Error::InvalidChangelogEvent(
-                "server sent an unspecified event type".into(),
-            )),
-        }
-    }
-}
-
-/// A single recorded write against a document, as streamed by
-/// [`ChangelogSubscription::next`].
+/// A single recorded write against a document, decrypted from the server's
+/// changelog. Inlines the document's fields rather than wrapping a
+/// [`Document`], since not every event type carries all of them: `content`
+/// is `None` for a metadata-only update, and both `content` and `metadata`
+/// are `None` for a deletion (only `document_id` is meaningful then).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangelogEvent {
     pub offset: i64,
-    pub document_id: Uuid,
     pub event_type: EventType,
-    pub created_at: i64,
+    pub document_id: Uuid,
+    pub content: Option<Vec<u8>>,
+    pub metadata: Option<Metadata>,
 }
 
 impl TryFrom<ProtoChangelogEvent> for ChangelogEvent {
     type Error = Error;
 
     fn try_from(proto: ProtoChangelogEvent) -> Result<Self> {
-        let event_type = ProtoEventType::try_from(proto.event_type).map_err(|_| {
-            Error::InvalidChangelogEvent(format!("unknown event type: {}", proto.event_type))
-        })?;
+        let (event_type, document_id, content, metadata) =
+            crypto::decrypt_event(&proto.encrypted_content).with_context(|| {
+                format!(
+                    "failed to decrypt changelog event at offset {}",
+                    proto.offset
+                )
+            })?;
 
         Ok(Self {
             offset: proto.offset,
-            document_id: Uuid::parse_str(&proto.document_id).with_context(|| {
-                format!(
-                    "invalid document id in changelog event: {}",
-                    proto.document_id
-                )
-            })?,
-            event_type: EventType::try_from(event_type).with_context(|| {
-                format!(
-                    "invalid event type in changelog event at offset {}",
-                    proto.offset
-                )
-            })?,
-            created_at: proto.created_at,
+            event_type,
+            document_id,
+            content,
+            metadata,
         })
     }
 }
 
-/// A page of changelog events, as returned by [`ChangelogClient::list_since`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventsSincePage {
-    pub events: Vec<ChangelogEvent>,
-    /// Offset to pass as `offset` on the next call to keep paginating.
-    /// Equal to the last returned event's offset, or to the request's
-    /// `offset` if this page was empty.
-    pub next_offset: i64,
-}
-
-/// A live subscription to changelog events, opened internally by
-/// [`Service::consume`]. Streams a [`ChangelogEvent`] for every new entry
-/// recorded from the moment the subscription was opened; it does not replay
-/// past entries.
-pub struct ChangelogSubscription {
-    stream: EventStream,
-}
-
-impl ChangelogSubscription {
-    /// Waits for and returns the next event, or `None` once the server
-    /// closes the stream.
-    pub async fn next(&mut self) -> Result<Option<ChangelogEvent>> {
-        match self.stream.next().await {
-            Some(Ok(proto_event)) => Ok(Some(
-                ChangelogEvent::try_from(proto_event)
-                    .context("received an invalid changelog event")?,
-            )),
-            Some(Err(status)) => Err(status.into()),
-            None => Ok(None),
-        }
-    }
-}
-
-/// A client for the fyde server's changelog service, used to subscribe to
-/// document write events over gRPC. Generic over the [`Storage`]
-/// implementation used by [`Service::consume`] to persist its cursor.
-/// [`Service::consume`] also fetches and caches every document referenced by
-/// the events it encounters, via an injected documents [`DocumentsService`].
-pub(super) struct ChangelogClient<S: Storage> {
+/// A client for the fyde server's changelog service. Generic over the
+/// [`DocumentStorage`] implementation used by [`Service::consume_since`] to
+/// cache documents materialized from consumed events.
+pub(super) struct ChangelogClient<D: DocumentStorage> {
     grpc: Box<dyn FydeClient>,
-    storage: S,
-    documents: Arc<dyn DocumentsService>,
+    document_storage: D,
 }
 
-impl<S: Storage> ChangelogClient<S> {
+impl<D: DocumentStorage> ChangelogClient<D> {
     /// Creates a client for the changelog service at the given `http://` or
-    /// `https://` base URL (e.g. `http://127.0.0.1:8080`), using `storage`
-    /// to persist [`Service::consume`]'s cursor, and `documents` to fetch and
-    /// cache the documents referenced by encountered events.
-    pub(super) async fn new(
-        base_url: impl AsRef<str>,
-        storage: S,
-        documents: Arc<dyn DocumentsService>,
-    ) -> Result<Self> {
+    /// `https://` base URL (e.g. `http://127.0.0.1:8080`), using
+    /// `document_storage` to cache documents materialized by
+    /// [`Service::consume_since`].
+    pub(super) async fn new(base_url: impl AsRef<str>, document_storage: D) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(
                 GrpcClient::new(base_url)
                     .await
                     .context("failed to create changelog grpc client")?,
             ),
-            storage,
-            documents,
+            document_storage,
         })
     }
 
@@ -143,162 +84,64 @@ impl<S: Storage> ChangelogClient<S> {
     /// testing against a [`super::grpc_client::MockFydeClient`] instead of a
     /// live server.
     #[cfg(test)]
-    fn with_grpc(
-        grpc: impl FydeClient + 'static,
-        storage: S,
-        documents: Arc<dyn DocumentsService>,
-    ) -> Self {
+    fn with_grpc(grpc: impl FydeClient + 'static, document_storage: D) -> Self {
         Self {
             grpc: Box::new(grpc),
-            storage,
-            documents,
+            document_storage,
         }
-    }
-
-    /// Fetches and caches every document referenced by `events` via
-    /// [`DocumentsService::download_many`], skipping the call entirely when
-    /// `events` is empty.
-    async fn fetch_documents(&self, events: &[ChangelogEvent]) -> Result<()> {
-        let ids: Vec<Uuid> = events.iter().map(|event| event.document_id).collect();
-
-        if ids.is_empty() {
-            return Ok(());
-        }
-
-        self.documents
-            .download_many(ids)
-            .await
-            .context("failed to download documents referenced by changelog events")?;
-
-        Ok(())
-    }
-
-    /// Catches up on every entry recorded since the offset persisted in
-    /// `storage`, advancing that offset as it goes, until none remain.
-    /// Invokes `callback` once for each event encountered.
-    async fn catch_up(&self, callback: &mut (dyn FnMut(ChangelogEvent) + Send)) -> Result<()> {
-        loop {
-            let offset = self
-                .storage
-                .read_offset()
-                .await
-                .context("failed to read changelog cursor")?;
-            let page = self.list_since(offset, 0).await.with_context(|| {
-                format!("failed to list changelog events since offset {offset}")
-            })?;
-
-            if page.events.is_empty() {
-                break;
-            }
-
-            self.fetch_documents(&page.events)
-                .await
-                .context("failed to fetch documents for changelog catch-up")?;
-
-            for event in page.events {
-                callback(event);
-            }
-
-            self.storage
-                .write_offset(page.next_offset)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to persist changelog cursor at offset {}",
-                        page.next_offset
-                    )
-                })?;
-        }
-
-        Ok(())
-    }
-
-    /// Lists entries recorded after `offset`, oldest first, one page at a
-    /// time. An `offset` of 0 means "from the beginning of the changelog".
-    /// A `limit` of 0 selects a server-side default.
-    ///
-    /// Paginate by repeatedly calling this with the previous page's
-    /// `next_offset` until the returned page is empty.
-    async fn list_since(&self, offset: i64, limit: i32) -> Result<EventsSincePage> {
-        let page = self
-            .grpc
-            .list_events_since(offset, limit)
-            .await
-            .with_context(|| {
-                format!("failed to list changelog events from server since offset {offset}")
-            })?;
-
-        let events = page
-            .events
-            .into_iter()
-            .map(ChangelogEvent::try_from)
-            .collect::<Result<_>>()
-            .context("failed to convert changelog events from server")?;
-
-        Ok(EventsSincePage {
-            events,
-            next_offset: page.next_offset,
-        })
     }
 }
 
 #[async_trait]
-impl<S: Storage> Service for ChangelogClient<S> {
-    /// First catches up on every entry already recorded since the offset
-    /// persisted in `storage`, via [`Self::catch_up`]. Then opens a
-    /// subscription streaming a [`ChangelogEvent`] every time a new entry is
-    /// recorded (starting from the moment the call is made, it does not
-    /// replay past entries), and for each one received, catches up again via
-    /// [`Self::list_since`], advancing the persisted offset afterwards.
-    ///
-    /// `callback` is invoked once for every event encountered, during both
-    /// the initial catch-up and the live subscription.
-    ///
-    /// Runs until the server closes the watch stream or an error occurs.
-    async fn consume(&self, mut callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
-        self.catch_up(&mut *callback)
-            .await
-            .context("failed to catch up on changelog before subscribing")?;
+impl<D: DocumentStorage> Service for ChangelogClient<D> {
+    async fn send(
+        &self,
+        event_type: EventType,
+        document_id: Uuid,
+        content: Option<&[u8]>,
+        metadata: Option<&Metadata>,
+    ) -> Result<()> {
+        let encrypted_content = crypto::encrypt_event(event_type, document_id, content, metadata)
+            .context("failed to encrypt changelog event")?;
 
-        let stream = self
+        self.grpc
+            .record_event(encrypted_content)
+            .await
+            .context("failed to send changelog event to server")?;
+
+        Ok(())
+    }
+
+    async fn consume_since(
+        &self,
+        offset: i64,
+        mut callback: Box<dyn FnMut(ChangelogEvent) + Send>,
+    ) -> Result<()> {
+        let mut stream = self
             .grpc
-            .watch_events()
+            .consume_since(offset)
             .await
-            .context("failed to open changelog watch stream")?;
-        let mut subscription = ChangelogSubscription { stream };
+            .with_context(|| format!("failed to open changelog stream from offset {offset}"))?;
 
-        while subscription
-            .next()
-            .await
-            .context("failed to read next changelog event")?
-            .is_some()
-        {
-            let offset = self
-                .storage
-                .read_offset()
-                .await
-                .context("failed to read changelog cursor")?;
-            let page = self.list_since(offset, 0).await.with_context(|| {
-                format!("failed to list changelog events since offset {offset}")
-            })?;
+        while let Some(proto_event) = stream.next().await {
+            let proto_event = proto_event.context("failed to read next changelog event")?;
+            let event = ChangelogEvent::try_from(proto_event)?;
 
-            self.fetch_documents(&page.events)
-                .await
-                .context("failed to fetch documents for changelog catch-up")?;
-
-            for event in page.events {
-                callback(event);
+            if let (Some(content), Some(metadata)) = (&event.content, &event.metadata) {
+                let document = Document {
+                    id: event.document_id,
+                    content: content.clone(),
+                    metadata: metadata.clone(),
+                };
+                self.document_storage
+                    .save_document(&document)
+                    .await
+                    .with_context(|| {
+                        format!("failed to cache document {} locally", event.document_id)
+                    })?;
             }
 
-            self.storage
-                .write_offset(page.next_offset)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to persist changelog cursor at offset {}",
-                        page.next_offset
-                    )
-                })?;
+            callback(event);
         }
 
         Ok(())
@@ -307,189 +150,133 @@ impl<S: Storage> Service for ChangelogClient<S> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Mutex;
 
     use futures::StreamExt as _;
 
-    use std::path::Path;
-
-    use super::super::grpc_client::{EventsSincePage as GrpcEventsSincePage, MockFydeClient};
+    use super::super::grpc_client::MockFydeClient;
     use super::*;
-    use crate::services::documents::Document;
 
-    /// A [`Storage`] backed by an in-memory cursor, for tests that don't
-    /// need to touch SQLite.
+    /// An in-memory [`DocumentStorage`], for tests that don't need to touch
+    /// SQLite.
     #[derive(Default)]
-    struct InMemoryStorage {
-        offset: AtomicI64,
+    struct InMemoryDocumentStorage {
+        documents: Mutex<Vec<Document>>,
     }
 
-    impl Storage for InMemoryStorage {
-        async fn read_offset(&self) -> Result<i64> {
-            Ok(self.offset.load(Ordering::SeqCst))
-        }
-
-        async fn write_offset(&self, offset: i64) -> Result<()> {
-            self.offset.store(offset, Ordering::SeqCst);
+    impl DocumentStorage for InMemoryDocumentStorage {
+        async fn save_document(&self, document: &Document) -> Result<()> {
+            self.documents.lock().unwrap().push(document.clone());
             Ok(())
         }
+
+        async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
+            Ok(self
+                .documents
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|document| document.id == id)
+                .cloned())
+        }
+
+        async fn list_documents(&self, _offset: i64, _limit: i64) -> Result<Vec<Document>> {
+            Ok(self.documents.lock().unwrap().clone())
+        }
     }
 
-    /// A [`DocumentsService`] that does nothing, for tests that only care
-    /// about changelog behavior.
-    struct NoopDocuments;
-
-    #[async_trait]
-    impl DocumentsService for NoopDocuments {
-        async fn upload(&self, _path: &Path) -> Result<Uuid> {
-            unimplemented!("not used by these tests")
-        }
-
-        async fn download(&self, _id: Uuid) -> Result<Option<Document>> {
-            Ok(None)
-        }
-
-        async fn get(&self, _id: Uuid) -> Result<Option<Document>> {
-            Ok(None)
-        }
-
-        async fn download_many(&self, _ids: Vec<Uuid>) -> Result<Vec<Document>> {
-            Ok(Vec::new())
-        }
-
-        async fn list(&self, _offset: i64, _limit: i64) -> Result<Vec<Document>> {
-            Ok(Vec::new())
+    fn sample_metadata() -> Metadata {
+        Metadata {
+            name: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            created_at: 1_700_000_000,
+            size: 4,
+            checksum: "checksum-value".to_string(),
+            transcript: String::new(),
         }
     }
 
     fn proto_event(offset: i64, document_id: Uuid) -> ProtoChangelogEvent {
+        let encrypted_content = crypto::encrypt_event(
+            EventType::Created,
+            document_id,
+            Some(b"content"),
+            Some(&sample_metadata()),
+        )
+        .unwrap();
         ProtoChangelogEvent {
             offset,
-            document_id: document_id.to_string(),
-            event_type: ProtoEventType::Created as i32,
-            created_at: 1_700_000_000,
+            encrypted_content,
         }
     }
 
     #[tokio::test]
-    async fn list_since_converts_proto_events_into_domain_events() {
+    async fn consume_since_decrypts_events_and_caches_the_document() {
         let document_id = Uuid::new_v4();
 
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
-            .expect_list_events_since()
-            .withf(|offset, limit| *offset == 42 && *limit == 10)
-            .returning(move |_, _| {
-                Ok(GrpcEventsSincePage {
-                    events: vec![proto_event(43, document_id)],
-                    next_offset: 43,
-                })
+            .expect_consume_since()
+            .withf(|offset| *offset == 0)
+            .returning(move |_| {
+                Ok(futures::stream::iter(vec![Ok(proto_event(1, document_id))]).boxed())
             });
 
-        let client = ChangelogClient::with_grpc(
-            mock_grpc,
-            InMemoryStorage::default(),
-            Arc::new(NoopDocuments),
-        );
+        let client = ChangelogClient::with_grpc(mock_grpc, InMemoryDocumentStorage::default());
 
-        let page = client.list_since(42, 10).await.unwrap();
-
-        assert_eq!(page.next_offset, 43);
-        assert_eq!(page.events.len(), 1);
-        assert_eq!(page.events[0].offset, 43);
-        assert_eq!(page.events[0].document_id, document_id);
-        assert_eq!(page.events[0].event_type, EventType::Created);
-    }
-
-    #[tokio::test]
-    async fn catch_up_pages_through_events_and_advances_the_offset() {
-        let document_id = Uuid::new_v4();
-
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc
-            .expect_list_events_since()
-            .withf(|offset, _| *offset == 0)
-            .returning(move |_, _| {
-                Ok(GrpcEventsSincePage {
-                    events: vec![proto_event(1, document_id)],
-                    next_offset: 1,
-                })
-            });
-        mock_grpc
-            .expect_list_events_since()
-            .withf(|offset, _| *offset == 1)
-            .returning(|_, _| {
-                Ok(GrpcEventsSincePage {
-                    events: vec![],
-                    next_offset: 1,
-                })
-            });
-
-        let client = ChangelogClient::with_grpc(
-            mock_grpc,
-            InMemoryStorage::default(),
-            Arc::new(NoopDocuments),
-        );
-
-        let mut received = Vec::new();
-        client
-            .catch_up(&mut |event| received.push(event))
-            .await
-            .unwrap();
-
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].document_id, document_id);
-    }
-
-    #[tokio::test]
-    async fn consume_catches_up_then_reacts_to_live_events() {
-        let document_id = Uuid::new_v4();
-
-        let mut mock_grpc = MockFydeClient::new();
-        // Nothing to catch up on.
-        mock_grpc
-            .expect_list_events_since()
-            .withf(|offset, _| *offset == 0)
-            .times(1)
-            .returning(|_, _| {
-                Ok(GrpcEventsSincePage {
-                    events: vec![],
-                    next_offset: 0,
-                })
-            });
-        // One live notification, then the stream closes.
-        mock_grpc.expect_watch_events().times(1).returning(move || {
-            Ok(futures::stream::iter(vec![Ok(proto_event(1, document_id))]).boxed())
-        });
-        // Catching up after the live notification finds the new event.
-        mock_grpc
-            .expect_list_events_since()
-            .withf(|offset, _| *offset == 0)
-            .times(1)
-            .returning(move |_, _| {
-                Ok(GrpcEventsSincePage {
-                    events: vec![proto_event(1, document_id)],
-                    next_offset: 1,
-                })
-            });
-
-        let client = ChangelogClient::with_grpc(
-            mock_grpc,
-            InMemoryStorage::default(),
-            Arc::new(NoopDocuments),
-        );
-
-        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = std::sync::Arc::new(Mutex::new(Vec::new()));
         let received_in_callback = received.clone();
         client
-            .consume(Box::new(move |event| {
-                received_in_callback.lock().unwrap().push(event);
-            }))
+            .consume_since(
+                0,
+                Box::new(move |event| received_in_callback.lock().unwrap().push(event)),
+            )
             .await
             .unwrap();
 
-        let received = received.lock().unwrap();
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].document_id, document_id);
+        {
+            let received = received.lock().unwrap();
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].offset, 1);
+            assert_eq!(received[0].document_id, document_id);
+            assert_eq!(received[0].event_type, EventType::Created);
+        }
+
+        let cached = client
+            .document_storage
+            .get_document(document_id)
+            .await
+            .unwrap();
+        assert_eq!(cached.unwrap().content, b"content");
+    }
+
+    #[tokio::test]
+    async fn send_encrypts_the_event_before_it_reaches_the_transport_layer() {
+        let document_id = Uuid::new_v4();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_record_event()
+            .withf(move |encrypted_content| {
+                let (event_type, id, content, metadata) =
+                    crypto::decrypt_event(encrypted_content).unwrap();
+                event_type == EventType::Created
+                    && id == document_id
+                    && content == Some(b"body".to_vec())
+                    && metadata == Some(sample_metadata())
+            })
+            .returning(|_| Ok(1));
+
+        let client = ChangelogClient::with_grpc(mock_grpc, InMemoryDocumentStorage::default());
+
+        client
+            .send(
+                EventType::Created,
+                document_id,
+                Some(b"body"),
+                Some(&sample_metadata()),
+            )
+            .await
+            .unwrap();
     }
 }

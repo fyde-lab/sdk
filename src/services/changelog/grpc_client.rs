@@ -12,38 +12,32 @@ mod proto {
     tonic::include_proto!("changelog");
 }
 
-pub(super) use proto::{ChangelogEvent, EventType};
+pub(super) use proto::ChangelogEvent;
 
 use proto::changelog_client::ChangelogClient;
-use proto::{ListEventsSinceRequest, WatchEventsRequest};
-
-/// A page of changelog events, as returned by [`FydeClient::list_events_since`].
-pub(super) struct EventsSincePage {
-    pub events: Vec<ChangelogEvent>,
-    pub next_offset: i64,
-}
+use proto::{ConsumeSinceRequest, RecordEventRequest};
 
 /// A stream of raw changelog events as received from the server, opened by
-/// [`FydeClient::watch_events`].
+/// [`FydeClient::consume_since`].
 pub(super) type EventStream =
     BoxStream<'static, std::result::Result<ChangelogEvent, tonic::Status>>;
 
 /// A gRPC transport for talking to the fyde server's changelog service.
 /// Knows nothing about changelog events themselves beyond the raw proto
-/// types; just opens the stream and hands back raw responses. Abstracted as
-/// a trait so callers can be tested against [`MockFydeClient`] instead of a
-/// live server.
+/// types; just sends/receives raw messages. Abstracted as a trait so
+/// callers can be tested against [`MockFydeClient`] instead of a live
+/// server.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(super) trait FydeClient: Send + Sync {
-    /// Opens a stream of `ChangelogEvent`s, starting from the moment the
-    /// call is made (it does not replay past entries).
-    async fn watch_events(&self) -> Result<EventStream>;
+    /// Submits a new, already-encrypted event, returning its assigned
+    /// offset.
+    async fn record_event(&self, encrypted_content: Vec<u8>) -> Result<i64>;
 
-    /// Lists entries recorded after `offset`, oldest first, one page at a
-    /// time. An `offset` of 0 means "from the beginning of the changelog". A
-    /// `limit` of 0 selects a server-side default.
-    async fn list_events_since(&self, offset: i64, limit: i32) -> Result<EventsSincePage>;
+    /// Streams every entry from `offset` onward, oldest first: replays
+    /// persisted history, then continues with the live tail. An `offset`
+    /// of 0 means "from the beginning of the changelog".
+    async fn consume_since(&self, offset: i64) -> Result<EventStream>;
 }
 
 /// The production [`FydeClient`] implementation, backed by a real tonic connection.
@@ -70,31 +64,28 @@ impl GrpcClient {
 
 #[async_trait]
 impl FydeClient for GrpcClient {
-    async fn watch_events(&self) -> Result<EventStream> {
+    async fn record_event(&self, encrypted_content: Vec<u8>) -> Result<i64> {
         // The generated client's RPC methods take `&mut self`, but the
         // underlying `Channel` is cheap to clone and safe to use
         // concurrently, so we clone it per call to expose `&self` here.
         let response = self
             .client
             .clone()
-            .watch_events(WatchEventsRequest {})
+            .record_event(RecordEventRequest { encrypted_content })
             .await
-            .context("failed to open changelog watch stream")?;
-        Ok(Box::pin(response.into_inner()))
+            .context("failed to record changelog event")?
+            .into_inner();
+
+        Ok(response.offset)
     }
 
-    async fn list_events_since(&self, offset: i64, limit: i32) -> Result<EventsSincePage> {
+    async fn consume_since(&self, offset: i64) -> Result<EventStream> {
         let response = self
             .client
             .clone()
-            .list_events_since(ListEventsSinceRequest { offset, limit })
+            .consume_since(ConsumeSinceRequest { offset })
             .await
-            .with_context(|| format!("failed to list changelog events since offset {offset}"))?
-            .into_inner();
-
-        Ok(EventsSincePage {
-            events: response.events,
-            next_offset: response.next_offset,
-        })
+            .with_context(|| format!("failed to consume changelog events since offset {offset}"))?;
+        Ok(Box::pin(response.into_inner()))
     }
 }

@@ -4,11 +4,11 @@ use crate::Result;
 
 use super::Document;
 
-/// Caches documents fetched from the server, unencrypted, by
-/// [`super::DocumentsClient::download`] and [`super::DocumentsClient::download_many`].
-/// Implementations are injected into [`super::DocumentsClient`] at
-/// construction.
-pub(super) trait Storage: Send + Sync {
+/// Caches documents, unencrypted, locally. Implementations are injected
+/// into [`super::service::DocumentsClient`] (to cache what it uploads) and
+/// into `changelog::ChangelogClient` (to cache documents materialized from
+/// consumed events) at construction.
+pub(crate) trait Storage: Send + Sync {
     /// Persists a document as-is, unencrypted.
     fn save_document(&self, document: &Document) -> impl Future<Output = Result<()>> + Send;
 

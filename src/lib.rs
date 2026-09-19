@@ -40,8 +40,10 @@ pub enum Error {
     UnsupportedDocumentExtension(String),
     #[error("encryption error: {0}")]
     Encryption(String),
-    #[error("invalid changelog event: {0}")]
-    InvalidChangelogEvent(String),
+    #[error("messagepack encode error: {0}")]
+    MessagePackEncode(#[from] rmp_serde::encode::Error),
+    #[error("messagepack decode error: {0}")]
+    MessagePackDecode(#[from] rmp_serde::decode::Error),
     #[error("{message}: {source}")]
     Context {
         message: String,
@@ -112,12 +114,10 @@ impl Client {
     async fn connect_with_sqlite(url: impl AsRef<str>, sqlite: SqliteClient) -> Result<Self> {
         let url = url.as_ref();
 
-        let documents = services::documents::init(url, sqlite.pool().clone())
-            .await
-            .context("failed to initialize documents service")?;
-        let changelog = services::changelog::init(url, sqlite.pool().clone(), documents.clone())
+        let changelog = services::changelog::init(url, sqlite.pool().clone())
             .await
             .context("failed to initialize changelog service")?;
+        let documents = services::documents::init(sqlite.pool().clone(), changelog.clone());
 
         Ok(Self {
             changelog,
