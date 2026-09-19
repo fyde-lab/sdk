@@ -37,6 +37,10 @@ Same three-piece layering as documents:
 - `grpc_client.rs` — thin gRPC transport (`GrpcClient`), also `&self`-per-call via cloning the generated client's `Channel`. Generated bindings come from `../api-protos/changelog.proto`.
 - `service.rs` — `ChangelogClient`, the default `Service` implementation. `consume` opens a `WatchEvents` subscription and, for every event it receives, pages through `ListEventsSince` starting from the cursor persisted in an injected `Storage`, advancing that cursor after each page; the callback is invoked once per event during both the initial catch-up and the live subscription. `list_since` and the private `catch_up` helper are inherent methods, not part of the trait, since nothing outside `consume` calls them.
 
+### Layering: simplified hexagonal architecture
+
+Across `documents` and `changelog`, the layer boundary is strict: **all business logic — validation, orchestration, cursor/offset bookkeeping, business rules — lives in `service.rs` and nowhere else.** `grpc_client.rs` is a transport adapter: it only sends proto requests and returns raw proto responses, no business rules. `crypto.rs` is a crypto adapter: it only performs envelope encryption/decryption, no business rules. Storage (`SqliteClient`/injected `Storage`) is a persistence adapter: it only reads/writes rows, no business rules. If you find yourself validating input or making a business decision inside a transport, crypto, or storage file, move it into `service.rs`.
+
 ### SQLite client (`src/lib/sql/sqlite.rs`)
 
 `SqliteClient` manages a local on-disk database independent of the gRPC services, at `$XDG_DATA_HOME/fyde/fyde.db` (falling back to `~/.local/share/fyde/fyde.db`), created on first connect. Uses a single-connection pool deliberately, since SQLite only supports one writer at a time.
