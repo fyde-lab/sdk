@@ -1,0 +1,22 @@
+version: '3'
+
+tasks:
+  build:
+    desc: Build fyde-sdk (also regenerates gRPC code from ../api-protos)
+    cmd: cargo build
+
+  test:
+    desc: Run all tests
+    cmd: cargo test
+
+  test-one:
+    desc: Run a single test by substring match, e.g. task sdk:test-one -- documents
+    cmd: cargo test {{.CLI_ARGS}}
+
+  fmt:
+    desc: Format code
+    cmd: cargo fmt
+
+  clippy:
+    desc: Lint code
+    cmd: cargo clippy
