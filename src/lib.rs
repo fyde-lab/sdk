@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 pub use services::changelog::{ChangelogEvent, Service as ChangelogService};
 pub use services::documents::{Document, Service as DocumentsService};
+pub use services::settings::Service as SettingsService;
 pub use services::users::{Service as UsersService, User};
 
 use session::SessionTokenStore;
@@ -93,6 +94,7 @@ where
 pub struct Client {
     changelog: Arc<dyn ChangelogService>,
     documents: Arc<dyn DocumentsService>,
+    settings: Arc<dyn SettingsService>,
     users: Arc<dyn UsersService>,
 }
 
@@ -127,6 +129,7 @@ impl Client {
             .await
             .context("failed to initialize changelog service")?;
         let documents = services::documents::init(sqlite.pool().clone(), changelog.clone());
+        let settings = services::settings::init(sqlite.pool().clone());
         let users = services::users::init(url, session)
             .await
             .context("failed to initialize users service")?;
@@ -134,6 +137,7 @@ impl Client {
         Ok(Self {
             changelog,
             documents,
+            settings,
             users,
         })
     }
@@ -151,6 +155,11 @@ impl Client {
     /// Returns a reference to the client's users service.
     pub fn users(&self) -> &dyn UsersService {
         self.users.as_ref()
+    }
+
+    /// Returns a reference to the client's settings service.
+    pub fn settings(&self) -> &dyn SettingsService {
+        self.settings.as_ref()
     }
 }
 
