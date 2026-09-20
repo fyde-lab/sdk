@@ -39,11 +39,14 @@ pub trait Service: Send + Sync {
     /// live tail — see `ConsumeSince` in `changelog.proto`), resuming from
     /// the cursor persisted locally in the `changelog_offset` table (from
     /// the very beginning of the changelog if it's never been consumed
-    /// before). For each event carrying both `content` and `metadata`
-    /// (currently only `Created` events), caches the resulting document in
+    /// before). For each `Created` event, caches the resulting document in
     /// local storage before invoking `callback`; the offset cursor is
     /// persisted as each event is processed, so a later call resumes right
     /// after the last event seen.
+    ///
+    /// Fails with [`crate::Error::InvalidChangelogEvent`] if a `Created`
+    /// event is missing its `content` or `metadata` — a `Created` event
+    /// must carry both.
     ///
     /// Runs until the server closes the stream or an error occurs.
     async fn consume(&self, callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()>;

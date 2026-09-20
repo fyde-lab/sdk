@@ -140,7 +140,14 @@ impl<D: DocumentStorage, O: OffsetStorage> Service for ChangelogClient<D, O> {
             let proto_event = proto_event.context("failed to read next changelog event")?;
             let event = ChangelogEvent::try_from(proto_event)?;
 
-            if let (Some(content), Some(metadata)) = (&event.content, &event.metadata) {
+            if event.event_type == EventType::Created {
+                let (Some(content), Some(metadata)) = (&event.content, &event.metadata) else {
+                    return Err(Error::InvalidChangelogEvent(format!(
+                        "created event at offset {} for document {} is missing content or metadata",
+                        event.offset, event.document_id
+                    )));
+                };
+
                 let document = Document {
                     id: event.document_id,
                     content: content.clone(),
@@ -236,8 +243,16 @@ mod tests {
     }
 
     fn proto_event(offset: i64, document_id: Uuid) -> ProtoChangelogEvent {
+        proto_event_with_type(offset, document_id, EventType::Created)
+    }
+
+    fn proto_event_with_type(
+        offset: i64,
+        document_id: Uuid,
+        event_type: EventType,
+    ) -> ProtoChangelogEvent {
         let encrypted_content = crypto::encrypt_event(
-            EventType::Created,
+            event_type,
             document_id,
             Some(b"content"),
             Some(&sample_metadata()),
@@ -290,6 +305,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cached.unwrap().content, b"content");
+    }
+
+    #[tokio::test]
+    async fn consume_does_not_cache_the_document_for_a_non_created_event() {
+        let document_id = Uuid::new_v4();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(vec![Ok(proto_event_with_type(
+                1,
+                document_id,
+                EventType::UpdateMetadata,
+            ))])
+            .boxed())
+        });
+
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            InMemoryDocumentStorage::default(),
+            InMemoryOffsetStorage::default(),
+        );
+
+        client.consume(Box::new(|_| {})).await.unwrap();
+
+        let cached = client
+            .document_storage
+            .get_document(document_id)
+            .await
+            .unwrap();
+        assert_eq!(cached, None);
+    }
+
+    #[tokio::test]
+    async fn consume_errors_on_a_created_event_missing_content_or_metadata() {
+        let document_id = Uuid::new_v4();
+
+        let encrypted_content =
+            crypto::encrypt_event(EventType::Created, document_id, None, None).unwrap();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(vec![Ok(ProtoChangelogEvent {
+                offset: 1,
+                encrypted_content: encrypted_content.clone(),
+            })])
+            .boxed())
+        });
+
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            InMemoryDocumentStorage::default(),
+            InMemoryOffsetStorage::default(),
+        );
+
+        let result = client.consume(Box::new(|_| {})).await;
+
+        assert!(matches!(result, Err(Error::InvalidChangelogEvent(_))));
     }
 
     #[tokio::test]
