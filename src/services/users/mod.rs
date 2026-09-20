@@ -1,3 +1,4 @@
+mod crypto;
 mod grpc_client;
 mod service;
 
@@ -9,6 +10,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::Result;
+use crate::services::settings::Service as SettingsService;
 use crate::session::SessionTokenStore;
 
 /// A user account, as returned by [`Service::create`]/[`Service::login`].
@@ -30,7 +32,9 @@ pub struct User {
 #[async_trait]
 pub trait Service: Send + Sync {
     /// Creates a new account and opens a session for the device named
-    /// `device_name`, returning the created user. Fails with
+    /// `device_name`, returning the created user. Also generates a random
+    /// master key, encrypts it under a key derived from `password`, and
+    /// persists it in the settings store under `master_key`. Fails with
     /// [`crate::Error::Grpc`] (`ALREADY_EXISTS`) if the username is
     /// already taken.
     async fn create(&self, username: &str, password: &str, device_name: &str) -> Result<User>;
@@ -49,10 +53,14 @@ pub trait Service: Send + Sync {
 /// Initializes the users service: connects to the fyde server's users
 /// service at `base_url`. `tokens` is written to on a successful
 /// `create`/`login` and shared with every other service's gRPC transport
-/// so they can authenticate their own calls.
+/// so they can authenticate their own calls. `settings` is where `create`
+/// persists the master key it generates for a new account.
 pub(crate) async fn init(
     base_url: impl AsRef<str>,
     tokens: SessionTokenStore,
+    settings: Arc<dyn SettingsService>,
 ) -> Result<Arc<dyn Service>> {
-    Ok(Arc::new(UsersClient::new(base_url, tokens).await?))
+    Ok(Arc::new(
+        UsersClient::new(base_url, tokens, settings).await?,
+    ))
 }

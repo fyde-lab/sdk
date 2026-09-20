@@ -1,11 +1,19 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use crate::services::settings::Service as SettingsService;
 use crate::session::SessionTokenStore;
 use crate::{Error, ErrorContext as _, Result};
 
 use super::Service;
+use super::crypto::generate_and_wrap_master_key;
 use super::grpc_client::{FydeClient, GrpcClient, ProtoUser};
+
+/// The settings key under which a newly created account's encrypted
+/// master key is persisted.
+const MASTER_KEY_SETTING: &str = "master_key";
 
 impl TryFrom<ProtoUser> for super::User {
     type Error = Error;
@@ -28,13 +36,19 @@ impl TryFrom<ProtoUser> for super::User {
 pub struct UsersClient {
     grpc: Box<dyn FydeClient>,
     tokens: SessionTokenStore,
+    settings: Arc<dyn SettingsService>,
 }
 
 impl UsersClient {
     /// Creates a client for the users service at the given `http://` or
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`), sharing
-    /// `tokens` with every other service's gRPC transport.
-    pub(super) async fn new(base_url: impl AsRef<str>, tokens: SessionTokenStore) -> Result<Self> {
+    /// `tokens` with every other service's gRPC transport and persisting
+    /// newly created accounts' master keys in `settings`.
+    pub(super) async fn new(
+        base_url: impl AsRef<str>,
+        tokens: SessionTokenStore,
+        settings: Arc<dyn SettingsService>,
+    ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(
                 GrpcClient::new(base_url, tokens.clone())
@@ -42,6 +56,7 @@ impl UsersClient {
                     .context("failed to create users grpc client")?,
             ),
             tokens,
+            settings,
         })
     }
 
@@ -49,10 +64,11 @@ impl UsersClient {
     /// testing against a [`super::grpc_client::MockFydeClient`] instead of
     /// a live server.
     #[cfg(test)]
-    fn with_grpc(grpc: impl FydeClient + 'static) -> Self {
+    fn with_grpc(grpc: impl FydeClient + 'static, settings: Arc<dyn SettingsService>) -> Self {
         Self {
             grpc: Box::new(grpc),
             tokens: SessionTokenStore::default(),
+            settings,
         }
     }
 }
@@ -73,6 +89,13 @@ impl Service for UsersClient {
         let user = super::User::try_from(proto_user).context("failed to parse created user")?;
 
         self.tokens.set(token);
+
+        let wrapped_master_key =
+            generate_and_wrap_master_key(password).context("failed to generate master key")?;
+        self.settings
+            .set(MASTER_KEY_SETTING, &wrapped_master_key)
+            .await
+            .context("failed to persist master key")?;
 
         Ok(user)
     }
@@ -110,8 +133,38 @@ impl Service for UsersClient {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
     use super::super::grpc_client::MockFydeClient;
     use super::*;
+
+    /// An in-memory [`SettingsService`] fake, so tests can assert on what
+    /// `create` persisted without touching SQLite.
+    #[derive(Default)]
+    struct FakeSettings {
+        values: Mutex<HashMap<String, String>>,
+    }
+
+    #[async_trait]
+    impl SettingsService for FakeSettings {
+        async fn get(&self, key: &str) -> Result<Option<String>> {
+            Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+
+        async fn set(&self, key: &str, value: &str) -> Result<()> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
 
     fn proto_user() -> ProtoUser {
         ProtoUser {
@@ -119,6 +172,10 @@ mod tests {
             username: "alice".to_string(),
             created_at: 1_700_000_000,
         }
+    }
+
+    fn client_with_grpc(grpc: impl FydeClient + 'static) -> UsersClient {
+        UsersClient::with_grpc(grpc, Arc::new(FakeSettings::default()))
     }
 
     #[tokio::test]
@@ -136,7 +193,7 @@ mod tests {
             })
             .returning(move |_, _, _| Ok((user.clone(), "a-token".to_string())));
 
-        let client = UsersClient::with_grpc(mock_grpc);
+        let client = client_with_grpc(mock_grpc);
 
         let created = client
             .create("alice", "correct horse battery staple", "Pierre's iPhone")
@@ -145,6 +202,30 @@ mod tests {
 
         assert_eq!(created.username, username);
         assert_eq!(client.tokens.get(), Some("a-token".to_string()));
+    }
+
+    #[tokio::test]
+    async fn create_persists_an_encrypted_master_key_in_settings() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_create_user()
+            .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
+
+        let client = client_with_grpc(mock_grpc);
+
+        client
+            .create("alice", "correct horse battery staple", "Pierre's iPhone")
+            .await
+            .unwrap();
+
+        let stored = client
+            .settings
+            .get(MASTER_KEY_SETTING)
+            .await
+            .unwrap()
+            .expect("create must persist a master key");
+        assert_ne!(stored, "correct horse battery staple");
+        assert!(!stored.is_empty());
     }
 
     #[tokio::test]
@@ -157,7 +238,7 @@ mod tests {
             .expect_login()
             .returning(move |_, _, _| Ok((user.clone(), "a-token".to_string())));
 
-        let client = UsersClient::with_grpc(mock_grpc);
+        let client = client_with_grpc(mock_grpc);
 
         let logged_in = client
             .login("alice", "correct horse battery staple", "Pierre's iPhone")
@@ -169,6 +250,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn login_does_not_persist_a_master_key() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_login()
+            .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
+
+        let client = client_with_grpc(mock_grpc);
+
+        client
+            .login("alice", "correct horse battery staple", "device")
+            .await
+            .unwrap();
+
+        assert_eq!(client.settings.get(MASTER_KEY_SETTING).await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn logout_closes_the_session_opened_by_login() {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
@@ -176,7 +274,7 @@ mod tests {
             .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
-        let client = UsersClient::with_grpc(mock_grpc);
+        let client = client_with_grpc(mock_grpc);
         client
             .login("alice", "correct horse battery staple", "device")
             .await
@@ -190,7 +288,7 @@ mod tests {
         // No `expect_logout()` set up: the mock panics if it's called.
         let mock_grpc = MockFydeClient::new();
 
-        let client = UsersClient::with_grpc(mock_grpc);
+        let client = client_with_grpc(mock_grpc);
 
         client.logout().await.unwrap();
     }
@@ -203,7 +301,7 @@ mod tests {
             .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
-        let client = UsersClient::with_grpc(mock_grpc);
+        let client = client_with_grpc(mock_grpc);
         client
             .login("alice", "correct horse battery staple", "device")
             .await

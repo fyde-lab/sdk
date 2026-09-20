@@ -137,7 +137,7 @@ impl Client {
         .await
         .context("failed to initialize changelog service")?;
         let documents = services::documents::init(sqlite.pool().clone(), changelog.clone());
-        let users = services::users::init(url, session)
+        let users = services::users::init(url, session, settings.clone())
             .await
             .context("failed to initialize users service")?;
 
