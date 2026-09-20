@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::services::changelog::EventType;
 use crate::services::documents::Metadata;
-use crate::{ChangelogEvent, Client, Document, Error};
+use crate::{ChangelogEvent, Client, Document, Error, User};
 
 /// Error type surfaced to FFI callers. UniFFI requires exported errors to be
 /// their own type rather than the crate's own [`Error`], so every failure is
@@ -128,6 +128,25 @@ impl From<ChangelogEvent> for FfiChangelogEvent {
     }
 }
 
+/// A user account, mirroring [`User`] across the FFI boundary. `id` crosses
+/// as a string since UniFFI has no native UUID type.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiUser {
+    pub id: String,
+    pub username: String,
+    pub created_at: i64,
+}
+
+impl From<User> for FfiUser {
+    fn from(user: User) -> Self {
+        Self {
+            id: user.id.to_string(),
+            username: user.username,
+            created_at: user.created_at,
+        }
+    }
+}
+
 /// Callback interface for [`FydeClient::consume`], implemented by foreign
 /// (Kotlin/Swift) callers and invoked once per [`FfiChangelogEvent`]
 /// encountered during changelog catch-up and live streaming.
@@ -162,6 +181,47 @@ impl FydeClient {
     pub async fn connect_memory(url: String) -> Result<Arc<Self>, FfiError> {
         let inner = Client::connect_memory(url).await?;
         Ok(Arc::new(Self { inner }))
+    }
+
+    /// Creates a new account and opens a session for the device named
+    /// `device_name`, returning the created user. Mirrors
+    /// [`crate::UsersService::create`].
+    pub async fn create_user(
+        &self,
+        username: String,
+        password: String,
+        device_name: String,
+    ) -> Result<FfiUser, FfiError> {
+        let user = self
+            .inner
+            .users()
+            .create(&username, &password, &device_name)
+            .await?;
+        Ok(user.into())
+    }
+
+    /// Verifies `username`/`password` and opens a session for the device
+    /// named `device_name`, returning the authenticated user. Mirrors
+    /// [`crate::UsersService::login`].
+    pub async fn login(
+        &self,
+        username: String,
+        password: String,
+        device_name: String,
+    ) -> Result<FfiUser, FfiError> {
+        let user = self
+            .inner
+            .users()
+            .login(&username, &password, &device_name)
+            .await?;
+        Ok(user.into())
+    }
+
+    /// Closes the session opened by the most recent `create_user`/`login`
+    /// call. Mirrors [`crate::UsersService::logout`].
+    pub async fn logout(&self) -> Result<(), FfiError> {
+        self.inner.users().logout().await?;
+        Ok(())
     }
 
     /// Reads the local file at `path`, encrypts it and its metadata, then
@@ -248,6 +308,21 @@ mod tests {
         assert_eq!(ffi.size, metadata.size);
         assert_eq!(ffi.checksum, metadata.checksum);
         assert_eq!(ffi.transcript, metadata.transcript);
+    }
+
+    #[test]
+    fn user_conversion_stringifies_the_id() {
+        let user = User {
+            id: Uuid::new_v4(),
+            username: "alice".to_string(),
+            created_at: 1_700_000_000,
+        };
+
+        let ffi: FfiUser = user.clone().into();
+
+        assert_eq!(ffi.id, user.id.to_string());
+        assert_eq!(ffi.username, user.username);
+        assert_eq!(ffi.created_at, user.created_at);
     }
 
     #[test]

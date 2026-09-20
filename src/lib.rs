@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub use services::changelog::{ChangelogEvent, Service as ChangelogService};
 pub use services::documents::{Document, Service as DocumentsService};
+pub use services::users::{Service as UsersService, User};
 
 use sql::SqliteClient;
 
@@ -38,6 +39,10 @@ pub enum Error {
     Pdf(#[from] lopdf::Error),
     #[error("unsupported document extension {0:?}: only .pdf is supported")]
     UnsupportedDocumentExtension(String),
+    #[error("invalid changelog event: {0}")]
+    InvalidChangelogEvent(String),
+    #[error("invalid server response: {0}")]
+    InvalidResponse(String),
     #[error("encryption error: {0}")]
     Encryption(String),
     #[error("messagepack encode error: {0}")]
@@ -86,6 +91,7 @@ where
 pub struct Client {
     changelog: Arc<dyn ChangelogService>,
     documents: Arc<dyn DocumentsService>,
+    users: Arc<dyn UsersService>,
 }
 
 impl Client {
@@ -118,10 +124,14 @@ impl Client {
             .await
             .context("failed to initialize changelog service")?;
         let documents = services::documents::init(sqlite.pool().clone(), changelog.clone());
+        let users = services::users::init(url)
+            .await
+            .context("failed to initialize users service")?;
 
         Ok(Self {
             changelog,
             documents,
+            users,
         })
     }
 
@@ -133,6 +143,11 @@ impl Client {
     /// Returns a reference to the client's changelog service.
     pub fn changelog(&self) -> &dyn ChangelogService {
         self.changelog.as_ref()
+    }
+
+    /// Returns a reference to the client's users service.
+    pub fn users(&self) -> &dyn UsersService {
+        self.users.as_ref()
     }
 }
 
