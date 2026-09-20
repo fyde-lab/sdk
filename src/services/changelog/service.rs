@@ -77,10 +77,11 @@ impl<D: DocumentStorage, O: OffsetStorage> ChangelogClient<D, O> {
         base_url: impl AsRef<str>,
         document_storage: D,
         offset_storage: O,
+        tokens: crate::session::SessionTokenStore,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(
-                GrpcClient::new(base_url)
+                GrpcClient::new(base_url, tokens)
                     .await
                     .context("failed to create changelog grpc client")?,
             ),

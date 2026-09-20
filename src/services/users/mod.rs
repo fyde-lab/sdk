@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::Result;
+use crate::session::SessionTokenStore;
 
 /// A user account, as returned by [`Service::create`]/[`Service::login`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,8 +22,11 @@ pub struct User {
 /// Manages account creation and session lifecycle against the fyde
 /// server's users service. Trait methods take `&self` (not `&mut self`) so
 /// implementations can be shared behind `Arc<dyn Service>`; the session
-/// token opened by `create`/`login` is tracked internally rather than
-/// threaded through every call, so `logout` takes no argument.
+/// token opened by `create`/`login` is tracked in the [`SessionTokenStore`]
+/// shared with every other service's gRPC transport (see
+/// [`crate::session::AuthInterceptor`]), which attaches it to authenticate
+/// subsequent calls, rather than it being threaded through every call
+/// here — so `logout` takes no argument.
 #[async_trait]
 pub trait Service: Send + Sync {
     /// Creates a new account and opens a session for the device named
@@ -43,7 +47,12 @@ pub trait Service: Send + Sync {
 }
 
 /// Initializes the users service: connects to the fyde server's users
-/// service at `base_url`.
-pub(crate) async fn init(base_url: impl AsRef<str>) -> Result<Arc<dyn Service>> {
-    Ok(Arc::new(UsersClient::new(base_url).await?))
+/// service at `base_url`. `tokens` is written to on a successful
+/// `create`/`login` and shared with every other service's gRPC transport
+/// so they can authenticate their own calls.
+pub(crate) async fn init(
+    base_url: impl AsRef<str>,
+    tokens: SessionTokenStore,
+) -> Result<Arc<dyn Service>> {
+    Ok(Arc::new(UsersClient::new(base_url, tokens).await?))
 }

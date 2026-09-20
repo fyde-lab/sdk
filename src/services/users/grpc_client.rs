@@ -2,8 +2,10 @@ use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
 use tonic::Request;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
+use crate::session::{AuthInterceptor, SessionTokenStore};
 use crate::{Error, ErrorContext as _, Result};
 
 /// Generated protobuf/gRPC bindings for the `users` service, compiled from
@@ -42,20 +44,25 @@ pub(super) trait FydeClient: Send + Sync {
         device_name: &str,
     ) -> Result<(ProtoUser, String)>;
 
-    /// Closes the session identified by `token`.
-    async fn logout(&self, token: &str) -> Result<()>;
+    /// Closes the session currently authenticating outgoing calls (see
+    /// [`AuthInterceptor`]).
+    async fn logout(&self) -> Result<()>;
 }
 
 /// The production [`FydeClient`] implementation, backed by a real tonic
-/// connection.
+/// connection. Every call, including `logout` itself, is authenticated:
+/// the underlying client is wrapped with an [`AuthInterceptor`] that
+/// attaches the current session token (if any) as a bearer `authorization`
+/// header.
 pub(super) struct GrpcClient {
-    client: GeneratedUsersClient<Channel>,
+    client: GeneratedUsersClient<InterceptedService<Channel, AuthInterceptor>>,
 }
 
 impl GrpcClient {
     /// Connects to the users service at the given `http://` or `https://`
-    /// base URL (e.g. `http://127.0.0.1:8080`).
-    pub async fn new(base_url: impl AsRef<str>) -> Result<Self> {
+    /// base URL (e.g. `http://127.0.0.1:8080`), authenticating every call
+    /// with the session token tracked by `tokens`.
+    pub async fn new(base_url: impl AsRef<str>, tokens: SessionTokenStore) -> Result<Self> {
         let endpoint = Channel::from_shared(base_url.as_ref().to_string())
             .map_err(|err| Error::InvalidEndpoint(err.to_string()))?;
         let channel = endpoint
@@ -64,7 +71,7 @@ impl GrpcClient {
             .context("failed to connect to users grpc endpoint")?;
 
         Ok(Self {
-            client: GeneratedUsersClient::new(channel),
+            client: GeneratedUsersClient::with_interceptor(channel, AuthInterceptor::new(tokens)),
         })
     }
 }
@@ -124,16 +131,10 @@ impl FydeClient for GrpcClient {
         Ok((user, response.session_token))
     }
 
-    async fn logout(&self, token: &str) -> Result<()> {
-        let mut request = Request::new(LogoutRequest {});
-        let bearer = format!("Bearer {token}").parse().map_err(|_| {
-            Error::InvalidResponse("session token is not a valid header value".into())
-        })?;
-        request.metadata_mut().insert("authorization", bearer);
-
+    async fn logout(&self) -> Result<()> {
         self.client
             .clone()
-            .logout(request)
+            .logout(Request::new(LogoutRequest {}))
             .await
             .context("failed to log out")?;
 
@@ -147,7 +148,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_rejects_a_malformed_base_url() {
-        let result = GrpcClient::new("not a valid uri").await;
+        let result = GrpcClient::new("not a valid uri", SessionTokenStore::default()).await;
 
         let err = match result {
             Ok(_) => panic!("a malformed base url must be rejected"),

@@ -1,5 +1,6 @@
 mod ffi;
 mod services;
+mod session;
 #[path = "lib/sql/mod.rs"]
 mod sql;
 
@@ -13,6 +14,7 @@ pub use services::changelog::{ChangelogEvent, Service as ChangelogService};
 pub use services::documents::{Document, Service as DocumentsService};
 pub use services::users::{Service as UsersService, User};
 
+use session::SessionTokenStore;
 use sql::SqliteClient;
 
 #[derive(Debug, thiserror::Error)]
@@ -119,12 +121,13 @@ impl Client {
 
     async fn connect_with_sqlite(url: impl AsRef<str>, sqlite: SqliteClient) -> Result<Self> {
         let url = url.as_ref();
+        let session = SessionTokenStore::default();
 
-        let changelog = services::changelog::init(url, sqlite.pool().clone())
+        let changelog = services::changelog::init(url, sqlite.pool().clone(), session.clone())
             .await
             .context("failed to initialize changelog service")?;
         let documents = services::documents::init(sqlite.pool().clone(), changelog.clone());
-        let users = services::users::init(url)
+        let users = services::users::init(url, session)
             .await
             .context("failed to initialize users service")?;
 

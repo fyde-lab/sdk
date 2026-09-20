@@ -1,8 +1,7 @@
-use std::sync::Mutex;
-
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use crate::session::SessionTokenStore;
 use crate::{Error, ErrorContext as _, Result};
 
 use super::Service;
@@ -20,25 +19,29 @@ impl TryFrom<ProtoUser> for super::User {
     }
 }
 
-/// A client for the fyde server's users service. Tracks the session token
-/// opened by the most recent `create`/`login` call, so [`Service::logout`]
-/// doesn't need one passed in.
+/// A client for the fyde server's users service. Writes the session token
+/// opened by the most recent `create`/`login` call into the shared
+/// [`SessionTokenStore`] also held by every other service's gRPC
+/// transport, so [`Service::logout`] doesn't need one passed in and other
+/// services' calls authenticate automatically (see
+/// [`crate::session::AuthInterceptor`]).
 pub struct UsersClient {
     grpc: Box<dyn FydeClient>,
-    session_token: Mutex<Option<String>>,
+    tokens: SessionTokenStore,
 }
 
 impl UsersClient {
     /// Creates a client for the users service at the given `http://` or
-    /// `https://` base URL (e.g. `http://127.0.0.1:8080`).
-    pub(super) async fn new(base_url: impl AsRef<str>) -> Result<Self> {
+    /// `https://` base URL (e.g. `http://127.0.0.1:8080`), sharing
+    /// `tokens` with every other service's gRPC transport.
+    pub(super) async fn new(base_url: impl AsRef<str>, tokens: SessionTokenStore) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(
-                GrpcClient::new(base_url)
+                GrpcClient::new(base_url, tokens.clone())
                     .await
                     .context("failed to create users grpc client")?,
             ),
-            session_token: Mutex::new(None),
+            tokens,
         })
     }
 
@@ -49,7 +52,7 @@ impl UsersClient {
     fn with_grpc(grpc: impl FydeClient + 'static) -> Self {
         Self {
             grpc: Box::new(grpc),
-            session_token: Mutex::new(None),
+            tokens: SessionTokenStore::default(),
         }
     }
 }
@@ -69,7 +72,7 @@ impl Service for UsersClient {
             .context("failed to create user")?;
         let user = super::User::try_from(proto_user).context("failed to parse created user")?;
 
-        *self.session_token.lock().unwrap() = Some(token);
+        self.tokens.set(token);
 
         Ok(user)
     }
@@ -87,21 +90,19 @@ impl Service for UsersClient {
             .context("failed to log in")?;
         let user = super::User::try_from(proto_user).context("failed to parse logged-in user")?;
 
-        *self.session_token.lock().unwrap() = Some(token);
+        self.tokens.set(token);
 
         Ok(user)
     }
 
     async fn logout(&self) -> Result<()> {
-        let token = self.session_token.lock().unwrap().take();
-        let Some(token) = token else {
+        if self.tokens.get().is_none() {
             return Ok(());
-        };
+        }
 
-        self.grpc
-            .logout(&token)
-            .await
-            .context("failed to log out")?;
+        self.grpc.logout().await.context("failed to log out")?;
+
+        self.tokens.take();
 
         Ok(())
     }
@@ -143,6 +144,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(created.username, username);
+        assert_eq!(client.tokens.get(), Some("a-token".to_string()));
     }
 
     #[tokio::test]
@@ -163,6 +165,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(logged_in.username, username);
+        assert_eq!(client.tokens.get(), Some("a-token".to_string()));
     }
 
     #[tokio::test]
@@ -171,10 +174,7 @@ mod tests {
         mock_grpc
             .expect_login()
             .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
-        mock_grpc
-            .expect_logout()
-            .withf(|token| token == "a-token")
-            .returning(|_| Ok(()));
+        mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
         let client = UsersClient::with_grpc(mock_grpc);
         client
@@ -187,6 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn logout_is_a_no_op_without_an_open_session() {
+        // No `expect_logout()` set up: the mock panics if it's called.
         let mock_grpc = MockFydeClient::new();
 
         let client = UsersClient::with_grpc(mock_grpc);
@@ -200,7 +201,7 @@ mod tests {
         mock_grpc
             .expect_login()
             .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
-        mock_grpc.expect_logout().times(1).returning(|_| Ok(()));
+        mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
         let client = UsersClient::with_grpc(mock_grpc);
         client

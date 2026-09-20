@@ -2,8 +2,10 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 #[cfg(test)]
 use mockall::automock;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
+use crate::session::{AuthInterceptor, SessionTokenStore};
 use crate::{Error, ErrorContext as _, Result};
 
 /// Generated protobuf/gRPC bindings for the `changelog` service, compiled
@@ -40,15 +42,19 @@ pub(super) trait FydeClient: Send + Sync {
     async fn consume_since(&self, offset: i64) -> Result<EventStream>;
 }
 
-/// The production [`FydeClient`] implementation, backed by a real tonic connection.
+/// The production [`FydeClient`] implementation, backed by a real tonic
+/// connection. Every call is authenticated: the underlying client is
+/// wrapped with an [`AuthInterceptor`] that attaches the current session
+/// token (if any) as a bearer `authorization` header.
 pub(super) struct GrpcClient {
-    client: ChangelogClient<Channel>,
+    client: ChangelogClient<InterceptedService<Channel, AuthInterceptor>>,
 }
 
 impl GrpcClient {
     /// Connects to the changelog service at the given `http://` or
-    /// `https://` base URL (e.g. `http://127.0.0.1:8080`).
-    pub async fn new(base_url: impl AsRef<str>) -> Result<Self> {
+    /// `https://` base URL (e.g. `http://127.0.0.1:8080`), authenticating
+    /// every call with the session token tracked by `tokens`.
+    pub async fn new(base_url: impl AsRef<str>, tokens: SessionTokenStore) -> Result<Self> {
         let endpoint = Channel::from_shared(base_url.as_ref().to_string())
             .map_err(|err| Error::InvalidEndpoint(err.to_string()))?;
         let channel = endpoint
@@ -57,7 +63,7 @@ impl GrpcClient {
             .context("failed to connect to changelog grpc endpoint")?;
 
         Ok(Self {
-            client: ChangelogClient::new(channel),
+            client: ChangelogClient::with_interceptor(channel, AuthInterceptor::new(tokens)),
         })
     }
 }
@@ -96,7 +102,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_rejects_a_malformed_base_url() {
-        let result = GrpcClient::new("not a valid uri").await;
+        let result = GrpcClient::new("not a valid uri", SessionTokenStore::default()).await;
 
         let err = match result {
             Ok(_) => panic!("a malformed base url must be rejected"),

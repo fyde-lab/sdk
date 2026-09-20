@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 
 use crate::services::documents::{self, Metadata};
+use crate::session::SessionTokenStore;
 use crate::{ErrorContext as _, Result};
 
 /// Publishes and consumes the fyde server's changelog: a blind relay for
@@ -51,11 +52,17 @@ pub trait Service: Send + Sync {
 /// Initializes the changelog service: connects to the fyde server at
 /// `base_url`, and uses `pool` to cache documents materialized from
 /// consumed events directly into the local `documents` table, and to track
-/// the changelog offset consumed so far.
-pub(crate) async fn init(base_url: impl AsRef<str>, pool: SqlitePool) -> Result<Arc<dyn Service>> {
+/// the changelog offset consumed so far. `tokens` is attached as a bearer
+/// `authorization` header on every outgoing call once a session is opened
+/// (see [`crate::session::AuthInterceptor`]).
+pub(crate) async fn init(
+    base_url: impl AsRef<str>,
+    pool: SqlitePool,
+    tokens: SessionTokenStore,
+) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool.clone());
     let offset_storage = storage_sqlite::SqliteOffsetStorage::new(pool);
-    let client = service::ChangelogClient::new(base_url, document_storage, offset_storage)
+    let client = service::ChangelogClient::new(base_url, document_storage, offset_storage, tokens)
         .await
         .context("failed to create changelog client")?;
 
