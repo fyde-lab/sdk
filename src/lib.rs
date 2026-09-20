@@ -127,12 +127,12 @@ impl Client {
         let url = url.as_ref();
         let session = SessionTokenStore::default();
 
-        let (settings, internal_settings) = services::settings::init(sqlite.pool().clone());
+        let settings = services::settings::init(sqlite.pool().clone());
         let changelog = services::changelog::init(
             url,
             sqlite.pool().clone(),
             session.clone(),
-            internal_settings,
+            settings.clone(),
         )
         .await
         .context("failed to initialize changelog service")?;

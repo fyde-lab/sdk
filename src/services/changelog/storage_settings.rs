@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::services::settings::InternalService as SettingsInternalService;
+use crate::services::settings::Service as SettingsService;
 use crate::{ErrorContext as _, Result};
 
 use super::storage::OffsetStorage;
@@ -9,15 +9,15 @@ use super::storage::OffsetStorage;
 /// the SDK's local settings store.
 const OFFSET_KEY: &str = "changelog_offset";
 
-/// An [`OffsetStorage`] backed by the SDK's local settings store (see
-/// `settings::InternalService`) rather than a dedicated table, storing the
-/// offset as its base-10 string representation.
+/// An [`OffsetStorage`] backed by the SDK's local settings store rather
+/// than a dedicated table, storing the offset as its base-10 string
+/// representation.
 pub(crate) struct SettingsOffsetStorage {
-    settings: Arc<dyn SettingsInternalService>,
+    settings: Arc<dyn SettingsService>,
 }
 
 impl SettingsOffsetStorage {
-    pub(crate) fn new(settings: Arc<dyn SettingsInternalService>) -> Self {
+    pub(crate) fn new(settings: Arc<dyn SettingsService>) -> Self {
         Self { settings }
     }
 }
@@ -26,7 +26,7 @@ impl OffsetStorage for SettingsOffsetStorage {
     async fn get_offset(&self) -> Result<i64> {
         let value = self
             .settings
-            .get_internal(OFFSET_KEY)
+            .get(OFFSET_KEY)
             .await
             .context("failed to fetch changelog offset from local settings")?;
 
@@ -40,7 +40,7 @@ impl OffsetStorage for SettingsOffsetStorage {
 
     async fn save_offset(&self, offset: i64) -> Result<()> {
         self.settings
-            .set_internal(OFFSET_KEY, &offset.to_string())
+            .set(OFFSET_KEY, &offset.to_string())
             .await
             .with_context(|| format!("failed to save changelog offset {offset} to local settings"))
     }
@@ -55,24 +55,29 @@ mod tests {
 
     use super::*;
 
-    /// An in-memory [`SettingsInternalService`] fake, for tests that don't
-    /// need to touch SQLite.
+    /// An in-memory [`SettingsService`] fake, for tests that don't need to
+    /// touch SQLite.
     #[derive(Default)]
     struct InMemorySettings {
         values: Mutex<HashMap<String, String>>,
     }
 
     #[async_trait]
-    impl SettingsInternalService for InMemorySettings {
-        async fn get_internal(&self, key: &str) -> Result<Option<String>> {
+    impl SettingsService for InMemorySettings {
+        async fn get(&self, key: &str) -> Result<Option<String>> {
             Ok(self.values.lock().unwrap().get(key).cloned())
         }
 
-        async fn set_internal(&self, key: &str, value: &str) -> Result<()> {
+        async fn set(&self, key: &str, value: &str) -> Result<()> {
             self.values
                 .lock()
                 .unwrap()
                 .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.values.lock().unwrap().remove(key);
             Ok(())
         }
     }
@@ -106,10 +111,7 @@ mod tests {
     #[tokio::test]
     async fn get_offset_rejects_a_non_numeric_stored_value() {
         let settings = Arc::new(InMemorySettings::default());
-        settings
-            .set_internal(OFFSET_KEY, "not-a-number")
-            .await
-            .unwrap();
+        settings.set(OFFSET_KEY, "not-a-number").await.unwrap();
         let storage = SettingsOffsetStorage::new(settings);
 
         assert!(storage.get_offset().await.is_err());

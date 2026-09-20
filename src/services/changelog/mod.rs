@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 
 use crate::services::documents::{self, Metadata};
-use crate::services::settings::InternalService as SettingsInternalService;
+use crate::services::settings::Service as SettingsService;
 use crate::session::SessionTokenStore;
 use crate::{ErrorContext as _, Result};
 
@@ -64,7 +64,7 @@ pub(crate) async fn init(
     base_url: impl AsRef<str>,
     pool: SqlitePool,
     tokens: SessionTokenStore,
-    settings: Arc<dyn SettingsInternalService>,
+    settings: Arc<dyn SettingsService>,
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool);
     let offset_storage = storage_settings::SettingsOffsetStorage::new(settings);
