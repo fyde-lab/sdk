@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
 
 use crate::{ErrorContext as _, Result};
@@ -16,6 +17,7 @@ impl SqliteStorage {
     }
 }
 
+#[async_trait]
 impl Storage for SqliteStorage {
     async fn get(&self, key: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM settings WHERE key = ?1")
