@@ -2,7 +2,7 @@ mod crypto;
 mod grpc_client;
 mod service;
 mod storage;
-mod storage_sqlite;
+mod storage_settings;
 
 pub use service::{ChangelogEvent, EventType};
 
@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 
 use crate::services::documents::{self, Metadata};
+use crate::services::settings::InternalService as SettingsInternalService;
 use crate::session::SessionTokenStore;
 use crate::{ErrorContext as _, Result};
 
@@ -37,9 +38,9 @@ pub trait Service: Send + Sync {
     /// Streams and decrypts every event since the last consumed offset,
     /// oldest first (replaying persisted history, then continuing with the
     /// live tail — see `ConsumeSince` in `changelog.proto`), resuming from
-    /// the cursor persisted locally in the `changelog_offset` table (from
-    /// the very beginning of the changelog if it's never been consumed
-    /// before). For each `Created` event, caches the resulting document in
+    /// the cursor persisted locally in the settings store (from the very
+    /// beginning of the changelog if it's never been consumed before). For
+    /// each `Created` event, caches the resulting document in
     /// local storage before invoking `callback`; the offset cursor is
     /// persisted as each event is processed, so a later call resumes right
     /// after the last event seen.
@@ -54,17 +55,19 @@ pub trait Service: Send + Sync {
 
 /// Initializes the changelog service: connects to the fyde server at
 /// `base_url`, and uses `pool` to cache documents materialized from
-/// consumed events directly into the local `documents` table, and to track
-/// the changelog offset consumed so far. `tokens` is attached as a bearer
-/// `authorization` header on every outgoing call once a session is opened
-/// (see [`crate::session::AuthInterceptor`]).
+/// consumed events directly into the local `documents` table, and
+/// `settings` to persist the changelog offset consumed so far (see
+/// [`storage_settings::SettingsOffsetStorage`]). `tokens` is attached as a
+/// bearer `authorization` header on every outgoing call once a session is
+/// opened (see [`crate::session::AuthInterceptor`]).
 pub(crate) async fn init(
     base_url: impl AsRef<str>,
     pool: SqlitePool,
     tokens: SessionTokenStore,
+    settings: Arc<dyn SettingsInternalService>,
 ) -> Result<Arc<dyn Service>> {
-    let document_storage = documents::SqliteStorage::new(pool.clone());
-    let offset_storage = storage_sqlite::SqliteOffsetStorage::new(pool);
+    let document_storage = documents::SqliteStorage::new(pool);
+    let offset_storage = storage_settings::SettingsOffsetStorage::new(settings);
     let client = service::ChangelogClient::new(base_url, document_storage, offset_storage, tokens)
         .await
         .context("failed to create changelog client")?;

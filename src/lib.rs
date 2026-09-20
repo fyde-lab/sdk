@@ -28,6 +28,8 @@ pub enum Error {
     InvalidEndpoint(String),
     #[error("invalid uuid: {0}")]
     InvalidUuid(#[from] uuid::Error),
+    #[error("invalid integer: {0}")]
+    InvalidInteger(#[from] std::num::ParseIntError),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("database error: {0}")]
@@ -125,11 +127,16 @@ impl Client {
         let url = url.as_ref();
         let session = SessionTokenStore::default();
 
-        let changelog = services::changelog::init(url, sqlite.pool().clone(), session.clone())
-            .await
-            .context("failed to initialize changelog service")?;
+        let (settings, internal_settings) = services::settings::init(sqlite.pool().clone());
+        let changelog = services::changelog::init(
+            url,
+            sqlite.pool().clone(),
+            session.clone(),
+            internal_settings,
+        )
+        .await
+        .context("failed to initialize changelog service")?;
         let documents = services::documents::init(sqlite.pool().clone(), changelog.clone());
-        let settings = services::settings::init(sqlite.pool().clone());
         let users = services::users::init(url, session)
             .await
             .context("failed to initialize users service")?;

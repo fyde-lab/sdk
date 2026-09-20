@@ -1,9 +1,10 @@
 use crate::Result;
 
-/// Tracks the SDK's cursor position into the server's changelog (the local
-/// `changelog_offset` table), so [`super::Service::consume`] can resume
-/// from where it left off across restarts instead of requiring the caller
-/// to track an offset itself.
+/// Tracks the SDK's cursor position into the server's changelog (persisted
+/// in the local settings store — see
+/// [`super::storage_settings::SettingsOffsetStorage`]), so
+/// [`super::Service::consume`] can resume from where it left off across
+/// restarts instead of requiring the caller to track an offset itself.
 pub(crate) trait OffsetStorage: Send + Sync {
     /// Returns the last offset persisted by [`Self::save_offset`], or `0`
     /// if the changelog has never been consumed.

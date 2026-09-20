@@ -2,11 +2,11 @@ use async_trait::async_trait;
 
 use crate::Result;
 
-use super::Service;
 use super::storage::Storage;
+use super::{InternalService, Service};
 
-/// The default [`Service`] implementation, delegating persistence to an
-/// injected [`Storage`].
+/// The default [`Service`]/[`InternalService`] implementation, delegating
+/// persistence to an injected [`Storage`].
 pub(super) struct SettingsClient<S: Storage> {
     storage: S,
 }
@@ -14,27 +14,6 @@ pub(super) struct SettingsClient<S: Storage> {
 impl<S: Storage> SettingsClient<S> {
     pub(super) fn new(storage: S) -> Self {
         Self { storage }
-    }
-
-    /// Returns the value stored under `key`, or `None` if it has never
-    /// been set. Internal-only: not part of the [`Service`] trait, so it
-    /// never crosses the SDK's public API — used by other SDK modules to
-    /// persist their own state (e.g. the session auth token, the local
-    /// master key, the changelog consumption offset) without exposing it
-    /// alongside user-facing settings.
-    // Not yet called outside tests: no other SDK module reads/writes its
-    // state through settings yet, but the split from `get`/`set` must
-    // exist before that wiring lands.
-    #[allow(dead_code)]
-    pub(crate) async fn get_internal(&self, key: &str) -> Result<Option<String>> {
-        self.storage.get(key).await
-    }
-
-    /// Stores `value` under `key`, overwriting any value previously
-    /// stored under it. Internal-only counterpart to [`Self::get_internal`].
-    #[allow(dead_code)]
-    pub(crate) async fn set_internal(&self, key: &str, value: &str) -> Result<()> {
-        self.storage.set(key, value).await
     }
 }
 
@@ -50,6 +29,17 @@ impl<S: Storage> Service for SettingsClient<S> {
 
     async fn delete(&self, key: &str) -> Result<()> {
         self.storage.delete(key).await
+    }
+}
+
+#[async_trait]
+impl<S: Storage> InternalService for SettingsClient<S> {
+    async fn get_internal(&self, key: &str) -> Result<Option<String>> {
+        self.storage.get(key).await
+    }
+
+    async fn set_internal(&self, key: &str, value: &str) -> Result<()> {
+        self.storage.set(key, value).await
     }
 }
 
