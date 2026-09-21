@@ -41,6 +41,10 @@ Same three-piece layering as documents:
 
 Across `documents` and `changelog`, the layer boundary is strict: **all business logic — validation, orchestration, cursor/offset bookkeeping, business rules — lives in `service.rs` and nowhere else.** `grpc_client.rs` is a transport adapter: it only sends proto requests and returns raw proto responses, no business rules. `crypto.rs` is a crypto adapter: it only performs envelope encryption/decryption, no business rules. Storage (`SqliteClient`/injected `Storage`) is a persistence adapter: it only reads/writes rows, no business rules. If you find yourself validating input or making a business decision inside a transport, crypto, or storage file, move it into `service.rs`.
 
+### Testing: `service.rs` tests use `mockall`, not real implementations
+
+**`service.rs` business logic (`DocumentsClient`, `ChangelogClient`) must be tested only against `mockall`-generated mocks of its injected dependency traits — `Storage`, `documents::Service`/`changelog::Service` where used cross-domain, etc. — never against a real `grpc_client.rs`, `crypto.rs`, or `SqliteClient` implementation.** Mark each dependency trait `#[async_trait]` plus `#[cfg_attr(test, mockall::automock)]`, build the service under test from the generated `Mock*` type, and fake persistence semantics with `.returning()` closures (e.g. a `Mutex`-backed map/list), following the same pattern used in `../server/CLAUDE.md`. `grpc_client.rs`, `crypto.rs`, and `src/lib/sql/sqlite.rs` are the exception: their own tests exercise the real transport/crypto/SQLite adapter, which is correct there — never in `service.rs`.
+
 ### SQLite client (`src/lib/sql/sqlite.rs`)
 
 `SqliteClient` manages a local on-disk database independent of the gRPC services, at `$XDG_DATA_HOME/fyde/fyde.db` (falling back to `~/.local/share/fyde/fyde.db`), created on first connect. Uses a single-connection pool deliberately, since SQLite only supports one writer at a time.
