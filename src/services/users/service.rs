@@ -133,38 +133,11 @@ impl Service for UsersClient {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use super::super::grpc_client::MockFydeClient;
     use super::*;
-
-    /// An in-memory [`SettingsService`] fake, so tests can assert on what
-    /// `create` persisted without touching SQLite.
-    #[derive(Default)]
-    struct FakeSettings {
-        values: Mutex<HashMap<String, String>>,
-    }
-
-    #[async_trait]
-    impl SettingsService for FakeSettings {
-        async fn get(&self, key: &str) -> Result<Option<String>> {
-            Ok(self.values.lock().unwrap().get(key).cloned())
-        }
-
-        async fn set(&self, key: &str, value: &str) -> Result<()> {
-            self.values
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), value.to_string());
-            Ok(())
-        }
-
-        async fn delete(&self, key: &str) -> Result<()> {
-            self.values.lock().unwrap().remove(key);
-            Ok(())
-        }
-    }
+    use crate::services::settings::MockService as MockSettingsService;
 
     fn proto_user() -> ProtoUser {
         ProtoUser {
@@ -174,8 +147,11 @@ mod tests {
         }
     }
 
-    fn client_with_grpc(grpc: impl FydeClient + 'static) -> UsersClient {
-        UsersClient::with_grpc(grpc, Arc::new(FakeSettings::default()))
+    fn client_with_grpc(
+        grpc: impl FydeClient + 'static,
+        settings: MockSettingsService,
+    ) -> UsersClient {
+        UsersClient::with_grpc(grpc, Arc::new(settings))
     }
 
     #[tokio::test]
@@ -193,7 +169,14 @@ mod tests {
             })
             .returning(move |_, _, _| Ok((user.clone(), "a-token".to_string())));
 
-        let client = client_with_grpc(mock_grpc);
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_set()
+            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let client = client_with_grpc(mock_grpc, settings);
 
         let created = client
             .create("alice", "correct horse battery staple", "Pierre's iPhone")
@@ -211,18 +194,32 @@ mod tests {
             .expect_create_user()
             .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
 
-        let client = client_with_grpc(mock_grpc);
+        // Captures what `create` persists so it can be read back and
+        // asserted on below, without a generic key/value store.
+        let persisted_master_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let mut settings = MockSettingsService::new();
+        let set_master_key = persisted_master_key.clone();
+        settings
+            .expect_set()
+            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .times(1)
+            .returning(move |_, value| {
+                *set_master_key.lock().unwrap() = Some(value.to_string());
+                Ok(())
+            });
+
+        let client = client_with_grpc(mock_grpc, settings);
 
         client
             .create("alice", "correct horse battery staple", "Pierre's iPhone")
             .await
             .unwrap();
 
-        let stored = client
-            .settings
-            .get(MASTER_KEY_SETTING)
-            .await
+        let stored = persisted_master_key
+            .lock()
             .unwrap()
+            .clone()
             .expect("create must persist a master key");
         assert_ne!(stored, "correct horse battery staple");
         assert!(!stored.is_empty());
@@ -238,7 +235,9 @@ mod tests {
             .expect_login()
             .returning(move |_, _, _| Ok((user.clone(), "a-token".to_string())));
 
-        let client = client_with_grpc(mock_grpc);
+        // `login` never touches settings: no expectations set, so the mock
+        // panics if it's called, which is how this test proves it isn't.
+        let client = client_with_grpc(mock_grpc, MockSettingsService::new());
 
         let logged_in = client
             .login("alice", "correct horse battery staple", "Pierre's iPhone")
@@ -256,7 +255,13 @@ mod tests {
             .expect_login()
             .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
 
-        let client = client_with_grpc(mock_grpc);
+        // `login` never touches settings: no `expect_set()` is set up, so
+        // the mock panics if it's called, which is how this test proves it
+        // isn't. `expect_get()` is only for the direct post-check below.
+        let mut settings = MockSettingsService::new();
+        settings.expect_get().returning(|_| Ok(None));
+
+        let client = client_with_grpc(mock_grpc, settings);
 
         client
             .login("alice", "correct horse battery staple", "device")
@@ -274,7 +279,7 @@ mod tests {
             .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
-        let client = client_with_grpc(mock_grpc);
+        let client = client_with_grpc(mock_grpc, MockSettingsService::new());
         client
             .login("alice", "correct horse battery staple", "device")
             .await
@@ -288,7 +293,7 @@ mod tests {
         // No `expect_logout()` set up: the mock panics if it's called.
         let mock_grpc = MockFydeClient::new();
 
-        let client = client_with_grpc(mock_grpc);
+        let client = client_with_grpc(mock_grpc, MockSettingsService::new());
 
         client.logout().await.unwrap();
     }
@@ -301,7 +306,7 @@ mod tests {
             .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
-        let client = client_with_grpc(mock_grpc);
+        let client = client_with_grpc(mock_grpc, MockSettingsService::new());
         client
             .login("alice", "correct horse battery staple", "device")
             .await

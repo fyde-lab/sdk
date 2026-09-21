@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
@@ -18,6 +19,7 @@ impl SqliteStorage {
     }
 }
 
+#[async_trait]
 impl Storage for SqliteStorage {
     async fn save_document(&self, document: &Document) -> Result<()> {
         sqlx::query(

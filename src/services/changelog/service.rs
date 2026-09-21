@@ -158,54 +158,9 @@ mod tests {
     use futures::StreamExt as _;
 
     use super::super::grpc_client::MockFydeClient;
+    use super::super::storage::MockOffsetStorage;
     use super::*;
-
-    /// An in-memory [`DocumentStorage`], for tests that don't need to touch
-    /// SQLite.
-    #[derive(Default)]
-    struct InMemoryDocumentStorage {
-        documents: Mutex<Vec<Document>>,
-    }
-
-    impl DocumentStorage for InMemoryDocumentStorage {
-        async fn save_document(&self, document: &Document) -> Result<()> {
-            self.documents.lock().unwrap().push(document.clone());
-            Ok(())
-        }
-
-        async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
-            Ok(self
-                .documents
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|document| document.id == id)
-                .cloned())
-        }
-
-        async fn list_documents(&self, _offset: i64, _limit: i64) -> Result<Vec<Document>> {
-            Ok(self.documents.lock().unwrap().clone())
-        }
-    }
-
-    /// An in-memory [`OffsetStorage`], for tests that don't need to touch
-    /// SQLite. Starts at offset 0, like a database that's never been
-    /// written to.
-    #[derive(Default)]
-    struct InMemoryOffsetStorage {
-        offset: Mutex<i64>,
-    }
-
-    impl OffsetStorage for InMemoryOffsetStorage {
-        async fn get_offset(&self) -> Result<i64> {
-            Ok(*self.offset.lock().unwrap())
-        }
-
-        async fn save_offset(&self, offset: i64) -> Result<()> {
-            *self.offset.lock().unwrap() = offset;
-            Ok(())
-        }
-    }
+    use crate::services::documents::MockStorage;
 
     fn sample_metadata() -> Metadata {
         Metadata {
@@ -252,11 +207,22 @@ mod tests {
                 Ok(futures::stream::iter(vec![Ok(proto_event(1, document_id))]).boxed())
             });
 
-        let client = ChangelogClient::with_grpc(
-            mock_grpc,
-            InMemoryDocumentStorage::default(),
-            InMemoryOffsetStorage::default(),
-        );
+        let mut document_storage = MockStorage::new();
+        document_storage
+            .expect_save_document()
+            .withf(move |document| document.id == document_id && document.content == b"content")
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let mut offset_storage = MockOffsetStorage::new();
+        offset_storage.expect_get_offset().returning(|| Ok(0));
+        offset_storage
+            .expect_save_offset()
+            .withf(|offset| *offset == 2)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let client = ChangelogClient::with_grpc(mock_grpc, document_storage, offset_storage);
 
         let received = std::sync::Arc::new(Mutex::new(Vec::new()));
         let received_in_callback = received.clone();
@@ -267,20 +233,11 @@ mod tests {
             .await
             .unwrap();
 
-        {
-            let received = received.lock().unwrap();
-            assert_eq!(received.len(), 1);
-            assert_eq!(received[0].offset, 1);
-            assert_eq!(received[0].document_id, document_id);
-            assert_eq!(received[0].event_type, EventType::Created);
-        }
-
-        let cached = client
-            .document_storage
-            .get_document(document_id)
-            .await
-            .unwrap();
-        assert_eq!(cached.unwrap().content, b"content");
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].offset, 1);
+        assert_eq!(received[0].document_id, document_id);
+        assert_eq!(received[0].event_type, EventType::Created);
     }
 
     #[tokio::test]
@@ -297,20 +254,21 @@ mod tests {
             .boxed())
         });
 
-        let client = ChangelogClient::with_grpc(
-            mock_grpc,
-            InMemoryDocumentStorage::default(),
-            InMemoryOffsetStorage::default(),
-        );
+        // No `expect_save_document()` set up: the mock panics if it's
+        // called, which is how this test proves it isn't.
+        let document_storage = MockStorage::new();
+
+        let mut offset_storage = MockOffsetStorage::new();
+        offset_storage.expect_get_offset().returning(|| Ok(0));
+        offset_storage
+            .expect_save_offset()
+            .withf(|offset| *offset == 2)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let client = ChangelogClient::with_grpc(mock_grpc, document_storage, offset_storage);
 
         client.consume(Box::new(|_| {})).await.unwrap();
-
-        let cached = client
-            .document_storage
-            .get_document(document_id)
-            .await
-            .unwrap();
-        assert_eq!(cached, None);
     }
 
     #[tokio::test]
@@ -329,11 +287,14 @@ mod tests {
             .boxed())
         });
 
-        let client = ChangelogClient::with_grpc(
-            mock_grpc,
-            InMemoryDocumentStorage::default(),
-            InMemoryOffsetStorage::default(),
-        );
+        // Decryption fails before either storage is touched, so neither
+        // mock needs `save_document`/`save_offset` expectations: the mock
+        // panics if it's called, which is how this test proves it isn't.
+        let document_storage = MockStorage::new();
+        let mut offset_storage = MockOffsetStorage::new();
+        offset_storage.expect_get_offset().returning(|| Ok(0));
+
+        let client = ChangelogClient::with_grpc(mock_grpc, document_storage, offset_storage);
 
         let result = client.consume(Box::new(|_| {})).await;
 
@@ -352,18 +313,22 @@ mod tests {
                 Ok(futures::stream::iter(vec![Ok(proto_event(5, document_id))]).boxed())
             });
 
-        let offset_storage = InMemoryOffsetStorage::default();
-        offset_storage.save_offset(5).await.unwrap();
+        let mut document_storage = MockStorage::new();
+        document_storage
+            .expect_save_document()
+            .returning(|_| Ok(()));
 
-        let client = ChangelogClient::with_grpc(
-            mock_grpc,
-            InMemoryDocumentStorage::default(),
-            offset_storage,
-        );
+        let mut offset_storage = MockOffsetStorage::new();
+        offset_storage.expect_get_offset().returning(|| Ok(5));
+        offset_storage
+            .expect_save_offset()
+            .withf(|offset| *offset == 6)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let client = ChangelogClient::with_grpc(mock_grpc, document_storage, offset_storage);
 
         client.consume(Box::new(|_| {})).await.unwrap();
-
-        assert_eq!(client.offset_storage.get_offset().await.unwrap(), 6);
     }
 
     #[tokio::test]
@@ -383,11 +348,8 @@ mod tests {
             })
             .returning(|_| Ok(1));
 
-        let client = ChangelogClient::with_grpc(
-            mock_grpc,
-            InMemoryDocumentStorage::default(),
-            InMemoryOffsetStorage::default(),
-        );
+        let client =
+            ChangelogClient::with_grpc(mock_grpc, MockStorage::new(), MockOffsetStorage::new());
 
         client
             .send(

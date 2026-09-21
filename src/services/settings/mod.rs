@@ -5,6 +5,8 @@ mod storage_sqlite;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(test)]
+use mockall::automock;
 use sqlx::SqlitePool;
 
 use crate::Result;
@@ -15,6 +17,7 @@ use crate::Result;
 /// offset — see `changelog::storage_settings`) and, later, for
 /// user-facing settings. Trait methods take `&self` (not `&mut self`) so
 /// implementations can be shared behind `Arc<dyn Service>`.
+#[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Service: Send + Sync {
     /// Returns the value stored under `key`, or `None` if it has never

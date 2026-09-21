@@ -7,6 +7,8 @@ mod transcript;
 pub use models::{Document, Metadata};
 #[cfg(test)]
 pub(crate) use models::{FakeDocument, FakeMetadata};
+#[cfg(test)]
+pub(crate) use storage::MockStorage;
 pub(crate) use storage::Storage;
 pub(crate) use storage_sqlite::SqliteStorage;
 

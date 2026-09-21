@@ -111,12 +111,11 @@ mod tests {
     use std::io::Write as _;
     use std::sync::Mutex;
 
-    use sqlx::sqlite::SqlitePoolOptions;
     use tempfile::NamedTempFile;
 
     use crate::services::changelog::ChangelogEvent;
 
-    use super::super::storage_sqlite::SqliteStorage;
+    use super::super::storage::MockStorage;
     use super::*;
 
     /// A single `send` call recorded by [`RecordingChangelog`].
@@ -164,27 +163,13 @@ mod tests {
         file
     }
 
-    async fn setup_storage() -> SqliteStorage {
-        // A single connection, so all queries in a test hit the same
-        // in-memory database rather than each getting its own.
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-
-        sqlx::migrate!().run(&pool).await.unwrap();
-
-        SqliteStorage::new(pool)
-    }
-
     #[tokio::test]
     async fn upload_publishes_a_created_event_for_the_document() {
         let pdf = super::super::transcript::tests::build_pdf("hello world");
         let file = write_temp_file("pdf", &pdf);
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(setup_storage().await, changelog.clone());
+        let client = DocumentsClient::new(MockStorage::new(), changelog.clone());
 
         client.upload(file.path()).await.unwrap();
 
@@ -204,10 +189,8 @@ mod tests {
     #[tokio::test]
     async fn upload_rejects_non_pdf_extensions() {
         let file = write_temp_file("txt", b"hello world");
-        let client = DocumentsClient::new(
-            setup_storage().await,
-            Arc::new(RecordingChangelog::default()),
-        );
+        let client =
+            DocumentsClient::new(MockStorage::new(), Arc::new(RecordingChangelog::default()));
 
         let result = client.upload(file.path()).await;
 
@@ -216,7 +199,6 @@ mod tests {
 
     #[tokio::test]
     async fn get_returns_a_document_previously_cached_locally() {
-        let storage = setup_storage().await;
         let id = Uuid::new_v4();
         let document = Document {
             id,
@@ -230,7 +212,14 @@ mod tests {
                 transcript: String::new(),
             },
         };
-        storage.save_document(&document).await.unwrap();
+
+        let mut storage = MockStorage::new();
+        let expected = document.clone();
+        storage
+            .expect_get_document()
+            .withf(move |queried_id| *queried_id == id)
+            .times(1)
+            .returning(move |_| Ok(Some(expected.clone())));
 
         let client = DocumentsClient::new(storage, Arc::new(RecordingChangelog::default()));
 
@@ -239,24 +228,41 @@ mod tests {
 
     #[tokio::test]
     async fn list_pages_through_documents_previously_cached_locally() {
-        let storage = setup_storage().await;
-        for (i, name) in ["one", "two", "three"].iter().enumerate() {
-            storage
-                .save_document(&Document {
-                    id: Uuid::new_v4(),
-                    content: Vec::new(),
-                    metadata: Metadata {
-                        name: name.to_string(),
-                        content_type: PDF_CONTENT_TYPE.to_string(),
-                        created_at: 1_700_000_000 + i as i64,
-                        size: 0,
-                        checksum: String::new(),
-                        transcript: String::new(),
-                    },
-                })
-                .await
-                .unwrap();
-        }
+        let page = vec![
+            Document {
+                id: Uuid::new_v4(),
+                content: Vec::new(),
+                metadata: Metadata {
+                    name: "two".to_string(),
+                    content_type: PDF_CONTENT_TYPE.to_string(),
+                    created_at: 1_700_000_001,
+                    size: 0,
+                    checksum: String::new(),
+                    transcript: String::new(),
+                },
+            },
+            Document {
+                id: Uuid::new_v4(),
+                content: Vec::new(),
+                metadata: Metadata {
+                    name: "three".to_string(),
+                    content_type: PDF_CONTENT_TYPE.to_string(),
+                    created_at: 1_700_000_002,
+                    size: 0,
+                    checksum: String::new(),
+                    transcript: String::new(),
+                },
+            },
+        ];
+
+        let mut storage = MockStorage::new();
+        let expected_page = page.clone();
+        storage
+            .expect_list_documents()
+            .withf(|offset, limit| *offset == 1 && *limit == 2)
+            .times(1)
+            .returning(move |_, _| Ok(expected_page.clone()));
+
         let client = DocumentsClient::new(storage, Arc::new(RecordingChangelog::default()));
 
         let page = client.list(1, 2).await.unwrap();
