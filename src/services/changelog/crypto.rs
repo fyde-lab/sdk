@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::services::documents::Metadata;
 use crate::{Error, ErrorContext as _, Result};
 
-use super::service::EventType;
+use super::models::EventType;
 
 /// Length in bytes of an AES-256 key (DEK or KEK).
 const KEY_LEN: usize = 32;

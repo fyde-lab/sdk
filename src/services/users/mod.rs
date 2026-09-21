@@ -1,25 +1,18 @@
 mod crypto;
 mod grpc_client;
+mod models;
 mod service;
 
+pub use models::User;
 pub use service::UsersClient;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use uuid::Uuid;
 
 use crate::Result;
 use crate::services::settings::Service as SettingsService;
 use crate::session::SessionTokenStore;
-
-/// A user account, as returned by [`Service::create`]/[`Service::login`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct User {
-    pub id: Uuid,
-    pub username: String,
-    pub created_at: i64,
-}
 
 /// Manages account creation and session lifecycle against the fyde
 /// server's users service. Trait methods take `&self` (not `&mut self`) so

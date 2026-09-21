@@ -1,8 +1,10 @@
+mod models;
 mod service;
 mod storage;
 mod storage_sqlite;
 mod transcript;
 
+pub use models::{Document, Metadata};
 pub(crate) use storage::Storage;
 pub(crate) use storage_sqlite::SqliteStorage;
 
@@ -10,35 +12,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::Result;
 use crate::services::changelog::Service as ChangelogService;
-
-/// Cleartext metadata encrypted under a document's DEK before upload, and
-/// decrypted back out of it on download.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Metadata {
-    pub name: String,
-    pub content_type: String,
-    pub created_at: i64,
-    pub size: u64,
-    pub checksum: String,
-    /// Plaintext transcript of the document's PDF text content, extracted
-    /// on upload.
-    pub transcript: String,
-}
-
-/// A file, as returned by [`Service::get`]/[`Service::list`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Document {
-    pub id: Uuid,
-    #[serde(with = "serde_bytes")]
-    pub content: Vec<u8>,
-    pub metadata: Metadata,
-}
 
 /// Uploads documents by publishing them as encrypted changelog events, and
 /// reads back documents materialized locally from consumed events (see

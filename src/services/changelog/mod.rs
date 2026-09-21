@@ -1,10 +1,11 @@
 mod crypto;
 mod grpc_client;
+mod models;
 mod service;
 mod storage;
 mod storage_settings;
 
-pub use service::{ChangelogEvent, EventType};
+pub use models::{ChangelogEvent, EventType};
 
 use std::sync::Arc;
 
