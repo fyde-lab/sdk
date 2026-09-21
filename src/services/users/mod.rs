@@ -45,6 +45,11 @@ pub trait Service: Send + Sync {
     /// Closes the session opened by the most recent `create`/`login` call.
     /// A no-op if there is no open session.
     async fn logout(&self) -> Result<()>;
+
+    /// Returns whether a session token is currently persisted in the
+    /// settings store (i.e. a `create`/`login` call succeeded and
+    /// `logout` hasn't been called since).
+    async fn is_connected(&self) -> Result<bool>;
 }
 
 /// Initializes the users service: connects to the fyde server's users

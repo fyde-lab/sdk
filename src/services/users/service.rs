@@ -101,13 +101,7 @@ impl Service for UsersClient {
     }
 
     async fn logout(&self) -> Result<()> {
-        let has_open_session = self
-            .settings
-            .get(SESSION_TOKEN_SETTING)
-            .await
-            .context("failed to read session token")?
-            .is_some();
-        if !has_open_session {
+        if !self.is_connected().await? {
             return Ok(());
         }
 
@@ -116,6 +110,15 @@ impl Service for UsersClient {
         self.sessions.remove_session().await?;
 
         Ok(())
+    }
+
+    async fn is_connected(&self) -> Result<bool> {
+        Ok(self
+            .settings
+            .get(SESSION_TOKEN_SETTING)
+            .await
+            .context("failed to read session token")?
+            .is_some())
     }
 }
 
@@ -432,5 +435,37 @@ mod tests {
 
         client.logout().await.unwrap();
         client.logout().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn is_connected_returns_true_with_an_open_session() {
+        let mock_grpc = MockFydeClient::new();
+
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(|_| Ok(Some("a-token".to_string())));
+
+        let client = client_with_grpc(mock_grpc, settings);
+
+        assert!(client.is_connected().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_connected_returns_false_without_an_open_session() {
+        let mock_grpc = MockFydeClient::new();
+
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(|_| Ok(None));
+
+        let client = client_with_grpc(mock_grpc, settings);
+
+        assert!(!client.is_connected().await.unwrap());
     }
 }
