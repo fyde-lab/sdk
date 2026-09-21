@@ -15,7 +15,7 @@ use std::sync::Arc;
 pub use services::changelog::{ChangelogEvent, Service as ChangelogService};
 pub use services::documents::{Document, Service as DocumentsService};
 pub use services::settings::Service as SettingsService;
-pub use services::users::{Service as UsersService, User};
+pub use services::users::Service as UsersService;
 
 use session::SessionTokenStore;
 use sql::SqliteClient;

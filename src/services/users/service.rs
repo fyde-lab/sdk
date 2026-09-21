@@ -1,31 +1,18 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use uuid::Uuid;
 
 use crate::services::settings::Service as SettingsService;
 use crate::session::SessionTokenStore;
-use crate::{Error, ErrorContext as _, Result};
+use crate::{ErrorContext as _, Result};
 
 use super::Service;
 use super::crypto::generate_and_wrap_master_key;
-use super::grpc_client::{FydeClient, GrpcClient, ProtoUser};
+use super::grpc_client::{FydeClient, GrpcClient};
 
 /// The settings key under which a newly created account's encrypted
 /// master key is persisted.
 const MASTER_KEY_SETTING: &str = "master_key";
-
-impl TryFrom<ProtoUser> for super::User {
-    type Error = Error;
-
-    fn try_from(proto: ProtoUser) -> Result<Self> {
-        Ok(Self {
-            id: Uuid::parse_str(&proto.id)?,
-            username: proto.username,
-            created_at: proto.created_at,
-        })
-    }
-}
 
 /// A client for the fyde server's users service. Writes the session token
 /// opened by the most recent `create`/`login` call into the shared
@@ -75,20 +62,14 @@ impl UsersClient {
 
 #[async_trait]
 impl Service for UsersClient {
-    async fn create(
-        &self,
-        username: &str,
-        password: &str,
-        device_name: &str,
-    ) -> Result<super::User> {
-        let (proto_user, token) = self
+    async fn create(&self, username: &str, password: &str, device_name: &str) -> Result<String> {
+        let token = self
             .grpc
             .create_user(username, password, device_name)
             .await
             .context("failed to create user")?;
-        let user = super::User::try_from(proto_user).context("failed to parse created user")?;
 
-        self.tokens.set(token);
+        self.tokens.set(token.clone());
 
         let wrapped_master_key =
             generate_and_wrap_master_key(password).context("failed to generate master key")?;
@@ -97,25 +78,19 @@ impl Service for UsersClient {
             .await
             .context("failed to persist master key")?;
 
-        Ok(user)
+        Ok(token)
     }
 
-    async fn login(
-        &self,
-        username: &str,
-        password: &str,
-        device_name: &str,
-    ) -> Result<super::User> {
-        let (proto_user, token) = self
+    async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String> {
+        let token = self
             .grpc
             .login(username, password, device_name)
             .await
             .context("failed to log in")?;
-        let user = super::User::try_from(proto_user).context("failed to parse logged-in user")?;
 
-        self.tokens.set(token);
+        self.tokens.set(token.clone());
 
-        Ok(user)
+        Ok(token)
     }
 
     async fn logout(&self) -> Result<()> {
@@ -139,14 +114,6 @@ mod tests {
     use super::*;
     use crate::services::settings::MockService as MockSettingsService;
 
-    fn proto_user() -> ProtoUser {
-        ProtoUser {
-            id: Uuid::new_v4().to_string(),
-            username: "alice".to_string(),
-            created_at: 1_700_000_000,
-        }
-    }
-
     fn client_with_grpc(
         grpc: impl FydeClient + 'static,
         settings: MockSettingsService,
@@ -155,10 +122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_returns_the_created_user() {
-        let user = proto_user();
-        let username = user.username.clone();
-
+    async fn create_returns_and_stores_the_session_token() {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_create_user()
@@ -167,7 +131,7 @@ mod tests {
                     && password == "correct horse battery staple"
                     && device_name == "Pierre's iPhone"
             })
-            .returning(move |_, _, _| Ok((user.clone(), "a-token".to_string())));
+            .returning(|_, _, _| Ok("a-token".to_string()));
 
         let mut settings = MockSettingsService::new();
         settings
@@ -178,12 +142,12 @@ mod tests {
 
         let client = client_with_grpc(mock_grpc, settings);
 
-        let created = client
+        let token = client
             .create("alice", "correct horse battery staple", "Pierre's iPhone")
             .await
             .unwrap();
 
-        assert_eq!(created.username, username);
+        assert_eq!(token, "a-token");
         assert_eq!(client.tokens.get(), Some("a-token".to_string()));
     }
 
@@ -192,7 +156,7 @@ mod tests {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_create_user()
-            .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
+            .returning(|_, _, _| Ok("a-token".to_string()));
 
         // Captures what `create` persists so it can be read back and
         // asserted on below, without a generic key/value store.
@@ -226,25 +190,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_returns_the_authenticated_user() {
-        let user = proto_user();
-        let username = user.username.clone();
-
+    async fn login_returns_and_stores_the_session_token() {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_login()
-            .returning(move |_, _, _| Ok((user.clone(), "a-token".to_string())));
+            .returning(|_, _, _| Ok("a-token".to_string()));
 
         // `login` never touches settings: no expectations set, so the mock
         // panics if it's called, which is how this test proves it isn't.
         let client = client_with_grpc(mock_grpc, MockSettingsService::new());
 
-        let logged_in = client
+        let token = client
             .login("alice", "correct horse battery staple", "Pierre's iPhone")
             .await
             .unwrap();
 
-        assert_eq!(logged_in.username, username);
+        assert_eq!(token, "a-token");
         assert_eq!(client.tokens.get(), Some("a-token".to_string()));
     }
 
@@ -253,7 +214,7 @@ mod tests {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_login()
-            .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
+            .returning(|_, _, _| Ok("a-token".to_string()));
 
         // `login` never touches settings: no `expect_set()` is set up, so
         // the mock panics if it's called, which is how this test proves it
@@ -276,7 +237,7 @@ mod tests {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_login()
-            .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
+            .returning(|_, _, _| Ok("a-token".to_string()));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
         let client = client_with_grpc(mock_grpc, MockSettingsService::new());
@@ -303,7 +264,7 @@ mod tests {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_login()
-            .returning(move |_, _, _| Ok((proto_user(), "a-token".to_string())));
+            .returning(|_, _, _| Ok("a-token".to_string()));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
         let client = client_with_grpc(mock_grpc, MockSettingsService::new());

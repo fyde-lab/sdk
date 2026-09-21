@@ -52,10 +52,6 @@ pub(crate) fn random_word() -> &'static str {
     pick(WORDS)
 }
 
-pub(crate) fn random_username() -> String {
-    format!("{}_{}", pick(WORDS), random_hex(3))
-}
-
 /// A random Unix timestamp within the last 30 days, so fixtures never
 /// carry a future `created_at`.
 pub(crate) fn random_past_timestamp() -> i64 {

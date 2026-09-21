@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::services::changelog::EventType;
 use crate::services::documents::Metadata;
-use crate::{ChangelogEvent, Client, Document, Error, User};
+use crate::{ChangelogEvent, Client, Document, Error};
 
 /// Error type surfaced to FFI callers. UniFFI requires exported errors to be
 /// their own type rather than the crate's own [`Error`], so every failure is
@@ -128,25 +128,6 @@ impl From<ChangelogEvent> for FfiChangelogEvent {
     }
 }
 
-/// A user account, mirroring [`User`] across the FFI boundary. `id` crosses
-/// as a string since UniFFI has no native UUID type.
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct FfiUser {
-    pub id: String,
-    pub username: String,
-    pub created_at: i64,
-}
-
-impl From<User> for FfiUser {
-    fn from(user: User) -> Self {
-        Self {
-            id: user.id().to_string(),
-            username: user.username().to_string(),
-            created_at: user.created_at(),
-        }
-    }
-}
-
 /// Callback interface for [`FydeClient::consume`], implemented by foreign
 /// (Kotlin/Swift) callers and invoked once per [`FfiChangelogEvent`]
 /// encountered during changelog catch-up and live streaming.
@@ -184,37 +165,37 @@ impl FydeClient {
     }
 
     /// Creates a new account and opens a session for the device named
-    /// `device_name`, returning the created user. Mirrors
+    /// `device_name`, returning its session token. Mirrors
     /// [`crate::UsersService::create`].
     pub async fn create_user(
         &self,
         username: String,
         password: String,
         device_name: String,
-    ) -> Result<FfiUser, FfiError> {
-        let user = self
+    ) -> Result<String, FfiError> {
+        let token = self
             .inner
             .users()
             .create(&username, &password, &device_name)
             .await?;
-        Ok(user.into())
+        Ok(token)
     }
 
     /// Verifies `username`/`password` and opens a session for the device
-    /// named `device_name`, returning the authenticated user. Mirrors
+    /// named `device_name`, returning its session token. Mirrors
     /// [`crate::UsersService::login`].
     pub async fn login(
         &self,
         username: String,
         password: String,
         device_name: String,
-    ) -> Result<FfiUser, FfiError> {
-        let user = self
+    ) -> Result<String, FfiError> {
+        let token = self
             .inner
             .users()
             .login(&username, &password, &device_name)
             .await?;
-        Ok(user.into())
+        Ok(token)
     }
 
     /// Closes the session opened by the most recent `create_user`/`login`
@@ -272,7 +253,6 @@ mod tests {
     use super::*;
     use crate::services::changelog::{EventType, FakeChangelogEvent};
     use crate::services::documents::{FakeDocument, FakeMetadata};
-    use crate::services::users::FakeUser;
 
     #[test]
     fn parse_uuid_accepts_a_canonical_uuid() {
@@ -298,20 +278,6 @@ mod tests {
         assert_eq!(ffi.size, metadata.size());
         assert_eq!(ffi.checksum, metadata.checksum());
         assert_eq!(ffi.transcript, metadata.transcript());
-    }
-
-    #[test]
-    fn user_conversion_stringifies_the_id() {
-        let user = FakeUser::new()
-            .with_username("alice")
-            .with_created_at(1_700_000_000)
-            .build();
-
-        let ffi: FfiUser = user.clone().into();
-
-        assert_eq!(ffi.id, user.id().to_string());
-        assert_eq!(ffi.username, user.username());
-        assert_eq!(ffi.created_at, user.created_at());
     }
 
     #[test]

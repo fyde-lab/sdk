@@ -14,8 +14,6 @@ mod proto {
     tonic::include_proto!("users");
 }
 
-pub(super) use proto::User as ProtoUser;
-
 use proto::{LogoutRequest, UserCredentials, users_client::UsersClient as GeneratedUsersClient};
 
 /// A gRPC transport for talking to the fyde server's users service. Knows
@@ -26,23 +24,17 @@ use proto::{LogoutRequest, UserCredentials, users_client::UsersClient as Generat
 #[async_trait]
 pub(super) trait FydeClient: Send + Sync {
     /// Creates a new account and opens a session for `device_name`,
-    /// returning the created user and its session token.
+    /// returning its session token.
     async fn create_user(
         &self,
         username: &str,
         password: &str,
         device_name: &str,
-    ) -> Result<(ProtoUser, String)>;
+    ) -> Result<String>;
 
     /// Verifies `username`/`password` and opens a session for
-    /// `device_name`, returning the authenticated user and its session
-    /// token.
-    async fn login(
-        &self,
-        username: &str,
-        password: &str,
-        device_name: &str,
-    ) -> Result<(ProtoUser, String)>;
+    /// `device_name`, returning its session token.
+    async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String>;
 
     /// Closes the session currently authenticating outgoing calls (see
     /// [`AuthInterceptor`]).
@@ -83,7 +75,7 @@ impl FydeClient for GrpcClient {
         username: &str,
         password: &str,
         device_name: &str,
-    ) -> Result<(ProtoUser, String)> {
+    ) -> Result<String> {
         // The generated client's RPC methods take `&mut self`, but the
         // underlying `Channel` is cheap to clone and safe to use
         // concurrently, so we clone it per call to expose `&self` here.
@@ -99,19 +91,10 @@ impl FydeClient for GrpcClient {
             .context("failed to create user")?
             .into_inner();
 
-        let user = response
-            .user
-            .ok_or_else(|| Error::InvalidResponse("create_user response missing user".into()))?;
-
-        Ok((user, response.session_token))
+        Ok(response.session_token)
     }
 
-    async fn login(
-        &self,
-        username: &str,
-        password: &str,
-        device_name: &str,
-    ) -> Result<(ProtoUser, String)> {
+    async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String> {
         let response = self
             .client
             .clone()
@@ -124,11 +107,7 @@ impl FydeClient for GrpcClient {
             .context("failed to log in")?
             .into_inner();
 
-        let user = response
-            .user
-            .ok_or_else(|| Error::InvalidResponse("login response missing user".into()))?;
-
-        Ok((user, response.session_token))
+        Ok(response.session_token)
     }
 
     async fn logout(&self) -> Result<()> {

@@ -1,11 +1,7 @@
 mod crypto;
 mod grpc_client;
-mod models;
 mod service;
 
-#[cfg(test)]
-pub(crate) use models::FakeUser;
-pub use models::User;
 pub use service::UsersClient;
 
 use std::sync::Arc;
@@ -27,18 +23,20 @@ use crate::session::SessionTokenStore;
 #[async_trait]
 pub trait Service: Send + Sync {
     /// Creates a new account and opens a session for the device named
-    /// `device_name`, returning the created user. Also generates a random
+    /// `device_name`, returning its session token. Also generates a random
     /// master key, encrypts it under a key derived from `password`, and
-    /// persists it in the settings store under `master_key`. Fails with
-    /// [`crate::Error::Grpc`] (`ALREADY_EXISTS`) if the username is
-    /// already taken.
-    async fn create(&self, username: &str, password: &str, device_name: &str) -> Result<User>;
+    /// persists it in the settings store under `master_key`. The server's
+    /// response carries only the new session's token (see
+    /// `../api-protos/users.proto`), so there is no user payload to return
+    /// here. Fails with [`crate::Error::Grpc`] (`ALREADY_EXISTS`) if the
+    /// username is already taken.
+    async fn create(&self, username: &str, password: &str, device_name: &str) -> Result<String>;
 
     /// Verifies `username`/`password` and opens a session for the device
-    /// named `device_name`, returning the authenticated user. Fails with
+    /// named `device_name`, returning its session token. Fails with
     /// [`crate::Error::Grpc`] (`UNAUTHENTICATED`) if the credentials are
     /// invalid.
-    async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<User>;
+    async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String>;
 
     /// Closes the session opened by the most recent `create`/`login` call.
     /// A no-op if there is no open session.
