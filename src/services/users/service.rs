@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::services::settings::Service as SettingsService;
-use crate::session::SessionTokenStore;
+use crate::session::SESSION_TOKEN_SETTING;
 use crate::{ErrorContext as _, Result};
 
 use super::Service;
@@ -14,35 +14,32 @@ use super::grpc_client::{FydeClient, GrpcClient};
 /// master key is persisted.
 const MASTER_KEY_SETTING: &str = "master_key";
 
-/// A client for the fyde server's users service. Writes the session token
-/// opened by the most recent `create`/`login` call into the shared
-/// [`SessionTokenStore`] also held by every other service's gRPC
-/// transport, so [`Service::logout`] doesn't need one passed in and other
-/// services' calls authenticate automatically (see
-/// [`crate::session::AuthInterceptor`]).
+/// A client for the fyde server's users service. Persists the session
+/// token opened by the most recent `create`/`login` call into `settings`
+/// under [`SESSION_TOKEN_SETTING`], read back from there by every other
+/// service's gRPC transport (see
+/// [`crate::session::authenticated_request`]) to authenticate its own
+/// calls, so [`Service::logout`] doesn't need a token passed in.
 pub struct UsersClient {
     grpc: Box<dyn FydeClient>,
-    tokens: SessionTokenStore,
     settings: Arc<dyn SettingsService>,
 }
 
 impl UsersClient {
     /// Creates a client for the users service at the given `http://` or
-    /// `https://` base URL (e.g. `http://127.0.0.1:8080`), sharing
-    /// `tokens` with every other service's gRPC transport and persisting
-    /// newly created accounts' master keys in `settings`.
+    /// `https://` base URL (e.g. `http://127.0.0.1:8080`), persisting the
+    /// session token and newly created accounts' master keys in
+    /// `settings`.
     pub(super) async fn new(
         base_url: impl AsRef<str>,
-        tokens: SessionTokenStore,
         settings: Arc<dyn SettingsService>,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(
-                GrpcClient::new(base_url, tokens.clone())
+                GrpcClient::new(base_url, settings.clone())
                     .await
                     .context("failed to create users grpc client")?,
             ),
-            tokens,
             settings,
         })
     }
@@ -54,7 +51,6 @@ impl UsersClient {
     fn with_grpc(grpc: impl FydeClient + 'static, settings: Arc<dyn SettingsService>) -> Self {
         Self {
             grpc: Box::new(grpc),
-            tokens: SessionTokenStore::default(),
             settings,
         }
     }
@@ -69,7 +65,10 @@ impl Service for UsersClient {
             .await
             .context("failed to create user")?;
 
-        self.tokens.set(token.clone());
+        self.settings
+            .set(SESSION_TOKEN_SETTING, &token)
+            .await
+            .context("failed to persist session token")?;
 
         let wrapped_master_key =
             generate_and_wrap_master_key(password).context("failed to generate master key")?;
@@ -88,19 +87,31 @@ impl Service for UsersClient {
             .await
             .context("failed to log in")?;
 
-        self.tokens.set(token.clone());
+        self.settings
+            .set(SESSION_TOKEN_SETTING, &token)
+            .await
+            .context("failed to persist session token")?;
 
         Ok(token)
     }
 
     async fn logout(&self) -> Result<()> {
-        if self.tokens.get().is_none() {
+        let has_open_session = self
+            .settings
+            .get(SESSION_TOKEN_SETTING)
+            .await
+            .context("failed to read session token")?
+            .is_some();
+        if !has_open_session {
             return Ok(());
         }
 
         self.grpc.logout().await.context("failed to log out")?;
 
-        self.tokens.take();
+        self.settings
+            .delete(SESSION_TOKEN_SETTING)
+            .await
+            .context("failed to remove persisted session token")?;
 
         Ok(())
     }
@@ -136,6 +147,11 @@ mod tests {
         let mut settings = MockSettingsService::new();
         settings
             .expect_set()
+            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
             .withf(|key, _| key == MASTER_KEY_SETTING)
             .times(1)
             .returning(|_, _| Ok(()));
@@ -148,7 +164,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(token, "a-token");
-        assert_eq!(client.tokens.get(), Some("a-token".to_string()));
     }
 
     #[tokio::test]
@@ -163,6 +178,11 @@ mod tests {
         let persisted_master_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let mut settings = MockSettingsService::new();
+        settings
+            .expect_set()
+            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
         let set_master_key = persisted_master_key.clone();
         settings
             .expect_set()
@@ -190,15 +210,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_persists_the_session_token_in_settings() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_create_user()
+            .returning(|_, _, _| Ok("a-token".to_string()));
+
+        // Captures what `create` persists under `SESSION_TOKEN_SETTING` so
+        // it can be read back and asserted on below.
+        let persisted_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let mut settings = MockSettingsService::new();
+        let set_token = persisted_token.clone();
+        settings
+            .expect_set()
+            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(move |_, value| {
+                *set_token.lock().unwrap() = Some(value.to_string());
+                Ok(())
+            });
+        settings
+            .expect_set()
+            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let client = client_with_grpc(mock_grpc, settings);
+
+        client
+            .create("alice", "correct horse battery staple", "Pierre's iPhone")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            persisted_token.lock().unwrap().clone(),
+            Some("a-token".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn login_returns_and_stores_the_session_token() {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_login()
             .returning(|_, _, _| Ok("a-token".to_string()));
 
-        // `login` never touches settings: no expectations set, so the mock
-        // panics if it's called, which is how this test proves it isn't.
-        let client = client_with_grpc(mock_grpc, MockSettingsService::new());
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_set()
+            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let client = client_with_grpc(mock_grpc, settings);
 
         let token = client
             .login("alice", "correct horse battery staple", "Pierre's iPhone")
@@ -206,7 +271,39 @@ mod tests {
             .unwrap();
 
         assert_eq!(token, "a-token");
-        assert_eq!(client.tokens.get(), Some("a-token".to_string()));
+    }
+
+    #[tokio::test]
+    async fn login_persists_the_session_token_in_settings() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_login()
+            .returning(|_, _, _| Ok("a-token".to_string()));
+
+        let persisted_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let mut settings = MockSettingsService::new();
+        let set_token = persisted_token.clone();
+        settings
+            .expect_set()
+            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(move |_, value| {
+                *set_token.lock().unwrap() = Some(value.to_string());
+                Ok(())
+            });
+
+        let client = client_with_grpc(mock_grpc, settings);
+
+        client
+            .login("alice", "correct horse battery staple", "device")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            persisted_token.lock().unwrap().clone(),
+            Some("a-token".to_string())
+        );
     }
 
     #[tokio::test]
@@ -216,10 +313,16 @@ mod tests {
             .expect_login()
             .returning(|_, _, _| Ok("a-token".to_string()));
 
-        // `login` never touches settings: no `expect_set()` is set up, so
-        // the mock panics if it's called, which is how this test proves it
-        // isn't. `expect_get()` is only for the direct post-check below.
+        // `login` persists the session token but never a master key: no
+        // `expect_set()` for `MASTER_KEY_SETTING` is set up, so the mock
+        // panics if it's called with that key, which is how this test
+        // proves it isn't. `expect_get()` is only for the direct
+        // post-check below.
         let mut settings = MockSettingsService::new();
+        settings
+            .expect_set()
+            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .returning(|_, _| Ok(()));
         settings.expect_get().returning(|_| Ok(None));
 
         let client = client_with_grpc(mock_grpc, settings);
@@ -240,7 +343,23 @@ mod tests {
             .returning(|_, _, _| Ok("a-token".to_string()));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
-        let client = client_with_grpc(mock_grpc, MockSettingsService::new());
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_set()
+            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(|_| Ok(Some("a-token".to_string())));
+        settings
+            .expect_delete()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let client = client_with_grpc(mock_grpc, settings);
         client
             .login("alice", "correct horse battery staple", "device")
             .await
@@ -254,7 +373,16 @@ mod tests {
         // No `expect_logout()` set up: the mock panics if it's called.
         let mock_grpc = MockFydeClient::new();
 
-        let client = client_with_grpc(mock_grpc, MockSettingsService::new());
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(|_| Ok(None));
+        // No `expect_delete()` set up: the early return means settings is
+        // never told to remove anything.
+
+        let client = client_with_grpc(mock_grpc, settings);
 
         client.logout().await.unwrap();
     }
@@ -267,7 +395,32 @@ mod tests {
             .returning(|_, _, _| Ok("a-token".to_string()));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
-        let client = client_with_grpc(mock_grpc, MockSettingsService::new());
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_set()
+            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .returning(|_, _| Ok(()));
+        // Mockall checks the most-recently-defined expectation first, so
+        // this "already gone" expectation (defined first, checked last)
+        // matches the second `logout()` call, once the "still open" one
+        // below has been used up by the first.
+        settings
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(|_| Ok(None));
+        settings
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(|_| Ok(Some("a-token".to_string())));
+        settings
+            .expect_delete()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let client = client_with_grpc(mock_grpc, settings);
         client
             .login("alice", "correct horse battery staple", "device")
             .await

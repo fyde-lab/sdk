@@ -16,7 +16,6 @@ use sqlx::SqlitePool;
 
 use crate::services::documents::{self, Metadata};
 use crate::services::settings::Service as SettingsService;
-use crate::session::SessionTokenStore;
 use crate::{ErrorContext as _, Result};
 
 /// Publishes and consumes the fyde server's changelog: a blind relay for
@@ -59,21 +58,22 @@ pub trait Service: Send + Sync {
 /// Initializes the changelog service: connects to the fyde server at
 /// `base_url`, and uses `pool` to cache documents materialized from
 /// consumed events directly into the local `documents` table, and
-/// `settings` to persist the changelog offset consumed so far (see
-/// [`storage_settings::SettingsOffsetStorage`]). `tokens` is attached as a
-/// bearer `authorization` header on every outgoing call once a session is
-/// opened (see [`crate::session::AuthInterceptor`]).
+/// `settings` both to persist the changelog offset consumed so far (see
+/// [`storage_settings::SettingsOffsetStorage`]) and to source the session
+/// token attached as a bearer `authorization` header on every outgoing
+/// call once a session is opened (see
+/// [`crate::session::authenticated_request`]).
 pub(crate) async fn init(
     base_url: impl AsRef<str>,
     pool: SqlitePool,
-    tokens: SessionTokenStore,
     settings: Arc<dyn SettingsService>,
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool);
-    let offset_storage = storage_settings::SettingsOffsetStorage::new(settings);
-    let client = service::ChangelogClient::new(base_url, document_storage, offset_storage, tokens)
-        .await
-        .context("failed to create changelog client")?;
+    let offset_storage = storage_settings::SettingsOffsetStorage::new(settings.clone());
+    let client =
+        service::ChangelogClient::new(base_url, document_storage, offset_storage, settings)
+            .await
+            .context("failed to create changelog client")?;
 
     Ok(Arc::new(client))
 }

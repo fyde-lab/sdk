@@ -1,119 +1,72 @@
-//! Shared session-token state, threaded into every service's gRPC
-//! transport so authenticated calls attach it automatically instead of
-//! each transport managing its own copy.
+//! Session-token attachment, shared by every service's gRPC transport so
+//! authenticated calls attach it automatically. The token itself has no
+//! in-memory copy: it is the one persisted by
+//! `users::Service::create`/`login` in the settings store, so a session
+//! survives across process restarts without extra plumbing.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use tonic::Status;
-use tonic::service::Interceptor;
+use crate::services::settings::Service as SettingsService;
+use crate::{Error, ErrorContext as _, Result};
 
-/// Thread-safe storage for the token of the session opened by the most
-/// recent `UsersService::create`/`login` call. Cheap to clone: every clone
-/// shares the same underlying token, so the same store can be handed to
-/// the users service (which writes it) and every other service's gRPC
-/// transport (which reads it to authenticate outgoing calls).
-#[derive(Clone, Default)]
-pub(crate) struct SessionTokenStore(Arc<Mutex<Option<String>>>);
+/// The settings key under which the session token opened by the most
+/// recent `users::Service::create`/`login` call is persisted.
+pub(crate) const SESSION_TOKEN_SETTING: &str = "session_token";
 
-impl SessionTokenStore {
-    pub(crate) fn get(&self) -> Option<String> {
-        self.0.lock().unwrap().clone()
+/// Builds a tonic request for `message`, attaching the session token
+/// currently persisted in `settings` (if any) as a `Bearer`
+/// `authorization` header. Calls made before any session is opened (e.g.
+/// `CreateUser`/`Login` themselves) go out unauthenticated, since there is
+/// nothing to attach yet.
+pub(crate) async fn authenticated_request<T>(
+    settings: &Arc<dyn SettingsService>,
+    message: T,
+) -> Result<tonic::Request<T>> {
+    let mut request = tonic::Request::new(message);
+
+    if let Some(token) = settings
+        .get(SESSION_TOKEN_SETTING)
+        .await
+        .context("failed to read session token")?
+    {
+        let value = format!("Bearer {token}").parse().map_err(|_| {
+            Error::InvalidResponse("session token is not a valid header value".to_string())
+        })?;
+        request.metadata_mut().insert("authorization", value);
     }
 
-    pub(crate) fn set(&self, token: String) {
-        *self.0.lock().unwrap() = Some(token);
-    }
-
-    /// Clears the stored token, returning the previous value (if any).
-    pub(crate) fn take(&self) -> Option<String> {
-        self.0.lock().unwrap().take()
-    }
-}
-
-/// A tonic interceptor that attaches the token tracked by a
-/// [`SessionTokenStore`] as a `Bearer` `authorization` header on every
-/// outgoing gRPC call, when one is available. Calls made before any
-/// session is opened (e.g. `CreateUser`/`Login` themselves) go out
-/// unauthenticated, since there is nothing to attach yet.
-#[derive(Clone)]
-pub(crate) struct AuthInterceptor {
-    tokens: SessionTokenStore,
-}
-
-impl AuthInterceptor {
-    pub(crate) fn new(tokens: SessionTokenStore) -> Self {
-        Self { tokens }
-    }
-}
-
-impl Interceptor for AuthInterceptor {
-    fn call(&mut self, mut request: tonic::Request<()>) -> Result<tonic::Request<()>, Status> {
-        if let Some(token) = self.tokens.get() {
-            let value = format!("Bearer {token}")
-                .parse()
-                .map_err(|_| Status::internal("session token is not a valid header value"))?;
-            request.metadata_mut().insert("authorization", value);
-        }
-
-        Ok(request)
-    }
+    Ok(request)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::settings::MockService as MockSettingsService;
 
-    #[test]
-    fn get_returns_none_before_any_token_is_set() {
-        let store = SessionTokenStore::default();
+    #[tokio::test]
+    async fn leaves_the_request_unauthenticated_without_a_stored_token() {
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .returning(|_| Ok(None));
+        let settings: Arc<dyn SettingsService> = Arc::new(settings);
 
-        assert_eq!(store.get(), None);
-    }
-
-    #[test]
-    fn set_then_get_returns_the_stored_token() {
-        let store = SessionTokenStore::default();
-
-        store.set("a-token".to_string());
-
-        assert_eq!(store.get(), Some("a-token".to_string()));
-    }
-
-    #[test]
-    fn take_clears_the_token_and_returns_the_previous_value() {
-        let store = SessionTokenStore::default();
-        store.set("a-token".to_string());
-
-        assert_eq!(store.take(), Some("a-token".to_string()));
-        assert_eq!(store.get(), None);
-    }
-
-    #[test]
-    fn clones_share_the_same_underlying_token() {
-        let store = SessionTokenStore::default();
-        let clone = store.clone();
-
-        store.set("a-token".to_string());
-
-        assert_eq!(clone.get(), Some("a-token".to_string()));
-    }
-
-    #[test]
-    fn interceptor_leaves_the_request_untouched_without_a_stored_token() {
-        let mut interceptor = AuthInterceptor::new(SessionTokenStore::default());
-
-        let request = interceptor.call(tonic::Request::new(())).unwrap();
+        let request = authenticated_request(&settings, ()).await.unwrap();
 
         assert!(request.metadata().get("authorization").is_none());
     }
 
-    #[test]
-    fn interceptor_attaches_the_stored_token_as_a_bearer_header() {
-        let tokens = SessionTokenStore::default();
-        tokens.set("a-token".to_string());
-        let mut interceptor = AuthInterceptor::new(tokens);
+    #[tokio::test]
+    async fn attaches_the_stored_token_as_a_bearer_header() {
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .returning(|_| Ok(Some("a-token".to_string())));
+        let settings: Arc<dyn SettingsService> = Arc::new(settings);
 
-        let request = interceptor.call(tonic::Request::new(())).unwrap();
+        let request = authenticated_request(&settings, ()).await.unwrap();
 
         assert_eq!(
             request.metadata().get("authorization").unwrap(),

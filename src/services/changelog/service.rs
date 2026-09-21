@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures::StreamExt;
 use uuid::Uuid;
 
 use crate::services::documents::{Document, Metadata, Storage as DocumentStorage};
+use crate::services::settings::Service as SettingsService;
 use crate::{Error, ErrorContext as _, Result};
 
 use super::Service;
@@ -53,11 +56,11 @@ impl<D: DocumentStorage, O: OffsetStorage> ChangelogClient<D, O> {
         base_url: impl AsRef<str>,
         document_storage: D,
         offset_storage: O,
-        tokens: crate::session::SessionTokenStore,
+        settings: Arc<dyn SettingsService>,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(
-                GrpcClient::new(base_url, tokens)
+                GrpcClient::new(base_url, settings)
                     .await
                     .context("failed to create changelog grpc client")?,
             ),

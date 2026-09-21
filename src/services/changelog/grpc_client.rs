@@ -1,11 +1,13 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 #[cfg(test)]
 use mockall::automock;
-use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
-use crate::session::{AuthInterceptor, SessionTokenStore};
+use crate::services::settings::Service as SettingsService;
+use crate::session::authenticated_request;
 use crate::{Error, ErrorContext as _, Result};
 
 /// Generated protobuf/gRPC bindings for the `changelog` service, compiled
@@ -43,18 +45,22 @@ pub(super) trait FydeClient: Send + Sync {
 }
 
 /// The production [`FydeClient`] implementation, backed by a real tonic
-/// connection. Every call is authenticated: the underlying client is
-/// wrapped with an [`AuthInterceptor`] that attaches the current session
-/// token (if any) as a bearer `authorization` header.
+/// connection. Every call is authenticated by attaching the session token
+/// currently persisted in `settings` (if any) as a bearer `authorization`
+/// header (see [`crate::session::authenticated_request`]).
 pub(super) struct GrpcClient {
-    client: ChangelogClient<InterceptedService<Channel, AuthInterceptor>>,
+    client: ChangelogClient<Channel>,
+    settings: Arc<dyn SettingsService>,
 }
 
 impl GrpcClient {
     /// Connects to the changelog service at the given `http://` or
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`), authenticating
-    /// every call with the session token tracked by `tokens`.
-    pub async fn new(base_url: impl AsRef<str>, tokens: SessionTokenStore) -> Result<Self> {
+    /// every call with the session token persisted in `settings`.
+    pub async fn new(
+        base_url: impl AsRef<str>,
+        settings: Arc<dyn SettingsService>,
+    ) -> Result<Self> {
         let endpoint = Channel::from_shared(base_url.as_ref().to_string())
             .map_err(|err| Error::InvalidEndpoint(err.to_string()))?;
         let channel = endpoint
@@ -63,7 +69,8 @@ impl GrpcClient {
             .context("failed to connect to changelog grpc endpoint")?;
 
         Ok(Self {
-            client: ChangelogClient::with_interceptor(channel, AuthInterceptor::new(tokens)),
+            client: ChangelogClient::new(channel),
+            settings,
         })
     }
 }
@@ -71,13 +78,16 @@ impl GrpcClient {
 #[async_trait]
 impl FydeClient for GrpcClient {
     async fn record_event(&self, encrypted_content: Vec<u8>) -> Result<i64> {
+        let request =
+            authenticated_request(&self.settings, RecordEventRequest { encrypted_content }).await?;
+
         // The generated client's RPC methods take `&mut self`, but the
         // underlying `Channel` is cheap to clone and safe to use
         // concurrently, so we clone it per call to expose `&self` here.
         let response = self
             .client
             .clone()
-            .record_event(RecordEventRequest { encrypted_content })
+            .record_event(request)
             .await
             .context("failed to record changelog event")?
             .into_inner();
@@ -86,10 +96,12 @@ impl FydeClient for GrpcClient {
     }
 
     async fn consume_since(&self, offset: i64) -> Result<EventStream> {
+        let request = authenticated_request(&self.settings, ConsumeSinceRequest { offset }).await?;
+
         let response = self
             .client
             .clone()
-            .consume_since(ConsumeSinceRequest { offset })
+            .consume_since(request)
             .await
             .with_context(|| format!("failed to consume changelog events since offset {offset}"))?;
         Ok(Box::pin(response.into_inner()))
@@ -99,10 +111,11 @@ impl FydeClient for GrpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::settings::MockService as MockSettingsService;
 
     #[tokio::test]
     async fn new_rejects_a_malformed_base_url() {
-        let result = GrpcClient::new("not a valid uri", SessionTokenStore::default()).await;
+        let result = GrpcClient::new("not a valid uri", Arc::new(MockSettingsService::new())).await;
 
         let err = match result {
             Ok(_) => panic!("a malformed base url must be rejected"),

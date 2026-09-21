@@ -17,7 +17,6 @@ pub use services::documents::{Document, Service as DocumentsService};
 pub use services::settings::Service as SettingsService;
 pub use services::users::Service as UsersService;
 
-use session::SessionTokenStore;
 use sql::SqliteClient;
 
 #[derive(Debug, thiserror::Error)]
@@ -127,19 +126,13 @@ impl Client {
 
     async fn connect_with_sqlite(url: impl AsRef<str>, sqlite: SqliteClient) -> Result<Self> {
         let url = url.as_ref();
-        let session = SessionTokenStore::default();
 
         let settings = services::settings::init(sqlite.pool().clone());
-        let changelog = services::changelog::init(
-            url,
-            sqlite.pool().clone(),
-            session.clone(),
-            settings.clone(),
-        )
-        .await
-        .context("failed to initialize changelog service")?;
+        let changelog = services::changelog::init(url, sqlite.pool().clone(), settings.clone())
+            .await
+            .context("failed to initialize changelog service")?;
         let documents = services::documents::init(sqlite.pool().clone(), changelog.clone());
-        let users = services::users::init(url, session, settings.clone())
+        let users = services::users::init(url, settings.clone())
             .await
             .context("failed to initialize users service")?;
 

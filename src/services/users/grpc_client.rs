@@ -1,11 +1,12 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
-use tonic::Request;
-use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
-use crate::session::{AuthInterceptor, SessionTokenStore};
+use crate::services::settings::Service as SettingsService;
+use crate::session::authenticated_request;
 use crate::{Error, ErrorContext as _, Result};
 
 /// Generated protobuf/gRPC bindings for the `users` service, compiled from
@@ -37,24 +38,28 @@ pub(super) trait FydeClient: Send + Sync {
     async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String>;
 
     /// Closes the session currently authenticating outgoing calls (see
-    /// [`AuthInterceptor`]).
+    /// [`crate::session::authenticated_request`]).
     async fn logout(&self) -> Result<()>;
 }
 
 /// The production [`FydeClient`] implementation, backed by a real tonic
-/// connection. Every call, including `logout` itself, is authenticated:
-/// the underlying client is wrapped with an [`AuthInterceptor`] that
-/// attaches the current session token (if any) as a bearer `authorization`
-/// header.
+/// connection. Every call, including `logout` itself, is authenticated by
+/// attaching the session token currently persisted in `settings` (if any)
+/// as a bearer `authorization` header (see
+/// [`crate::session::authenticated_request`]).
 pub(super) struct GrpcClient {
-    client: GeneratedUsersClient<InterceptedService<Channel, AuthInterceptor>>,
+    client: GeneratedUsersClient<Channel>,
+    settings: Arc<dyn SettingsService>,
 }
 
 impl GrpcClient {
     /// Connects to the users service at the given `http://` or `https://`
     /// base URL (e.g. `http://127.0.0.1:8080`), authenticating every call
-    /// with the session token tracked by `tokens`.
-    pub async fn new(base_url: impl AsRef<str>, tokens: SessionTokenStore) -> Result<Self> {
+    /// with the session token persisted in `settings`.
+    pub async fn new(
+        base_url: impl AsRef<str>,
+        settings: Arc<dyn SettingsService>,
+    ) -> Result<Self> {
         let endpoint = Channel::from_shared(base_url.as_ref().to_string())
             .map_err(|err| Error::InvalidEndpoint(err.to_string()))?;
         let channel = endpoint
@@ -63,7 +68,8 @@ impl GrpcClient {
             .context("failed to connect to users grpc endpoint")?;
 
         Ok(Self {
-            client: GeneratedUsersClient::with_interceptor(channel, AuthInterceptor::new(tokens)),
+            client: GeneratedUsersClient::new(channel),
+            settings,
         })
     }
 }
@@ -76,17 +82,23 @@ impl FydeClient for GrpcClient {
         password: &str,
         device_name: &str,
     ) -> Result<String> {
+        let request = authenticated_request(
+            &self.settings,
+            UserCredentials {
+                username: username.to_string(),
+                password: password.to_string(),
+                device_name: device_name.to_string(),
+            },
+        )
+        .await?;
+
         // The generated client's RPC methods take `&mut self`, but the
         // underlying `Channel` is cheap to clone and safe to use
         // concurrently, so we clone it per call to expose `&self` here.
         let response = self
             .client
             .clone()
-            .create_user(UserCredentials {
-                username: username.to_string(),
-                password: password.to_string(),
-                device_name: device_name.to_string(),
-            })
+            .create_user(request)
             .await
             .context("failed to create user")?
             .into_inner();
@@ -95,14 +107,20 @@ impl FydeClient for GrpcClient {
     }
 
     async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String> {
-        let response = self
-            .client
-            .clone()
-            .login(UserCredentials {
+        let request = authenticated_request(
+            &self.settings,
+            UserCredentials {
                 username: username.to_string(),
                 password: password.to_string(),
                 device_name: device_name.to_string(),
-            })
+            },
+        )
+        .await?;
+
+        let response = self
+            .client
+            .clone()
+            .login(request)
             .await
             .context("failed to log in")?
             .into_inner();
@@ -111,9 +129,11 @@ impl FydeClient for GrpcClient {
     }
 
     async fn logout(&self) -> Result<()> {
+        let request = authenticated_request(&self.settings, LogoutRequest {}).await?;
+
         self.client
             .clone()
-            .logout(Request::new(LogoutRequest {}))
+            .logout(request)
             .await
             .context("failed to log out")?;
 
@@ -124,10 +144,11 @@ impl FydeClient for GrpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::settings::MockService as MockSettingsService;
 
     #[tokio::test]
     async fn new_rejects_a_malformed_base_url() {
-        let result = GrpcClient::new("not a valid uri", SessionTokenStore::default()).await;
+        let result = GrpcClient::new("not a valid uri", Arc::new(MockSettingsService::new())).await;
 
         let err = match result {
             Ok(_) => panic!("a malformed base url must be rejected"),
