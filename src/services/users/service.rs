@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::services::sessions::{
-    SESSION_TOKEN_SETTING, Service as SessionsService, SessionsClient,
-};
+#[cfg(test)]
+use crate::services::sessions::SESSION_TOKEN_SETTING;
+use crate::services::sessions::{Service as SessionsService, SessionsClient};
 use crate::services::settings::Service as SettingsService;
 use crate::{ErrorContext as _, Result};
 
@@ -18,7 +18,8 @@ const MASTER_KEY_SETTING: &str = "master_key";
 
 /// A client for the fyde server's users service. Persists the session
 /// token opened by the most recent `create`/`login` call via
-/// [`SessionsClient::save_new_session`] under [`SESSION_TOKEN_SETTING`],
+/// [`SessionsClient::save_new_session`] under
+/// [`crate::services::sessions::SESSION_TOKEN_SETTING`],
 /// read back from there by every other service's gRPC transport (via
 /// [`crate::services::sessions::Service::authenticated_request`]) to
 /// authenticate its own calls, so [`Service::logout`] doesn't need a token
@@ -101,7 +102,7 @@ impl Service for UsersClient {
     }
 
     async fn logout(&self) -> Result<()> {
-        if !self.is_connected().await? {
+        if !self.sessions.is_connected().await? {
             return Ok(());
         }
 
@@ -110,15 +111,6 @@ impl Service for UsersClient {
         self.sessions.remove_session().await?;
 
         Ok(())
-    }
-
-    async fn is_connected(&self) -> Result<bool> {
-        Ok(self
-            .settings
-            .get(SESSION_TOKEN_SETTING)
-            .await
-            .context("failed to read session token")?
-            .is_some())
     }
 }
 
@@ -435,37 +427,5 @@ mod tests {
 
         client.logout().await.unwrap();
         client.logout().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn is_connected_returns_true_with_an_open_session() {
-        let mock_grpc = MockFydeClient::new();
-
-        let mut settings = MockSettingsService::new();
-        settings
-            .expect_get()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
-            .times(1)
-            .returning(|_| Ok(Some("a-token".to_string())));
-
-        let client = client_with_grpc(mock_grpc, settings);
-
-        assert!(client.is_connected().await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn is_connected_returns_false_without_an_open_session() {
-        let mock_grpc = MockFydeClient::new();
-
-        let mut settings = MockSettingsService::new();
-        settings
-            .expect_get()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
-            .times(1)
-            .returning(|_| Ok(None));
-
-        let client = client_with_grpc(mock_grpc, settings);
-
-        assert!(!client.is_connected().await.unwrap());
     }
 }

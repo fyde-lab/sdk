@@ -43,6 +43,12 @@ pub(crate) trait Service: Send + Sync {
     /// [`Service::save_new_session`] call, if any. Called by
     /// `users::Service::logout` once the server has closed the session.
     async fn remove_session(&self) -> Result<()>;
+
+    /// Returns whether a session token is currently persisted (i.e. a
+    /// [`Service::save_new_session`] call happened and no
+    /// [`Service::remove_session`] call has happened since). Called by
+    /// `users::Service::logout`.
+    async fn is_connected(&self) -> Result<bool>;
 }
 
 /// Initializes the sessions service: uses `settings` to read the session

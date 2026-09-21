@@ -55,6 +55,15 @@ impl Service for SessionsClient {
             .await
             .context("failed to remove persisted session token")
     }
+
+    async fn is_connected(&self) -> Result<bool> {
+        Ok(self
+            .settings
+            .get(SESSION_TOKEN_SETTING)
+            .await
+            .context("failed to read session token")?
+            .is_some())
+    }
 }
 
 #[cfg(test)]
@@ -117,5 +126,29 @@ mod tests {
         let client = SessionsClient::new(Arc::new(settings));
 
         client.remove_session().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn is_connected_returns_true_with_a_stored_token() {
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .returning(|_| Ok(Some("a-token".to_string())));
+        let client = SessionsClient::new(Arc::new(settings));
+
+        assert!(client.is_connected().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_connected_returns_false_without_a_stored_token() {
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .returning(|_| Ok(None));
+        let client = SessionsClient::new(Arc::new(settings));
+
+        assert!(!client.is_connected().await.unwrap());
     }
 }

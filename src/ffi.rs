@@ -226,6 +226,15 @@ impl FydeClient {
         Ok(())
     }
 
+    /// Returns whether a session token is currently persisted, i.e. a
+    /// `create_user`/`login`/`save_new_session` call succeeded and neither
+    /// `logout` nor `remove_session` has been called since. Mirrors
+    /// `sessions::Service::is_connected`.
+    pub async fn is_connected(&self) -> Result<bool, FfiError> {
+        let connected = self.inner.sessions().is_connected().await?;
+        Ok(connected)
+    }
+
     /// Reads the local file at `path`, encrypts it and its metadata, then
     /// publishes it as a "created" changelog event, returning its generated
     /// id. Mirrors [`crate::DocumentsService::upload`].
