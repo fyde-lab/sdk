@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::services::sessions::{
+    SESSION_TOKEN_SETTING, Service as SessionsService, SessionsClient,
+};
 use crate::services::settings::Service as SettingsService;
-use crate::session::SESSION_TOKEN_SETTING;
 use crate::{ErrorContext as _, Result};
 
 use super::Service;
@@ -15,32 +17,36 @@ use super::grpc_client::{FydeClient, GrpcClient};
 const MASTER_KEY_SETTING: &str = "master_key";
 
 /// A client for the fyde server's users service. Persists the session
-/// token opened by the most recent `create`/`login` call into `settings`
-/// under [`SESSION_TOKEN_SETTING`], read back from there by every other
-/// service's gRPC transport (see
-/// [`crate::session::authenticated_request`]) to authenticate its own
-/// calls, so [`Service::logout`] doesn't need a token passed in.
+/// token opened by the most recent `create`/`login` call via
+/// [`SessionsClient::save_new_session`] under [`SESSION_TOKEN_SETTING`],
+/// read back from there by every other service's gRPC transport (via
+/// [`crate::services::sessions::Service::authenticated_request`]) to
+/// authenticate its own calls, so [`Service::logout`] doesn't need a token
+/// passed in.
 pub struct UsersClient {
     grpc: Box<dyn FydeClient>,
     settings: Arc<dyn SettingsService>,
+    sessions: Arc<SessionsClient>,
 }
 
 impl UsersClient {
     /// Creates a client for the users service at the given `http://` or
-    /// `https://` base URL (e.g. `http://127.0.0.1:8080`), persisting the
-    /// session token and newly created accounts' master keys in
-    /// `settings`.
+    /// `https://` base URL (e.g. `http://127.0.0.1:8080`), persisting
+    /// newly created accounts' master keys in `settings`, and the session
+    /// token and authenticating outgoing calls via `sessions`.
     pub(super) async fn new(
         base_url: impl AsRef<str>,
         settings: Arc<dyn SettingsService>,
+        sessions: Arc<SessionsClient>,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(
-                GrpcClient::new(base_url, settings.clone())
+                GrpcClient::new(base_url, sessions.clone())
                     .await
                     .context("failed to create users grpc client")?,
             ),
             settings,
+            sessions,
         })
     }
 
@@ -48,10 +54,15 @@ impl UsersClient {
     /// testing against a [`super::grpc_client::MockFydeClient`] instead of
     /// a live server.
     #[cfg(test)]
-    fn with_grpc(grpc: impl FydeClient + 'static, settings: Arc<dyn SettingsService>) -> Self {
+    fn with_grpc(
+        grpc: impl FydeClient + 'static,
+        settings: Arc<dyn SettingsService>,
+        sessions: Arc<SessionsClient>,
+    ) -> Self {
         Self {
             grpc: Box::new(grpc),
             settings,
+            sessions,
         }
     }
 }
@@ -65,10 +76,7 @@ impl Service for UsersClient {
             .await
             .context("failed to create user")?;
 
-        self.settings
-            .set(SESSION_TOKEN_SETTING, &token)
-            .await
-            .context("failed to persist session token")?;
+        self.sessions.save_new_session(&token).await?;
 
         let wrapped_master_key =
             generate_and_wrap_master_key(password).context("failed to generate master key")?;
@@ -87,10 +95,7 @@ impl Service for UsersClient {
             .await
             .context("failed to log in")?;
 
-        self.settings
-            .set(SESSION_TOKEN_SETTING, &token)
-            .await
-            .context("failed to persist session token")?;
+        self.sessions.save_new_session(&token).await?;
 
         Ok(token)
     }
@@ -108,10 +113,7 @@ impl Service for UsersClient {
 
         self.grpc.logout().await.context("failed to log out")?;
 
-        self.settings
-            .delete(SESSION_TOKEN_SETTING)
-            .await
-            .context("failed to remove persisted session token")?;
+        self.sessions.remove_session().await?;
 
         Ok(())
     }
@@ -129,7 +131,9 @@ mod tests {
         grpc: impl FydeClient + 'static,
         settings: MockSettingsService,
     ) -> UsersClient {
-        UsersClient::with_grpc(grpc, Arc::new(settings))
+        let settings: Arc<dyn SettingsService> = Arc::new(settings);
+        let sessions = Arc::new(SessionsClient::new(settings.clone()));
+        UsersClient::with_grpc(grpc, settings, sessions)
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ use futures::StreamExt;
 use uuid::Uuid;
 
 use crate::services::documents::{Document, Metadata, Storage as DocumentStorage};
-use crate::services::settings::Service as SettingsService;
+use crate::services::sessions::SessionsClient;
 use crate::{Error, ErrorContext as _, Result};
 
 use super::Service;
@@ -56,11 +56,11 @@ impl<D: DocumentStorage, O: OffsetStorage> ChangelogClient<D, O> {
         base_url: impl AsRef<str>,
         document_storage: D,
         offset_storage: O,
-        settings: Arc<dyn SettingsService>,
+        sessions: Arc<SessionsClient>,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(
-                GrpcClient::new(base_url, settings)
+                GrpcClient::new(base_url, sessions)
                     .await
                     .context("failed to create changelog grpc client")?,
             ),

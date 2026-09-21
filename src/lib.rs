@@ -1,6 +1,5 @@
 mod ffi;
 mod services;
-mod session;
 #[path = "lib/sql/mod.rs"]
 mod sql;
 #[cfg(test)]
@@ -128,11 +127,17 @@ impl Client {
         let url = url.as_ref();
 
         let settings = services::settings::init(sqlite.pool().clone());
-        let changelog = services::changelog::init(url, sqlite.pool().clone(), settings.clone())
-            .await
-            .context("failed to initialize changelog service")?;
+        let sessions = services::sessions::init(settings.clone());
+        let changelog = services::changelog::init(
+            url,
+            sqlite.pool().clone(),
+            settings.clone(),
+            sessions.clone(),
+        )
+        .await
+        .context("failed to initialize changelog service")?;
         let documents = services::documents::init(sqlite.pool().clone(), changelog.clone());
-        let users = services::users::init(url, settings.clone())
+        let users = services::users::init(url, settings.clone(), sessions.clone())
             .await
             .context("failed to initialize users service")?;
 

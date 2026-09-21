@@ -6,8 +6,7 @@ use futures::stream::BoxStream;
 use mockall::automock;
 use tonic::transport::Channel;
 
-use crate::services::settings::Service as SettingsService;
-use crate::session::authenticated_request;
+use crate::services::sessions::{Service as SessionsService, SessionsClient};
 use crate::{Error, ErrorContext as _, Result};
 
 /// Generated protobuf/gRPC bindings for the `changelog` service, compiled
@@ -46,21 +45,19 @@ pub(super) trait FydeClient: Send + Sync {
 
 /// The production [`FydeClient`] implementation, backed by a real tonic
 /// connection. Every call is authenticated by attaching the session token
-/// currently persisted in `settings` (if any) as a bearer `authorization`
-/// header (see [`crate::session::authenticated_request`]).
+/// currently persisted in settings (if any) as a bearer `authorization`
+/// header (see
+/// [`crate::services::sessions::Service::authenticated_request`]).
 pub(super) struct GrpcClient {
     client: ChangelogClient<Channel>,
-    settings: Arc<dyn SettingsService>,
+    sessions: Arc<SessionsClient>,
 }
 
 impl GrpcClient {
     /// Connects to the changelog service at the given `http://` or
     /// `https://` base URL (e.g. `http://127.0.0.1:8080`), authenticating
-    /// every call with the session token persisted in `settings`.
-    pub async fn new(
-        base_url: impl AsRef<str>,
-        settings: Arc<dyn SettingsService>,
-    ) -> Result<Self> {
+    /// every call via `sessions`.
+    pub async fn new(base_url: impl AsRef<str>, sessions: Arc<SessionsClient>) -> Result<Self> {
         let endpoint = Channel::from_shared(base_url.as_ref().to_string())
             .map_err(|err| Error::InvalidEndpoint(err.to_string()))?;
         let channel = endpoint
@@ -70,7 +67,7 @@ impl GrpcClient {
 
         Ok(Self {
             client: ChangelogClient::new(channel),
-            settings,
+            sessions,
         })
     }
 }
@@ -78,8 +75,10 @@ impl GrpcClient {
 #[async_trait]
 impl FydeClient for GrpcClient {
     async fn record_event(&self, encrypted_content: Vec<u8>) -> Result<i64> {
-        let request =
-            authenticated_request(&self.settings, RecordEventRequest { encrypted_content }).await?;
+        let request = self
+            .sessions
+            .authenticated_request(RecordEventRequest { encrypted_content })
+            .await?;
 
         // The generated client's RPC methods take `&mut self`, but the
         // underlying `Channel` is cheap to clone and safe to use
@@ -96,7 +95,10 @@ impl FydeClient for GrpcClient {
     }
 
     async fn consume_since(&self, offset: i64) -> Result<EventStream> {
-        let request = authenticated_request(&self.settings, ConsumeSinceRequest { offset }).await?;
+        let request = self
+            .sessions
+            .authenticated_request(ConsumeSinceRequest { offset })
+            .await?;
 
         let response = self
             .client
@@ -115,7 +117,8 @@ mod tests {
 
     #[tokio::test]
     async fn new_rejects_a_malformed_base_url() {
-        let result = GrpcClient::new("not a valid uri", Arc::new(MockSettingsService::new())).await;
+        let sessions = Arc::new(SessionsClient::new(Arc::new(MockSettingsService::new())));
+        let result = GrpcClient::new("not a valid uri", sessions).await;
 
         let err = match result {
             Ok(_) => panic!("a malformed base url must be rejected"),

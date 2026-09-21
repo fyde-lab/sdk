@@ -9,16 +9,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::Result;
+use crate::services::sessions::SessionsClient;
 use crate::services::settings::Service as SettingsService;
 
 /// Manages account creation and session lifecycle against the fyde
 /// server's users service. Trait methods take `&self` (not `&mut self`) so
 /// implementations can be shared behind `Arc<dyn Service>`; the session
 /// token opened by `create`/`login` is persisted in the settings store
-/// under `session_token` (see [`crate::session::SESSION_TOKEN_SETTING`]),
-/// shared with every other service's gRPC transport, which reads it from
-/// there to authenticate outgoing calls (see
-/// [`crate::session::authenticated_request`]) rather than it being
+/// under `session_token` (see
+/// [`crate::services::sessions::SESSION_TOKEN_SETTING`]), shared with every
+/// other service's gRPC transport, which reads it from there to
+/// authenticate outgoing calls (see
+/// [`crate::services::sessions::Service::authenticated_request`]) rather than it being
 /// threaded through every call here — so `logout` takes no argument.
 /// Persisting it in settings, rather than only holding it in memory, means
 /// a session survives across process restarts; `logout` removes it again.
@@ -47,12 +49,15 @@ pub trait Service: Send + Sync {
 
 /// Initializes the users service: connects to the fyde server's users
 /// service at `base_url`. `settings` is where `create`/`login` persist the
-/// session token (read back by every other service's gRPC transport to
-/// authenticate their own calls) and where `create` also persists the
-/// master key it generates for a new account.
+/// session token (read back by every other service's gRPC transport, via
+/// `sessions`, to authenticate their own calls) and where `create` also
+/// persists the master key it generates for a new account.
 pub(crate) async fn init(
     base_url: impl AsRef<str>,
     settings: Arc<dyn SettingsService>,
+    sessions: Arc<SessionsClient>,
 ) -> Result<Arc<dyn Service>> {
-    Ok(Arc::new(UsersClient::new(base_url, settings).await?))
+    Ok(Arc::new(
+        UsersClient::new(base_url, settings, sessions).await?,
+    ))
 }
