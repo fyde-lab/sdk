@@ -3,6 +3,8 @@ mod grpc_client;
 mod models;
 mod service;
 
+#[cfg(test)]
+pub(crate) use models::FakeUser;
 pub use models::User;
 pub use service::UsersClient;
 

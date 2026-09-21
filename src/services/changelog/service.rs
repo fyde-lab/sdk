@@ -124,11 +124,7 @@ impl<D: DocumentStorage, O: OffsetStorage> Service for ChangelogClient<D, O> {
                     )));
                 };
 
-                let document = Document {
-                    id: event.document_id,
-                    content: content.clone(),
-                    metadata: metadata.clone(),
-                };
+                let document = Document::new(event.document_id, content.clone(), metadata.clone());
                 self.document_storage
                     .save_document(&document)
                     .await
@@ -160,18 +156,7 @@ mod tests {
     use super::super::grpc_client::MockFydeClient;
     use super::super::storage::MockOffsetStorage;
     use super::*;
-    use crate::services::documents::MockStorage;
-
-    fn sample_metadata() -> Metadata {
-        Metadata {
-            name: "report.pdf".to_string(),
-            content_type: "application/pdf".to_string(),
-            created_at: 1_700_000_000,
-            size: 4,
-            checksum: "checksum-value".to_string(),
-            transcript: String::new(),
-        }
-    }
+    use crate::services::documents::{FakeMetadata, MockStorage};
 
     fn proto_event(offset: i64, document_id: Uuid) -> ProtoChangelogEvent {
         proto_event_with_type(offset, document_id, EventType::Created)
@@ -186,7 +171,7 @@ mod tests {
             event_type,
             document_id,
             Some(b"content"),
-            Some(&sample_metadata()),
+            Some(&FakeMetadata::new().build()),
         )
         .unwrap();
         ProtoChangelogEvent {
@@ -210,7 +195,7 @@ mod tests {
         let mut document_storage = MockStorage::new();
         document_storage
             .expect_save_document()
-            .withf(move |document| document.id == document_id && document.content == b"content")
+            .withf(move |document| document.id() == document_id && document.content() == b"content")
             .times(1)
             .returning(|_| Ok(()));
 
@@ -334,17 +319,19 @@ mod tests {
     #[tokio::test]
     async fn send_encrypts_the_event_before_it_reaches_the_transport_layer() {
         let document_id = Uuid::new_v4();
+        let metadata = FakeMetadata::new().build();
 
         let mut mock_grpc = MockFydeClient::new();
+        let expected_metadata = metadata.clone();
         mock_grpc
             .expect_record_event()
             .withf(move |encrypted_content| {
-                let (event_type, id, content, metadata) =
+                let (event_type, id, content, decrypted_metadata) =
                     crypto::decrypt_event(encrypted_content).unwrap();
                 event_type == EventType::Created
                     && id == document_id
                     && content == Some(b"body".to_vec())
-                    && metadata == Some(sample_metadata())
+                    && decrypted_metadata == Some(expected_metadata.clone())
             })
             .returning(|_| Ok(1));
 
@@ -356,7 +343,7 @@ mod tests {
                 EventType::Created,
                 document_id,
                 Some(b"body"),
-                Some(&sample_metadata()),
+                Some(&metadata),
             )
             .await
             .unwrap();

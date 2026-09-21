@@ -5,6 +5,8 @@ mod service;
 mod storage;
 mod storage_settings;
 
+#[cfg(test)]
+pub(crate) use models::FakeChangelogEvent;
 pub use models::{ChangelogEvent, EventType};
 
 use std::sync::Arc;

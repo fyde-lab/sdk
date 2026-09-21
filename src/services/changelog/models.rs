@@ -21,11 +21,33 @@ pub enum EventType {
 /// `document_id` is meaningful then).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangelogEvent {
-    pub offset: i64,
-    pub event_type: EventType,
-    pub document_id: Uuid,
-    pub content: Option<Vec<u8>>,
-    pub metadata: Option<Metadata>,
+    pub(super) offset: i64,
+    pub(super) event_type: EventType,
+    pub(super) document_id: Uuid,
+    pub(super) content: Option<Vec<u8>>,
+    pub(super) metadata: Option<Metadata>,
+}
+
+impl ChangelogEvent {
+    pub fn offset(&self) -> i64 {
+        self.offset
+    }
+
+    pub fn event_type(&self) -> EventType {
+        self.event_type
+    }
+
+    pub fn document_id(&self) -> Uuid {
+        self.document_id
+    }
+
+    pub fn content(&self) -> Option<&[u8]> {
+        self.content.as_deref()
+    }
+
+    pub fn metadata(&self) -> Option<&Metadata> {
+        self.metadata.as_ref()
+    }
 }
 
 /// Builds a [`ChangelogEvent`] filled with random-but-plausible data,
@@ -62,7 +84,7 @@ impl FakeChangelogEvent {
     /// Sets `document_id` to `document`'s id, so the event refers to a
     /// document that actually exists in the test's fixtures.
     pub(crate) fn for_document(mut self, document: &crate::services::documents::Document) -> Self {
-        self.event.document_id = document.id;
+        self.event.document_id = document.id();
         self
     }
 
@@ -116,7 +138,7 @@ mod tests {
 
         let event = FakeChangelogEvent::new().for_document(&document).build();
 
-        assert_eq!(event.document_id, document.id);
+        assert_eq!(event.document_id, document.id());
     }
 
     #[test]

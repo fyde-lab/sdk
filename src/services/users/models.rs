@@ -3,9 +3,23 @@ use uuid::Uuid;
 /// A user account, as returned by [`super::Service::create`]/[`super::Service::login`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
-    pub id: Uuid,
-    pub username: String,
-    pub created_at: i64,
+    pub(super) id: Uuid,
+    pub(super) username: String,
+    pub(super) created_at: i64,
+}
+
+impl User {
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn created_at(&self) -> i64 {
+        self.created_at
+    }
 }
 
 /// Builds a [`User`] filled with random-but-plausible data, overridable

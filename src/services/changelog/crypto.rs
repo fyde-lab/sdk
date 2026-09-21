@@ -171,22 +171,12 @@ pub(super) fn decrypt_event(encrypted_content: &[u8]) -> Result<DecryptedEvent> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn metadata() -> Metadata {
-        Metadata {
-            name: "report.pdf".to_string(),
-            content_type: "application/pdf".to_string(),
-            created_at: 1_700_000_000,
-            size: 4,
-            checksum: "checksum-value".to_string(),
-            transcript: "some transcript text".to_string(),
-        }
-    }
+    use crate::services::documents::FakeMetadata;
 
     #[test]
     fn encrypt_event_roundtrips_a_created_event() {
         let document_id = Uuid::new_v4();
-        let metadata = metadata();
+        let metadata = FakeMetadata::new().build();
 
         let encrypted = encrypt_event(
             EventType::Created,

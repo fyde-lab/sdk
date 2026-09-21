@@ -55,12 +55,12 @@ pub struct FfiMetadata {
 impl From<Metadata> for FfiMetadata {
     fn from(metadata: Metadata) -> Self {
         Self {
-            name: metadata.name,
-            content_type: metadata.content_type,
-            created_at: metadata.created_at,
-            size: metadata.size,
-            checksum: metadata.checksum,
-            transcript: metadata.transcript,
+            name: metadata.name().to_string(),
+            content_type: metadata.content_type().to_string(),
+            created_at: metadata.created_at(),
+            size: metadata.size(),
+            checksum: metadata.checksum().to_string(),
+            transcript: metadata.transcript().to_string(),
         }
     }
 }
@@ -77,9 +77,9 @@ pub struct FfiDocument {
 impl From<Document> for FfiDocument {
     fn from(document: Document) -> Self {
         Self {
-            id: document.id.to_string(),
-            content: document.content,
-            metadata: document.metadata.into(),
+            id: document.id().to_string(),
+            content: document.content().to_vec(),
+            metadata: document.metadata().clone().into(),
         }
     }
 }
@@ -119,11 +119,11 @@ pub struct FfiChangelogEvent {
 impl From<ChangelogEvent> for FfiChangelogEvent {
     fn from(event: ChangelogEvent) -> Self {
         Self {
-            offset: event.offset,
-            event_type: event.event_type.into(),
-            document_id: event.document_id.to_string(),
-            content: event.content,
-            metadata: event.metadata.map(FfiMetadata::from),
+            offset: event.offset(),
+            event_type: event.event_type().into(),
+            document_id: event.document_id().to_string(),
+            content: event.content().map(<[u8]>::to_vec),
+            metadata: event.metadata().cloned().map(FfiMetadata::from),
         }
     }
 }
@@ -140,9 +140,9 @@ pub struct FfiUser {
 impl From<User> for FfiUser {
     fn from(user: User) -> Self {
         Self {
-            id: user.id.to_string(),
-            username: user.username,
-            created_at: user.created_at,
+            id: user.id().to_string(),
+            username: user.username().to_string(),
+            created_at: user.created_at(),
         }
     }
 }
@@ -270,19 +270,9 @@ impl FydeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::changelog::EventType;
-    use crate::services::documents::Metadata;
-
-    fn metadata() -> Metadata {
-        Metadata {
-            name: "report.pdf".to_string(),
-            content_type: "application/pdf".to_string(),
-            created_at: 1_700_000_000,
-            size: 4,
-            checksum: "checksum-value".to_string(),
-            transcript: "some text".to_string(),
-        }
-    }
+    use crate::services::changelog::{EventType, FakeChangelogEvent};
+    use crate::services::documents::{FakeDocument, FakeMetadata};
+    use crate::services::users::FakeUser;
 
     #[test]
     fn parse_uuid_accepts_a_canonical_uuid() {
@@ -298,46 +288,44 @@ mod tests {
 
     #[test]
     fn metadata_conversion_preserves_every_field() {
-        let metadata = metadata();
+        let metadata = FakeMetadata::new().build();
 
         let ffi: FfiMetadata = metadata.clone().into();
 
-        assert_eq!(ffi.name, metadata.name);
-        assert_eq!(ffi.content_type, metadata.content_type);
-        assert_eq!(ffi.created_at, metadata.created_at);
-        assert_eq!(ffi.size, metadata.size);
-        assert_eq!(ffi.checksum, metadata.checksum);
-        assert_eq!(ffi.transcript, metadata.transcript);
+        assert_eq!(ffi.name, metadata.name());
+        assert_eq!(ffi.content_type, metadata.content_type());
+        assert_eq!(ffi.created_at, metadata.created_at());
+        assert_eq!(ffi.size, metadata.size());
+        assert_eq!(ffi.checksum, metadata.checksum());
+        assert_eq!(ffi.transcript, metadata.transcript());
     }
 
     #[test]
     fn user_conversion_stringifies_the_id() {
-        let user = User {
-            id: Uuid::new_v4(),
-            username: "alice".to_string(),
-            created_at: 1_700_000_000,
-        };
+        let user = FakeUser::new()
+            .with_username("alice")
+            .with_created_at(1_700_000_000)
+            .build();
 
         let ffi: FfiUser = user.clone().into();
 
-        assert_eq!(ffi.id, user.id.to_string());
-        assert_eq!(ffi.username, user.username);
-        assert_eq!(ffi.created_at, user.created_at);
+        assert_eq!(ffi.id, user.id().to_string());
+        assert_eq!(ffi.username, user.username());
+        assert_eq!(ffi.created_at, user.created_at());
     }
 
     #[test]
     fn document_conversion_stringifies_the_id() {
-        let document = Document {
-            id: Uuid::new_v4(),
-            content: b"hello".to_vec(),
-            metadata: metadata(),
-        };
+        let document = FakeDocument::new()
+            .with_content(b"hello".to_vec())
+            .with_metadata(FakeMetadata::new().build())
+            .build();
 
         let ffi: FfiDocument = document.clone().into();
 
-        assert_eq!(ffi.id, document.id.to_string());
-        assert_eq!(ffi.content, document.content);
-        assert_eq!(ffi.metadata.name, document.metadata.name);
+        assert_eq!(ffi.id, document.id().to_string());
+        assert_eq!(ffi.content, document.content());
+        assert_eq!(ffi.metadata.name, document.metadata().name());
     }
 
     #[test]
@@ -359,13 +347,13 @@ mod tests {
     #[test]
     fn changelog_event_conversion_stringifies_the_document_id_and_preserves_payload() {
         let document_id = Uuid::new_v4();
-        let event = ChangelogEvent {
-            offset: 7,
-            event_type: EventType::Created,
-            document_id,
-            content: Some(b"body".to_vec()),
-            metadata: Some(metadata()),
-        };
+        let event = FakeChangelogEvent::new()
+            .with_offset(7)
+            .with_event_type(EventType::Created)
+            .with_document_id(document_id)
+            .with_content(b"body".to_vec())
+            .with_metadata(FakeMetadata::new().build())
+            .build();
 
         let ffi: FfiChangelogEvent = event.into();
 
@@ -378,13 +366,13 @@ mod tests {
 
     #[test]
     fn changelog_event_conversion_handles_events_with_no_content_or_metadata() {
-        let event = ChangelogEvent {
-            offset: 1,
-            event_type: EventType::Deleted,
-            document_id: Uuid::new_v4(),
-            content: None,
-            metadata: None,
-        };
+        let event = FakeChangelogEvent::new()
+            .with_offset(1)
+            .with_event_type(EventType::Deleted)
+            .with_document_id(Uuid::new_v4())
+            .without_content()
+            .without_metadata()
+            .build();
 
         let ffi: FfiChangelogEvent = event.into();
 

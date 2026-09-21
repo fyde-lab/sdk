@@ -5,23 +5,75 @@ use uuid::Uuid;
 /// decrypted back out of it on download.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metadata {
-    pub name: String,
-    pub content_type: String,
-    pub created_at: i64,
-    pub size: u64,
-    pub checksum: String,
+    pub(super) name: String,
+    pub(super) content_type: String,
+    pub(super) created_at: i64,
+    pub(super) size: u64,
+    pub(super) checksum: String,
     /// Plaintext transcript of the document's PDF text content, extracted
     /// on upload.
-    pub transcript: String,
+    pub(super) transcript: String,
+}
+
+impl Metadata {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn content_type(&self) -> &str {
+        &self.content_type
+    }
+
+    pub fn created_at(&self) -> i64 {
+        self.created_at
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn checksum(&self) -> &str {
+        &self.checksum
+    }
+
+    pub fn transcript(&self) -> &str {
+        &self.transcript
+    }
 }
 
 /// A file, as returned by [`super::Service::get`]/[`super::Service::list`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Document {
-    pub id: Uuid,
+    pub(super) id: Uuid,
     #[serde(with = "serde_bytes")]
-    pub content: Vec<u8>,
-    pub metadata: Metadata,
+    pub(super) content: Vec<u8>,
+    pub(super) metadata: Metadata,
+}
+
+impl Document {
+    /// Constructs a document from already-known parts. Used by other
+    /// domains (e.g. `changelog`, materializing a document from a decrypted
+    /// event) that need to build one without going through `documents`'s
+    /// own storage/service layer.
+    pub(crate) fn new(id: Uuid, content: Vec<u8>, metadata: Metadata) -> Self {
+        Self {
+            id,
+            content,
+            metadata,
+        }
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn content(&self) -> &[u8] {
+        &self.content
+    }
+
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
 }
 
 /// Builds a [`Metadata`] filled with random-but-plausible data, overridable
