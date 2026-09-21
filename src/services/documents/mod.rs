@@ -5,6 +5,8 @@ mod storage_sqlite;
 mod transcript;
 
 pub use models::{Document, Metadata};
+#[cfg(test)]
+pub(crate) use models::{FakeDocument, FakeMetadata};
 pub(crate) use storage::Storage;
 pub(crate) use storage_sqlite::SqliteStorage;
 

@@ -66,7 +66,10 @@ mod tests {
     #[tokio::test]
     async fn delete_removes_the_stored_value() {
         let mut storage = MockStorage::new();
-        storage.expect_delete().with(eq("theme")).return_once(|_| Ok(()));
+        storage
+            .expect_delete()
+            .with(eq("theme"))
+            .return_once(|_| Ok(()));
         let client = SettingsClient::new(storage);
 
         client.delete("theme").await.unwrap();

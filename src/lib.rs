@@ -3,6 +3,8 @@ mod services;
 mod session;
 #[path = "lib/sql/mod.rs"]
 mod sql;
+#[cfg(test)]
+mod testing;
 
 uniffi::setup_scaffolding!();
 
