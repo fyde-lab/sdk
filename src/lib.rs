@@ -16,6 +16,7 @@ pub use services::documents::{Document, Service as DocumentsService};
 pub use services::settings::Service as SettingsService;
 pub use services::users::Service as UsersService;
 
+use services::sessions::SessionsClient;
 use sql::SqliteClient;
 
 #[derive(Debug, thiserror::Error)]
@@ -96,6 +97,7 @@ where
 pub struct Client {
     changelog: Arc<dyn ChangelogService>,
     documents: Arc<dyn DocumentsService>,
+    sessions: Arc<SessionsClient>,
     settings: Arc<dyn SettingsService>,
     users: Arc<dyn UsersService>,
 }
@@ -144,6 +146,7 @@ impl Client {
         Ok(Self {
             changelog,
             documents,
+            sessions,
             settings,
             users,
         })
@@ -167,6 +170,15 @@ impl Client {
     /// Returns a reference to the client's settings service.
     pub fn settings(&self) -> &dyn SettingsService {
         self.settings.as_ref()
+    }
+
+    /// Returns a reference to the client's sessions service. Returns the
+    /// concrete `SessionsClient` rather than a trait object, like
+    /// [`services::sessions::init`], since `sessions::Service` is not
+    /// object-safe. `pub(crate)` rather than `pub` since `sessions::Service`
+    /// itself is internal plumbing, not part of the SDK's public API.
+    pub(crate) fn sessions(&self) -> &SessionsClient {
+        self.sessions.as_ref()
     }
 }
 

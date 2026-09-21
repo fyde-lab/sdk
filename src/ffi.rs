@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::services::changelog::EventType;
 use crate::services::documents::Metadata;
+use crate::services::sessions::Service as SessionsService;
 use crate::{ChangelogEvent, Client, Document, Error};
 
 /// Error type surfaced to FFI callers. UniFFI requires exported errors to be
@@ -202,6 +203,26 @@ impl FydeClient {
     /// call. Mirrors [`crate::UsersService::logout`].
     pub async fn logout(&self) -> Result<(), FfiError> {
         self.inner.users().logout().await?;
+        Ok(())
+    }
+
+    /// Persists `token` as the session token attached to every subsequent
+    /// authenticated request, overwriting any token already stored.
+    /// `create_user`/`login` already do this as part of opening a session;
+    /// this is for restoring a previously-issued token (e.g. one a caller
+    /// kept in secure storage across app restarts) without a network round
+    /// trip. Mirrors `sessions::Service::save_new_session`.
+    pub async fn save_new_session(&self, token: String) -> Result<(), FfiError> {
+        self.inner.sessions().save_new_session(&token).await?;
+        Ok(())
+    }
+
+    /// Removes the currently persisted session token, if any, so subsequent
+    /// requests go out unauthenticated. Unlike `logout`, this never talks to
+    /// the server — it only clears the local token. Mirrors
+    /// `sessions::Service::remove_session`.
+    pub async fn remove_session(&self) -> Result<(), FfiError> {
+        self.inner.sessions().remove_session().await?;
         Ok(())
     }
 
