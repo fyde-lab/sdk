@@ -1,6 +1,6 @@
 mod ffi;
 mod domains;
-#[path = "lib/sql/mod.rs"]
+#[path = "tools/sql/mod.rs"]
 mod sql;
 #[cfg(test)]
 mod testing;
