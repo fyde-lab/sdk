@@ -148,7 +148,7 @@ impl FakeDocument {
     pub(crate) fn new() -> Self {
         Self {
             document: Document {
-                id: Uuid::new_v4(),
+                id: Uuid::now_v7(),
                 content: crate::testing::random_bytes(64),
                 metadata: FakeMetadata::new().build(),
             },
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn fake_document_with_methods_override_defaults() {
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let metadata = FakeMetadata::new().with_name("report.pdf").build();
 
         let document = FakeDocument::new()

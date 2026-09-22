@@ -185,7 +185,7 @@ mod tests {
 
     #[tokio::test]
     async fn consume_decrypts_events_and_caches_the_document() {
-        let document_id = Uuid::new_v4();
+        let document_id = Uuid::now_v7();
 
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
@@ -230,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn consume_does_not_cache_the_document_for_a_non_created_event() {
-        let document_id = Uuid::new_v4();
+        let document_id = Uuid::now_v7();
 
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc.expect_consume_since().returning(move |_| {
@@ -261,7 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn consume_errors_on_a_created_event_missing_content_or_metadata() {
-        let document_id = Uuid::new_v4();
+        let document_id = Uuid::now_v7();
 
         let encrypted_content =
             crypto::encrypt_event(EventType::Created, document_id, None, None).unwrap();
@@ -291,7 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn consume_resumes_from_the_persisted_offset() {
-        let document_id = Uuid::new_v4();
+        let document_id = Uuid::now_v7();
 
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
@@ -321,7 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_encrypts_the_event_before_it_reaches_the_transport_layer() {
-        let document_id = Uuid::new_v4();
+        let document_id = Uuid::now_v7();
         let metadata = FakeMetadata::new().build();
 
         let mut mock_grpc = MockFydeClient::new();

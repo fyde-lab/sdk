@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn encrypt_event_roundtrips_a_created_event() {
-        let document_id = Uuid::new_v4();
+        let document_id = Uuid::now_v7();
         let metadata = FakeMetadata::new().build();
 
         let encrypted = encrypt_event(
@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn encrypt_event_roundtrips_a_deleted_event_with_no_content_or_metadata() {
-        let document_id = Uuid::new_v4();
+        let document_id = Uuid::now_v7();
 
         let encrypted = encrypt_event(EventType::Deleted, document_id, None, None).unwrap();
 
@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn decrypt_event_rejects_content_tampered_with_after_encryption() {
-        let document_id = Uuid::new_v4();
+        let document_id = Uuid::now_v7();
         let mut encrypted =
             encrypt_event(EventType::Created, document_id, Some(b"body"), None).unwrap();
         let last = encrypted.len() - 1;

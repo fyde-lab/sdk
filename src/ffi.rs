@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn parse_uuid_accepts_a_canonical_uuid() {
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
 
         assert_eq!(parse_uuid(&id.to_string()).unwrap(), id);
     }
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn changelog_event_conversion_stringifies_the_document_id_and_preserves_payload() {
-        let document_id = Uuid::new_v4();
+        let document_id = Uuid::now_v7();
         let event = FakeChangelogEvent::new()
             .with_offset(7)
             .with_event_type(EventType::Created)
@@ -365,7 +365,7 @@ mod tests {
         let event = FakeChangelogEvent::new()
             .with_offset(1)
             .with_event_type(EventType::Deleted)
-            .with_document_id(Uuid::new_v4())
+            .with_document_id(Uuid::now_v7())
             .without_content()
             .without_metadata()
             .build();

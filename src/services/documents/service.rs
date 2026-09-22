@@ -87,7 +87,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
             transcript: doc_transcript,
         };
 
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
 
         self.changelog
             .send(EventType::Created, id, Some(&content), Some(&metadata))
@@ -199,7 +199,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_returns_a_document_previously_cached_locally() {
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
         let document = Document {
             id,
             content: b"hello".to_vec(),
@@ -230,7 +230,7 @@ mod tests {
     async fn list_pages_through_documents_previously_cached_locally() {
         let page = vec![
             Document {
-                id: Uuid::new_v4(),
+                id: Uuid::now_v7(),
                 content: Vec::new(),
                 metadata: Metadata {
                     name: "two".to_string(),
@@ -242,7 +242,7 @@ mod tests {
                 },
             },
             Document {
-                id: Uuid::new_v4(),
+                id: Uuid::now_v7(),
                 content: Vec::new(),
                 metadata: Metadata {
                     name: "three".to_string(),

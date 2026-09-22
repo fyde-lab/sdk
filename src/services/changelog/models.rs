@@ -64,7 +64,7 @@ impl FakeChangelogEvent {
             event: ChangelogEvent {
                 offset: crate::testing::random_u64(10_000) as i64,
                 event_type: EventType::Created,
-                document_id: Uuid::new_v4(),
+                document_id: Uuid::now_v7(),
                 content: Some(crate::testing::random_bytes(64)),
                 metadata: Some(crate::services::documents::FakeMetadata::new().build()),
             },
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn with_methods_override_every_other_field() {
-        let document_id = Uuid::new_v4();
+        let document_id = Uuid::now_v7();
         let metadata = crate::services::documents::FakeMetadata::new().build();
 
         let event = FakeChangelogEvent::new()

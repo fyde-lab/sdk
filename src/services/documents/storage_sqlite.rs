@@ -128,7 +128,7 @@ mod tests {
     async fn get_document_returns_none_when_missing() {
         let storage = setup().await;
 
-        let result = storage.get_document(Uuid::new_v4()).await.unwrap();
+        let result = storage.get_document(Uuid::now_v7()).await.unwrap();
 
         assert_eq!(result, None);
     }
@@ -136,7 +136,7 @@ mod tests {
     #[tokio::test]
     async fn get_document_returns_a_previously_saved_document() {
         let storage = setup().await;
-        let id = Uuid::new_v4();
+        let id = Uuid::now_v7();
 
         storage
             .save_document(&Document {
@@ -176,7 +176,7 @@ mod tests {
     #[tokio::test]
     async fn save_document_does_not_affect_other_documents() {
         let storage = setup().await;
-        let (id1, id2) = (Uuid::new_v4(), Uuid::new_v4());
+        let (id1, id2) = (Uuid::now_v7(), Uuid::now_v7());
 
         storage
             .save_document(&Document {
@@ -219,7 +219,7 @@ mod tests {
         for (i, name) in names.iter().enumerate() {
             storage
                 .save_document(&Document {
-                    id: Uuid::new_v4(),
+                    id: Uuid::now_v7(),
                     content: Vec::new(),
                     metadata: Metadata {
                         name: name.to_string(),

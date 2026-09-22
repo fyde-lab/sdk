@@ -137,7 +137,7 @@ mod tests {
     use super::*;
 
     fn temp_db_path() -> PathBuf {
-        std::env::temp_dir().join(format!("fyde-sdk-test-{}.db", uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!("fyde-sdk-test-{}.db", uuid::Uuid::now_v7()))
     }
 
     #[tokio::test]
