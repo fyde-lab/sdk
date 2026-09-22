@@ -11,8 +11,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::domains::changelog::EventType;
-use crate::domains::documents::Metadata;
+use crate::domains::documents::{EventType, Metadata};
 use crate::domains::sessions::Service as SessionsService;
 use crate::{ChangelogEvent, Client, Document, Error};
 
@@ -133,7 +132,7 @@ impl From<ChangelogEvent> for FfiChangelogEvent {
     }
 }
 
-/// Callback interface for [`FydeClient::consume`], implemented by foreign
+/// Callback interface for [`FydeClient::sync`], implemented by foreign
 /// (Kotlin/Swift) callers and invoked once per [`FfiChangelogEvent`]
 /// encountered during changelog catch-up and live streaming.
 #[uniffi::export(callback_interface)]
@@ -272,11 +271,11 @@ impl FydeClient {
     /// continuing with the live tail). Resumes from the cursor persisted
     /// locally by a previous call, or from the beginning of the changelog
     /// if there is none. Runs until the server closes the stream or an
-    /// error occurs. Mirrors [`crate::ChangelogService::consume`].
-    pub async fn consume(&self, listener: Box<dyn ChangelogListener>) -> Result<(), FfiError> {
+    /// error occurs. Mirrors [`crate::DocumentsService::sync`].
+    pub async fn sync(&self, listener: Box<dyn ChangelogListener>) -> Result<(), FfiError> {
         self.inner
-            .changelog()
-            .consume(Box::new(move |event| listener.on_event(event.into())))
+            .documents()
+            .sync(Box::new(move |event| listener.on_event(event.into())))
             .await?;
         Ok(())
     }
@@ -285,8 +284,7 @@ impl FydeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domains::changelog::{EventType, FakeChangelogEvent};
-    use crate::domains::documents::{FakeDocument, FakeMetadata};
+    use crate::domains::documents::{EventType, FakeChangelogEvent, FakeDocument, FakeMetadata};
 
     #[test]
     fn parse_uuid_accepts_a_canonical_uuid() {

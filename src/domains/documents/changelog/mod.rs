@@ -26,7 +26,7 @@ use crate::{ErrorContext as _, Result};
 /// trait-object parameters — see `consume`), so tests use hand-written
 /// fakes instead.
 #[async_trait]
-pub trait Service: Send + Sync {
+pub(super) trait Service: Send + Sync {
     /// Encrypts and publishes a new event. `content`/`metadata` are `None`
     /// for event types that don't carry them (e.g. a future `Deleted`
     /// event only carries `document_id`).
@@ -64,7 +64,7 @@ pub trait Service: Send + Sync {
 /// the session token as a bearer `authorization` header on every outgoing
 /// call once a session is opened (see
 /// [`crate::domains::sessions::Service::authenticated_request`]).
-pub(crate) async fn init(
+pub(super) async fn init(
     base_url: impl AsRef<str>,
     pool: SqlitePool,
     settings: Arc<dyn SettingsService>,

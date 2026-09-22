@@ -16,21 +16,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-`Client` (`src/lib.rs`) is the SDK entry point, with two constructors: `Client::connect(url)` opens a gRPC connection backed by the local SQLite database in the default XDG data directory, and `Client::connect_memory(url)` does the same but backed by a private in-memory database that only lives for the process's lifetime. Both expose the same service-specific sub-clients (`documents()` → `&DocumentsClient`, `changelog()` → `&ChangelogClient`). As more server services are added, they should follow the same pattern: a submodule under `src/domains/`, wired into `Client`.
+`Client` (`src/lib.rs`) is the SDK entry point, with two constructors: `Client::connect(url)` opens a gRPC connection backed by the local SQLite database in the default XDG data directory, and `Client::connect_memory(url)` does the same but backed by a private in-memory database that only lives for the process's lifetime. Both expose the same service-specific sub-clients (`documents()` → `&DocumentsClient`). As more server services are added, they should follow the same pattern: a submodule under `src/domains/`, wired into `Client`.
 
 ### Documents service (`src/domains/documents/`)
 
 Layered in three pieces, each only aware of the layer below it, following the same `mod.rs`/`service.rs` split as `../server`'s domain modules:
 
 - `models.rs` — the domain-specific structs (`Document`, `Metadata`), with no logic beyond field definitions and derives.
-- `mod.rs` — re-exports the domain types from `models.rs`, plus the `Service` trait (`upload`/`get`/`list`), the business-level API other code depends on. Trait methods take `&self` (not `&mut self`) so implementations can be shared behind `Arc<dyn Service>`.
+- `mod.rs` — re-exports the domain types from `models.rs` and `changelog/models.rs` (`ChangelogEvent`, `EventType`), plus the `Service` trait (`upload`/`get`/`list`/`update_name`/`sync`), the business-level API other code depends on. Trait methods take `&self` (not `&mut self`) so implementations can be shared behind `Arc<dyn Service>`.
 - `grpc_client.rs` — thin gRPC transport (`GrpcClient`). Knows nothing about documents semantics; just sends proto requests and returns raw proto responses. Methods take `&self`, cloning the underlying tonic `Channel` per call (cheap, safe to use concurrently) since the generated client's RPC methods require `&mut self`. Generated protobuf bindings are compiled from `../api-protos/documents.proto` by `build.rs` (via `tonic-prost-build`) and included with `tonic::include_proto!("documents")`.
 - `crypto.rs` — envelope encryption primitives (AES-256-GCM). Generates a fresh per-document data encryption key (DEK), encrypts content and metadata under it, and wraps the DEK under a key-encryption-key (KEK) before anything leaves the process. The server only ever stores/returns ciphertext and a wrapped DEK — it cannot read document content or metadata (name, content type, etc.).
-- `service.rs` — `DocumentsClient`, the default `Service` implementation, which composes the crypto and gRPC layers and delegates local, unencrypted persistence to an injected `Storage`. `download`/`download_many` are single round-trips against the server: the server's `FetchDocument`/`FetchDocuments` RPCs return `EncryptedDocument`s (ciphertext content, wrapped DEK, and encrypted metadata together), so no separate lookup is needed to decrypt them. `get` and `list`, unlike `download`, never talk to the server — they read documents previously persisted by `save` straight out of the injected `Storage`; `list` pages through them oldest-first via `offset`/`limit`. There is no listing RPC — `ListDocuments` was removed from `documents.proto`, so `list` only ever sees documents already cached locally by a prior `download`/`download_many`.
+- `service.rs` — `DocumentsClient`, the default `Service` implementation, which composes the crypto and gRPC layers and delegates local, unencrypted persistence to an injected `Storage`. `download`/`download_many` are single round-trips against the server: the server's `FetchDocument`/`FetchDocuments` RPCs return `EncryptedDocument`s (ciphertext content, wrapped DEK, and encrypted metadata together), so no separate lookup is needed to decrypt them. `get` and `list`, unlike `download`, never talk to the server — they read documents previously persisted by `save` straight out of the injected `Storage`; `list` pages through them oldest-first via `offset`/`limit`. There is no listing RPC — `ListDocuments` was removed from `documents.proto`, so `list` only ever sees documents already cached locally by a prior `download`/`download_many`. `sync` delegates straight to the internal `changelog::Service::consume`.
 
 **Known temporary state**: `crypto.rs` derives its KEK from a hard-coded placeholder secret (`TEMP_HARDCODED_KEK_SECRET`), explicitly marked in a doc comment as needing replacement with a real KMS/HSM/secrets-manager-sourced key before handling real data. Don't remove that comment when touching this file unless the underlying issue is actually fixed.
 
-### Changelog service (`src/domains/changelog/`)
+### Changelog service (`src/domains/documents/changelog/`)
+
+A private submodule of `documents` — not a sibling domain. Nothing outside `documents` may reference `changelog::Service`, `changelog::init`, or any other changelog item directly (both are scoped `pub(super)`); the only way to reach the changelog from outside `documents` is `documents::Service::sync`, which just calls `changelog::Service::consume`. `ChangelogEvent`/`EventType` (from `changelog/models.rs`) are the one exception — they're the payload `sync` hands back to callers, so `documents::mod.rs` re-exports them publicly.
 
 Same layering as documents:
 
@@ -41,7 +43,7 @@ Same layering as documents:
 
 ### Layering: simplified hexagonal architecture
 
-Across `documents` and `changelog`, the layer boundary is strict: **all business logic — validation, orchestration, cursor/offset bookkeeping, business rules — lives in `service.rs` and nowhere else.** `grpc_client.rs` is a transport adapter: it only sends proto requests and returns raw proto responses, no business rules. `crypto.rs` is a crypto adapter: it only performs envelope encryption/decryption, no business rules. Storage (`SqliteClient`/injected `Storage`) is a persistence adapter: it only reads/writes rows, no business rules. If you find yourself validating input or making a business decision inside a transport, crypto, or storage file, move it into `service.rs`.
+Across `documents` and `documents::changelog`, the layer boundary is strict: **all business logic — validation, orchestration, cursor/offset bookkeeping, business rules — lives in `service.rs` and nowhere else.** `grpc_client.rs` is a transport adapter: it only sends proto requests and returns raw proto responses, no business rules. `crypto.rs` is a crypto adapter: it only performs envelope encryption/decryption, no business rules. Storage (`SqliteClient`/injected `Storage`) is a persistence adapter: it only reads/writes rows, no business rules. If you find yourself validating input or making a business decision inside a transport, crypto, or storage file, move it into `service.rs`.
 
 ### Testing: `service.rs` tests use `mockall`, not real implementations
 

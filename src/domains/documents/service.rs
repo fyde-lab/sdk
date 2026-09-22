@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::domains::changelog::{EventType, Service as ChangelogService};
 use crate::{Error, ErrorContext as _, Result};
 
+use super::changelog::{ChangelogEvent, EventType, Service as ChangelogService};
 use super::storage::Storage;
 use super::{Document, Metadata, Service, transcript};
 
@@ -121,6 +121,10 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
         Ok(())
     }
+
+    async fn sync(&self, callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
+        self.changelog.consume(callback).await
+    }
 }
 
 #[cfg(test)]
@@ -130,8 +134,6 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
-    use crate::domains::changelog::ChangelogEvent;
-
     use super::super::storage::MockStorage;
     use super::*;
 
@@ -139,11 +141,13 @@ mod tests {
     type SentEvent = (EventType, Uuid, Option<Vec<u8>>, Option<Metadata>);
 
     /// A [`ChangelogService`] fake recording every event passed to
-    /// [`ChangelogService::send`], for tests that don't need a live server.
-    /// `consume` is never exercised through `DocumentsClient`.
+    /// [`ChangelogService::send`], and replaying `to_consume` through
+    /// [`ChangelogService::consume`]'s callback, for tests that don't need
+    /// a live server.
     #[derive(Default)]
     struct RecordingChangelog {
         sent: Mutex<Vec<SentEvent>>,
+        to_consume: Mutex<Vec<ChangelogEvent>>,
     }
 
     #[async_trait]
@@ -164,8 +168,11 @@ mod tests {
             Ok(())
         }
 
-        async fn consume(&self, _callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
-            unimplemented!("not exercised by these tests")
+        async fn consume(&self, mut callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
+            for event in self.to_consume.lock().unwrap().drain(..) {
+                callback(event);
+            }
+            Ok(())
         }
     }
 
@@ -331,5 +338,27 @@ mod tests {
         assert_eq!(metadata.name, "new.pdf");
         assert_eq!(metadata.original_name, "old.pdf");
         assert_eq!(metadata.checksum, "deadbeef");
+    }
+
+    #[tokio::test]
+    async fn sync_delegates_to_the_changelog_services_consume() {
+        let event = super::super::FakeChangelogEvent::new().build();
+
+        let changelog = Arc::new(RecordingChangelog {
+            to_consume: Mutex::new(vec![event.clone()]),
+            ..Default::default()
+        });
+        let client = DocumentsClient::new(MockStorage::new(), changelog);
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_in_callback = received.clone();
+        client
+            .sync(Box::new(move |event| {
+                received_in_callback.lock().unwrap().push(event)
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(*received.lock().unwrap(), vec![event]);
     }
 }

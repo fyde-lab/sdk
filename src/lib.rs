@@ -11,8 +11,7 @@ pub use ffi::{FfiError, FydeClient};
 
 use std::sync::Arc;
 
-pub use domains::changelog::{ChangelogEvent, Service as ChangelogService};
-pub use domains::documents::{Document, Service as DocumentsService};
+pub use domains::documents::{ChangelogEvent, Document, Service as DocumentsService};
 pub use domains::settings::Service as SettingsService;
 pub use domains::users::Service as UsersService;
 
@@ -97,7 +96,6 @@ where
 
 /// A connection to a fyde server.
 pub struct Client {
-    changelog: Arc<dyn ChangelogService>,
     documents: Arc<dyn DocumentsService>,
     sessions: Arc<SessionsClient>,
     settings: Arc<dyn SettingsService>,
@@ -132,21 +130,19 @@ impl Client {
 
         let settings = domains::settings::init(sqlite.pool().clone());
         let sessions = domains::sessions::init(settings.clone());
-        let changelog = domains::changelog::init(
+        let documents = domains::documents::init(
             url,
             sqlite.pool().clone(),
             settings.clone(),
             sessions.clone(),
         )
         .await
-        .context("failed to initialize changelog service")?;
-        let documents = domains::documents::init(sqlite.pool().clone(), changelog.clone());
+        .context("failed to initialize documents service")?;
         let users = domains::users::init(url, settings.clone(), sessions.clone())
             .await
             .context("failed to initialize users service")?;
 
         Ok(Self {
-            changelog,
             documents,
             sessions,
             settings,
@@ -157,11 +153,6 @@ impl Client {
     /// Returns a reference to the client's documents service.
     pub fn documents(&self) -> &dyn DocumentsService {
         self.documents.as_ref()
-    }
-
-    /// Returns a reference to the client's changelog service.
-    pub fn changelog(&self) -> &dyn ChangelogService {
-        self.changelog.as_ref()
     }
 
     /// Returns a reference to the client's users service.
