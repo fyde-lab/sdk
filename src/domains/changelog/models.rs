@@ -21,7 +21,7 @@ pub enum EventType {
 /// `document_id` is meaningful then).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangelogEvent {
-    pub(super) offset: i64,
+    pub(super) id: Uuid,
     pub(super) event_type: EventType,
     pub(super) document_id: Uuid,
     pub(super) content: Option<Vec<u8>>,
@@ -29,8 +29,8 @@ pub struct ChangelogEvent {
 }
 
 impl ChangelogEvent {
-    pub fn offset(&self) -> i64 {
-        self.offset
+    pub fn id(&self) -> Uuid {
+        self.id
     }
 
     pub fn event_type(&self) -> EventType {
@@ -62,7 +62,7 @@ impl FakeChangelogEvent {
     pub(crate) fn new() -> Self {
         Self {
             event: ChangelogEvent {
-                offset: crate::testing::random_u64(10_000) as i64,
+                id: Uuid::now_v7(),
                 event_type: EventType::Created,
                 document_id: Uuid::now_v7(),
                 content: Some(crate::testing::random_bytes(64)),
@@ -71,8 +71,8 @@ impl FakeChangelogEvent {
         }
     }
 
-    pub(crate) fn with_offset(mut self, offset: i64) -> Self {
-        self.event.offset = offset;
+    pub(crate) fn with_id(mut self, id: Uuid) -> Self {
+        self.event.id = id;
         self
     }
 
@@ -152,17 +152,18 @@ mod tests {
 
     #[test]
     fn with_methods_override_every_other_field() {
+        let id = Uuid::now_v7();
         let document_id = Uuid::now_v7();
         let metadata = crate::domains::documents::FakeMetadata::new().build();
 
         let event = FakeChangelogEvent::new()
-            .with_offset(42)
+            .with_id(id)
             .with_event_type(EventType::Deleted)
             .with_document_id(document_id)
             .with_metadata(metadata.clone())
             .build();
 
-        assert_eq!(event.offset, 42);
+        assert_eq!(event.id, id);
         assert_eq!(event.event_type, EventType::Deleted);
         assert_eq!(event.document_id, document_id);
         assert_eq!(event.metadata, Some(metadata));

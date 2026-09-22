@@ -38,15 +38,15 @@ pub trait Service: Send + Sync {
         metadata: Option<&Metadata>,
     ) -> Result<()>;
 
-    /// Streams and decrypts every event since the last consumed offset,
-    /// oldest first (replaying persisted history, then continuing with the
-    /// live tail — see `ConsumeSince` in `changelog.proto`), resuming from
-    /// the cursor persisted locally in the settings store (from the very
+    /// Streams and decrypts every event since the last consumed id, oldest
+    /// first (replaying persisted history, then continuing with the live
+    /// tail — see `ConsumeSince` in `changelog.proto`), resuming from the
+    /// cursor persisted locally in the settings store (from the very
     /// beginning of the changelog if it's never been consumed before). For
     /// each `Created` event, caches the resulting document in
-    /// local storage before invoking `callback`; the offset cursor is
-    /// persisted as each event is processed, so a later call resumes right
-    /// after the last event seen.
+    /// local storage before invoking `callback`; the cursor is persisted
+    /// as each event is processed, so a later call resumes right after the
+    /// last event seen.
     ///
     /// Fails with [`crate::Error::InvalidChangelogEvent`] if a `Created`
     /// event is missing its `content` or `metadata` — a `Created` event
@@ -59,8 +59,8 @@ pub trait Service: Send + Sync {
 /// Initializes the changelog service: connects to the fyde server at
 /// `base_url`, and uses `pool` to cache documents materialized from
 /// consumed events directly into the local `documents` table, `settings`
-/// to persist the changelog offset consumed so far (see
-/// [`storage_settings::SettingsOffsetStorage`]), and `sessions` to attach
+/// to persist the changelog cursor consumed so far (see
+/// [`storage_settings::SettingsCursorStorage`]), and `sessions` to attach
 /// the session token as a bearer `authorization` header on every outgoing
 /// call once a session is opened (see
 /// [`crate::domains::sessions::Service::authenticated_request`]).
@@ -71,9 +71,9 @@ pub(crate) async fn init(
     sessions: Arc<SessionsClient>,
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool);
-    let offset_storage = storage_settings::SettingsOffsetStorage::new(settings);
+    let cursor_storage = storage_settings::SettingsCursorStorage::new(settings);
     let client =
-        service::ChangelogClient::new(base_url, document_storage, offset_storage, sessions)
+        service::ChangelogClient::new(base_url, document_storage, cursor_storage, sessions)
             .await
             .context("failed to create changelog client")?;
 

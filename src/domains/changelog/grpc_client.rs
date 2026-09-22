@@ -5,6 +5,7 @@ use futures::stream::BoxStream;
 #[cfg(test)]
 use mockall::automock;
 use tonic::transport::Channel;
+use uuid::Uuid;
 
 use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::{Error, ErrorContext as _, Result};
@@ -33,14 +34,14 @@ pub(super) type EventStream =
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(super) trait FydeClient: Send + Sync {
-    /// Submits a new, already-encrypted event, returning its assigned
-    /// offset.
-    async fn record_event(&self, encrypted_content: Vec<u8>) -> Result<i64>;
+    /// Submits a new, already-encrypted event, returning its assigned id.
+    async fn record_event(&self, encrypted_content: Vec<u8>) -> Result<Uuid>;
 
-    /// Streams every entry from `offset` onward, oldest first: replays
-    /// persisted history, then continues with the live tail. An `offset`
-    /// of 0 means "from the beginning of the changelog".
-    async fn consume_since(&self, offset: i64) -> Result<EventStream>;
+    /// Streams every entry with an id greater than or equal to `id`,
+    /// oldest first: replays persisted history, then continues with the
+    /// live tail. [`Uuid::nil`] means "from the beginning of the
+    /// changelog".
+    async fn consume_since(&self, id: Uuid) -> Result<EventStream>;
 }
 
 /// The production [`FydeClient`] implementation, backed by a real tonic
@@ -74,7 +75,7 @@ impl GrpcClient {
 
 #[async_trait]
 impl FydeClient for GrpcClient {
-    async fn record_event(&self, encrypted_content: Vec<u8>) -> Result<i64> {
+    async fn record_event(&self, encrypted_content: Vec<u8>) -> Result<Uuid> {
         let request = self
             .sessions
             .authenticated_request(RecordEventRequest { encrypted_content })
@@ -91,13 +92,18 @@ impl FydeClient for GrpcClient {
             .context("failed to record changelog event")?
             .into_inner();
 
-        Ok(response.offset)
+        Uuid::parse_str(&response.id).with_context(|| {
+            format!(
+                "invalid changelog event id {:?} returned by server",
+                response.id
+            )
+        })
     }
 
-    async fn consume_since(&self, offset: i64) -> Result<EventStream> {
+    async fn consume_since(&self, id: Uuid) -> Result<EventStream> {
         let request = self
             .sessions
-            .authenticated_request(ConsumeSinceRequest { offset })
+            .authenticated_request(ConsumeSinceRequest { id: id.to_string() })
             .await?;
 
         let response = self
@@ -105,7 +111,7 @@ impl FydeClient for GrpcClient {
             .clone()
             .consume_since(request)
             .await
-            .with_context(|| format!("failed to consume changelog events since offset {offset}"))?;
+            .with_context(|| format!("failed to consume changelog events since id {id}"))?;
         Ok(Box::pin(response.into_inner()))
     }
 }

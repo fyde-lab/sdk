@@ -107,12 +107,12 @@ impl From<EventType> for FfiEventType {
 }
 
 /// A single recorded write against a document, mirroring [`ChangelogEvent`]
-/// across the FFI boundary. `document_id` crosses as a string since UniFFI
-/// has no native UUID type. `content`/`metadata` are `None` for event types
-/// that don't carry them.
+/// across the FFI boundary. `id`/`document_id` cross as strings since
+/// UniFFI has no native UUID type. `content`/`metadata` are `None` for
+/// event types that don't carry them.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiChangelogEvent {
-    pub offset: i64,
+    pub id: String,
     pub event_type: FfiEventType,
     pub document_id: String,
     pub content: Option<Vec<u8>>,
@@ -122,7 +122,7 @@ pub struct FfiChangelogEvent {
 impl From<ChangelogEvent> for FfiChangelogEvent {
     fn from(event: ChangelogEvent) -> Self {
         Self {
-            offset: event.offset(),
+            id: event.id().to_string(),
             event_type: event.event_type().into(),
             document_id: event.document_id().to_string(),
             content: event.content().map(<[u8]>::to_vec),
@@ -266,7 +266,7 @@ impl FydeClient {
     }
 
     /// Streams and decrypts every changelog event since the last consumed
-    /// offset, invoking `listener` once for each (replaying history, then
+    /// id, invoking `listener` once for each (replaying history, then
     /// continuing with the live tail). Resumes from the cursor persisted
     /// locally by a previous call, or from the beginning of the changelog
     /// if there is none. Runs until the server closes the stream or an
@@ -345,9 +345,10 @@ mod tests {
 
     #[test]
     fn changelog_event_conversion_stringifies_the_document_id_and_preserves_payload() {
+        let id = Uuid::now_v7();
         let document_id = Uuid::now_v7();
         let event = FakeChangelogEvent::new()
-            .with_offset(7)
+            .with_id(id)
             .with_event_type(EventType::Created)
             .with_document_id(document_id)
             .with_content(b"body".to_vec())
@@ -356,7 +357,7 @@ mod tests {
 
         let ffi: FfiChangelogEvent = event.into();
 
-        assert_eq!(ffi.offset, 7);
+        assert_eq!(ffi.id, id.to_string());
         assert!(matches!(ffi.event_type, FfiEventType::Created));
         assert_eq!(ffi.document_id, document_id.to_string());
         assert_eq!(ffi.content, Some(b"body".to_vec()));
@@ -366,7 +367,6 @@ mod tests {
     #[test]
     fn changelog_event_conversion_handles_events_with_no_content_or_metadata() {
         let event = FakeChangelogEvent::new()
-            .with_offset(1)
             .with_event_type(EventType::Deleted)
             .with_document_id(Uuid::now_v7())
             .without_content()

@@ -35,7 +35,7 @@ const WRAPPED_KEY_LEN: usize = NONCE_LEN + KEY_LEN + TAG_LEN;
 const TEMP_HARDCODED_KEK_SECRET: &[u8] = b"CHANGE-ME-temporary-development-only-secret";
 
 /// The plaintext shape of a changelog event, MessagePack-serialized then
-/// encrypted as a whole. Mirrors [`super::ChangelogEvent`] minus `offset`
+/// encrypted as a whole. Mirrors [`super::ChangelogEvent`] minus `id`
 /// (assigned by the server, sent alongside the encrypted blob in the
 /// clear).
 #[derive(Serialize, Deserialize)]
