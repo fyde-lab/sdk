@@ -48,6 +48,14 @@ pub trait Service: Send + Sync {
     /// Paginate by repeatedly incrementing `offset` by the returned page's
     /// length until it comes back shorter than `limit`.
     async fn list(&self, offset: i64, limit: i64) -> Result<Vec<Document>>;
+
+    /// Renames a previously cached document: loads its current metadata,
+    /// replaces its `name`, encrypts the result, and publishes it as an
+    /// "update metadata" changelog event.
+    ///
+    /// Fails with [`crate::Error::DocumentNotFound`] if `id` isn't cached
+    /// locally (see [`Self::get`]).
+    async fn update_name(&self, id: Uuid, name: String) -> Result<()>;
 }
 
 /// Initializes the documents service: wires up local SQLite-backed caching

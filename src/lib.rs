@@ -1,5 +1,5 @@
-mod ffi;
 mod domains;
+mod ffi;
 #[path = "tools/sql/mod.rs"]
 mod sql;
 #[cfg(test)]
@@ -45,6 +45,8 @@ pub enum Error {
     Pdf(#[from] lopdf::Error),
     #[error("unsupported document extension {0:?}: only .pdf is supported")]
     UnsupportedDocumentExtension(String),
+    #[error("document {0} not found in local cache")]
+    DocumentNotFound(uuid::Uuid),
     #[error("invalid changelog event: {0}")]
     InvalidChangelogEvent(String),
     #[error("invalid server response: {0}")]

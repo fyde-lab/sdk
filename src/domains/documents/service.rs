@@ -105,6 +105,27 @@ impl<S: Storage> Service for DocumentsClient<S> {
     async fn list(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
         self.storage.list_documents(offset, limit).await
     }
+
+    async fn update_name(&self, id: Uuid, name: String) -> Result<()> {
+        let document = self
+            .storage
+            .get_document(id)
+            .await
+            .with_context(|| format!("failed to load document {id} for name update"))?
+            .ok_or(Error::DocumentNotFound(id))?;
+
+        let metadata = Metadata {
+            name,
+            ..document.metadata
+        };
+
+        self.changelog
+            .send(EventType::UpdateMetadata, id, None, Some(&metadata))
+            .await
+            .with_context(|| format!("failed to publish changelog event for document {id}"))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -278,5 +299,64 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["two", "three"]
         );
+    }
+
+    #[tokio::test]
+    async fn update_name_publishes_an_update_metadata_event_with_the_new_name() {
+        let id = Uuid::now_v7();
+        let document = Document {
+            id,
+            content: b"hello".to_vec(),
+            metadata: Metadata {
+                id,
+                name: "old.pdf".to_string(),
+                content_type: PDF_CONTENT_TYPE.to_string(),
+                created_at: 1_700_000_000,
+                size: 5,
+                checksum: "deadbeef".to_string(),
+                transcript: String::new(),
+            },
+        };
+
+        let mut storage = MockStorage::new();
+        let expected = document.clone();
+        storage
+            .expect_get_document()
+            .withf(move |queried_id| *queried_id == id)
+            .times(1)
+            .returning(move |_| Ok(Some(expected.clone())));
+
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = DocumentsClient::new(storage, changelog.clone());
+
+        client.update_name(id, "new.pdf".to_string()).await.unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let (event_type, document_id, content, metadata) = &sent[0];
+        assert_eq!(*event_type, EventType::UpdateMetadata);
+        assert_eq!(*document_id, id);
+        assert_eq!(*content, None);
+        let metadata = metadata.as_ref().unwrap();
+        assert_eq!(metadata.name, "new.pdf");
+        assert_eq!(metadata.checksum, "deadbeef");
+    }
+
+    #[tokio::test]
+    async fn update_name_fails_when_the_document_is_not_cached_locally() {
+        let id = Uuid::now_v7();
+
+        let mut storage = MockStorage::new();
+        storage
+            .expect_get_document()
+            .withf(move |queried_id| *queried_id == id)
+            .times(1)
+            .returning(|_| Ok(None));
+
+        let client = DocumentsClient::new(storage, Arc::new(RecordingChangelog::default()));
+
+        let result = client.update_name(id, "new.pdf".to_string()).await;
+
+        assert!(matches!(result, Err(Error::DocumentNotFound(err_id)) if err_id == id));
     }
 }
