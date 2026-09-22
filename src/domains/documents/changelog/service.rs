@@ -132,21 +132,43 @@ impl<D: DocumentStorage, O: CursorStorage> Service for ChangelogClient<D, O> {
             let proto_event = proto_event.context("failed to read next changelog event")?;
             let event = ChangelogEvent::try_from(proto_event)?;
 
-            if event.event_type == EventType::Created {
-                let (Some(content), Some(metadata)) = (&event.content, &event.metadata) else {
-                    return Err(Error::InvalidChangelogEvent(format!(
-                        "created event {} for document {} is missing content or metadata",
-                        event.id, event.document_id
-                    )));
-                };
+            match event.event_type {
+                EventType::Created => {
+                    let (Some(content), Some(metadata)) = (&event.content, &event.metadata) else {
+                        return Err(Error::InvalidChangelogEvent(format!(
+                            "created event {} for document {} is missing content or metadata",
+                            event.id, event.document_id
+                        )));
+                    };
 
-                let document = Document::new(event.document_id, content.clone(), metadata.clone());
-                self.document_storage
-                    .save_document(&document)
-                    .await
-                    .with_context(|| {
-                        format!("failed to cache document {} locally", event.document_id)
-                    })?;
+                    let document =
+                        Document::new(event.document_id, content.clone(), metadata.clone());
+                    self.document_storage
+                        .save_document(&document)
+                        .await
+                        .with_context(|| {
+                            format!("failed to cache document {} locally", event.document_id)
+                        })?;
+                }
+                EventType::UpdateMetadata => {
+                    let Some(metadata) = &event.metadata else {
+                        return Err(Error::InvalidChangelogEvent(format!(
+                            "update metadata event {} for document {} is missing metadata",
+                            event.id, event.document_id
+                        )));
+                    };
+
+                    self.document_storage
+                        .update_metadata(event.document_id, metadata)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to update cached document {} locally",
+                                event.document_id
+                            )
+                        })?;
+                }
+                EventType::Deleted => {}
             }
 
             let next_cursor = successor(event.id);
@@ -244,7 +266,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_does_not_cache_the_document_for_a_non_created_event() {
+    async fn consume_does_not_cache_the_document_for_a_deleted_event() {
+        let document_id = Uuid::now_v7();
+        let event_id = Uuid::now_v7();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(vec![Ok(proto_event_with_type(
+                event_id,
+                document_id,
+                EventType::Deleted,
+            ))])
+            .boxed())
+        });
+
+        // No `expect_save_document()`/`expect_get_document()` set up: the
+        // mock panics if either is called, which is how this test proves
+        // neither is.
+        let document_storage = MockStorage::new();
+
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+        cursor_storage
+            .expect_save_cursor()
+            .withf(move |id| *id == successor(event_id))
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let client = ChangelogClient::with_grpc(mock_grpc, document_storage, cursor_storage);
+
+        client.consume(Box::new(|_| {})).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn consume_updates_the_cached_documents_metadata_for_an_update_metadata_event() {
         let document_id = Uuid::now_v7();
         let event_id = Uuid::now_v7();
 
@@ -258,9 +315,12 @@ mod tests {
             .boxed())
         });
 
-        // No `expect_save_document()` set up: the mock panics if it's
-        // called, which is how this test proves it isn't.
-        let document_storage = MockStorage::new();
+        let mut document_storage = MockStorage::new();
+        document_storage
+            .expect_update_metadata()
+            .withf(move |id, _metadata| *id == document_id)
+            .times(1)
+            .returning(|_, _| Ok(()));
 
         let mut cursor_storage = MockCursorStorage::new();
         cursor_storage

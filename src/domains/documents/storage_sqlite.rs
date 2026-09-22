@@ -108,6 +108,26 @@ impl Storage for SqliteStorage {
             })
             .collect()
     }
+
+    async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()> {
+        sqlx::query(
+            "UPDATE documents
+             SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6
+             WHERE id = ?7",
+        )
+        .bind(&metadata.name)
+        .bind(&metadata.original_name)
+        .bind(&metadata.content_type)
+        .bind(&metadata.checksum)
+        .bind(metadata.created_at)
+        .bind(&metadata.transcript)
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("failed to update document {id} metadata in local database"))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -290,5 +310,72 @@ mod tests {
         let page = storage.list_documents(5, 2).await.unwrap();
 
         assert_eq!(page, Vec::new());
+    }
+
+    #[tokio::test]
+    async fn update_metadata_replaces_metadata_and_leaves_content_untouched() {
+        let storage = setup().await;
+        let id = Uuid::now_v7();
+        storage
+            .save_document(&Document {
+                id,
+                content: b"hello".to_vec(),
+                metadata: Metadata {
+                    id,
+                    name: "old.pdf".to_string(),
+                    original_name: "old.pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    created_at: 1_700_000_000,
+                    size: 5,
+                    checksum: "deadbeef".to_string(),
+                    transcript: "hello".to_string(),
+                },
+            })
+            .await
+            .unwrap();
+
+        storage
+            .update_metadata(
+                id,
+                &Metadata {
+                    id,
+                    name: "new.pdf".to_string(),
+                    original_name: "old.pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    created_at: 1_700_000_000,
+                    size: 0,
+                    checksum: "deadbeef".to_string(),
+                    transcript: "hello".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let document = storage.get_document(id).await.unwrap().unwrap();
+        assert_eq!(document.metadata.name, "new.pdf");
+        assert_eq!(document.content, b"hello");
+    }
+
+    #[tokio::test]
+    async fn update_metadata_does_nothing_when_no_document_matches_the_id() {
+        let storage = setup().await;
+
+        let result = storage
+            .update_metadata(
+                Uuid::now_v7(),
+                &Metadata {
+                    id: Uuid::now_v7(),
+                    name: "new.pdf".to_string(),
+                    original_name: "new.pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    created_at: 1_700_000_000,
+                    size: 0,
+                    checksum: String::new(),
+                    transcript: String::new(),
+                },
+            )
+            .await;
+
+        assert!(result.is_ok());
     }
 }

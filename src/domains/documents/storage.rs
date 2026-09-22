@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::Result;
 
-use super::Document;
+use super::{Document, Metadata};
 
 /// Caches documents, unencrypted, locally. Implementations are injected
 /// into [`super::service::DocumentsClient`] (to cache what it uploads) and
@@ -24,4 +24,9 @@ pub(crate) trait Storage: Send + Sync {
     /// Lists documents previously saved locally by [`Self::save_document`],
     /// ordered oldest first, skipping `offset` and returning at most `limit`.
     async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>>;
+
+    /// Replaces the metadata of the document `id`, leaving its content
+    /// untouched. Does nothing if no document with `id` was previously
+    /// saved locally.
+    async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()>;
 }
