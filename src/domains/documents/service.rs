@@ -78,6 +78,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
         let metadata = Metadata {
             id,
+            original_name: name.clone(),
             name,
             content_type: PDF_CONTENT_TYPE.to_string(),
             created_at,
@@ -222,6 +223,7 @@ mod tests {
             metadata: Metadata {
                 id,
                 name: "report.pdf".to_string(),
+                original_name: "report.pdf".to_string(),
                 content_type: PDF_CONTENT_TYPE.to_string(),
                 created_at: 1_700_000_000,
                 size: 5,
@@ -253,6 +255,7 @@ mod tests {
                 metadata: Metadata {
                     id: id_two,
                     name: "two".to_string(),
+                    original_name: "two".to_string(),
                     content_type: PDF_CONTENT_TYPE.to_string(),
                     created_at: 1_700_000_001,
                     size: 0,
@@ -266,6 +269,7 @@ mod tests {
                 metadata: Metadata {
                     id: id_three,
                     name: "three".to_string(),
+                    original_name: "three".to_string(),
                     content_type: PDF_CONTENT_TYPE.to_string(),
                     created_at: 1_700_000_002,
                     size: 0,
@@ -301,6 +305,7 @@ mod tests {
         let metadata = Metadata {
             id,
             name: "old.pdf".to_string(),
+            original_name: "old.pdf".to_string(),
             content_type: PDF_CONTENT_TYPE.to_string(),
             created_at: 1_700_000_000,
             size: 5,
@@ -324,6 +329,7 @@ mod tests {
         assert_eq!(*content, None);
         let metadata = metadata.as_ref().unwrap();
         assert_eq!(metadata.name, "new.pdf");
+        assert_eq!(metadata.original_name, "old.pdf");
         assert_eq!(metadata.checksum, "deadbeef");
     }
 }

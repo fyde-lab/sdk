@@ -7,6 +7,9 @@ use uuid::Uuid;
 pub struct Metadata {
     pub(super) id: Uuid,
     pub(super) name: String,
+    /// The file name as originally uploaded. Unlike `name`, this never
+    /// changes after creation.
+    pub(super) original_name: String,
     pub(super) content_type: String,
     pub(super) created_at: i64,
     pub(super) size: u64,
@@ -23,6 +26,10 @@ impl Metadata {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn original_name(&self) -> &str {
+        &self.original_name
     }
 
     pub fn content_type(&self) -> &str {
@@ -91,10 +98,12 @@ pub(crate) struct FakeMetadata {
 #[cfg(test)]
 impl FakeMetadata {
     pub(crate) fn new() -> Self {
+        let name = format!("{}.pdf", crate::testing::random_word());
         Self {
             metadata: Metadata {
                 id: Uuid::now_v7(),
-                name: format!("{}.pdf", crate::testing::random_word()),
+                original_name: name.clone(),
+                name,
                 content_type: "application/pdf".to_string(),
                 created_at: crate::testing::random_past_timestamp(),
                 size: 1024 + crate::testing::random_u64(10 * 1024 * 1024),
@@ -114,6 +123,11 @@ impl FakeMetadata {
 
     pub(crate) fn with_name(mut self, name: impl Into<String>) -> Self {
         self.metadata.name = name.into();
+        self
+    }
+
+    pub(crate) fn with_original_name(mut self, original_name: impl Into<String>) -> Self {
+        self.metadata.original_name = original_name.into();
         self
     }
 
@@ -207,6 +221,7 @@ mod tests {
         let metadata = FakeMetadata::new()
             .with_id(id)
             .with_name("report.pdf")
+            .with_original_name("original-report.pdf")
             .with_content_type("application/pdf")
             .with_created_at(1_700_000_000)
             .with_size(42)
@@ -216,6 +231,7 @@ mod tests {
 
         assert_eq!(metadata.id, id);
         assert_eq!(metadata.name, "report.pdf");
+        assert_eq!(metadata.original_name, "original-report.pdf");
         assert_eq!(metadata.content_type, "application/pdf");
         assert_eq!(metadata.created_at, 1_700_000_000);
         assert_eq!(metadata.size, 42);

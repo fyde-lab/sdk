@@ -23,11 +23,12 @@ impl SqliteStorage {
 impl Storage for SqliteStorage {
     async fn save_document(&self, document: &Document) -> Result<()> {
         sqlx::query(
-            "INSERT INTO documents (id, name, content_type, content, checksum, created_at, transcript)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .bind(document.id.to_string())
         .bind(&document.metadata.name)
+        .bind(&document.metadata.original_name)
         .bind(&document.metadata.content_type)
         .bind(&document.content)
         .bind(&document.metadata.checksum)
@@ -42,7 +43,7 @@ impl Storage for SqliteStorage {
 
     async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
         let row = sqlx::query(
-            "SELECT name, content_type, content, checksum, created_at, transcript FROM documents WHERE id = ?1",
+            "SELECT name, original_name, content_type, content, checksum, created_at, transcript FROM documents WHERE id = ?1",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -60,6 +61,7 @@ impl Storage for SqliteStorage {
             metadata: Metadata {
                 id,
                 name: row.get("name"),
+                original_name: row.get("original_name"),
                 content_type: row.get("content_type"),
                 created_at: row.get("created_at"),
                 size: content.len() as u64,
@@ -72,7 +74,7 @@ impl Storage for SqliteStorage {
 
     async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
         let rows = sqlx::query(
-            "SELECT id, name, content_type, content, checksum, created_at, transcript FROM documents
+            "SELECT id, name, original_name, content_type, content, checksum, created_at, transcript FROM documents
              ORDER BY created_at ASC, id ASC
              LIMIT ?1 OFFSET ?2",
         )
@@ -94,6 +96,7 @@ impl Storage for SqliteStorage {
                     metadata: Metadata {
                         id,
                         name: row.get("name"),
+                        original_name: row.get("original_name"),
                         content_type: row.get("content_type"),
                         created_at: row.get("created_at"),
                         size: content.len() as u64,
@@ -148,6 +151,7 @@ mod tests {
                 metadata: Metadata {
                     id,
                     name: "report.pdf".to_string(),
+                    original_name: "report.pdf".to_string(),
                     content_type: "application/pdf".to_string(),
                     created_at: 1_700_000_000,
                     size: 5,
@@ -168,6 +172,7 @@ mod tests {
                 metadata: Metadata {
                     id,
                     name: "report.pdf".to_string(),
+                    original_name: "report.pdf".to_string(),
                     content_type: "application/pdf".to_string(),
                     created_at: 1_700_000_000,
                     size: 5,
@@ -190,6 +195,7 @@ mod tests {
                 metadata: Metadata {
                     id: id1,
                     name: "one.txt".to_string(),
+                    original_name: "one.txt".to_string(),
                     content_type: "text/plain".to_string(),
                     created_at: 1_700_000_000,
                     size: 3,
@@ -206,6 +212,7 @@ mod tests {
                 metadata: Metadata {
                     id: id2,
                     name: "two.txt".to_string(),
+                    original_name: "two.txt".to_string(),
                     content_type: "text/plain".to_string(),
                     created_at: 1_700_000_001,
                     size: 3,
@@ -232,6 +239,7 @@ mod tests {
                     metadata: Metadata {
                         id,
                         name: name.to_string(),
+                        original_name: name.to_string(),
                         content_type: "text/plain".to_string(),
                         created_at: 1_700_000_000 + i as i64,
                         size: 0,

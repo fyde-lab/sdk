@@ -47,6 +47,7 @@ fn parse_uuid(id: &str) -> Result<Uuid, FfiError> {
 pub struct FfiMetadata {
     pub id: String,
     pub name: String,
+    pub original_name: String,
     pub content_type: String,
     pub created_at: i64,
     pub size: u64,
@@ -59,6 +60,7 @@ impl From<Metadata> for FfiMetadata {
         Self {
             id: metadata.id().to_string(),
             name: metadata.name().to_string(),
+            original_name: metadata.original_name().to_string(),
             content_type: metadata.content_type().to_string(),
             created_at: metadata.created_at(),
             size: metadata.size(),
