@@ -5,6 +5,7 @@ use uuid::Uuid;
 /// decrypted back out of it on download.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metadata {
+    pub(super) id: Uuid,
     pub(super) name: String,
     pub(super) content_type: String,
     pub(super) created_at: i64,
@@ -16,6 +17,10 @@ pub struct Metadata {
 }
 
 impl Metadata {
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -88,6 +93,7 @@ impl FakeMetadata {
     pub(crate) fn new() -> Self {
         Self {
             metadata: Metadata {
+                id: Uuid::now_v7(),
                 name: format!("{}.pdf", crate::testing::random_word()),
                 content_type: "application/pdf".to_string(),
                 created_at: crate::testing::random_past_timestamp(),
@@ -99,6 +105,11 @@ impl FakeMetadata {
                 ),
             },
         }
+    }
+
+    pub(crate) fn with_id(mut self, id: Uuid) -> Self {
+        self.metadata.id = id;
+        self
     }
 
     pub(crate) fn with_name(mut self, name: impl Into<String>) -> Self {
@@ -146,17 +157,19 @@ pub(crate) struct FakeDocument {
 #[cfg(test)]
 impl FakeDocument {
     pub(crate) fn new() -> Self {
+        let id = Uuid::now_v7();
         Self {
             document: Document {
-                id: Uuid::now_v7(),
+                id,
                 content: crate::testing::random_bytes(64),
-                metadata: FakeMetadata::new().build(),
+                metadata: FakeMetadata::new().with_id(id).build(),
             },
         }
     }
 
     pub(crate) fn with_id(mut self, id: Uuid) -> Self {
         self.document.id = id;
+        self.document.metadata.id = id;
         self
     }
 
@@ -190,7 +203,9 @@ mod tests {
 
     #[test]
     fn fake_metadata_with_methods_override_defaults() {
+        let id = Uuid::now_v7();
         let metadata = FakeMetadata::new()
+            .with_id(id)
             .with_name("report.pdf")
             .with_content_type("application/pdf")
             .with_created_at(1_700_000_000)
@@ -199,6 +214,7 @@ mod tests {
             .with_transcript("hello world")
             .build();
 
+        assert_eq!(metadata.id, id);
         assert_eq!(metadata.name, "report.pdf");
         assert_eq!(metadata.content_type, "application/pdf");
         assert_eq!(metadata.created_at, 1_700_000_000);

@@ -58,6 +58,7 @@ impl Storage for SqliteStorage {
         Ok(Some(Document {
             id,
             metadata: Metadata {
+                id,
                 name: row.get("name"),
                 content_type: row.get("content_type"),
                 created_at: row.get("created_at"),
@@ -85,11 +86,13 @@ impl Storage for SqliteStorage {
             .map(|row| {
                 let id: String = row.get("id");
                 let content: Vec<u8> = row.get("content");
+                let id = Uuid::parse_str(&id)
+                    .with_context(|| format!("invalid document id in local database: {id}"))?;
 
                 Ok(Document {
-                    id: Uuid::parse_str(&id)
-                        .with_context(|| format!("invalid document id in local database: {id}"))?,
+                    id,
                     metadata: Metadata {
+                        id,
                         name: row.get("name"),
                         content_type: row.get("content_type"),
                         created_at: row.get("created_at"),
@@ -143,6 +146,7 @@ mod tests {
                 id,
                 content: b"hello".to_vec(),
                 metadata: Metadata {
+                    id,
                     name: "report.pdf".to_string(),
                     content_type: "application/pdf".to_string(),
                     created_at: 1_700_000_000,
@@ -162,6 +166,7 @@ mod tests {
                 id,
                 content: b"hello".to_vec(),
                 metadata: Metadata {
+                    id,
                     name: "report.pdf".to_string(),
                     content_type: "application/pdf".to_string(),
                     created_at: 1_700_000_000,
@@ -183,6 +188,7 @@ mod tests {
                 id: id1,
                 content: b"one".to_vec(),
                 metadata: Metadata {
+                    id: id1,
                     name: "one.txt".to_string(),
                     content_type: "text/plain".to_string(),
                     created_at: 1_700_000_000,
@@ -198,6 +204,7 @@ mod tests {
                 id: id2,
                 content: b"two".to_vec(),
                 metadata: Metadata {
+                    id: id2,
                     name: "two.txt".to_string(),
                     content_type: "text/plain".to_string(),
                     created_at: 1_700_000_001,
@@ -217,11 +224,13 @@ mod tests {
 
     async fn save_documents(storage: &SqliteStorage, names: &[&str]) {
         for (i, name) in names.iter().enumerate() {
+            let id = Uuid::now_v7();
             storage
                 .save_document(&Document {
-                    id: Uuid::now_v7(),
+                    id,
                     content: Vec::new(),
                     metadata: Metadata {
+                        id,
                         name: name.to_string(),
                         content_type: "text/plain".to_string(),
                         created_at: 1_700_000_000 + i as i64,

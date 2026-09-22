@@ -45,6 +45,7 @@ fn parse_uuid(id: &str) -> Result<Uuid, FfiError> {
 /// boundary.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiMetadata {
+    pub id: String,
     pub name: String,
     pub content_type: String,
     pub created_at: i64,
@@ -56,6 +57,7 @@ pub struct FfiMetadata {
 impl From<Metadata> for FfiMetadata {
     fn from(metadata: Metadata) -> Self {
         Self {
+            id: metadata.id().to_string(),
             name: metadata.name().to_string(),
             content_type: metadata.content_type().to_string(),
             created_at: metadata.created_at(),
@@ -302,6 +304,7 @@ mod tests {
 
         let ffi: FfiMetadata = metadata.clone().into();
 
+        assert_eq!(ffi.id, metadata.id().to_string());
         assert_eq!(ffi.name, metadata.name());
         assert_eq!(ffi.content_type, metadata.content_type());
         assert_eq!(ffi.created_at, metadata.created_at());

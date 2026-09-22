@@ -74,7 +74,10 @@ impl<S: Storage> Service for DocumentsClient<S> {
         let doc_transcript =
             transcript::extract(&content).context("failed to extract document transcript")?;
 
+        let id = Uuid::now_v7();
+
         let metadata = Metadata {
+            id,
             name,
             content_type: PDF_CONTENT_TYPE.to_string(),
             created_at,
@@ -86,8 +89,6 @@ impl<S: Storage> Service for DocumentsClient<S> {
                 .collect(),
             transcript: doc_transcript,
         };
-
-        let id = Uuid::now_v7();
 
         self.changelog
             .send(EventType::Created, id, Some(&content), Some(&metadata))
@@ -204,6 +205,7 @@ mod tests {
             id,
             content: b"hello".to_vec(),
             metadata: Metadata {
+                id,
                 name: "report.pdf".to_string(),
                 content_type: PDF_CONTENT_TYPE.to_string(),
                 created_at: 1_700_000_000,
@@ -228,11 +230,13 @@ mod tests {
 
     #[tokio::test]
     async fn list_pages_through_documents_previously_cached_locally() {
+        let (id_two, id_three) = (Uuid::now_v7(), Uuid::now_v7());
         let page = vec![
             Document {
-                id: Uuid::now_v7(),
+                id: id_two,
                 content: Vec::new(),
                 metadata: Metadata {
+                    id: id_two,
                     name: "two".to_string(),
                     content_type: PDF_CONTENT_TYPE.to_string(),
                     created_at: 1_700_000_001,
@@ -242,9 +246,10 @@ mod tests {
                 },
             },
             Document {
-                id: Uuid::now_v7(),
+                id: id_three,
                 content: Vec::new(),
                 metadata: Metadata {
+                    id: id_three,
                     name: "three".to_string(),
                     content_type: PDF_CONTENT_TYPE.to_string(),
                     created_at: 1_700_000_002,
