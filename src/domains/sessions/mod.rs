@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use mockall::automock;
 
 use crate::Result;
-use crate::services::settings::Service as SettingsService;
+use crate::domains::settings::Service as SettingsService;
 
 pub(crate) use service::SessionsClient;
 

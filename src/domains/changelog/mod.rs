@@ -14,9 +14,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 
-use crate::services::documents::{self, Metadata};
-use crate::services::sessions::SessionsClient;
-use crate::services::settings::Service as SettingsService;
+use crate::domains::documents::{self, Metadata};
+use crate::domains::sessions::SessionsClient;
+use crate::domains::settings::Service as SettingsService;
 use crate::{ErrorContext as _, Result};
 
 /// Publishes and consumes the fyde server's changelog: a blind relay for
@@ -63,7 +63,7 @@ pub trait Service: Send + Sync {
 /// [`storage_settings::SettingsOffsetStorage`]), and `sessions` to attach
 /// the session token as a bearer `authorization` header on every outgoing
 /// call once a session is opened (see
-/// [`crate::services::sessions::Service::authenticated_request`]).
+/// [`crate::domains::sessions::Service::authenticated_request`]).
 pub(crate) async fn init(
     base_url: impl AsRef<str>,
     pool: SqlitePool,

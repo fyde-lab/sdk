@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::services::changelog::EventType;
-use crate::services::documents::Metadata;
-use crate::services::sessions::Service as SessionsService;
+use crate::domains::changelog::EventType;
+use crate::domains::documents::Metadata;
+use crate::domains::sessions::Service as SessionsService;
 use crate::{ChangelogEvent, Client, Document, Error};
 
 /// Error type surfaced to FFI callers. UniFFI requires exported errors to be
@@ -281,8 +281,8 @@ impl FydeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::changelog::{EventType, FakeChangelogEvent};
-    use crate::services::documents::{FakeDocument, FakeMetadata};
+    use crate::domains::changelog::{EventType, FakeChangelogEvent};
+    use crate::domains::documents::{FakeDocument, FakeMetadata};
 
     #[test]
     fn parse_uuid_accepts_a_canonical_uuid() {

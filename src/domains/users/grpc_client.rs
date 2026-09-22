@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use mockall::automock;
 use tonic::transport::Channel;
 
-use crate::services::sessions::{Service as SessionsService, SessionsClient};
+use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::{Error, ErrorContext as _, Result};
 
 /// Generated protobuf/gRPC bindings for the `users` service, compiled from
@@ -37,7 +37,7 @@ pub(super) trait FydeClient: Send + Sync {
     async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String>;
 
     /// Closes the session currently authenticating outgoing calls (see
-    /// [`crate::services::sessions::Service::authenticated_request`]).
+    /// [`crate::domains::sessions::Service::authenticated_request`]).
     async fn logout(&self) -> Result<()>;
 }
 
@@ -45,7 +45,7 @@ pub(super) trait FydeClient: Send + Sync {
 /// connection. Every call, including `logout` itself, is authenticated by
 /// attaching the session token currently persisted in settings (if any) as
 /// a bearer `authorization` header (see
-/// [`crate::services::sessions::Service::authenticated_request`]).
+/// [`crate::domains::sessions::Service::authenticated_request`]).
 pub(super) struct GrpcClient {
     client: GeneratedUsersClient<Channel>,
     sessions: Arc<SessionsClient>,
@@ -141,7 +141,7 @@ impl FydeClient for GrpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::settings::MockService as MockSettingsService;
+    use crate::domains::settings::MockService as MockSettingsService;
 
     #[tokio::test]
     async fn new_rejects_a_malformed_base_url() {

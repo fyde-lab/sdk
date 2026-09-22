@@ -20,7 +20,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::Result;
-use crate::services::changelog::Service as ChangelogService;
+use crate::domains::changelog::Service as ChangelogService;
 
 /// Uploads documents by publishing them as encrypted changelog events, and
 /// reads back documents materialized locally from consumed events (see

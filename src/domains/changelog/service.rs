@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use uuid::Uuid;
 
-use crate::services::documents::{Document, Metadata, Storage as DocumentStorage};
-use crate::services::sessions::SessionsClient;
+use crate::domains::documents::{Document, Metadata, Storage as DocumentStorage};
+use crate::domains::sessions::SessionsClient;
 use crate::{Error, ErrorContext as _, Result};
 
 use super::Service;
@@ -159,7 +159,7 @@ mod tests {
     use super::super::grpc_client::MockFydeClient;
     use super::super::storage::MockOffsetStorage;
     use super::*;
-    use crate::services::documents::{FakeMetadata, MockStorage};
+    use crate::domains::documents::{FakeMetadata, MockStorage};
 
     fn proto_event(offset: i64, document_id: Uuid) -> ProtoChangelogEvent {
         proto_event_with_type(offset, document_id, EventType::Created)

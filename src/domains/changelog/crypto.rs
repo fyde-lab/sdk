@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::services::documents::Metadata;
+use crate::domains::documents::Metadata;
 use crate::{Error, ErrorContext as _, Result};
 
 use super::models::EventType;
@@ -171,7 +171,7 @@ pub(super) fn decrypt_event(encrypted_content: &[u8]) -> Result<DecryptedEvent> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::documents::FakeMetadata;
+    use crate::domains::documents::FakeMetadata;
 
     #[test]
     fn encrypt_event_roundtrips_a_created_event() {

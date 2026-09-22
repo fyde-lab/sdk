@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::services::changelog::{EventType, Service as ChangelogService};
+use crate::domains::changelog::{EventType, Service as ChangelogService};
 use crate::{Error, ErrorContext as _, Result};
 
 use super::storage::Storage;
@@ -113,7 +113,7 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
-    use crate::services::changelog::ChangelogEvent;
+    use crate::domains::changelog::ChangelogEvent;
 
     use super::super::storage::MockStorage;
     use super::*;

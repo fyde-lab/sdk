@@ -16,9 +16,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Architecture
 
-`Client` (`src/lib.rs`) is the SDK entry point, with two constructors: `Client::connect(url)` opens a gRPC connection backed by the local SQLite database in the default XDG data directory, and `Client::connect_memory(url)` does the same but backed by a private in-memory database that only lives for the process's lifetime. Both expose the same service-specific sub-clients (`documents()` → `&DocumentsClient`, `changelog()` → `&ChangelogClient`). As more server services are added, they should follow the same pattern: a submodule under `src/services/`, wired into `Client`.
+`Client` (`src/lib.rs`) is the SDK entry point, with two constructors: `Client::connect(url)` opens a gRPC connection backed by the local SQLite database in the default XDG data directory, and `Client::connect_memory(url)` does the same but backed by a private in-memory database that only lives for the process's lifetime. Both expose the same service-specific sub-clients (`documents()` → `&DocumentsClient`, `changelog()` → `&ChangelogClient`). As more server services are added, they should follow the same pattern: a submodule under `src/domains/`, wired into `Client`.
 
-### Documents service (`src/services/documents/`)
+### Documents service (`src/domains/documents/`)
 
 Layered in three pieces, each only aware of the layer below it, following the same `mod.rs`/`service.rs` split as `../server`'s domain modules:
 
@@ -30,7 +30,7 @@ Layered in three pieces, each only aware of the layer below it, following the sa
 
 **Known temporary state**: `crypto.rs` derives its KEK from a hard-coded placeholder secret (`TEMP_HARDCODED_KEK_SECRET`), explicitly marked in a doc comment as needing replacement with a real KMS/HSM/secrets-manager-sourced key before handling real data. Don't remove that comment when touching this file unless the underlying issue is actually fixed.
 
-### Changelog service (`src/services/changelog/`)
+### Changelog service (`src/domains/changelog/`)
 
 Same layering as documents:
 

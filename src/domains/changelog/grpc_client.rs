@@ -6,7 +6,7 @@ use futures::stream::BoxStream;
 use mockall::automock;
 use tonic::transport::Channel;
 
-use crate::services::sessions::{Service as SessionsService, SessionsClient};
+use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::{Error, ErrorContext as _, Result};
 
 /// Generated protobuf/gRPC bindings for the `changelog` service, compiled
@@ -47,7 +47,7 @@ pub(super) trait FydeClient: Send + Sync {
 /// connection. Every call is authenticated by attaching the session token
 /// currently persisted in settings (if any) as a bearer `authorization`
 /// header (see
-/// [`crate::services::sessions::Service::authenticated_request`]).
+/// [`crate::domains::sessions::Service::authenticated_request`]).
 pub(super) struct GrpcClient {
     client: ChangelogClient<Channel>,
     sessions: Arc<SessionsClient>,
@@ -113,7 +113,7 @@ impl FydeClient for GrpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::settings::MockService as MockSettingsService;
+    use crate::domains::settings::MockService as MockSettingsService;
 
     #[tokio::test]
     async fn new_rejects_a_malformed_base_url() {

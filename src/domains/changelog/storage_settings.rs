@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::services::settings::Service as SettingsService;
+use crate::domains::settings::Service as SettingsService;
 use crate::{ErrorContext as _, Result};
 
 use super::storage::OffsetStorage;
@@ -51,7 +51,7 @@ impl OffsetStorage for SettingsOffsetStorage {
 
 #[cfg(test)]
 mod tests {
-    use crate::services::settings::MockService as MockSettingsService;
+    use crate::domains::settings::MockService as MockSettingsService;
 
     use super::*;
 

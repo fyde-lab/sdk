@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::services::settings::Service as SettingsService;
+use crate::domains::settings::Service as SettingsService;
 use crate::{Error, ErrorContext as _, Result};
 
 use super::{SESSION_TOKEN_SETTING, Service};
@@ -69,7 +69,7 @@ impl Service for SessionsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::settings::MockService as MockSettingsService;
+    use crate::domains::settings::MockService as MockSettingsService;
 
     #[tokio::test]
     async fn leaves_the_request_unauthenticated_without_a_stored_token() {

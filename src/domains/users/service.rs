@@ -3,9 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 #[cfg(test)]
-use crate::services::sessions::SESSION_TOKEN_SETTING;
-use crate::services::sessions::{Service as SessionsService, SessionsClient};
-use crate::services::settings::Service as SettingsService;
+use crate::domains::sessions::SESSION_TOKEN_SETTING;
+use crate::domains::sessions::{Service as SessionsService, SessionsClient};
+use crate::domains::settings::Service as SettingsService;
 use crate::{ErrorContext as _, Result};
 
 use super::Service;
@@ -19,9 +19,9 @@ const MASTER_KEY_SETTING: &str = "master_key";
 /// A client for the fyde server's users service. Persists the session
 /// token opened by the most recent `create`/`login` call via
 /// [`SessionsClient::save_new_session`] under
-/// [`crate::services::sessions::SESSION_TOKEN_SETTING`],
+/// [`crate::domains::sessions::SESSION_TOKEN_SETTING`],
 /// read back from there by every other service's gRPC transport (via
-/// [`crate::services::sessions::Service::authenticated_request`]) to
+/// [`crate::domains::sessions::Service::authenticated_request`]) to
 /// authenticate its own calls, so [`Service::logout`] doesn't need a token
 /// passed in.
 pub struct UsersClient {
@@ -120,7 +120,7 @@ mod tests {
 
     use super::super::grpc_client::MockFydeClient;
     use super::*;
-    use crate::services::settings::MockService as MockSettingsService;
+    use crate::domains::settings::MockService as MockSettingsService;
 
     fn client_with_grpc(
         grpc: impl FydeClient + 'static,

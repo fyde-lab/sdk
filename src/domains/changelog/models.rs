@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::services::documents::Metadata;
+use crate::domains::documents::Metadata;
 
 /// The kind of write recorded by a [`ChangelogEvent`]. Only [`Self::Created`]
 /// is producible today (there is no update/delete flow yet), but the shape
@@ -15,7 +15,7 @@ pub enum EventType {
 
 /// A single recorded write against a document, decrypted from the server's
 /// changelog. Inlines the document's fields rather than wrapping a
-/// [`crate::services::documents::Document`], since not every event type
+/// [`crate::domains::documents::Document`], since not every event type
 /// carries all of them: `content` is `None` for a metadata-only update, and
 /// both `content` and `metadata` are `None` for a deletion (only
 /// `document_id` is meaningful then).
@@ -66,7 +66,7 @@ impl FakeChangelogEvent {
                 event_type: EventType::Created,
                 document_id: Uuid::now_v7(),
                 content: Some(crate::testing::random_bytes(64)),
-                metadata: Some(crate::services::documents::FakeMetadata::new().build()),
+                metadata: Some(crate::domains::documents::FakeMetadata::new().build()),
             },
         }
     }
@@ -83,7 +83,7 @@ impl FakeChangelogEvent {
 
     /// Sets `document_id` to `document`'s id, so the event refers to a
     /// document that actually exists in the test's fixtures.
-    pub(crate) fn for_document(mut self, document: &crate::services::documents::Document) -> Self {
+    pub(crate) fn for_document(mut self, document: &crate::domains::documents::Document) -> Self {
         self.event.document_id = document.id();
         self
     }
@@ -121,7 +121,7 @@ impl FakeChangelogEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::documents::FakeDocument;
+    use crate::domains::documents::FakeDocument;
 
     #[test]
     fn fake_changelog_event_builds_with_plausible_defaults() {
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn with_methods_override_every_other_field() {
         let document_id = Uuid::now_v7();
-        let metadata = crate::services::documents::FakeMetadata::new().build();
+        let metadata = crate::domains::documents::FakeMetadata::new().build();
 
         let event = FakeChangelogEvent::new()
             .with_offset(42)

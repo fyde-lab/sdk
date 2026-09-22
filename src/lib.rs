@@ -1,5 +1,5 @@
 mod ffi;
-mod services;
+mod domains;
 #[path = "lib/sql/mod.rs"]
 mod sql;
 #[cfg(test)]
@@ -11,12 +11,12 @@ pub use ffi::{FfiError, FydeClient};
 
 use std::sync::Arc;
 
-pub use services::changelog::{ChangelogEvent, Service as ChangelogService};
-pub use services::documents::{Document, Service as DocumentsService};
-pub use services::settings::Service as SettingsService;
-pub use services::users::Service as UsersService;
+pub use domains::changelog::{ChangelogEvent, Service as ChangelogService};
+pub use domains::documents::{Document, Service as DocumentsService};
+pub use domains::settings::Service as SettingsService;
+pub use domains::users::Service as UsersService;
 
-use services::sessions::SessionsClient;
+use domains::sessions::SessionsClient;
 use sql::SqliteClient;
 
 #[derive(Debug, thiserror::Error)]
@@ -128,9 +128,9 @@ impl Client {
     async fn connect_with_sqlite(url: impl AsRef<str>, sqlite: SqliteClient) -> Result<Self> {
         let url = url.as_ref();
 
-        let settings = services::settings::init(sqlite.pool().clone());
-        let sessions = services::sessions::init(settings.clone());
-        let changelog = services::changelog::init(
+        let settings = domains::settings::init(sqlite.pool().clone());
+        let sessions = domains::sessions::init(settings.clone());
+        let changelog = domains::changelog::init(
             url,
             sqlite.pool().clone(),
             settings.clone(),
@@ -138,8 +138,8 @@ impl Client {
         )
         .await
         .context("failed to initialize changelog service")?;
-        let documents = services::documents::init(sqlite.pool().clone(), changelog.clone());
-        let users = services::users::init(url, settings.clone(), sessions.clone())
+        let documents = domains::documents::init(sqlite.pool().clone(), changelog.clone());
+        let users = domains::users::init(url, settings.clone(), sessions.clone())
             .await
             .context("failed to initialize users service")?;
 
@@ -174,7 +174,7 @@ impl Client {
 
     /// Returns a reference to the client's sessions service. Returns the
     /// concrete `SessionsClient` rather than a trait object, like
-    /// [`services::sessions::init`], since `sessions::Service` is not
+    /// [`domains::sessions::init`], since `sessions::Service` is not
     /// object-safe. `pub(crate)` rather than `pub` since `sessions::Service`
     /// itself is internal plumbing, not part of the SDK's public API.
     pub(crate) fn sessions(&self) -> &SessionsClient {
