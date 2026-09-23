@@ -12,6 +12,7 @@ pub use ffi::{FfiError, FydeClient};
 use std::sync::Arc;
 
 pub use domains::documents::{ChangelogEvent, Document, Service as DocumentsService};
+pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
 pub use domains::users::Service as UsersService;
 
@@ -98,6 +99,7 @@ where
 /// A connection to a fyde server.
 pub struct Client {
     documents: Arc<dyn DocumentsService>,
+    server_state: Arc<dyn ServerStateService>,
     sessions: Arc<SessionsClient>,
     settings: Arc<dyn SettingsService>,
     users: Arc<dyn UsersService>,
@@ -146,12 +148,14 @@ impl Client {
         )
         .await
         .context("failed to initialize documents service")?;
-        let users = domains::users::init(channel, settings.clone(), sessions.clone())
+        let users = domains::users::init(channel.clone(), settings.clone(), sessions.clone())
             .await
             .context("failed to initialize users service")?;
+        let server_state = domains::server_state::init(channel);
 
         Ok(Self {
             documents,
+            server_state,
             sessions,
             settings,
             users,
@@ -171,6 +175,11 @@ impl Client {
     /// Returns a reference to the client's settings service.
     pub fn settings(&self) -> &dyn SettingsService {
         self.settings.as_ref()
+    }
+
+    /// Returns a reference to the client's server_state service.
+    pub fn server_state(&self) -> &dyn ServerStateService {
+        self.server_state.as_ref()
     }
 
     /// Returns a reference to the client's sessions service. Returns the
