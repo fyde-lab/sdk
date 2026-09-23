@@ -57,8 +57,14 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .await
             .with_context(|| format!("failed to read document at {}", path.display()))?;
 
-        let name = path
+        let original_name = path
             .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let name = path
+            .file_stem()
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_string();
@@ -78,7 +84,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
         let metadata = Metadata {
             id,
-            original_name: name.clone(),
+            original_name,
             name,
             content_type: PDF_CONTENT_TYPE.to_string(),
             created_at,
@@ -207,6 +213,18 @@ mod tests {
                 .as_ref()
                 .map(|metadata| metadata.transcript.as_str()),
             Some("hello world\n")
+        );
+        let file_stem = file.path().file_stem().unwrap().to_str().unwrap();
+        let file_name = file.path().file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            metadata.as_ref().map(|metadata| metadata.name.as_str()),
+            Some(file_stem)
+        );
+        assert_eq!(
+            metadata
+                .as_ref()
+                .map(|metadata| metadata.original_name.as_str()),
+            Some(file_name)
         );
     }
 
