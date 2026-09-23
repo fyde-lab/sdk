@@ -118,11 +118,13 @@ impl<D: DocumentStorage, O: CursorStorage> Service for ChangelogClient<D, O> {
             .await
             .context("failed to read the local changelog cursor")?;
 
+        let since = if cursor.is_nil() { None } else { Some(cursor) };
+
         let mut stream = self
             .grpc
-            .consume_since(cursor)
+            .consume_since(since)
             .await
-            .with_context(|| format!("failed to open changelog stream from id {cursor}"))?;
+            .with_context(|| format!("failed to open changelog stream from id {since:?}"))?;
 
         while let Some(proto_event) = stream.next().await {
             let proto_event = proto_event.context("failed to read next changelog event")?;
@@ -221,7 +223,7 @@ mod tests {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_consume_since()
-            .withf(|id| *id == Uuid::nil())
+            .withf(|id| id.is_none())
             .returning(move |_| {
                 Ok(futures::stream::iter(vec![Ok(proto_event(event_id, document_id))]).boxed())
             });
@@ -375,7 +377,7 @@ mod tests {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_consume_since()
-            .withf(move |id| *id == cursor)
+            .withf(move |id| *id == Some(cursor))
             .returning(move |_| {
                 Ok(futures::stream::iter(vec![Ok(proto_event(event_id, document_id))]).boxed())
             });

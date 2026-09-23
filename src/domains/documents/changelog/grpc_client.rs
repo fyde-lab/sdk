@@ -39,9 +39,8 @@ pub(super) trait FydeClient: Send + Sync {
 
     /// Streams every entry with an id greater than or equal to `id`,
     /// oldest first: replays persisted history, then continues with the
-    /// live tail. [`Uuid::nil`] means "from the beginning of the
-    /// changelog".
-    async fn consume_since(&self, id: Uuid) -> Result<EventStream>;
+    /// live tail. `None` means "from the beginning of the changelog".
+    async fn consume_since(&self, id: Option<Uuid>) -> Result<EventStream>;
 }
 
 /// The production [`FydeClient`] implementation, backed by a tonic
@@ -99,17 +98,19 @@ impl FydeClient for GrpcClient {
         })
     }
 
-    async fn consume_since(&self, id: Uuid) -> Result<EventStream> {
+    async fn consume_since(&self, id: Option<Uuid>) -> Result<EventStream> {
         let request = self
             .sessions
-            .authenticated_request(ConsumeSinceRequest { id: id.to_string() })
+            .authenticated_request(ConsumeSinceRequest {
+                id: id.map(|id| id.to_string()).unwrap_or_default(),
+            })
             .await?;
 
         let response = self
             .client()
             .consume_since(request)
             .await
-            .with_context(|| format!("failed to consume changelog events since id {id}"))?;
+            .with_context(|| format!("failed to consume changelog events since id {id:?}"))?;
         Ok(Box::pin(response.into_inner()))
     }
 }
