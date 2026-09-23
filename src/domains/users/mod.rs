@@ -7,6 +7,7 @@ pub use service::UsersClient;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tonic::transport::Channel;
 
 use crate::Result;
 use crate::domains::sessions::SessionsClient;
@@ -48,16 +49,16 @@ pub trait Service: Send + Sync {
 }
 
 /// Initializes the users service: connects to the fyde server's users
-/// service at `base_url`. `settings` is where `create`/`login` persist the
-/// session token (read back by every other service's gRPC transport, via
-/// `sessions`, to authenticate their own calls) and where `create` also
-/// persists the master key it generates for a new account.
+/// service over the shared `channel`. `settings` is where `create`/`login`
+/// persist the session token (read back by every other service's gRPC
+/// transport, via `sessions`, to authenticate their own calls) and where
+/// `create` also persists the master key it generates for a new account.
 pub(crate) async fn init(
-    base_url: impl AsRef<str>,
+    channel: Channel,
     settings: Arc<dyn SettingsService>,
     sessions: Arc<SessionsClient>,
 ) -> Result<Arc<dyn Service>> {
     Ok(Arc::new(
-        UsersClient::new(base_url, settings, sessions).await?,
+        UsersClient::new(channel, settings, sessions).await?,
     ))
 }

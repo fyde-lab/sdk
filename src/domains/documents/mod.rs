@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sqlx::SqlitePool;
+use tonic::transport::Channel;
 use uuid::Uuid;
 
 use crate::domains::sessions::SessionsClient;
@@ -75,17 +76,17 @@ pub trait Service: Send + Sync {
 }
 
 /// Initializes the documents service: connects the internal changelog
-/// service to the fyde server at `base_url` (see `changelog::init`), wires
+/// service to the fyde server over `channel` (see `changelog::init`), wires
 /// up local SQLite-backed caching (via `pool`) of documents materialized
 /// from its consumed events, and publishes new documents through it.
 pub(crate) async fn init(
-    base_url: impl AsRef<str>,
+    channel: Channel,
     pool: SqlitePool,
     settings: Arc<dyn SettingsService>,
     sessions: Arc<SessionsClient>,
 ) -> Result<Arc<dyn Service>> {
     let storage = storage_sqlite::SqliteStorage::new(pool.clone());
-    let changelog = changelog::init(base_url, pool, settings, sessions)
+    let changelog = changelog::init(channel, pool, settings, sessions)
         .await
         .context("failed to initialize changelog service")?;
 

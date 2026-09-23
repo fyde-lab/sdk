@@ -8,7 +8,7 @@ use tonic::transport::Channel;
 use uuid::Uuid;
 
 use crate::domains::sessions::{Service as SessionsService, SessionsClient};
-use crate::{Error, ErrorContext as _, Result};
+use crate::{ErrorContext as _, Result};
 
 /// Generated protobuf/gRPC bindings for the `changelog` service, compiled
 /// from `../api-protos/changelog.proto` by `build.rs`.
@@ -44,32 +44,35 @@ pub(super) trait FydeClient: Send + Sync {
     async fn consume_since(&self, id: Uuid) -> Result<EventStream>;
 }
 
-/// The production [`FydeClient`] implementation, backed by a real tonic
-/// connection. Every call is authenticated by attaching the session token
-/// currently persisted in settings (if any) as a bearer `authorization`
-/// header (see
+/// The production [`FydeClient`] implementation, backed by a tonic
+/// [`Channel`] shared with every other domain's gRPC client (see
+/// [`crate::Client::connect`]), so they all reuse the same underlying
+/// connection instead of each opening one of their own. The channel is
+/// typically opened lazily (via `Endpoint::connect_lazy`), so the SDK can be
+/// used offline for anything that doesn't reach this client; a call that
+/// does need the server surfaces a connection failure as
+/// [`crate::Error::GrpcTransport`]. Cloning a [`Channel`] is cheap — it's
+/// just a handle to the same underlying connection — so a fresh generated
+/// client is created per call. Every call is authenticated by attaching the
+/// session token currently persisted in settings (if any) as a bearer
+/// `authorization` header (see
 /// [`crate::domains::sessions::Service::authenticated_request`]).
 pub(super) struct GrpcClient {
-    client: ChangelogClient<Channel>,
+    channel: Channel,
     sessions: Arc<SessionsClient>,
 }
 
 impl GrpcClient {
-    /// Connects to the changelog service at the given `http://` or
-    /// `https://` base URL (e.g. `http://127.0.0.1:8080`), authenticating
-    /// every call via `sessions`.
-    pub async fn new(base_url: impl AsRef<str>, sessions: Arc<SessionsClient>) -> Result<Self> {
-        let endpoint = Channel::from_shared(base_url.as_ref().to_string())
-            .map_err(|err| Error::InvalidEndpoint(err.to_string()))?;
-        let channel = endpoint
-            .connect()
-            .await
-            .context("failed to connect to changelog grpc endpoint")?;
+    /// Creates a client for the changelog service using the shared
+    /// `channel` connection to the fyde server, authenticating every call
+    /// via `sessions`.
+    pub fn new(channel: Channel, sessions: Arc<SessionsClient>) -> Self {
+        Self { channel, sessions }
+    }
 
-        Ok(Self {
-            client: ChangelogClient::new(channel),
-            sessions,
-        })
+    /// Returns a generated client wrapping the shared connection.
+    fn client(&self) -> ChangelogClient<Channel> {
+        ChangelogClient::new(self.channel.clone())
     }
 }
 
@@ -81,12 +84,8 @@ impl FydeClient for GrpcClient {
             .authenticated_request(RecordEventRequest { encrypted_content })
             .await?;
 
-        // The generated client's RPC methods take `&mut self`, but the
-        // underlying `Channel` is cheap to clone and safe to use
-        // concurrently, so we clone it per call to expose `&self` here.
         let response = self
-            .client
-            .clone()
+            .client()
             .record_event(request)
             .await
             .context("failed to record changelog event")?
@@ -107,8 +106,7 @@ impl FydeClient for GrpcClient {
             .await?;
 
         let response = self
-            .client
-            .clone()
+            .client()
             .consume_since(request)
             .await
             .with_context(|| format!("failed to consume changelog events since id {id}"))?;
@@ -118,18 +116,25 @@ impl FydeClient for GrpcClient {
 
 #[cfg(test)]
 mod tests {
+    use tonic::transport::Endpoint;
+
     use super::*;
+    use crate::Error;
     use crate::domains::settings::MockService as MockSettingsService;
 
     #[tokio::test]
-    async fn new_rejects_a_malformed_base_url() {
-        let sessions = Arc::new(SessionsClient::new(Arc::new(MockSettingsService::new())));
-        let result = GrpcClient::new("not a valid uri", sessions).await;
+    async fn new_does_not_connect_to_the_server() {
+        // A syntactically valid but unreachable address, connected lazily:
+        // if `client()` dialed eagerly at construction, this would fail
+        // here rather than on first use below.
+        let mut settings = MockSettingsService::new();
+        settings.expect_get().returning(|_| Ok(None));
+        let sessions = Arc::new(SessionsClient::new(Arc::new(settings)));
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let grpc = GrpcClient::new(channel, sessions);
 
-        let err = match result {
-            Ok(_) => panic!("a malformed base url must be rejected"),
-            Err(err) => err,
-        };
-        assert!(matches!(err, Error::InvalidEndpoint(_)));
+        let err = grpc.record_event(vec![1, 2, 3]).await.unwrap_err();
+
+        assert!(matches!(err, Error::Context { .. }));
     }
 }

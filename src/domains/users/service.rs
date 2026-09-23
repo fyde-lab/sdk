@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tonic::transport::Channel;
 
 #[cfg(test)]
 use crate::domains::sessions::SESSION_TOKEN_SETTING;
@@ -31,21 +32,17 @@ pub struct UsersClient {
 }
 
 impl UsersClient {
-    /// Creates a client for the users service at the given `http://` or
-    /// `https://` base URL (e.g. `http://127.0.0.1:8080`), persisting
-    /// newly created accounts' master keys in `settings`, and the session
-    /// token and authenticating outgoing calls via `sessions`.
+    /// Creates a client for the users service using the shared `channel`
+    /// connection to the fyde server, persisting newly created accounts'
+    /// master keys in `settings`, and the session token and authenticating
+    /// outgoing calls via `sessions`.
     pub(super) async fn new(
-        base_url: impl AsRef<str>,
+        channel: Channel,
         settings: Arc<dyn SettingsService>,
         sessions: Arc<SessionsClient>,
     ) -> Result<Self> {
         Ok(Self {
-            grpc: Box::new(
-                GrpcClient::new(base_url, sessions.clone())
-                    .await
-                    .context("failed to create users grpc client")?,
-            ),
+            grpc: Box::new(GrpcClient::new(channel, sessions.clone())),
             settings,
             sessions,
         })

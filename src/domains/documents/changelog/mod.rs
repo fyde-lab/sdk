@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sqlx::SqlitePool;
+use tonic::transport::Channel;
 
 use crate::domains::documents::{self, Metadata};
 use crate::domains::sessions::SessionsClient;
@@ -56,8 +57,8 @@ pub(super) trait Service: Send + Sync {
     async fn consume(&self, callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()>;
 }
 
-/// Initializes the changelog service: connects to the fyde server at
-/// `base_url`, and uses `pool` to cache documents materialized from
+/// Initializes the changelog service: connects to the fyde server over the
+/// shared `channel`, and uses `pool` to cache documents materialized from
 /// consumed events directly into the local `documents` table, `settings`
 /// to persist the changelog cursor consumed so far (see
 /// [`storage_settings::SettingsCursorStorage`]), and `sessions` to attach
@@ -65,17 +66,16 @@ pub(super) trait Service: Send + Sync {
 /// call once a session is opened (see
 /// [`crate::domains::sessions::Service::authenticated_request`]).
 pub(super) async fn init(
-    base_url: impl AsRef<str>,
+    channel: Channel,
     pool: SqlitePool,
     settings: Arc<dyn SettingsService>,
     sessions: Arc<SessionsClient>,
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool);
     let cursor_storage = storage_settings::SettingsCursorStorage::new(settings);
-    let client =
-        service::ChangelogClient::new(base_url, document_storage, cursor_storage, sessions)
-            .await
-            .context("failed to create changelog client")?;
+    let client = service::ChangelogClient::new(channel, document_storage, cursor_storage, sessions)
+        .await
+        .context("failed to create changelog client")?;
 
     Ok(Arc::new(client))
 }

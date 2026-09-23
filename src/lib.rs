@@ -17,6 +17,7 @@ pub use domains::users::Service as UsersService;
 
 use domains::sessions::SessionsClient;
 use sql::SqliteClient;
+use tonic::transport::Endpoint;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -126,19 +127,26 @@ impl Client {
     }
 
     async fn connect_with_sqlite(url: impl AsRef<str>, sqlite: SqliteClient) -> Result<Self> {
-        let url = url.as_ref();
+        // Opened lazily: `connect_lazy` doesn't dial the server here, only
+        // once some call actually needs it (see each domain's
+        // `grpc_client.rs`). The resulting `Channel` is cheap to clone and
+        // shared by every domain's gRPC client, so they all reuse the same
+        // underlying HTTP/2 connection instead of opening one each.
+        let channel = Endpoint::from_shared(url.as_ref().to_string())
+            .map_err(|err| Error::InvalidEndpoint(err.to_string()))?
+            .connect_lazy();
 
         let settings = domains::settings::init(sqlite.pool().clone());
         let sessions = domains::sessions::init(settings.clone());
         let documents = domains::documents::init(
-            url,
+            channel.clone(),
             sqlite.pool().clone(),
             settings.clone(),
             sessions.clone(),
         )
         .await
         .context("failed to initialize documents service")?;
-        let users = domains::users::init(url, settings.clone(), sessions.clone())
+        let users = domains::users::init(channel, settings.clone(), sessions.clone())
             .await
             .context("failed to initialize users service")?;
 
@@ -215,5 +223,15 @@ mod tests {
         let ok: std::io::Result<u32> = Ok(42);
 
         assert_eq!(ok.context("unused").unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn connect_memory_rejects_a_malformed_url() {
+        let err = match Client::connect_memory("not a valid uri").await {
+            Ok(_) => panic!("a malformed url must be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(err, Error::InvalidEndpoint(_)));
     }
 }

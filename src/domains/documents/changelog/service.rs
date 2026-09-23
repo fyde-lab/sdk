@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use tonic::transport::Channel;
 use uuid::Uuid;
 
 use crate::domains::documents::{Document, Metadata, Storage as DocumentStorage};
@@ -60,23 +61,18 @@ pub(super) struct ChangelogClient<D: DocumentStorage, O: CursorStorage> {
 }
 
 impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
-    /// Creates a client for the changelog service at the given `http://` or
-    /// `https://` base URL (e.g. `http://127.0.0.1:8080`), using
-    /// `document_storage` to cache documents materialized by
-    /// [`Service::consume`] and `cursor_storage` to track its progress
-    /// through the changelog.
+    /// Creates a client for the changelog service using the shared
+    /// `channel` connection to the fyde server, using `document_storage` to
+    /// cache documents materialized by [`Service::consume`] and
+    /// `cursor_storage` to track its progress through the changelog.
     pub(super) async fn new(
-        base_url: impl AsRef<str>,
+        channel: Channel,
         document_storage: D,
         cursor_storage: O,
         sessions: Arc<SessionsClient>,
     ) -> Result<Self> {
         Ok(Self {
-            grpc: Box::new(
-                GrpcClient::new(base_url, sessions)
-                    .await
-                    .context("failed to create changelog grpc client")?,
-            ),
+            grpc: Box::new(GrpcClient::new(channel, sessions)),
             document_storage,
             cursor_storage,
         })
