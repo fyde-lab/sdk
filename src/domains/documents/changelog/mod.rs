@@ -49,11 +49,12 @@ pub(super) trait Service: Send + Sync {
     /// as each event is processed, so a later call resumes right after the
     /// last event seen.
     ///
-    /// Fails with [`crate::Error::InvalidChangelogEvent`] if a `Created`
-    /// event is missing its `content` or `metadata` — a `Created` event
-    /// must carry both.
-    ///
-    /// Runs until the server closes the stream or an error occurs.
+    /// Never returns. If a pass over the stream fails — including with
+    /// [`crate::Error::InvalidChangelogEvent`] if a `Created` event is
+    /// missing its `content` or `metadata`, since a `Created` event must
+    /// carry both — the error is logged and consumption is retried from
+    /// the persisted cursor after sleeping 1s. If a pass ends cleanly (the
+    /// server closes the stream), it's retried immediately.
     async fn consume(&self, callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()>;
 }
 

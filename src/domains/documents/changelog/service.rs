@@ -89,29 +89,13 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
             cursor_storage,
         }
     }
-}
 
-#[async_trait]
-impl<D: DocumentStorage, O: CursorStorage> Service for ChangelogClient<D, O> {
-    async fn send(
-        &self,
-        event_type: EventType,
-        document_id: Uuid,
-        content: Option<&[u8]>,
-        metadata: Option<&Metadata>,
-    ) -> Result<()> {
-        let encrypted_content = crypto::encrypt_event(event_type, document_id, content, metadata)
-            .context("failed to encrypt changelog event")?;
-
-        self.grpc
-            .record_event(encrypted_content)
-            .await
-            .context("failed to send changelog event to server")?;
-
-        Ok(())
-    }
-
-    async fn consume(&self, mut callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
+    /// One pass of [`Service::consume`]: opens a stream from the persisted
+    /// cursor and processes events until the stream ends or an error
+    /// occurs. Split out as an inherent method (rather than inlined in
+    /// `consume`) so it can be retried in a loop without re-implementing
+    /// the retry itself, and so tests can exercise a single pass directly.
+    async fn consume_once(&self, callback: &mut (dyn FnMut(ChangelogEvent) + Send)) -> Result<()> {
         let cursor = self
             .cursor_storage
             .get_cursor()
@@ -182,6 +166,36 @@ impl<D: DocumentStorage, O: CursorStorage> Service for ChangelogClient<D, O> {
     }
 }
 
+#[async_trait]
+impl<D: DocumentStorage, O: CursorStorage> Service for ChangelogClient<D, O> {
+    async fn send(
+        &self,
+        event_type: EventType,
+        document_id: Uuid,
+        content: Option<&[u8]>,
+        metadata: Option<&Metadata>,
+    ) -> Result<()> {
+        let encrypted_content = crypto::encrypt_event(event_type, document_id, content, metadata)
+            .context("failed to encrypt changelog event")?;
+
+        self.grpc
+            .record_event(encrypted_content)
+            .await
+            .context("failed to send changelog event to server")?;
+
+        Ok(())
+    }
+
+    async fn consume(&self, mut callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
+        loop {
+            if let Err(err) = self.consume_once(&mut *callback).await {
+                tracing::error!("changelog consume failed, retrying in 1s: {err:?}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -249,12 +263,8 @@ mod tests {
 
         let received = std::sync::Arc::new(Mutex::new(Vec::new()));
         let received_in_callback = received.clone();
-        client
-            .consume(Box::new(move |event| {
-                received_in_callback.lock().unwrap().push(event)
-            }))
-            .await
-            .unwrap();
+        let mut callback = move |event| received_in_callback.lock().unwrap().push(event);
+        client.consume_once(&mut callback).await.unwrap();
 
         let received = received.lock().unwrap();
         assert_eq!(received.len(), 1);
@@ -295,7 +305,7 @@ mod tests {
 
         let client = ChangelogClient::with_grpc(mock_grpc, document_storage, cursor_storage);
 
-        client.consume(Box::new(|_| {})).await.unwrap();
+        client.consume_once(&mut |_| {}).await.unwrap();
     }
 
     #[tokio::test]
@@ -332,7 +342,7 @@ mod tests {
 
         let client = ChangelogClient::with_grpc(mock_grpc, document_storage, cursor_storage);
 
-        client.consume(Box::new(|_| {})).await.unwrap();
+        client.consume_once(&mut |_| {}).await.unwrap();
     }
 
     #[tokio::test]
@@ -363,7 +373,7 @@ mod tests {
 
         let client = ChangelogClient::with_grpc(mock_grpc, document_storage, cursor_storage);
 
-        let result = client.consume(Box::new(|_| {})).await;
+        let result = client.consume_once(&mut |_| {}).await;
 
         assert!(matches!(result, Err(Error::InvalidChangelogEvent(_))));
     }
@@ -399,7 +409,55 @@ mod tests {
 
         let client = ChangelogClient::with_grpc(mock_grpc, document_storage, cursor_storage);
 
-        client.consume(Box::new(|_| {})).await.unwrap();
+        client.consume_once(&mut |_| {}).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consume_never_returns_and_retries_after_an_error() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_in_mock = attempts.clone();
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            if attempts_in_mock.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(Error::InvalidChangelogEvent("boom".to_string()))
+            } else {
+                // A never-ending stream, mirroring the real `WatchEvents`
+                // RPC staying open: this keeps the retried attempt parked
+                // awaiting the next event, rather than looping back into
+                // `consume_since` in a tight, unyielding busy loop the way
+                // an immediately-exhausted stream would.
+                Ok(futures::stream::pending().boxed())
+            }
+        });
+
+        let document_storage = MockStorage::new();
+
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+
+        let client = ChangelogClient::with_grpc(mock_grpc, document_storage, cursor_storage);
+
+        let consume_fut = client.consume(Box::new(|_| {}));
+        tokio::pin!(consume_fut);
+
+        // First attempt fails immediately, so `consume` should be waiting
+        // in the 1s retry sleep without a second attempt yet.
+        tokio::time::timeout(std::time::Duration::from_millis(0), &mut consume_fut)
+            .await
+            .unwrap_err();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // Once the retry sleep elapses, `consume` should retry (and keep
+        // looping forever rather than returning).
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::time::timeout(std::time::Duration::from_millis(0), &mut consume_fut)
+            .await
+            .unwrap_err();
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
     }
 
     #[tokio::test]
