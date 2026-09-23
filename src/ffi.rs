@@ -238,6 +238,13 @@ impl FydeClient {
         Ok(connected)
     }
 
+    /// Returns whether the fyde server currently responds as reachable.
+    /// Mirrors [`crate::ServerStateService::is_server_reachable`].
+    pub async fn is_server_reachable(&self) -> Result<bool, FfiError> {
+        let reachable = self.inner.server_state().is_server_reachable().await?;
+        Ok(reachable)
+    }
+
     /// Reads the local file at `path`, encrypts it and its metadata, then
     /// publishes it as a "created" changelog event, returning its generated
     /// id. Mirrors [`crate::DocumentsService::upload`].
