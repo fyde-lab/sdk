@@ -215,8 +215,7 @@ impl<D: DocumentStorage, O: CursorStorage> Service for ChangelogClient<D, O> {
     async fn consume(&self, mut callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
         loop {
             if let Err(err) = self.consume_once(&mut *callback).await {
-                tracing::error!("changelog consume failed, retrying in 1s: {err:?}");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tracing::error!("changelog consume failed, retrying: {err:?}");
             }
         }
     }
@@ -535,7 +534,7 @@ mod tests {
         client.consume_once(&mut |_| {}).await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn consume_never_returns_and_retries_after_an_error() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -572,20 +571,13 @@ mod tests {
         let consume_fut = client.consume(Box::new(|_| {}));
         tokio::pin!(consume_fut);
 
-        // First attempt fails immediately, so `consume` should be waiting
-        // in the 1s retry sleep without a second attempt yet.
+        // The first attempt fails immediately, and with no retry delay
+        // `consume` should retry right away — parking in the second
+        // attempt's never-ending stream rather than returning.
         tokio::time::timeout(std::time::Duration::from_millis(0), &mut consume_fut)
             .await
             .unwrap_err();
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
-
-        // Once the retry sleep elapses, `consume` should retry (and keep
-        // looping forever rather than returning).
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        tokio::time::timeout(std::time::Duration::from_millis(0), &mut consume_fut)
-            .await
-            .unwrap_err();
-        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
