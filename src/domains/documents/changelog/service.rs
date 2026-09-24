@@ -6,6 +6,7 @@ use tonic::transport::Channel;
 use uuid::Uuid;
 
 use crate::domains::documents::{Document, Metadata, Storage as DocumentStorage};
+use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
 use crate::{Error, ErrorContext as _, Result};
 
@@ -58,23 +59,33 @@ pub(super) struct ChangelogClient<D: DocumentStorage, O: CursorStorage> {
     grpc: Box<dyn FydeClient>,
     document_storage: D,
     cursor_storage: O,
+    server_state: Arc<dyn ServerStateService>,
 }
+
+/// Delay between reachability checks in [`ChangelogClient::consume_once`]
+/// while waiting for the server to come back up.
+const SERVER_REACHABILITY_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(200);
 
 impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
     /// Creates a client for the changelog service using the shared
     /// `channel` connection to the fyde server, using `document_storage` to
-    /// cache documents materialized by [`Service::consume`] and
-    /// `cursor_storage` to track its progress through the changelog.
+    /// cache documents materialized by [`Service::consume`],
+    /// `cursor_storage` to track its progress through the changelog, and
+    /// `server_state` to wait for the server to be reachable before opening
+    /// a changelog stream.
     pub(super) async fn new(
         channel: Channel,
         document_storage: D,
         cursor_storage: O,
         sessions: Arc<SessionsClient>,
+        server_state: Arc<dyn ServerStateService>,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(channel, sessions)),
             document_storage,
             cursor_storage,
+            server_state,
         })
     }
 
@@ -82,11 +93,17 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
     /// testing against a [`super::grpc_client::MockFydeClient`] instead of a
     /// live server.
     #[cfg(test)]
-    fn with_grpc(grpc: impl FydeClient + 'static, document_storage: D, cursor_storage: O) -> Self {
+    fn with_grpc(
+        grpc: impl FydeClient + 'static,
+        document_storage: D,
+        cursor_storage: O,
+        server_state: Arc<dyn ServerStateService>,
+    ) -> Self {
         Self {
             grpc: Box::new(grpc),
             document_storage,
             cursor_storage,
+            server_state,
         }
     }
 
@@ -103,6 +120,15 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
             .context("failed to read the local changelog cursor")?;
 
         let since = if cursor.is_nil() { None } else { Some(cursor) };
+
+        while !self
+            .server_state
+            .is_server_reachable()
+            .await
+            .context("failed to check server reachability")?
+        {
+            tokio::time::sleep(SERVER_REACHABILITY_POLL_INTERVAL).await;
+        }
 
         let mut stream = self
             .grpc
@@ -206,6 +232,15 @@ mod tests {
     use super::super::storage::MockCursorStorage;
     use super::*;
     use crate::domains::documents::{FakeMetadata, MockStorage};
+    use crate::domains::server_state::MockService as MockServerState;
+
+    /// A [`ServerStateService`] mock reporting the server as always
+    /// reachable, for tests where reachability isn't under test.
+    fn reachable_server_state() -> Arc<dyn ServerStateService> {
+        let mut mock = MockServerState::new();
+        mock.expect_is_server_reachable().returning(|| Ok(true));
+        Arc::new(mock)
+    }
 
     fn proto_event(id: Uuid, document_id: Uuid) -> ProtoChangelogEvent {
         proto_event_with_type(id, document_id, EventType::Created)
@@ -259,7 +294,12 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ChangelogClient::with_grpc(mock_grpc, document_storage, cursor_storage);
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            cursor_storage,
+            reachable_server_state(),
+        );
 
         let received = std::sync::Arc::new(Mutex::new(Vec::new()));
         let received_in_callback = received.clone();
@@ -271,6 +311,69 @@ mod tests {
         assert_eq!(received[0].id, event_id);
         assert_eq!(received[0].document_id, document_id);
         assert_eq!(received[0].event_type, EventType::Created);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn consume_once_waits_for_the_server_to_become_reachable_before_streaming() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let document_id = Uuid::now_v7();
+        let event_id = Uuid::now_v7();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(vec![Ok(proto_event(event_id, document_id))]).boxed())
+        });
+
+        let mut document_storage = MockStorage::new();
+        document_storage
+            .expect_save_document()
+            .returning(|_| Ok(()));
+
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+        cursor_storage.expect_save_cursor().returning(|_| Ok(()));
+
+        let reachability_checks = Arc::new(AtomicU32::new(0));
+        let reachability_checks_in_mock = reachability_checks.clone();
+        let mut server_state = MockServerState::new();
+        server_state
+            .expect_is_server_reachable()
+            .returning(move || {
+                let attempt = reachability_checks_in_mock.fetch_add(1, Ordering::SeqCst);
+                Ok(attempt >= 2)
+            });
+
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            cursor_storage,
+            Arc::new(server_state),
+        );
+
+        let mut callback = |_| {};
+        let consume_once_fut = client.consume_once(&mut callback);
+        tokio::pin!(consume_once_fut);
+
+        // Not yet reachable on the first two checks, so the stream must not
+        // have been opened yet.
+        tokio::time::timeout(std::time::Duration::from_millis(0), &mut consume_once_fut)
+            .await
+            .unwrap_err();
+        assert_eq!(reachability_checks.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(SERVER_REACHABILITY_POLL_INTERVAL).await;
+        tokio::time::timeout(std::time::Duration::from_millis(0), &mut consume_once_fut)
+            .await
+            .unwrap_err();
+        assert_eq!(reachability_checks.load(Ordering::SeqCst), 2);
+
+        // Third check reports reachable, so the pass should now complete.
+        tokio::time::advance(SERVER_REACHABILITY_POLL_INTERVAL).await;
+        consume_once_fut.await.unwrap();
+        assert_eq!(reachability_checks.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -303,7 +406,12 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ChangelogClient::with_grpc(mock_grpc, document_storage, cursor_storage);
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            cursor_storage,
+            reachable_server_state(),
+        );
 
         client.consume_once(&mut |_| {}).await.unwrap();
     }
@@ -340,7 +448,12 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ChangelogClient::with_grpc(mock_grpc, document_storage, cursor_storage);
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            cursor_storage,
+            reachable_server_state(),
+        );
 
         client.consume_once(&mut |_| {}).await.unwrap();
     }
@@ -371,7 +484,12 @@ mod tests {
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
 
-        let client = ChangelogClient::with_grpc(mock_grpc, document_storage, cursor_storage);
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            cursor_storage,
+            reachable_server_state(),
+        );
 
         let result = client.consume_once(&mut |_| {}).await;
 
@@ -407,7 +525,12 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ChangelogClient::with_grpc(mock_grpc, document_storage, cursor_storage);
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            cursor_storage,
+            reachable_server_state(),
+        );
 
         client.consume_once(&mut |_| {}).await.unwrap();
     }
@@ -439,7 +562,12 @@ mod tests {
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
 
-        let client = ChangelogClient::with_grpc(mock_grpc, document_storage, cursor_storage);
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            cursor_storage,
+            reachable_server_state(),
+        );
 
         let consume_fut = client.consume(Box::new(|_| {}));
         tokio::pin!(consume_fut);
@@ -479,8 +607,12 @@ mod tests {
             })
             .returning(|_| Ok(Uuid::now_v7()));
 
-        let client =
-            ChangelogClient::with_grpc(mock_grpc, MockStorage::new(), MockCursorStorage::new());
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            MockStorage::new(),
+            MockCursorStorage::new(),
+            reachable_server_state(),
+        );
 
         client
             .send(

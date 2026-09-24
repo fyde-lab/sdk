@@ -24,6 +24,7 @@ use sqlx::SqlitePool;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
+use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
 use crate::{ErrorContext as _, Result};
@@ -84,9 +85,10 @@ pub(crate) async fn init(
     pool: SqlitePool,
     settings: Arc<dyn SettingsService>,
     sessions: Arc<SessionsClient>,
+    server_state: Arc<dyn ServerStateService>,
 ) -> Result<Arc<dyn Service>> {
     let storage = storage_sqlite::SqliteStorage::new(pool.clone());
-    let changelog = changelog::init(channel, pool, settings, sessions)
+    let changelog = changelog::init(channel, pool, settings, sessions, server_state)
         .await
         .context("failed to initialize changelog service")?;
 

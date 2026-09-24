@@ -16,6 +16,7 @@ use sqlx::SqlitePool;
 use tonic::transport::Channel;
 
 use crate::domains::documents::{self, Metadata};
+use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
 use crate::{ErrorContext as _, Result};
@@ -71,12 +72,19 @@ pub(super) async fn init(
     pool: SqlitePool,
     settings: Arc<dyn SettingsService>,
     sessions: Arc<SessionsClient>,
+    server_state: Arc<dyn ServerStateService>,
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool);
     let cursor_storage = storage_settings::SettingsCursorStorage::new(settings);
-    let client = service::ChangelogClient::new(channel, document_storage, cursor_storage, sessions)
-        .await
-        .context("failed to create changelog client")?;
+    let client = service::ChangelogClient::new(
+        channel,
+        document_storage,
+        cursor_storage,
+        sessions,
+        server_state,
+    )
+    .await
+    .context("failed to create changelog client")?;
 
     Ok(Arc::new(client))
 }
