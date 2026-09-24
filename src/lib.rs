@@ -1,8 +1,11 @@
 mod domains;
 mod ffi;
+#[path = "tools/log/mod.rs"]
+mod log;
 #[path = "tools/sql/mod.rs"]
 mod sql;
 #[cfg(test)]
+#[path = "tools/testing/mod.rs"]
 mod testing;
 
 uniffi::setup_scaffolding!();
@@ -15,8 +18,10 @@ pub use domains::documents::{ChangelogEvent, Document, Service as DocumentsServi
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
 pub use domains::users::Service as UsersService;
+pub use log::LogLevel;
 
 use domains::sessions::SessionsClient;
+use log::CallbackLayer;
 use sql::SqliteClient;
 use tonic::transport::Endpoint;
 
@@ -107,84 +112,6 @@ pub enum Storage {
     Memory,
 }
 
-/// The verbosity of the SDK's internal `tracing` logs, set up by
-/// [`Client::init`]. Mirrors [`tracing::Level`] plus an `Off` variant to
-/// silence logging entirely, since callers (in particular FFI callers like
-/// the Kotlin Multiplatform app) have no `RUST_LOG` environment variable to
-/// set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogLevel {
-    Off,
-    Error,
-    Warn,
-    Info,
-    Debug,
-    Trace,
-}
-
-impl From<LogLevel> for tracing_subscriber::filter::LevelFilter {
-    fn from(level: LogLevel) -> Self {
-        match level {
-            LogLevel::Off => Self::OFF,
-            LogLevel::Error => Self::ERROR,
-            LogLevel::Warn => Self::WARN,
-            LogLevel::Info => Self::INFO,
-            LogLevel::Debug => Self::DEBUG,
-            LogLevel::Trace => Self::TRACE,
-        }
-    }
-}
-
-impl From<&tracing::Level> for LogLevel {
-    fn from(level: &tracing::Level) -> Self {
-        match *level {
-            tracing::Level::ERROR => Self::Error,
-            tracing::Level::WARN => Self::Warn,
-            tracing::Level::INFO => Self::Info,
-            tracing::Level::DEBUG => Self::Debug,
-            tracing::Level::TRACE => Self::Trace,
-        }
-    }
-}
-
-/// A `tracing_subscriber` [`Layer`](tracing_subscriber::Layer) that forwards
-/// every log line it sees, formatted as a single string, to a caller-supplied
-/// callback. Installed alongside the crate's usual `fmt` layer when
-/// [`ClientConfig::on_log`] is set, so callers (in particular FFI callers
-/// with no terminal to print to) can observe SDK logs directly.
-struct CallbackLayer {
-    callback: Arc<dyn Fn(LogLevel, String) + Send + Sync>,
-}
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallbackLayer {
-    fn on_event(
-        &self,
-        event: &tracing::Event<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-        struct MessageVisitor(String);
-
-        impl tracing::field::Visit for MessageVisitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                use std::fmt::Write;
-                if field.name() == "message" {
-                    let _ = write!(self.0, "{value:?}");
-                } else {
-                    let _ = write!(self.0, " {}={value:?}", field.name());
-                }
-            }
-        }
-
-        let mut visitor = MessageVisitor(String::new());
-        event.record(&mut visitor);
-
-        (self.callback)(
-            LogLevel::from(event.metadata().level()),
-            format!("{}: {}", event.metadata().target(), visitor.0),
-        );
-    }
-}
-
 /// Configuration for [`Client::init`].
 pub struct ClientConfig {
     /// The `http://` or `https://` base URL of the fyde server to connect
@@ -246,18 +173,19 @@ impl Client {
 
         let settings = domains::settings::init(sqlite.pool().clone());
         let sessions = domains::sessions::init(settings.clone());
+        let server_state = domains::server_state::init(channel.clone());
         let documents = domains::documents::init(
             channel.clone(),
             sqlite.pool().clone(),
             settings.clone(),
             sessions.clone(),
+            server_state.clone(),
         )
         .await
         .context("failed to initialize documents service")?;
         let users = domains::users::init(channel.clone(), settings.clone(), sessions.clone())
             .await
             .context("failed to initialize users service")?;
-        let server_state = domains::server_state::init(channel);
 
         Ok(Self {
             documents,
