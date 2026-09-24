@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::domains::documents::{EventType, Metadata};
 use crate::domains::sessions::Service as SessionsService;
-use crate::{ChangelogEvent, Client, Document, Error};
+use crate::{ChangelogEvent, Client, ClientConfig, Document, Error, LogLevel, Storage};
 
 /// Error type surfaced to FFI callers. UniFFI requires exported errors to be
 /// their own type rather than the crate's own [`Error`], so every failure is
@@ -132,6 +132,87 @@ impl From<ChangelogEvent> for FfiChangelogEvent {
     }
 }
 
+/// Which SQLite backend a [`FydeClient`] persists local state to, mirroring
+/// [`Storage`].
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiStorage {
+    Disk { path: String },
+    Memory,
+}
+
+impl From<FfiStorage> for Storage {
+    fn from(storage: FfiStorage) -> Self {
+        match storage {
+            FfiStorage::Disk { path } => Storage::Disk(path.into()),
+            FfiStorage::Memory => Storage::Memory,
+        }
+    }
+}
+
+/// The verbosity of the SDK's internal logs, mirroring [`LogLevel`].
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiLogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<FfiLogLevel> for LogLevel {
+    fn from(level: FfiLogLevel) -> Self {
+        match level {
+            FfiLogLevel::Off => LogLevel::Off,
+            FfiLogLevel::Error => LogLevel::Error,
+            FfiLogLevel::Warn => LogLevel::Warn,
+            FfiLogLevel::Info => LogLevel::Info,
+            FfiLogLevel::Debug => LogLevel::Debug,
+            FfiLogLevel::Trace => LogLevel::Trace,
+        }
+    }
+}
+
+impl From<LogLevel> for FfiLogLevel {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Off => FfiLogLevel::Off,
+            LogLevel::Error => FfiLogLevel::Error,
+            LogLevel::Warn => FfiLogLevel::Warn,
+            LogLevel::Info => FfiLogLevel::Info,
+            LogLevel::Debug => FfiLogLevel::Debug,
+            LogLevel::Trace => FfiLogLevel::Trace,
+        }
+    }
+}
+
+/// Callback interface for [`FfiClientConfig::on_log`], implemented by
+/// foreign (Kotlin/Swift) callers and invoked once per log line emitted by
+/// the SDK.
+#[uniffi::export(callback_interface)]
+pub trait LogListener: Send + Sync {
+    fn on_log(&self, level: FfiLogLevel, line: String);
+}
+
+/// Configuration for [`FydeClient::init`], mirroring [`ClientConfig`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiClientConfig {
+    pub url: String,
+    pub storage: FfiStorage,
+    pub log_level: FfiLogLevel,
+}
+
+impl From<FfiClientConfig> for ClientConfig {
+    fn from(config: FfiClientConfig) -> Self {
+        Self {
+            url: config.url,
+            storage: config.storage.into(),
+            log_level: config.log_level.into(),
+            on_log: None,
+        }
+    }
+}
+
 /// Callback interface for [`FydeClient::sync`], implemented by foreign
 /// (Kotlin/Swift) callers and invoked once per [`FfiChangelogEvent`]
 /// encountered during changelog catch-up and live streaming.
@@ -148,23 +229,23 @@ pub struct FydeClient {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl FydeClient {
-    /// Connects to a fyde server at `url`, backed by the default on-disk
-    /// SQLite database. Mirrors [`Client::connect`].
+    /// Connects to a fyde server per `config`. Mirrors [`Client::init`].
     ///
-    /// Needs `async_runtime = "tokio"`: `Client::connect` goes through
-    /// sqlx's connection pool, which requires an active Tokio context to
-    /// spawn its background tasks on — not just a generic future poller.
+    /// Needs `async_runtime = "tokio"`: `Client::init` goes through sqlx's
+    /// connection pool, which requires an active Tokio context to spawn its
+    /// background tasks on — not just a generic future poller.
     #[uniffi::constructor(async_runtime = "tokio")]
-    pub async fn connect(url: String) -> Result<Arc<Self>, FfiError> {
-        let inner = Client::connect(url).await?;
-        Ok(Arc::new(Self { inner }))
-    }
+    pub async fn init(
+        config: FfiClientConfig,
+        on_log: Option<Box<dyn LogListener>>,
+    ) -> Result<Arc<Self>, FfiError> {
+        let mut config: ClientConfig = config.into();
+        config.on_log = on_log.map(|listener| -> Arc<dyn Fn(LogLevel, String) + Send + Sync> {
+            let listener: Arc<dyn LogListener> = Arc::from(listener);
+            Arc::new(move |level, line| listener.on_log(level.into(), line))
+        });
 
-    /// Connects to a fyde server backed by a private in-memory database.
-    /// Mirrors [`Client::connect_memory`].
-    #[uniffi::constructor(async_runtime = "tokio")]
-    pub async fn connect_memory(url: String) -> Result<Arc<Self>, FfiError> {
-        let inner = Client::connect_memory(url).await?;
+        let inner = Client::init(config).await?;
         Ok(Arc::new(Self { inner }))
     }
 

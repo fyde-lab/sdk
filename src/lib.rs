@@ -96,6 +96,111 @@ where
     }
 }
 
+/// Selects which SQLite backend a [`Client`] persists local state to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Storage {
+    /// An on-disk database at the given path (see
+    /// [`sql::SqliteClient::connect_with`]).
+    Disk(std::path::PathBuf),
+    /// A private in-memory database that only lives for the process's
+    /// lifetime (see [`sql::SqliteClient::connect_with`]).
+    Memory,
+}
+
+/// The verbosity of the SDK's internal `tracing` logs, set up by
+/// [`Client::init`]. Mirrors [`tracing::Level`] plus an `Off` variant to
+/// silence logging entirely, since callers (in particular FFI callers like
+/// the Kotlin Multiplatform app) have no `RUST_LOG` environment variable to
+/// set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<LogLevel> for tracing_subscriber::filter::LevelFilter {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Off => Self::OFF,
+            LogLevel::Error => Self::ERROR,
+            LogLevel::Warn => Self::WARN,
+            LogLevel::Info => Self::INFO,
+            LogLevel::Debug => Self::DEBUG,
+            LogLevel::Trace => Self::TRACE,
+        }
+    }
+}
+
+impl From<&tracing::Level> for LogLevel {
+    fn from(level: &tracing::Level) -> Self {
+        match *level {
+            tracing::Level::ERROR => Self::Error,
+            tracing::Level::WARN => Self::Warn,
+            tracing::Level::INFO => Self::Info,
+            tracing::Level::DEBUG => Self::Debug,
+            tracing::Level::TRACE => Self::Trace,
+        }
+    }
+}
+
+/// A `tracing_subscriber` [`Layer`](tracing_subscriber::Layer) that forwards
+/// every log line it sees, formatted as a single string, to a caller-supplied
+/// callback. Installed alongside the crate's usual `fmt` layer when
+/// [`ClientConfig::on_log`] is set, so callers (in particular FFI callers
+/// with no terminal to print to) can observe SDK logs directly.
+struct CallbackLayer {
+    callback: Arc<dyn Fn(LogLevel, String) + Send + Sync>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallbackLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct MessageVisitor(String);
+
+        impl tracing::field::Visit for MessageVisitor {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                if field.name() == "message" {
+                    let _ = write!(self.0, "{value:?}");
+                } else {
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+        }
+
+        let mut visitor = MessageVisitor(String::new());
+        event.record(&mut visitor);
+
+        (self.callback)(
+            LogLevel::from(event.metadata().level()),
+            format!("{}: {}", event.metadata().target(), visitor.0),
+        );
+    }
+}
+
+/// Configuration for [`Client::init`].
+pub struct ClientConfig {
+    /// The `http://` or `https://` base URL of the fyde server to connect
+    /// to (e.g. `http://127.0.0.1:8080`).
+    pub url: String,
+    /// Which SQLite backend to persist local state to.
+    pub storage: Storage,
+    /// The verbosity of the SDK's internal logs.
+    pub log_level: LogLevel,
+    /// Called once for every log line emitted by the SDK, in addition to the
+    /// usual terminal output, when set. Useful for callers with no
+    /// terminal/stderr to inspect (in particular FFI callers like the Kotlin
+    /// Multiplatform app).
+    pub on_log: Option<Arc<dyn Fn(LogLevel, String) + Send + Sync>>,
+}
+
 /// A connection to a fyde server.
 pub struct Client {
     documents: Arc<dyn DocumentsService>,
@@ -106,35 +211,36 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connects to a fyde server at the given `http://` or `https://` base
-    /// URL (e.g. `http://127.0.0.1:8080`), using the default local SQLite
-    /// database location (see [`sql::SqliteClient::connect`]).
-    pub async fn connect(url: impl AsRef<str>) -> Result<Self> {
-        let sqlite = SqliteClient::connect()
-            .await
-            .context("failed to open local database")?;
+    /// Connects to a fyde server per `config`.
+    pub async fn init(config: ClientConfig) -> Result<Self> {
+        // Ignore the result: a subscriber may already be installed by the
+        // consuming binary (e.g. `cli` sets one up via `RUST_LOG`), or by a
+        // previous `Client::init` call, and a library must not panic over it.
+        use tracing_subscriber::prelude::*;
+        let callback_layer = config
+            .on_log
+            .clone()
+            .map(|callback| CallbackLayer { callback });
+        let _ = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(callback_layer)
+            .with(tracing_subscriber::filter::LevelFilter::from(
+                config.log_level,
+            ))
+            .try_init();
 
-        Self::connect_with_sqlite(url, sqlite).await
-    }
+        let sqlite = match config.storage {
+            Storage::Disk(path) => SqliteClient::connect_at(path).await,
+            Storage::Memory => SqliteClient::connect_with(sql::IN_MEMORY_DB).await,
+        }
+        .context("failed to open local database")?;
 
-    /// Connects to a fyde server, like [`Client::connect`], but backed by a
-    /// private in-memory SQLite database that only lives for the process's
-    /// lifetime, instead of the default XDG data directory location.
-    pub async fn connect_memory(url: impl AsRef<str>) -> Result<Self> {
-        let sqlite = SqliteClient::connect_with(sql::IN_MEMORY_DB)
-            .await
-            .context("failed to open local database")?;
-
-        Self::connect_with_sqlite(url, sqlite).await
-    }
-
-    async fn connect_with_sqlite(url: impl AsRef<str>, sqlite: SqliteClient) -> Result<Self> {
         // Opened lazily: `connect_lazy` doesn't dial the server here, only
         // once some call actually needs it (see each domain's
         // `grpc_client.rs`). The resulting `Channel` is cheap to clone and
         // shared by every domain's gRPC client, so they all reuse the same
         // underlying HTTP/2 connection instead of opening one each.
-        let channel = Endpoint::from_shared(url.as_ref().to_string())
+        let channel = Endpoint::from_shared(config.url)
             .map_err(|err| Error::InvalidEndpoint(err.to_string()))?
             .connect_lazy();
 
@@ -235,8 +341,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_memory_rejects_a_malformed_url() {
-        let err = match Client::connect_memory("not a valid uri").await {
+    async fn init_rejects_a_malformed_url() {
+        let config = ClientConfig {
+            url: "not a valid uri".to_string(),
+            storage: Storage::Memory,
+            log_level: LogLevel::Off,
+            on_log: None,
+        };
+
+        let err = match Client::init(config).await {
             Ok(_) => panic!("a malformed url must be rejected"),
             Err(err) => err,
         };

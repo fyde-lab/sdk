@@ -14,11 +14,9 @@ use crate::{Error, ErrorContext as _, Result};
 /// in-memory database instead of a file on disk.
 pub const IN_MEMORY_DB: &str = ":memory:";
 
-/// A local SQLite database used by the SDK to persist data on disk.
-///
-/// The database file lives under the XDG Base Directory Specification's
-/// data directory (`$XDG_DATA_HOME/fyde/fyde.db`, falling back to
-/// `~/.local/share/fyde/fyde.db`), which is created if it doesn't exist.
+/// A local SQLite database used by the SDK to persist data on disk, at a
+/// caller-provided path (see [`SqliteClient::connect_with`]), created if it
+/// doesn't exist.
 ///
 /// Opening a file-backed database also takes an OS-level exclusive lock, so
 /// a second process (or a second [`SqliteClient`] in the same process)
@@ -35,13 +33,6 @@ pub struct SqliteClient {
 }
 
 impl SqliteClient {
-    /// Opens the local SQLite database, creating its containing directory
-    /// and the database file if they don't already exist.
-    pub async fn connect() -> Result<Self> {
-        let path = local_database_path().context("failed to resolve local database path")?;
-        Self::connect_at(path).await
-    }
-
     /// Opens the local SQLite database at a caller-provided location:
     /// either a filesystem path, or [`IN_MEMORY_DB`] (`":memory:"`) for a
     /// private in-memory database that only lives for the process's
@@ -54,7 +45,7 @@ impl SqliteClient {
         }
     }
 
-    async fn connect_at(path: PathBuf) -> Result<Self> {
+    pub(crate) async fn connect_at(path: PathBuf) -> Result<Self> {
         let lock = lock_database_file(&path)
             .with_context(|| format!("failed to lock local database at {}", path.display()))?;
 
@@ -99,14 +90,6 @@ impl SqliteClient {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
-}
-
-/// Resolves the path to the local database file per the XDG Base Directory
-/// Specification, creating its parent directory if needed.
-fn local_database_path() -> Result<PathBuf> {
-    let dirs = xdg::BaseDirectories::with_prefix("fyde")
-        .context("failed to resolve XDG base directories")?;
-    dirs.place_data_file("fyde.db").map_err(Error::Io)
 }
 
 /// Acquires an OS-level exclusive lock on a `.lock` file next to `db_path`,
