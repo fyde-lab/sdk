@@ -50,6 +50,12 @@ xdg = "2.5.2"
 tonic-prost-build = "0.14.6"
 
 [dev-dependencies]
+anyhow = "1.0.104"
+# Only used to spin up a real server in `tests/` (see `tests/common/mod.rs`);
+# `../server` in turn dev-depends on this crate for its own `tests/` in the
+# other direction, which is a supported cargo pattern since neither side's
+# regular dependencies (only their dev-dependencies) form the cycle.
+fyde-server = { path = "../server" }
 mockall = "0.15.0"
 tempfile = "3.14.0"
 tokio = { version = "1.53.1", features = ["test-util"] }
