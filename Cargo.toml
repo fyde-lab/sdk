@@ -49,6 +49,19 @@ xdg = "2.5.2"
 [build-dependencies]
 tonic-prost-build = "0.14.6"
 
+# Argon2id runs as OPAQUE's key-stretching function on every login/registration
+# (see `users/crypto.rs`'s `high_effort_ksf`), and its RFC 9106 low-memory
+# params (64 MiB, 3 iterations, 4 lanes) are deliberately expensive. Without
+# this override, an unoptimized debug build takes ~3s per call versus ~200ms
+# in release — opting just these crates into full optimization even under
+# `cargo build`/`cargo test` (no --release) keeps debug builds usable without
+# losing debug info for the rest of this crate.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 [dev-dependencies]
 anyhow = "1.0.104"
 # Only used to spin up a real server in `tests/` (see `tests/common/mod.rs`);
