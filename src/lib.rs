@@ -156,11 +156,13 @@ impl Client {
             ))
             .try_init();
 
-        let sqlite = match config.storage {
-            Storage::Disk(path) => SqliteClient::connect_at(path).await,
-            Storage::Memory => SqliteClient::connect_with(sql::IN_MEMORY_DB).await,
-        }
-        .context("failed to open local database")?;
+        let sqlite: Arc<SqliteClient> = Arc::new(
+            match config.storage {
+                Storage::Disk(path) => SqliteClient::connect_at(path).await,
+                Storage::Memory => SqliteClient::connect_with(sql::IN_MEMORY_DB).await,
+            }
+            .context("failed to open local database")?,
+        );
 
         // Opened lazily: `connect_lazy` doesn't dial the server here, only
         // once some call actually needs it (see each domain's
@@ -183,9 +185,14 @@ impl Client {
         )
         .await
         .context("failed to initialize documents service")?;
-        let users = domains::users::init(channel.clone(), settings.clone(), sessions.clone())
-            .await
-            .context("failed to initialize users service")?;
+        let users = domains::users::init(
+            channel.clone(),
+            settings.clone(),
+            sessions.clone(),
+            sqlite.clone(),
+        )
+        .await
+        .context("failed to initialize users service")?;
 
         Ok(Self {
             documents,

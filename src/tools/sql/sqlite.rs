@@ -90,6 +90,36 @@ impl SqliteClient {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+
+    /// Deletes every row from every table in the local database, used to
+    /// wipe all local state (cached documents, settings — including the
+    /// session token — and the changelog offset) on logout. The single
+    /// pooled connection stays open throughout, unlike deleting the
+    /// database file itself would: the SDK keeps working against the same
+    /// (now empty) database for the rest of the process's lifetime, so a
+    /// subsequent login persists correctly instead of writing into an
+    /// orphaned, unlinked file.
+    pub(crate) async fn wipe(&self) -> Result<()> {
+        let tables: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+             AND name != '_sqlx_migrations'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list local database tables")?;
+
+        for (table,) in tables {
+            // `table` comes from `sqlite_master`, not external input, so
+            // interpolating it into the query is safe.
+            sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
+                .execute(&self.pool)
+                .await
+                .with_context(|| format!("failed to wipe local database table {table}"))?;
+        }
+
+        Ok(())
+    }
 }
 
 /// Acquires an OS-level exclusive lock on a `.lock` file next to `db_path`,
@@ -170,5 +200,29 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(format!("{}.lock", path.display())).unwrap();
+    }
+
+    #[tokio::test]
+    async fn wipe_deletes_all_rows_from_every_table_but_keeps_the_database_usable() {
+        let client = SqliteClient::connect_with(IN_MEMORY_DB).await.unwrap();
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('session_token', 'a-token')")
+            .execute(client.pool())
+            .await
+            .unwrap();
+
+        client.wipe().await.unwrap();
+
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM settings")
+            .fetch_one(client.pool())
+            .await
+            .unwrap();
+        assert_eq!(row.0, 0);
+
+        // The connection still works afterwards, e.g. for a subsequent
+        // login to persist a fresh session token.
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('session_token', 'new-token')")
+            .execute(client.pool())
+            .await
+            .unwrap();
     }
 }

@@ -301,19 +301,9 @@ impl FydeClient {
         Ok(())
     }
 
-    /// Removes the currently persisted session token, if any, so subsequent
-    /// requests go out unauthenticated. Unlike `logout`, this never talks to
-    /// the server — it only clears the local token. Mirrors
-    /// `sessions::Service::remove_session`.
-    pub async fn remove_session(&self) -> Result<(), FfiError> {
-        self.inner.sessions().remove_session().await?;
-        Ok(())
-    }
-
     /// Returns whether a session token is currently persisted, i.e. a
-    /// `create_user`/`login`/`save_new_session` call succeeded and neither
-    /// `logout` nor `remove_session` has been called since. Mirrors
-    /// `sessions::Service::is_connected`.
+    /// `create_user`/`login`/`save_new_session` call succeeded and `logout`
+    /// hasn't been called since. Mirrors `sessions::Service::is_connected`.
     pub async fn is_connected(&self) -> Result<bool, FfiError> {
         let connected = self.inner.sessions().is_connected().await?;
         Ok(connected)

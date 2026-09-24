@@ -7,6 +7,7 @@ use tonic::transport::Channel;
 use crate::domains::sessions::SESSION_TOKEN_SETTING;
 use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
+use crate::sql::LocalDatabase;
 use crate::{ErrorContext as _, Result};
 
 use super::Service;
@@ -29,22 +30,25 @@ pub struct UsersClient {
     grpc: Box<dyn FydeClient>,
     settings: Arc<dyn SettingsService>,
     sessions: Arc<SessionsClient>,
+    local_db: Arc<dyn LocalDatabase>,
 }
 
 impl UsersClient {
     /// Creates a client for the users service using the shared `channel`
     /// connection to the fyde server, persisting newly created accounts'
-    /// master keys in `settings`, and the session token and authenticating
-    /// outgoing calls via `sessions`.
+    /// master keys in `settings`, the session token and authenticating
+    /// outgoing calls via `sessions`, and wiping `local_db` on `logout`.
     pub(super) async fn new(
         channel: Channel,
         settings: Arc<dyn SettingsService>,
         sessions: Arc<SessionsClient>,
+        local_db: Arc<dyn LocalDatabase>,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(channel, sessions.clone())),
             settings,
             sessions,
+            local_db,
         })
     }
 
@@ -56,11 +60,13 @@ impl UsersClient {
         grpc: impl FydeClient + 'static,
         settings: Arc<dyn SettingsService>,
         sessions: Arc<SessionsClient>,
+        local_db: Arc<dyn LocalDatabase>,
     ) -> Self {
         Self {
             grpc: Box::new(grpc),
             settings,
             sessions,
+            local_db,
         }
     }
 }
@@ -105,7 +111,10 @@ impl Service for UsersClient {
 
         self.grpc.logout().await.context("failed to log out")?;
 
-        self.sessions.remove_session().await?;
+        self.local_db
+            .wipe()
+            .await
+            .context("failed to wipe local database")?;
 
         Ok(())
     }
@@ -118,6 +127,7 @@ mod tests {
     use super::super::grpc_client::MockFydeClient;
     use super::*;
     use crate::domains::settings::MockService as MockSettingsService;
+    use crate::sql::MockLocalDatabase;
 
     fn client_with_grpc(
         grpc: impl FydeClient + 'static,
@@ -125,7 +135,9 @@ mod tests {
     ) -> UsersClient {
         let settings: Arc<dyn SettingsService> = Arc::new(settings);
         let sessions = Arc::new(SessionsClient::new(settings.clone()));
-        UsersClient::with_grpc(grpc, settings, sessions)
+        let mut local_db = MockLocalDatabase::new();
+        local_db.expect_wipe().returning(|| Ok(()));
+        UsersClient::with_grpc(grpc, settings, sessions, Arc::new(local_db))
     }
 
     #[tokio::test]
@@ -349,11 +361,6 @@ mod tests {
             .withf(|key| key == SESSION_TOKEN_SETTING)
             .times(1)
             .returning(|_| Ok(Some("a-token".to_string())));
-        settings
-            .expect_delete()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
-            .times(1)
-            .returning(|_| Ok(()));
 
         let client = client_with_grpc(mock_grpc, settings);
         client
@@ -375,8 +382,6 @@ mod tests {
             .withf(|key| key == SESSION_TOKEN_SETTING)
             .times(1)
             .returning(|_| Ok(None));
-        // No `expect_delete()` set up: the early return means settings is
-        // never told to remove anything.
 
         let client = client_with_grpc(mock_grpc, settings);
 
@@ -410,11 +415,6 @@ mod tests {
             .withf(|key| key == SESSION_TOKEN_SETTING)
             .times(1)
             .returning(|_| Ok(Some("a-token".to_string())));
-        settings
-            .expect_delete()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
-            .times(1)
-            .returning(|_| Ok(()));
 
         let client = client_with_grpc(mock_grpc, settings);
         client
@@ -423,6 +423,38 @@ mod tests {
             .unwrap();
 
         client.logout().await.unwrap();
+        client.logout().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn logout_wipes_the_local_database() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_login()
+            .returning(|_, _, _| Ok("a-token".to_string()));
+        mock_grpc.expect_logout().times(1).returning(|| Ok(()));
+
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_set()
+            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .returning(|_| Ok(Some("a-token".to_string())));
+        let settings: Arc<dyn SettingsService> = Arc::new(settings);
+        let sessions = Arc::new(SessionsClient::new(settings.clone()));
+
+        let mut local_db = MockLocalDatabase::new();
+        local_db.expect_wipe().times(1).returning(|| Ok(()));
+
+        let client = UsersClient::with_grpc(mock_grpc, settings, sessions, Arc::new(local_db));
+        client
+            .login("alice", "correct horse battery staple", "device")
+            .await
+            .unwrap();
+
         client.logout().await.unwrap();
     }
 }

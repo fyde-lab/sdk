@@ -49,13 +49,6 @@ impl Service for SessionsClient {
             .context("failed to persist session token")
     }
 
-    async fn remove_session(&self) -> Result<()> {
-        self.settings
-            .delete(SESSION_TOKEN_SETTING)
-            .await
-            .context("failed to remove persisted session token")
-    }
-
     async fn is_connected(&self) -> Result<bool> {
         Ok(self
             .settings
@@ -113,19 +106,6 @@ mod tests {
         let client = SessionsClient::new(Arc::new(settings));
 
         client.save_new_session("a-token").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn remove_session_deletes_the_session_key() {
-        let mut settings = MockSettingsService::new();
-        settings
-            .expect_delete()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
-            .times(1)
-            .returning(|_| Ok(()));
-        let client = SessionsClient::new(Arc::new(settings));
-
-        client.remove_session().await.unwrap();
     }
 
     #[tokio::test]

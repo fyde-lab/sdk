@@ -12,6 +12,7 @@ use tonic::transport::Channel;
 use crate::Result;
 use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
+use crate::sql::LocalDatabase;
 
 /// Manages account creation and session lifecycle against the fyde
 /// server's users service. Trait methods take `&self` (not `&mut self`) so
@@ -43,8 +44,10 @@ pub trait Service: Send + Sync {
     /// invalid.
     async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String>;
 
-    /// Closes the session opened by the most recent `create`/`login` call.
-    /// A no-op if there is no open session.
+    /// Closes the session opened by the most recent `create`/`login` call
+    /// and wipes the SDK's local database, clearing all locally cached
+    /// state (documents, settings — including the session token itself —
+    /// and the changelog offset). A no-op if there is no open session.
     async fn logout(&self) -> Result<()>;
 }
 
@@ -53,12 +56,14 @@ pub trait Service: Send + Sync {
 /// persist the session token (read back by every other service's gRPC
 /// transport, via `sessions`, to authenticate their own calls) and where
 /// `create` also persists the master key it generates for a new account.
+/// `local_db` is wiped by `logout` to clear local state.
 pub(crate) async fn init(
     channel: Channel,
     settings: Arc<dyn SettingsService>,
     sessions: Arc<SessionsClient>,
+    local_db: Arc<dyn LocalDatabase>,
 ) -> Result<Arc<dyn Service>> {
     Ok(Arc::new(
-        UsersClient::new(channel, settings, sessions).await?,
+        UsersClient::new(channel, settings, sessions, local_db).await?,
     ))
 }

@@ -39,14 +39,9 @@ pub(crate) trait Service: Send + Sync {
     /// session, overwriting whatever token (if any) was persisted before.
     async fn save_new_session(&self, token: &str) -> Result<()>;
 
-    /// Removes the session token persisted by a previous
-    /// [`Service::save_new_session`] call, if any. Called by
-    /// `users::Service::logout` once the server has closed the session.
-    async fn remove_session(&self) -> Result<()>;
-
     /// Returns whether a session token is currently persisted (i.e. a
-    /// [`Service::save_new_session`] call happened and no
-    /// [`Service::remove_session`] call has happened since). Called by
+    /// [`Service::save_new_session`] call happened since the local database
+    /// was last wiped by `users::Service::logout`). Called by
     /// `users::Service::logout`.
     async fn is_connected(&self) -> Result<bool>;
 }
