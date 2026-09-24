@@ -1,29 +1,228 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
+use hkdf::Hkdf;
+#[cfg(test)]
+use mockall::automock;
+use opaque_ke::ciphersuite::CipherSuite;
+use opaque_ke::rand::rngs::OsRng;
+use opaque_ke::{
+    ClientLogin, ClientLoginFinishParameters, ClientRegistration,
+    ClientRegistrationFinishParameters, CredentialResponse, RegistrationResponse,
+};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, ErrorContext as _, Result};
 
 /// Length in bytes of an AES-256 key: the master key, and the key derived
-/// from the user's password to wrap it.
+/// from the OPAQUE export key to wrap it.
 const KEY_LEN: usize = 32;
 /// Length in bytes of an AES-GCM nonce (96 bits, as recommended by NIST
 /// SP 800-38D / OWASP for AES-GCM).
 const NONCE_LEN: usize = 12;
-/// Length in bytes of the random salt used to derive the password-wrapping
-/// key.
-const SALT_LEN: usize = 16;
 
-/// A random master key wrapped under a key derived from the user's
-/// password, JSON-serialized for storage as a single settings value under
-/// `master_key`. `salt` and `nonce` aren't secret — both are required to
-/// re-derive the wrapping key and decrypt, so they travel alongside the
-/// ciphertext.
+/// The OPAQUE ciphersuite used across the fyde protocol: the ristretto255
+/// group for both the OPRF and the key exchange, SHA-512 as the
+/// key-exchange hash (3DH), and Argon2id — configured via
+/// [`high_effort_ksf`] — as the key-stretching function (KSF). Must match
+/// what the server declares (`../../../../server/CLAUDE.md`'s `tools::opaque`
+/// section) for registration and login to compute the same record on both
+/// sides, though the `Ksf` type specifically only ever matters here: key
+/// stretching in OPAQUE is a client-only operation.
+struct FydeCipherSuite;
+
+impl CipherSuite for FydeCipherSuite {
+    type OprfCs = opaque_ke::Ristretto255;
+    type KeyExchange = opaque_ke::TripleDh<opaque_ke::Ristretto255, sha2_opaque::Sha512>;
+    type Ksf = Argon2<'static>;
+}
+
+/// RFC 9106 §4's "low-memory" recommended Argon2id parameters (64 MiB, 3
+/// iterations, 4 lanes) — safe on the mobile clients this SDK is meant to
+/// eventually back (see the top-level `CLAUDE.md`'s `application/` entry),
+/// unlike the RFC's other "high-memory" option (2 GiB), which risks getting
+/// OOM-killed there. Applied as OPAQUE's key-stretching function on every
+/// registration and login, on top of (not instead of) the security its
+/// oblivious PRF already provides: the KSF is what protects against a
+/// compromised server using a stolen OPRF key to brute-force weak
+/// passwords offline.
+const KSF_M_COST_KIB: u32 = 64 * 1024;
+const KSF_T_COST: u32 = 3;
+const KSF_P_COST: u32 = 4;
+
+fn high_effort_ksf() -> Argon2<'static> {
+    Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        Params::new(KSF_M_COST_KIB, KSF_T_COST, KSF_P_COST, None)
+            .expect("hardcoded Argon2 parameters are valid"),
+    )
+}
+
+/// Client-side state produced by `start_registration`, to be round-tripped
+/// into `finish_registration` once the server's response arrives. Opaque
+/// outside this module: wraps `opaque-ke`'s generic ciphersuite machinery
+/// so callers never need to name [`FydeCipherSuite`] themselves.
+pub(super) struct RegistrationState(ClientRegistration<FydeCipherSuite>);
+
+/// Client-side state produced by `start_login`, to be round-tripped into
+/// `finish_login` once the server's response arrives.
+pub(super) struct LoginState(ClientLogin<FydeCipherSuite>);
+
+/// Drives the client side of the OPAQUE registration/login exchange.
+/// Abstracted as a trait — even though, unlike [`super::grpc_client::FydeClient`],
+/// there's only ever one real implementation — so [`super::service`]'s tests
+/// can substitute [`MockOpaqueClient`] instead of paying the cost of the
+/// real (deliberately expensive, see [`high_effort_ksf`]) key-stretching
+/// function on every test, and without needing to hand-construct
+/// protocol-valid response bytes for every scenario.
+#[cfg_attr(test, automock)]
+pub(super) trait OpaqueClient: Send + Sync {
+    /// First step of OPAQUE registration: derives an oblivious request
+    /// from `password`, to send to the server's `StartRegistration` RPC.
+    fn start_registration(&self, password: &str) -> Result<(RegistrationState, Vec<u8>)>;
+
+    /// Second and final step of OPAQUE registration: turns the server's
+    /// `StartRegistration` response into the registration record to send
+    /// to `FinishRegistration`, alongside the export key the server never
+    /// sees — used by [`generate_and_wrap_master_key`] to protect the
+    /// account's master key.
+    fn finish_registration(
+        &self,
+        state: RegistrationState,
+        password: &str,
+        response: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>)>;
+
+    /// First step of OPAQUE login: derives an oblivious request from
+    /// `password`, to send to the server's `StartLogin` RPC.
+    fn start_login(&self, password: &str) -> Result<(LoginState, Vec<u8>)>;
+
+    /// Second and final step of OPAQUE login: turns the server's
+    /// `StartLogin` response into the finalization message to send to
+    /// `FinishLogin`. A wrong password is detected right here, without a
+    /// round trip to the server: OPAQUE's envelope can't be opened with
+    /// the wrong password-derived key, so there's no finalization message
+    /// to produce. Fails with [`crate::Error::InvalidCredentials`] in that
+    /// case — the same error a wrong password produces if it isn't caught
+    /// until the server rejects `FinishLogin`.
+    fn finish_login(&self, state: LoginState, password: &str, response: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// The default [`OpaqueClient`] implementation, backed by real `opaque-ke`
+/// cryptographic operations.
+pub(super) struct DefaultOpaqueClient;
+
+impl OpaqueClient for DefaultOpaqueClient {
+    fn start_registration(&self, password: &str) -> Result<(RegistrationState, Vec<u8>)> {
+        let mut rng = OsRng;
+        let result = ClientRegistration::<FydeCipherSuite>::start(&mut rng, password.as_bytes())
+            .map_err(|err| {
+                Error::Encryption(format!("failed to start OPAQUE registration: {err}"))
+            })?;
+
+        Ok((
+            RegistrationState(result.state),
+            result.message.serialize().to_vec(),
+        ))
+    }
+
+    fn finish_registration(
+        &self,
+        state: RegistrationState,
+        password: &str,
+        response: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let response = RegistrationResponse::deserialize(response).map_err(|err| {
+            Error::Encryption(format!(
+                "failed to parse OPAQUE registration response: {err}"
+            ))
+        })?;
+
+        let mut rng = OsRng;
+        let ksf = high_effort_ksf();
+        let result = state
+            .0
+            .finish(
+                &mut rng,
+                password.as_bytes(),
+                response,
+                ClientRegistrationFinishParameters::new(Default::default(), Some(&ksf)),
+            )
+            .map_err(|err| {
+                Error::Encryption(format!("failed to finish OPAQUE registration: {err}"))
+            })?;
+
+        Ok((
+            result.message.serialize().to_vec(),
+            result.export_key.to_vec(),
+        ))
+    }
+
+    fn start_login(&self, password: &str) -> Result<(LoginState, Vec<u8>)> {
+        let mut rng = OsRng;
+        let result = ClientLogin::<FydeCipherSuite>::start(&mut rng, password.as_bytes())
+            .map_err(|err| Error::Encryption(format!("failed to start OPAQUE login: {err}")))?;
+
+        Ok((
+            LoginState(result.state),
+            result.message.serialize().to_vec(),
+        ))
+    }
+
+    fn finish_login(&self, state: LoginState, password: &str, response: &[u8]) -> Result<Vec<u8>> {
+        let response = CredentialResponse::deserialize(response).map_err(|err| {
+            Error::Encryption(format!("failed to parse OPAQUE login response: {err}"))
+        })?;
+
+        let mut rng = OsRng;
+        let ksf = high_effort_ksf();
+        let result = state
+            .0
+            .finish(
+                &mut rng,
+                password.as_bytes(),
+                response,
+                ClientLoginFinishParameters::new(None, Default::default(), Some(&ksf)),
+            )
+            .map_err(|_| Error::InvalidCredentials)?;
+
+        Ok(result.message.serialize().to_vec())
+    }
+}
+
+/// Produces a placeholder [`RegistrationState`]/[`LoginState`] for tests
+/// outside this module (`super::service`'s, mocking [`OpaqueClient`]) that
+/// need *a* value satisfying `finish_registration`/`finish_login`'s
+/// signature but don't care about its content — [`FydeCipherSuite`] is
+/// private to this module, so nothing outside it can construct one
+/// directly. Cheap: only exercises OPAQUE's first message (blinding), never
+/// the key-stretching function.
+#[cfg(test)]
+pub(super) fn fake_registration_state() -> RegistrationState {
+    RegistrationState(
+        ClientRegistration::<FydeCipherSuite>::start(&mut OsRng, b"placeholder")
+            .unwrap()
+            .state,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn fake_login_state() -> LoginState {
+    LoginState(
+        ClientLogin::<FydeCipherSuite>::start(&mut OsRng, b"placeholder")
+            .unwrap()
+            .state,
+    )
+}
+
+/// A random master key wrapped under a key derived from the OPAQUE export
+/// key (see [`finish_registration`]), JSON-serialized for storage as a
+/// single settings value under `master_key`. `nonce` isn't secret — it's
+/// required to decrypt, so it travels alongside the ciphertext.
 #[derive(Serialize, Deserialize)]
 struct WrappedMasterKey {
-    salt: Vec<u8>,
     nonce: Vec<u8>,
     ciphertext: Vec<u8>,
 }
@@ -36,27 +235,29 @@ fn generate_master_key() -> [u8; KEY_LEN] {
     key
 }
 
-/// Derives a 256-bit key-wrapping key from `password` and `salt` using
-/// Argon2id (OWASP's recommended memory-hard password KDF), the same
-/// algorithm the server uses to hash passwords for authentication.
-fn derive_wrapping_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
+/// Derives a 256-bit key-wrapping key from an OPAQUE export key via
+/// HKDF-SHA256. Unlike the master key wrapping this crate used before
+/// OPAQUE (which derived straight from the plaintext password via Argon2),
+/// no further stretching happens here: the export key is already the
+/// output of OPAQUE's own key-stretched, oblivious-PRF-hardened exchange
+/// (see [`high_effort_ksf`]) — running another slow hash over it would add
+/// cost without adding security.
+fn derive_wrapping_key(export_key: &[u8]) -> Result<[u8; KEY_LEN]> {
     let mut key = [0u8; KEY_LEN];
-    Argon2::default()
-        .hash_password_into(password.as_bytes(), salt, &mut key)
-        .map_err(|err| Error::Encryption(format!("failed to derive key from password: {err}")))?;
+    Hkdf::<sha2_opaque::Sha256>::new(None, export_key)
+        .expand(b"fyde/master-key-wrap-key-v1", &mut key)
+        .map_err(|err| Error::Encryption(format!("failed to derive key from export key: {err}")))?;
     Ok(key)
 }
 
 /// Generates a fresh random master key and encrypts it under a key derived
-/// from `password` (AES-256-GCM, random nonce), returning the result
+/// from `export_key` (AES-256-GCM, random nonce), returning the result
 /// JSON-serialized and ready to persist as a settings value.
-pub(super) fn generate_and_wrap_master_key(password: &str) -> Result<String> {
+pub(super) fn generate_and_wrap_master_key(export_key: &[u8]) -> Result<String> {
     let master_key = generate_master_key();
 
-    let mut salt = [0u8; SALT_LEN];
-    rand::rng().fill_bytes(&mut salt);
     let wrapping_key =
-        derive_wrapping_key(password, &salt).context("failed to derive master key wrapping key")?;
+        derive_wrapping_key(export_key).context("failed to derive master key wrapping key")?;
 
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::rng().fill_bytes(&mut nonce_bytes);
@@ -68,7 +269,6 @@ pub(super) fn generate_and_wrap_master_key(password: &str) -> Result<String> {
         .map_err(|_| Error::Encryption("failed to encrypt master key".into()))?;
 
     let wrapped = WrappedMasterKey {
-        salt: salt.to_vec(),
         nonce: nonce_bytes.to_vec(),
         ciphertext,
     };
@@ -82,9 +282,9 @@ mod tests {
 
     /// Decrypts a [`generate_and_wrap_master_key`] result back to the raw
     /// master key, for asserting on it in tests.
-    fn unwrap_master_key(password: &str, wrapped_json: &str) -> Vec<u8> {
+    fn unwrap_master_key(export_key: &[u8], wrapped_json: &str) -> Vec<u8> {
         let wrapped: WrappedMasterKey = serde_json::from_str(wrapped_json).unwrap();
-        let wrapping_key = derive_wrapping_key(password, &wrapped.salt).unwrap();
+        let wrapping_key = derive_wrapping_key(export_key).unwrap();
         let nonce_bytes: [u8; NONCE_LEN] = wrapped.nonce.try_into().unwrap();
         let cipher = Aes256Gcm::new(&wrapping_key.into());
         cipher
@@ -92,34 +292,150 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn generate_and_wrap_master_key_roundtrips_under_the_same_password() {
-        let wrapped = generate_and_wrap_master_key("correct horse battery staple").unwrap();
+    /// Runs a full OPAQUE registration for `password` against an in-process
+    /// server (real `opaque-ke`, no mocks, since this module's whole job is
+    /// to drive that crate correctly) sharing `server_setup` — the same
+    /// setup a subsequent login must use, since the client's envelope
+    /// embeds and cross-checks the server's static public key from
+    /// registration time — returning `(registration record, export key)`.
+    /// Exercises the real (expensive) high-effort KSF, so tests share this
+    /// helper rather than each registering from scratch.
+    fn register(
+        server_setup: &opaque_ke::ServerSetup<FydeCipherSuite>,
+        password: &str,
+    ) -> (Vec<u8>, Vec<u8>) {
+        use opaque_ke::{RegistrationRequest, RegistrationUpload, ServerRegistration};
 
-        let master_key = unwrap_master_key("correct horse battery staple", &wrapped);
+        let client = DefaultOpaqueClient;
+
+        let (state, request_bytes) = client.start_registration(password).unwrap();
+        let server_response = ServerRegistration::<FydeCipherSuite>::start(
+            server_setup,
+            RegistrationRequest::deserialize(&request_bytes).unwrap(),
+            b"alice",
+        )
+        .unwrap();
+
+        let (upload_bytes, export_key) = client
+            .finish_registration(state, password, &server_response.message.serialize())
+            .unwrap();
+
+        let record = ServerRegistration::<FydeCipherSuite>::finish(
+            RegistrationUpload::deserialize(&upload_bytes).unwrap(),
+        )
+        .serialize()
+        .to_vec();
+
+        (record, export_key)
+    }
+
+    #[test]
+    fn finish_login_succeeds_with_the_correct_password_and_the_server_accepts_it() {
+        use opaque_ke::rand::rngs::OsRng as ServerOsRng;
+        use opaque_ke::{
+            CredentialRequest, ServerLogin, ServerLoginParameters, ServerRegistration, ServerSetup,
+        };
+
+        let mut server_rng = ServerOsRng;
+        let server_setup = ServerSetup::<FydeCipherSuite>::new(&mut server_rng);
+        let client = DefaultOpaqueClient;
+        let password = "correct horse battery staple";
+        let (record, export_key) = register(&server_setup, password);
+        assert!(!export_key.is_empty());
+
+        let (login_state, login_request_bytes) = client.start_login(password).unwrap();
+        let server_login = ServerLogin::start(
+            &mut server_rng,
+            &server_setup,
+            Some(ServerRegistration::<FydeCipherSuite>::deserialize(&record).unwrap()),
+            CredentialRequest::deserialize(&login_request_bytes).unwrap(),
+            b"alice",
+            ServerLoginParameters::default(),
+        )
+        .unwrap();
+
+        let finalization_bytes = client
+            .finish_login(login_state, password, &server_login.message.serialize())
+            .unwrap();
+
+        // Proves the finalization this module produced is one the server
+        // actually accepts, not just that `finish_login` returned `Ok`.
+        server_login
+            .state
+            .finish(
+                opaque_ke::CredentialFinalization::deserialize(&finalization_bytes).unwrap(),
+                ServerLoginParameters::default(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn finish_login_rejects_the_wrong_password() {
+        use opaque_ke::rand::rngs::OsRng as ServerOsRng;
+        use opaque_ke::{
+            CredentialRequest, ServerLogin, ServerLoginParameters, ServerRegistration, ServerSetup,
+        };
+
+        let mut server_rng = ServerOsRng;
+        let server_setup = ServerSetup::<FydeCipherSuite>::new(&mut server_rng);
+        let client = DefaultOpaqueClient;
+        let (record, _export_key) = register(&server_setup, "correct horse battery staple");
+
+        let (login_state, login_request_bytes) = client.start_login("wrong password").unwrap();
+        let server_login = ServerLogin::start(
+            &mut server_rng,
+            &server_setup,
+            Some(ServerRegistration::<FydeCipherSuite>::deserialize(&record).unwrap()),
+            CredentialRequest::deserialize(&login_request_bytes).unwrap(),
+            b"alice",
+            ServerLoginParameters::default(),
+        )
+        .unwrap();
+
+        let err = client
+            .finish_login(
+                login_state,
+                "wrong password",
+                &server_login.message.serialize(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, Error::InvalidCredentials));
+    }
+
+    #[test]
+    fn generate_and_wrap_master_key_roundtrips_under_the_same_export_key() {
+        let export_key = b"a-fake-64-byte-export-key-------------------------------------";
+
+        let wrapped = generate_and_wrap_master_key(export_key).unwrap();
+
+        let master_key = unwrap_master_key(export_key, &wrapped);
 
         assert_eq!(master_key.len(), KEY_LEN);
     }
 
     #[test]
-    fn generate_and_wrap_master_key_produces_a_fresh_key_and_salt_each_call() {
-        let first = generate_and_wrap_master_key("correct horse battery staple").unwrap();
-        let second = generate_and_wrap_master_key("correct horse battery staple").unwrap();
+    fn generate_and_wrap_master_key_produces_a_fresh_key_and_nonce_each_call() {
+        let export_key = b"a-fake-64-byte-export-key-------------------------------------";
+
+        let first = generate_and_wrap_master_key(export_key).unwrap();
+        let second = generate_and_wrap_master_key(export_key).unwrap();
 
         assert_ne!(first, second);
-        let first_key = unwrap_master_key("correct horse battery staple", &first);
-        let second_key = unwrap_master_key("correct horse battery staple", &second);
+        let first_key = unwrap_master_key(export_key, &first);
+        let second_key = unwrap_master_key(export_key, &second);
         assert_ne!(first_key, second_key);
     }
 
     #[test]
-    fn wrapped_master_key_cannot_be_unwrapped_with_the_wrong_password() {
-        let wrapped = generate_and_wrap_master_key("correct horse battery staple").unwrap();
+    fn wrapped_master_key_cannot_be_unwrapped_with_the_wrong_export_key() {
+        let export_key = b"a-fake-64-byte-export-key-------------------------------------";
+        let wrapped = generate_and_wrap_master_key(export_key).unwrap();
         let wrapped_data: WrappedMasterKey = serde_json::from_str(&wrapped).unwrap();
 
-        let wrapping_key = derive_wrapping_key("wrong password", &wrapped_data.salt).unwrap();
+        let wrong_key = derive_wrapping_key(b"a-different-export-key").unwrap();
         let nonce_bytes: [u8; NONCE_LEN] = wrapped_data.nonce.try_into().unwrap();
-        let cipher = Aes256Gcm::new(&wrapping_key.into());
+        let cipher = Aes256Gcm::new(&wrong_key.into());
 
         assert!(
             cipher

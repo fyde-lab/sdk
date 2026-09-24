@@ -14,27 +14,53 @@ mod proto {
     tonic::include_proto!("users");
 }
 
-use proto::{LogoutRequest, UserCredentials, users_client::UsersClient as GeneratedUsersClient};
+use proto::{
+    LoginFinishRequest, LoginStartRequest, LogoutRequest, RegistrationFinishRequest,
+    RegistrationStartRequest, users_client::UsersClient as GeneratedUsersClient,
+};
 
 /// A gRPC transport for talking to the fyde server's users service. Knows
-/// nothing about users semantics beyond the raw proto types; just
-/// sends/receives raw messages. Abstracted as a trait so callers can be
-/// tested against [`MockFydeClient`] instead of a live server.
+/// nothing about OPAQUE or users semantics beyond the raw proto types —
+/// every method here just carries opaque protocol bytes back and forth;
+/// [`super::crypto`] is what actually drives the OPAQUE exchange. Abstracted
+/// as a trait so callers can be tested against [`MockFydeClient`] instead of
+/// a live server.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(super) trait FydeClient: Send + Sync {
-    /// Creates a new account and opens a session for `device_name`,
-    /// returning its session token.
-    async fn create_user(
+    /// First step of registration: forwards a serialized OPAQUE
+    /// `RegistrationRequest` for `username` and returns the server's
+    /// serialized `RegistrationResponse`.
+    async fn start_registration(&self, username: &str, opaque_request: &[u8]) -> Result<Vec<u8>>;
+
+    /// Second and final step of registration: sends the serialized OPAQUE
+    /// `RegistrationUpload` for `username`, the master key encrypted
+    /// client-side under a key derived from the OPAQUE export key, and
+    /// opens a session for `device_name`, returning its session token.
+    async fn finish_registration(
         &self,
         username: &str,
-        password: &str,
+        opaque_upload: &[u8],
         device_name: &str,
+        encrypted_master_key: &[u8],
     ) -> Result<String>;
 
-    /// Verifies `username`/`password` and opens a session for
-    /// `device_name`, returning its session token.
-    async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String>;
+    /// First step of logging in: forwards a serialized OPAQUE
+    /// `CredentialRequest` for `username` and returns the server's
+    /// serialized `CredentialResponse` alongside the `login_id`
+    /// correlating this call with the matching `finish_login` call.
+    async fn start_login(&self, username: &str, opaque_request: &[u8])
+    -> Result<(String, Vec<u8>)>;
+
+    /// Second and final step of logging in: sends the serialized OPAQUE
+    /// `CredentialFinalization` for the exchange identified by `login_id`
+    /// and opens a session for `device_name`, returning its session token.
+    async fn finish_login(
+        &self,
+        login_id: &str,
+        opaque_upload: &[u8],
+        device_name: &str,
+    ) -> Result<String>;
 
     /// Closes the session currently authenticating outgoing calls (see
     /// [`crate::domains::sessions::Service::authenticated_request`]).
@@ -53,7 +79,9 @@ pub(super) trait FydeClient: Send + Sync {
 /// client is created per call. Every call, including `logout` itself, is
 /// authenticated by attaching the session token currently persisted in
 /// settings (if any) as a bearer `authorization` header (see
-/// [`crate::domains::sessions::Service::authenticated_request`]).
+/// [`crate::domains::sessions::Service::authenticated_request`]) — harmless
+/// for the four registration/login steps, which the server doesn't require
+/// one for.
 pub(super) struct GrpcClient {
     channel: Channel,
     sessions: Arc<SessionsClient>,
@@ -75,46 +103,95 @@ impl GrpcClient {
 
 #[async_trait]
 impl FydeClient for GrpcClient {
-    async fn create_user(
-        &self,
-        username: &str,
-        password: &str,
-        device_name: &str,
-    ) -> Result<String> {
+    async fn start_registration(&self, username: &str, opaque_request: &[u8]) -> Result<Vec<u8>> {
         let request = self
             .sessions
-            .authenticated_request(UserCredentials {
+            .authenticated_request(RegistrationStartRequest {
                 username: username.to_string(),
-                password: password.to_string(),
-                device_name: device_name.to_string(),
+                opaque_request: opaque_request.to_vec(),
             })
             .await?;
 
         let response = self
             .client()
-            .create_user(request)
+            .start_registration(request)
             .await
-            .context("failed to create user")?
+            .context("failed to start registration")?
+            .into_inner();
+
+        Ok(response.opaque_response)
+    }
+
+    async fn finish_registration(
+        &self,
+        username: &str,
+        opaque_upload: &[u8],
+        device_name: &str,
+        encrypted_master_key: &[u8],
+    ) -> Result<String> {
+        let request = self
+            .sessions
+            .authenticated_request(RegistrationFinishRequest {
+                username: username.to_string(),
+                opaque_upload: opaque_upload.to_vec(),
+                device_name: device_name.to_string(),
+                encrypted_master_key: encrypted_master_key.to_vec(),
+            })
+            .await?;
+
+        let response = self
+            .client()
+            .finish_registration(request)
+            .await
+            .context("failed to finish registration")?
             .into_inner();
 
         Ok(response.session_token)
     }
 
-    async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String> {
+    async fn start_login(
+        &self,
+        username: &str,
+        opaque_request: &[u8],
+    ) -> Result<(String, Vec<u8>)> {
         let request = self
             .sessions
-            .authenticated_request(UserCredentials {
+            .authenticated_request(LoginStartRequest {
                 username: username.to_string(),
-                password: password.to_string(),
+                opaque_request: opaque_request.to_vec(),
+            })
+            .await?;
+
+        let response = self
+            .client()
+            .start_login(request)
+            .await
+            .context("failed to start login")?
+            .into_inner();
+
+        Ok((response.login_id, response.opaque_response))
+    }
+
+    async fn finish_login(
+        &self,
+        login_id: &str,
+        opaque_upload: &[u8],
+        device_name: &str,
+    ) -> Result<String> {
+        let request = self
+            .sessions
+            .authenticated_request(LoginFinishRequest {
+                login_id: login_id.to_string(),
+                opaque_upload: opaque_upload.to_vec(),
                 device_name: device_name.to_string(),
             })
             .await?;
 
         let response = self
             .client()
-            .login(request)
+            .finish_login(request)
             .await
-            .context("failed to log in")?
+            .context("failed to finish login")?
             .into_inner();
 
         Ok(response.session_token)
@@ -154,7 +231,7 @@ mod tests {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         let grpc = GrpcClient::new(channel, sessions);
 
-        let err = grpc.login("alice", "password", "device").await.unwrap_err();
+        let err = grpc.start_login("alice", b"the-request").await.unwrap_err();
 
         assert!(matches!(err, Error::Context { .. }));
     }

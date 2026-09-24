@@ -59,6 +59,8 @@ pub enum Error {
     InvalidResponse(String),
     #[error("encryption error: {0}")]
     Encryption(String),
+    #[error("invalid credentials")]
+    InvalidCredentials,
     #[error("messagepack encode error: {0}")]
     MessagePackEncode(#[from] rmp_serde::encode::Error),
     #[error("messagepack decode error: {0}")]

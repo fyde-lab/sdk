@@ -11,7 +11,7 @@ use crate::sql::LocalDatabase;
 use crate::{ErrorContext as _, Result};
 
 use super::Service;
-use super::crypto::generate_and_wrap_master_key;
+use super::crypto::{DefaultOpaqueClient, OpaqueClient, generate_and_wrap_master_key};
 use super::grpc_client::{FydeClient, GrpcClient};
 
 /// The settings key under which a newly created account's encrypted
@@ -28,6 +28,7 @@ const MASTER_KEY_SETTING: &str = "master_key";
 /// passed in.
 pub struct UsersClient {
     grpc: Box<dyn FydeClient>,
+    opaque: Box<dyn OpaqueClient>,
     settings: Arc<dyn SettingsService>,
     sessions: Arc<SessionsClient>,
     local_db: Arc<dyn LocalDatabase>,
@@ -46,24 +47,28 @@ impl UsersClient {
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(channel, sessions.clone())),
+            opaque: Box::new(DefaultOpaqueClient),
             settings,
             sessions,
             local_db,
         })
     }
 
-    /// Creates a client from an already-constructed [`FydeClient`], for
-    /// testing against a [`super::grpc_client::MockFydeClient`] instead of
-    /// a live server.
+    /// Creates a client from already-constructed [`FydeClient`] and
+    /// [`OpaqueClient`] implementations, for testing against
+    /// [`super::grpc_client::MockFydeClient`]/[`super::crypto::MockOpaqueClient`]
+    /// instead of a live server and real cryptography.
     #[cfg(test)]
-    fn with_grpc(
+    fn with_deps(
         grpc: impl FydeClient + 'static,
+        opaque: impl OpaqueClient + 'static,
         settings: Arc<dyn SettingsService>,
         sessions: Arc<SessionsClient>,
         local_db: Arc<dyn LocalDatabase>,
     ) -> Self {
         Self {
             grpc: Box::new(grpc),
+            opaque: Box::new(opaque),
             settings,
             sessions,
             local_db,
@@ -74,16 +79,38 @@ impl UsersClient {
 #[async_trait]
 impl Service for UsersClient {
     async fn create(&self, username: &str, password: &str, device_name: &str) -> Result<String> {
+        let (state, opaque_request) = self
+            .opaque
+            .start_registration(password)
+            .context("failed to start OPAQUE registration")?;
+
+        let opaque_response = self
+            .grpc
+            .start_registration(username, &opaque_request)
+            .await
+            .context("failed to start registration")?;
+
+        let (opaque_upload, export_key) = self
+            .opaque
+            .finish_registration(state, password, &opaque_response)
+            .context("failed to finish OPAQUE registration")?;
+
+        let wrapped_master_key =
+            generate_and_wrap_master_key(&export_key).context("failed to generate master key")?;
+
         let token = self
             .grpc
-            .create_user(username, password, device_name)
+            .finish_registration(
+                username,
+                &opaque_upload,
+                device_name,
+                wrapped_master_key.as_bytes(),
+            )
             .await
-            .context("failed to create user")?;
+            .context("failed to finish registration")?;
 
         self.sessions.save_new_session(&token).await?;
 
-        let wrapped_master_key =
-            generate_and_wrap_master_key(password).context("failed to generate master key")?;
         self.settings
             .set(MASTER_KEY_SETTING, &wrapped_master_key)
             .await
@@ -93,9 +120,25 @@ impl Service for UsersClient {
     }
 
     async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String> {
+        let (state, opaque_request) = self
+            .opaque
+            .start_login(password)
+            .context("failed to start OPAQUE login")?;
+
+        let (login_id, opaque_response) = self
+            .grpc
+            .start_login(username, &opaque_request)
+            .await
+            .context("failed to start login")?;
+
+        let opaque_upload = self
+            .opaque
+            .finish_login(state, password, &opaque_response)
+            .context("failed to finish OPAQUE login")?;
+
         let token = self
             .grpc
-            .login(username, password, device_name)
+            .finish_login(&login_id, &opaque_upload, device_name)
             .await
             .context("failed to log in")?;
 
@@ -124,33 +167,73 @@ impl Service for UsersClient {
 mod tests {
     use std::sync::Mutex;
 
+    use super::super::crypto::{MockOpaqueClient, fake_login_state, fake_registration_state};
     use super::super::grpc_client::MockFydeClient;
     use super::*;
     use crate::domains::settings::MockService as MockSettingsService;
     use crate::sql::MockLocalDatabase;
 
-    fn client_with_grpc(
+    fn client_with_deps(
         grpc: impl FydeClient + 'static,
+        opaque: impl OpaqueClient + 'static,
         settings: MockSettingsService,
     ) -> UsersClient {
         let settings: Arc<dyn SettingsService> = Arc::new(settings);
         let sessions = Arc::new(SessionsClient::new(settings.clone()));
         let mut local_db = MockLocalDatabase::new();
         local_db.expect_wipe().returning(|| Ok(()));
-        UsersClient::with_grpc(grpc, settings, sessions, Arc::new(local_db))
+        UsersClient::with_deps(grpc, opaque, settings, sessions, Arc::new(local_db))
+    }
+
+    /// A [`MockOpaqueClient`] wired up for a successful `create()` call:
+    /// `start_registration` returns a placeholder state plus `request`,
+    /// and `finish_registration` returns `upload`/`export_key` regardless
+    /// of what it's called with, so real OPAQUE/Argon2 never runs in these
+    /// tests.
+    fn opaque_for_create(
+        request: &'static [u8],
+        upload: &'static [u8],
+        export_key: &'static [u8],
+    ) -> MockOpaqueClient {
+        let mut opaque = MockOpaqueClient::new();
+        opaque
+            .expect_start_registration()
+            .times(1)
+            .returning(move |_| Ok((fake_registration_state(), request.to_vec())));
+        opaque
+            .expect_finish_registration()
+            .times(1)
+            .returning(move |_, _, _| Ok((upload.to_vec(), export_key.to_vec())));
+        opaque
+    }
+
+    fn opaque_for_login(request: &'static [u8], upload: &'static [u8]) -> MockOpaqueClient {
+        let mut opaque = MockOpaqueClient::new();
+        opaque
+            .expect_start_login()
+            .times(1)
+            .returning(move |_| Ok((fake_login_state(), request.to_vec())));
+        opaque
+            .expect_finish_login()
+            .times(1)
+            .returning(move |_, _, _| Ok(upload.to_vec()));
+        opaque
     }
 
     #[tokio::test]
     async fn create_returns_and_stores_the_session_token() {
+        let opaque = opaque_for_create(b"the-request", b"the-upload", b"the-export-key");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
-            .expect_create_user()
-            .withf(|username, password, device_name| {
-                username == "alice"
-                    && password == "correct horse battery staple"
-                    && device_name == "Pierre's iPhone"
+            .expect_start_registration()
+            .withf(|username, request| username == "alice" && request == b"the-request")
+            .returning(|_, _| Ok(b"the-response".to_vec()));
+        mock_grpc
+            .expect_finish_registration()
+            .withf(|username, upload, device_name, _| {
+                username == "alice" && upload == b"the-upload" && device_name == "Pierre's iPhone"
             })
-            .returning(|_, _, _| Ok("a-token".to_string()));
+            .returning(|_, _, _, _| Ok("a-token".to_string()));
 
         let mut settings = MockSettingsService::new();
         settings
@@ -164,7 +247,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_grpc(mock_grpc, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings);
 
         let token = client
             .create("alice", "correct horse battery staple", "Pierre's iPhone")
@@ -175,11 +258,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_persists_an_encrypted_master_key_in_settings() {
+    async fn create_sends_the_master_key_wrapped_under_the_export_key_to_the_server() {
+        let opaque = opaque_for_create(b"the-request", b"the-upload", b"the-export-key");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
-            .expect_create_user()
-            .returning(|_, _, _| Ok("a-token".to_string()));
+            .expect_start_registration()
+            .returning(|_, _| Ok(b"the-response".to_vec()));
+
+        // Captures what `create` sends the server as `encrypted_master_key`
+        // so it can be compared against what it persists locally below.
+        let sent_master_key: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let capture = sent_master_key.clone();
+        mock_grpc.expect_finish_registration().times(1).returning(
+            move |_, _, _, encrypted_master_key| {
+                *capture.lock().unwrap() = Some(encrypted_master_key.to_vec());
+                Ok("a-token".to_string())
+            },
+        );
+
+        let persisted_master_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_set()
+            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .returning(|_, _| Ok(()));
+        let set_master_key = persisted_master_key.clone();
+        settings
+            .expect_set()
+            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .times(1)
+            .returning(move |_, value| {
+                *set_master_key.lock().unwrap() = Some(value.to_string());
+                Ok(())
+            });
+
+        let client = client_with_deps(mock_grpc, opaque, settings);
+        client
+            .create("alice", "correct horse battery staple", "device")
+            .await
+            .unwrap();
+
+        let sent = sent_master_key.lock().unwrap().clone().unwrap();
+        let persisted = persisted_master_key.lock().unwrap().clone().unwrap();
+        assert_eq!(sent, persisted.into_bytes());
+    }
+
+    #[tokio::test]
+    async fn create_persists_an_encrypted_master_key_in_settings() {
+        let opaque = opaque_for_create(b"the-request", b"the-upload", b"the-export-key");
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_registration()
+            .returning(|_, _| Ok(b"the-response".to_vec()));
+        mock_grpc
+            .expect_finish_registration()
+            .returning(|_, _, _, _| Ok("a-token".to_string()));
 
         // Captures what `create` persists so it can be read back and
         // asserted on below, without a generic key/value store.
@@ -201,7 +334,7 @@ mod tests {
                 Ok(())
             });
 
-        let client = client_with_grpc(mock_grpc, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings);
 
         client
             .create("alice", "correct horse battery staple", "Pierre's iPhone")
@@ -219,10 +352,14 @@ mod tests {
 
     #[tokio::test]
     async fn create_persists_the_session_token_in_settings() {
+        let opaque = opaque_for_create(b"the-request", b"the-upload", b"the-export-key");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
-            .expect_create_user()
-            .returning(|_, _, _| Ok("a-token".to_string()));
+            .expect_start_registration()
+            .returning(|_, _| Ok(b"the-response".to_vec()));
+        mock_grpc
+            .expect_finish_registration()
+            .returning(|_, _, _, _| Ok("a-token".to_string()));
 
         // Captures what `create` persists under `SESSION_TOKEN_SETTING` so
         // it can be read back and asserted on below.
@@ -244,7 +381,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_grpc(mock_grpc, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings);
 
         client
             .create("alice", "correct horse battery staple", "Pierre's iPhone")
@@ -259,9 +396,19 @@ mod tests {
 
     #[tokio::test]
     async fn login_returns_and_stores_the_session_token() {
+        let opaque = opaque_for_login(b"the-request", b"the-upload");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
-            .expect_login()
+            .expect_start_login()
+            .withf(|username, request| username == "alice" && request == b"the-request")
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        mock_grpc
+            .expect_finish_login()
+            .withf(|login_id, upload, device_name| {
+                login_id == "a-login-id"
+                    && upload == b"the-upload"
+                    && device_name == "Pierre's iPhone"
+            })
             .returning(|_, _, _| Ok("a-token".to_string()));
 
         let mut settings = MockSettingsService::new();
@@ -271,7 +418,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_grpc(mock_grpc, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings);
 
         let token = client
             .login("alice", "correct horse battery staple", "Pierre's iPhone")
@@ -283,9 +430,13 @@ mod tests {
 
     #[tokio::test]
     async fn login_persists_the_session_token_in_settings() {
+        let opaque = opaque_for_login(b"the-request", b"the-upload");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
-            .expect_login()
+            .expect_start_login()
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        mock_grpc
+            .expect_finish_login()
             .returning(|_, _, _| Ok("a-token".to_string()));
 
         let persisted_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -301,7 +452,7 @@ mod tests {
                 Ok(())
             });
 
-        let client = client_with_grpc(mock_grpc, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings);
 
         client
             .login("alice", "correct horse battery staple", "device")
@@ -316,9 +467,13 @@ mod tests {
 
     #[tokio::test]
     async fn login_does_not_persist_a_master_key() {
+        let opaque = opaque_for_login(b"the-request", b"the-upload");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
-            .expect_login()
+            .expect_start_login()
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        mock_grpc
+            .expect_finish_login()
             .returning(|_, _, _| Ok("a-token".to_string()));
 
         // `login` persists the session token but never a master key: no
@@ -333,7 +488,7 @@ mod tests {
             .returning(|_, _| Ok(()));
         settings.expect_get().returning(|_| Ok(None));
 
-        let client = client_with_grpc(mock_grpc, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings);
 
         client
             .login("alice", "correct horse battery staple", "device")
@@ -345,9 +500,13 @@ mod tests {
 
     #[tokio::test]
     async fn logout_closes_the_session_opened_by_login() {
+        let opaque = opaque_for_login(b"the-request", b"the-upload");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
-            .expect_login()
+            .expect_start_login()
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        mock_grpc
+            .expect_finish_login()
             .returning(|_, _, _| Ok("a-token".to_string()));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
@@ -362,7 +521,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(Some("a-token".to_string())));
 
-        let client = client_with_grpc(mock_grpc, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings);
         client
             .login("alice", "correct horse battery staple", "device")
             .await
@@ -375,6 +534,7 @@ mod tests {
     async fn logout_is_a_no_op_without_an_open_session() {
         // No `expect_logout()` set up: the mock panics if it's called.
         let mock_grpc = MockFydeClient::new();
+        let opaque = MockOpaqueClient::new();
 
         let mut settings = MockSettingsService::new();
         settings
@@ -383,16 +543,20 @@ mod tests {
             .times(1)
             .returning(|_| Ok(None));
 
-        let client = client_with_grpc(mock_grpc, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings);
 
         client.logout().await.unwrap();
     }
 
     #[tokio::test]
     async fn logout_forgets_the_session_token_once_used() {
+        let opaque = opaque_for_login(b"the-request", b"the-upload");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
-            .expect_login()
+            .expect_start_login()
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        mock_grpc
+            .expect_finish_login()
             .returning(|_, _, _| Ok("a-token".to_string()));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
@@ -416,7 +580,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(Some("a-token".to_string())));
 
-        let client = client_with_grpc(mock_grpc, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings);
         client
             .login("alice", "correct horse battery staple", "device")
             .await
@@ -430,7 +594,10 @@ mod tests {
     async fn logout_wipes_the_local_database() {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
-            .expect_login()
+            .expect_start_login()
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        mock_grpc
+            .expect_finish_login()
             .returning(|_, _, _| Ok("a-token".to_string()));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
@@ -449,7 +616,13 @@ mod tests {
         let mut local_db = MockLocalDatabase::new();
         local_db.expect_wipe().times(1).returning(|| Ok(()));
 
-        let client = UsersClient::with_grpc(mock_grpc, settings, sessions, Arc::new(local_db));
+        let client = UsersClient::with_deps(
+            mock_grpc,
+            opaque_for_login(b"the-request", b"the-upload"),
+            settings,
+            sessions,
+            Arc::new(local_db),
+        );
         client
             .login("alice", "correct horse battery staple", "device")
             .await
