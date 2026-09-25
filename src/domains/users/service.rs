@@ -8,10 +8,12 @@ use crate::domains::sessions::SESSION_TOKEN_SETTING;
 use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
 use crate::sql::LocalDatabase;
-use crate::{ErrorContext as _, Result};
+use crate::{Error, ErrorContext as _, Result};
 
 use super::Service;
-use super::crypto::{DefaultOpaqueClient, OpaqueClient, generate_and_wrap_master_key};
+use super::crypto::{
+    DefaultOpaqueClient, OpaqueClient, generate_and_wrap_master_key, unwrap_master_key,
+};
 use super::grpc_client::{FydeClient, GrpcClient};
 
 /// The settings key under which a newly created account's encrypted
@@ -131,18 +133,29 @@ impl Service for UsersClient {
             .await
             .context("failed to start login")?;
 
-        let opaque_upload = self
+        let (opaque_upload, export_key) = self
             .opaque
             .finish_login(state, password, &opaque_response)
             .context("failed to finish OPAQUE login")?;
 
-        let token = self
+        let (token, encrypted_master_key) = self
             .grpc
             .finish_login(&login_id, &opaque_upload, device_name)
             .await
             .context("failed to log in")?;
 
         self.sessions.save_new_session(&token).await?;
+
+        let wrapped_master_key = String::from_utf8(encrypted_master_key)
+            .map_err(|_| Error::Encryption("server returned a non-UTF-8 master key".into()))
+            .context("failed to decode master key returned by the server")?;
+        unwrap_master_key(&export_key, &wrapped_master_key)
+            .context("failed to unwrap master key returned by the server")?;
+
+        self.settings
+            .set(MASTER_KEY_SETTING, &wrapped_master_key)
+            .await
+            .context("failed to persist master key")?;
 
         Ok(token)
     }
@@ -207,6 +220,11 @@ mod tests {
         opaque
     }
 
+    /// The export key [`opaque_for_login`]'s `MockOpaqueClient` produces —
+    /// shared with [`login_master_key`] so callers can build a server
+    /// response the resulting `login()` call can actually unwrap.
+    const LOGIN_EXPORT_KEY: &[u8] = b"the-login-export-key";
+
     fn opaque_for_login(request: &'static [u8], upload: &'static [u8]) -> MockOpaqueClient {
         let mut opaque = MockOpaqueClient::new();
         opaque
@@ -216,8 +234,18 @@ mod tests {
         opaque
             .expect_finish_login()
             .times(1)
-            .returning(move |_, _, _| Ok(upload.to_vec()));
+            .returning(move |_, _, _| Ok((upload.to_vec(), LOGIN_EXPORT_KEY.to_vec())));
         opaque
+    }
+
+    /// A master key wrapped under [`LOGIN_EXPORT_KEY`], for `MockFydeClient`
+    /// `finish_login` expectations to return as `encrypted_master_key` —
+    /// what a real server would send back, and what `login()` must be able
+    /// to unwrap with the export key `opaque_for_login`'s mock produces.
+    fn login_master_key() -> Vec<u8> {
+        super::super::crypto::generate_and_wrap_master_key(LOGIN_EXPORT_KEY)
+            .unwrap()
+            .into_bytes()
     }
 
     #[tokio::test]
@@ -409,12 +437,17 @@ mod tests {
                     && upload == b"the-upload"
                     && device_name == "Pierre's iPhone"
             })
-            .returning(|_, _, _| Ok("a-token".to_string()));
+            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key())));
 
         let mut settings = MockSettingsService::new();
         settings
             .expect_set()
             .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == MASTER_KEY_SETTING)
             .times(1)
             .returning(|_, _| Ok(()));
 
@@ -437,7 +470,7 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         mock_grpc
             .expect_finish_login()
-            .returning(|_, _, _| Ok("a-token".to_string()));
+            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key())));
 
         let persisted_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
@@ -451,6 +484,11 @@ mod tests {
                 *set_token.lock().unwrap() = Some(value.to_string());
                 Ok(())
             });
+        settings
+            .expect_set()
+            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
 
         let client = client_with_deps(mock_grpc, opaque, settings);
 
@@ -466,27 +504,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_does_not_persist_a_master_key() {
+    async fn login_persists_the_master_key_the_server_returns() {
         let opaque = opaque_for_login(b"the-request", b"the-upload");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_start_login()
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        let master_key = login_master_key();
+        let returned_master_key = master_key.clone();
         mock_grpc
             .expect_finish_login()
-            .returning(|_, _, _| Ok("a-token".to_string()));
+            .returning(move |_, _, _| Ok(("a-token".to_string(), returned_master_key.clone())));
 
-        // `login` persists the session token but never a master key: no
-        // `expect_set()` for `MASTER_KEY_SETTING` is set up, so the mock
-        // panics if it's called with that key, which is how this test
-        // proves it isn't. `expect_get()` is only for the direct
-        // post-check below.
+        let persisted_master_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
         let mut settings = MockSettingsService::new();
         settings
             .expect_set()
             .withf(|key, _| key == SESSION_TOKEN_SETTING)
             .returning(|_, _| Ok(()));
-        settings.expect_get().returning(|_| Ok(None));
+        let set_master_key = persisted_master_key.clone();
+        settings
+            .expect_set()
+            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .times(1)
+            .returning(move |_, value| {
+                *set_master_key.lock().unwrap() = Some(value.to_string());
+                Ok(())
+            });
 
         let client = client_with_deps(mock_grpc, opaque, settings);
 
@@ -495,7 +540,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(client.settings.get(MASTER_KEY_SETTING).await.unwrap(), None);
+        assert_eq!(
+            persisted_master_key.lock().unwrap().clone(),
+            Some(String::from_utf8(master_key).unwrap())
+        );
     }
 
     #[tokio::test]
@@ -507,13 +555,17 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         mock_grpc
             .expect_finish_login()
-            .returning(|_, _, _| Ok("a-token".to_string()));
+            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key())));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
         let mut settings = MockSettingsService::new();
         settings
             .expect_set()
             .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == MASTER_KEY_SETTING)
             .returning(|_, _| Ok(()));
         settings
             .expect_get()
@@ -557,13 +609,17 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         mock_grpc
             .expect_finish_login()
-            .returning(|_, _, _| Ok("a-token".to_string()));
+            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key())));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
         let mut settings = MockSettingsService::new();
         settings
             .expect_set()
             .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == MASTER_KEY_SETTING)
             .returning(|_, _| Ok(()));
         // Mockall checks the most-recently-defined expectation first, so
         // this "already gone" expectation (defined first, checked last)
@@ -598,13 +654,17 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         mock_grpc
             .expect_finish_login()
-            .returning(|_, _, _| Ok("a-token".to_string()));
+            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key())));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
         let mut settings = MockSettingsService::new();
         settings
             .expect_set()
             .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == MASTER_KEY_SETTING)
             .returning(|_, _| Ok(()));
         settings
             .expect_get()

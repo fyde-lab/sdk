@@ -101,13 +101,23 @@ pub(super) trait OpaqueClient: Send + Sync {
 
     /// Second and final step of OPAQUE login: turns the server's
     /// `StartLogin` response into the finalization message to send to
-    /// `FinishLogin`. A wrong password is detected right here, without a
-    /// round trip to the server: OPAQUE's envelope can't be opened with
-    /// the wrong password-derived key, so there's no finalization message
-    /// to produce. Fails with [`crate::Error::InvalidCredentials`] in that
-    /// case — the same error a wrong password produces if it isn't caught
-    /// until the server rejects `FinishLogin`.
-    fn finish_login(&self, state: LoginState, password: &str, response: &[u8]) -> Result<Vec<u8>>;
+    /// `FinishLogin`, alongside the export key — deterministic across every
+    /// successful login for the same account/password, so it's the same
+    /// value [`generate_and_wrap_master_key`] used at registration time —
+    /// used by [`unwrap_master_key`] to recover the account's master key
+    /// from what `FinishLogin` returns. A wrong password is detected right
+    /// here, without a round trip to the server: OPAQUE's envelope can't be
+    /// opened with the wrong password-derived key, so there's no
+    /// finalization message to produce. Fails with
+    /// [`crate::Error::InvalidCredentials`] in that case — the same error a
+    /// wrong password produces if it isn't caught until the server rejects
+    /// `FinishLogin`.
+    fn finish_login(
+        &self,
+        state: LoginState,
+        password: &str,
+        response: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>)>;
 }
 
 /// The default [`OpaqueClient`] implementation, backed by real `opaque-ke`
@@ -171,7 +181,12 @@ impl OpaqueClient for DefaultOpaqueClient {
         ))
     }
 
-    fn finish_login(&self, state: LoginState, password: &str, response: &[u8]) -> Result<Vec<u8>> {
+    fn finish_login(
+        &self,
+        state: LoginState,
+        password: &str,
+        response: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
         let response = CredentialResponse::deserialize(response).map_err(|err| {
             Error::Encryption(format!("failed to parse OPAQUE login response: {err}"))
         })?;
@@ -188,7 +203,10 @@ impl OpaqueClient for DefaultOpaqueClient {
             )
             .map_err(|_| Error::InvalidCredentials)?;
 
-        Ok(result.message.serialize().to_vec())
+        Ok((
+            result.message.serialize().to_vec(),
+            result.export_key.to_vec(),
+        ))
     }
 }
 
@@ -276,21 +294,33 @@ pub(super) fn generate_and_wrap_master_key(export_key: &[u8]) -> Result<String> 
     serde_json::to_string(&wrapped).context("failed to serialize wrapped master key")
 }
 
+/// Decrypts a [`generate_and_wrap_master_key`]-produced wrapped master key
+/// back to the raw master key, using a wrapping key derived from
+/// `export_key` the same way registration derived the one that wrapped it.
+/// Used by `login` to recover the account's master key from what
+/// `FinishLogin` returns, on a device that doesn't already have it cached
+/// locally.
+pub(super) fn unwrap_master_key(export_key: &[u8], wrapped_json: &str) -> Result<Vec<u8>> {
+    let wrapped: WrappedMasterKey =
+        serde_json::from_str(wrapped_json).context("failed to parse wrapped master key")?;
+
+    let wrapping_key =
+        derive_wrapping_key(export_key).context("failed to derive master key wrapping key")?;
+
+    let nonce_bytes: [u8; NONCE_LEN] = wrapped
+        .nonce
+        .try_into()
+        .map_err(|_| Error::Encryption("wrapped master key nonce has the wrong length".into()))?;
+
+    let cipher = Aes256Gcm::new(&wrapping_key.into());
+    cipher
+        .decrypt(&Nonce::from(nonce_bytes), wrapped.ciphertext.as_slice())
+        .map_err(|_| Error::Encryption("failed to decrypt master key".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Decrypts a [`generate_and_wrap_master_key`] result back to the raw
-    /// master key, for asserting on it in tests.
-    fn unwrap_master_key(export_key: &[u8], wrapped_json: &str) -> Vec<u8> {
-        let wrapped: WrappedMasterKey = serde_json::from_str(wrapped_json).unwrap();
-        let wrapping_key = derive_wrapping_key(export_key).unwrap();
-        let nonce_bytes: [u8; NONCE_LEN] = wrapped.nonce.try_into().unwrap();
-        let cipher = Aes256Gcm::new(&wrapping_key.into());
-        cipher
-            .decrypt(&Nonce::from(nonce_bytes), wrapped.ciphertext.as_slice())
-            .unwrap()
-    }
 
     /// Runs a full OPAQUE registration for `password` against an in-process
     /// server (real `opaque-ke`, no mocks, since this module's whole job is
@@ -354,9 +384,14 @@ mod tests {
         )
         .unwrap();
 
-        let finalization_bytes = client
+        let (finalization_bytes, login_export_key) = client
             .finish_login(login_state, password, &server_login.message.serialize())
             .unwrap();
+        // The export key `finish_login` returns must match the one
+        // `finish_registration` produced for the same account/password,
+        // since `login()` uses it to unwrap the master key
+        // `finish_registration`'s caller wrapped.
+        assert_eq!(login_export_key, export_key);
 
         // Proves the finalization this module produced is one the server
         // actually accepts, not just that `finish_login` returned `Ok`.
@@ -409,7 +444,7 @@ mod tests {
 
         let wrapped = generate_and_wrap_master_key(export_key).unwrap();
 
-        let master_key = unwrap_master_key(export_key, &wrapped);
+        let master_key = unwrap_master_key(export_key, &wrapped).unwrap();
 
         assert_eq!(master_key.len(), KEY_LEN);
     }
@@ -422,8 +457,8 @@ mod tests {
         let second = generate_and_wrap_master_key(export_key).unwrap();
 
         assert_ne!(first, second);
-        let first_key = unwrap_master_key(export_key, &first);
-        let second_key = unwrap_master_key(export_key, &second);
+        let first_key = unwrap_master_key(export_key, &first).unwrap();
+        let second_key = unwrap_master_key(export_key, &second).unwrap();
         assert_ne!(first_key, second_key);
     }
 
@@ -431,19 +466,9 @@ mod tests {
     fn wrapped_master_key_cannot_be_unwrapped_with_the_wrong_export_key() {
         let export_key = b"a-fake-64-byte-export-key-------------------------------------";
         let wrapped = generate_and_wrap_master_key(export_key).unwrap();
-        let wrapped_data: WrappedMasterKey = serde_json::from_str(&wrapped).unwrap();
 
-        let wrong_key = derive_wrapping_key(b"a-different-export-key").unwrap();
-        let nonce_bytes: [u8; NONCE_LEN] = wrapped_data.nonce.try_into().unwrap();
-        let cipher = Aes256Gcm::new(&wrong_key.into());
+        let err = unwrap_master_key(b"a-different-export-key", &wrapped).unwrap_err();
 
-        assert!(
-            cipher
-                .decrypt(
-                    &Nonce::from(nonce_bytes),
-                    wrapped_data.ciphertext.as_slice()
-                )
-                .is_err()
-        );
+        assert!(matches!(err, Error::Encryption(_)));
     }
 }

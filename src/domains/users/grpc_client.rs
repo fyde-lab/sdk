@@ -54,13 +54,16 @@ pub(super) trait FydeClient: Send + Sync {
 
     /// Second and final step of logging in: sends the serialized OPAQUE
     /// `CredentialFinalization` for the exchange identified by `login_id`
-    /// and opens a session for `device_name`, returning its session token.
+    /// and opens a session for `device_name`, returning its session token
+    /// alongside the account's master key, still encrypted client-side
+    /// under a key derived from the OPAQUE export key (see
+    /// [`super::crypto::unwrap_master_key`]).
     async fn finish_login(
         &self,
         login_id: &str,
         opaque_upload: &[u8],
         device_name: &str,
-    ) -> Result<String>;
+    ) -> Result<(String, Vec<u8>)>;
 
     /// Closes the session currently authenticating outgoing calls (see
     /// [`crate::domains::sessions::Service::authenticated_request`]).
@@ -177,7 +180,7 @@ impl FydeClient for GrpcClient {
         login_id: &str,
         opaque_upload: &[u8],
         device_name: &str,
-    ) -> Result<String> {
+    ) -> Result<(String, Vec<u8>)> {
         let request = self
             .sessions
             .authenticated_request(LoginFinishRequest {
@@ -194,7 +197,7 @@ impl FydeClient for GrpcClient {
             .context("failed to finish login")?
             .into_inner();
 
-        Ok(response.session_token)
+        Ok((response.session_token, response.encrypted_master_key))
     }
 
     async fn logout(&self) -> Result<()> {
