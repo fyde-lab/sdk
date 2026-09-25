@@ -131,6 +131,10 @@ impl<S: Storage> Service for DocumentsClient<S> {
     async fn sync(&self, callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
         self.changelog.consume(callback).await
     }
+
+    fn stop_sync(&self) {
+        self.changelog.stop();
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +158,7 @@ mod tests {
     struct RecordingChangelog {
         sent: Mutex<Vec<SentEvent>>,
         to_consume: Mutex<Vec<ChangelogEvent>>,
+        stopped: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -179,6 +184,11 @@ mod tests {
                 callback(event);
             }
             Ok(())
+        }
+
+        fn stop(&self) {
+            self.stopped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -378,5 +388,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(*received.lock().unwrap(), vec![event]);
+    }
+
+    #[tokio::test]
+    async fn stop_sync_delegates_to_the_changelog_services_stop() {
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = DocumentsClient::new(MockStorage::new(), changelog.clone());
+
+        client.stop_sync();
+
+        assert!(changelog.stopped.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

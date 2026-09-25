@@ -60,6 +60,15 @@ pub(super) trait Service: Send + Sync {
     /// being unreachable. If a pass ends cleanly (the server closes the
     /// stream), it's also retried immediately.
     async fn consume(&self, callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()>;
+
+    /// Signals a running [`Self::consume`] call to return. Idempotent, and
+    /// safe to call before [`Self::consume`] has started (in which case
+    /// that call returns immediately without ever opening a stream) or
+    /// after it has already returned (a no-op). Interrupts `consume`
+    /// promptly even while it's parked awaiting the next event on an
+    /// otherwise idle stream, rather than only being checked between
+    /// passes.
+    fn stop(&self);
 }
 
 /// Initializes the changelog service: connects to the fyde server over the

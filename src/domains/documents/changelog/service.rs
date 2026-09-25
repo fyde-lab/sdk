@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use tokio::sync::watch;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
@@ -68,6 +69,11 @@ pub(super) struct ChangelogClient<D: DocumentStorage, O: CursorStorage> {
     cursor_storage: O,
     server_state: Arc<dyn ServerStateService>,
     settings: Arc<dyn SettingsService>,
+    /// Signals [`Service::stop`] to a running [`Service::consume`] call. A
+    /// `watch` channel (rather than [`tokio::sync::Notify`]) so the signal
+    /// is level-triggered: a `stop()` call is never lost even if it lands
+    /// before `consume` starts watching it or between two of its passes.
+    stop: watch::Sender<bool>,
 }
 
 /// Delay between reachability checks in [`ChangelogClient::consume_once`]
@@ -97,6 +103,7 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
             cursor_storage,
             server_state,
             settings,
+            stop: watch::Sender::new(false),
         })
     }
 
@@ -117,6 +124,7 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
             cursor_storage,
             server_state,
             settings,
+            stop: watch::Sender::new(false),
         }
     }
 
@@ -228,11 +236,30 @@ impl<D: DocumentStorage, O: CursorStorage> Service for ChangelogClient<D, O> {
     }
 
     async fn consume(&self, mut callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
-        loop {
-            if let Err(err) = self.consume_once(&mut *callback).await {
-                tracing::error!("changelog consume failed, retrying: {err:?}");
+        let mut stop = self.stop.subscribe();
+
+        while !*stop.borrow() {
+            tokio::select! {
+                result = self.consume_once(&mut *callback) => {
+                    if let Err(err) = result {
+                        tracing::error!("changelog consume failed, retrying: {err:?}");
+                    }
+                }
+                _ = stop.changed() => {}
             }
         }
+
+        Ok(())
+    }
+
+    fn stop(&self) {
+        // `send_replace`, not `send`: `send` is a no-op (doesn't even
+        // update the value) when there are currently no receivers, which
+        // is exactly the case where `stop` is called before `consume` has
+        // subscribed — `send_replace` updates the value unconditionally,
+        // so a `consume` call that starts afterwards still sees it
+        // immediately via `subscribe`.
+        self.stop.send_replace(true);
     }
 }
 
@@ -619,6 +646,73 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn stop_interrupts_a_consume_call_parked_on_an_idle_stream() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_consume_since()
+            .returning(|_| Ok(futures::stream::pending().boxed()));
+
+        let document_storage = MockStorage::new();
+
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+
+        let client = Arc::new(ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            cursor_storage,
+            reachable_server_state(),
+            fake_settings(),
+        ));
+
+        let consume_client = client.clone();
+        let consume_task =
+            tokio::spawn(async move { consume_client.consume(Box::new(|_| {})).await });
+
+        // Give `consume` a chance to actually start and park on the
+        // never-ending stream before stopping it.
+        tokio::task::yield_now().await;
+
+        client.stop();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), consume_task)
+            .await
+            .expect("consume did not return promptly after stop()")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_called_before_consume_makes_it_return_immediately() {
+        // No `expect_consume_since()`: the mock panics if it's called,
+        // which is how this test proves `consume` never opens a stream
+        // when it's already been stopped.
+        let mock_grpc = MockFydeClient::new();
+        let document_storage = MockStorage::new();
+        let cursor_storage = MockCursorStorage::new();
+
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            cursor_storage,
+            reachable_server_state(),
+            fake_settings(),
+        );
+
+        client.stop();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.consume(Box::new(|_| {})),
+        )
+        .await
+        .expect("consume did not return promptly")
+        .unwrap();
     }
 
     #[tokio::test]

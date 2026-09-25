@@ -74,6 +74,14 @@ pub trait Service: Send + Sync {
     ///
     /// Runs until the server closes the stream or an error occurs.
     async fn sync(&self, callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()>;
+
+    /// Signals a running [`Self::sync`] call to return. Idempotent, and
+    /// safe to call before [`Self::sync`] has started (in which case that
+    /// call returns immediately) or after it has already returned (a
+    /// no-op). Delegates to the internal changelog service's `stop` — see
+    /// [`Self::sync`]'s own doc comment for why that's the only way to
+    /// reach it.
+    fn stop_sync(&self);
 }
 
 /// Initializes the documents service: connects the internal changelog
