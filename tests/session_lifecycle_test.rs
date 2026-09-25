@@ -7,10 +7,15 @@
 mod common;
 
 use anyhow::{Context as _, ensure};
+use serial_test::serial;
 
 use common::{Scenario, TEST_PASSWORD, random_username, write_temp_pdf};
 
+// `#[serial(e2e)]`: this suite must not run concurrently with
+// `document_lifecycle_test.rs` — see the sdk CLAUDE.md's "must run
+// serially" note under Testing.
 #[tokio::test]
+#[serial(e2e)]
 async fn session_lifecycle() {
     let scenario = Scenario::start().await;
     let username = random_username();

@@ -69,5 +69,10 @@ anyhow = "1.0.104"
 # regular dependencies (only their dev-dependencies) form the cycle.
 fyde-server = { path = "../server" }
 mockall = "0.15.0"
+# Only used to force the `tests/` end-to-end suite to run serially (see
+# `tests/common/mod.rs` and the sdk CLAUDE.md's "must run serially" note) —
+# its lock is filesystem-based, so it serializes across the separate test
+# binaries `tests/` compiles into, not just threads within one binary.
+serial_test = "3.2.0"
 tempfile = "3.14.0"
 tokio = { version = "1.53.1", features = ["test-util"] }

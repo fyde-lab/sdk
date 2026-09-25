@@ -9,11 +9,16 @@ use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 use anyhow::{Context as _, ensure};
+use serial_test::serial;
 use uuid::Uuid;
 
 use common::{Scenario, TEST_PASSWORD, build_pdf, random_username, wait_for};
 
+// `#[serial(e2e)]`: this suite must not run concurrently with
+// `session_lifecycle_test.rs` — see the sdk CLAUDE.md's "must run
+// serially" note under Testing.
 #[tokio::test]
+#[serial(e2e)]
 async fn document_lifecycle() {
     let scenario = Scenario::start().await;
     let username = random_username();
