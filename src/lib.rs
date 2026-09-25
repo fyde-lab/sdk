@@ -192,6 +192,7 @@ impl Client {
             settings.clone(),
             sessions.clone(),
             sqlite.clone(),
+            documents.clone(),
         )
         .await
         .context("failed to initialize users service")?;

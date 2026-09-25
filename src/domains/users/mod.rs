@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use tonic::transport::Channel;
 
 use crate::Result;
+use crate::domains::documents::Service as DocumentsService;
 use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
 use crate::sql::LocalDatabase;
@@ -72,14 +73,17 @@ pub trait Service: Send + Sync {
 /// persist the session token (read back by every other service's gRPC
 /// transport, via `sessions`, to authenticate their own calls) and where
 /// `create` also persists the master key it generates for a new account.
-/// `local_db` is wiped by `logout` to clear local state.
+/// `local_db` is wiped by `logout` to clear local state, and `documents`'
+/// [`DocumentsService::stop_sync`] is called by `logout` to stop any
+/// running changelog consumption.
 pub(crate) async fn init(
     channel: Channel,
     settings: Arc<dyn SettingsService>,
     sessions: Arc<SessionsClient>,
     local_db: Arc<dyn LocalDatabase>,
+    documents: Arc<dyn DocumentsService>,
 ) -> Result<Arc<dyn Service>> {
     Ok(Arc::new(
-        UsersClient::new(channel, settings, sessions, local_db).await?,
+        UsersClient::new(channel, settings, sessions, local_db, documents).await?,
     ))
 }

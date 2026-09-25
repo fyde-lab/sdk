@@ -3,6 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tonic::transport::Channel;
 
+use crate::domains::documents::Service as DocumentsService;
 #[cfg(test)]
 use crate::domains::sessions::SESSION_TOKEN_SETTING;
 use crate::domains::sessions::{Service as SessionsService, SessionsClient};
@@ -30,18 +31,22 @@ pub struct UsersClient {
     settings: Arc<dyn SettingsService>,
     sessions: Arc<SessionsClient>,
     local_db: Arc<dyn LocalDatabase>,
+    documents: Arc<dyn DocumentsService>,
 }
 
 impl UsersClient {
     /// Creates a client for the users service using the shared `channel`
     /// connection to the fyde server, persisting newly created accounts'
     /// master keys in `settings`, the session token and authenticating
-    /// outgoing calls via `sessions`, and wiping `local_db` on `logout`.
+    /// outgoing calls via `sessions`, wiping `local_db` on `logout`, and
+    /// stopping any running changelog consumption on `documents` on
+    /// `logout`.
     pub(super) async fn new(
         channel: Channel,
         settings: Arc<dyn SettingsService>,
         sessions: Arc<SessionsClient>,
         local_db: Arc<dyn LocalDatabase>,
+        documents: Arc<dyn DocumentsService>,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(channel, sessions.clone())),
@@ -49,6 +54,7 @@ impl UsersClient {
             settings,
             sessions,
             local_db,
+            documents,
         })
     }
 
@@ -63,6 +69,7 @@ impl UsersClient {
         settings: Arc<dyn SettingsService>,
         sessions: Arc<SessionsClient>,
         local_db: Arc<dyn LocalDatabase>,
+        documents: Arc<dyn DocumentsService>,
     ) -> Self {
         Self {
             grpc: Box::new(grpc),
@@ -70,6 +77,7 @@ impl UsersClient {
             settings,
             sessions,
             local_db,
+            documents,
         }
     }
 }
@@ -161,6 +169,8 @@ impl Service for UsersClient {
             return Ok(());
         }
 
+        self.documents.stop_sync();
+
         self.grpc.logout().await.context("failed to log out")?;
 
         self.local_db
@@ -191,7 +201,64 @@ mod tests {
         let sessions = Arc::new(SessionsClient::new(settings.clone()));
         let mut local_db = MockLocalDatabase::new();
         local_db.expect_wipe().returning(|| Ok(()));
-        UsersClient::with_deps(grpc, opaque, settings, sessions, Arc::new(local_db))
+        UsersClient::with_deps(
+            grpc,
+            opaque,
+            settings,
+            sessions,
+            Arc::new(local_db),
+            Arc::new(RecordingDocuments::default()),
+        )
+    }
+
+    /// A [`DocumentsService`] fake recording whether [`Service::stop_sync`]
+    /// was called, for tests that don't need a live changelog. Every other
+    /// method is unused by [`UsersClient`], so left unimplemented.
+    #[derive(Default)]
+    struct RecordingDocuments {
+        stop_sync_called: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl DocumentsService for RecordingDocuments {
+        async fn upload(&self, _path: &std::path::Path) -> Result<uuid::Uuid> {
+            unimplemented!()
+        }
+
+        async fn get(
+            &self,
+            _id: uuid::Uuid,
+        ) -> Result<Option<crate::domains::documents::Document>> {
+            unimplemented!()
+        }
+
+        async fn list(
+            &self,
+            _offset: i64,
+            _limit: i64,
+        ) -> Result<Vec<crate::domains::documents::Document>> {
+            unimplemented!()
+        }
+
+        async fn update_name(
+            &self,
+            _metadata: crate::domains::documents::Metadata,
+            _new_name: String,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn sync(
+            &self,
+            _callback: Box<dyn FnMut(crate::domains::documents::ChangelogEvent) + Send>,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn stop_sync(&self) {
+            self.stop_sync_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// A [`MockOpaqueClient`] wired up for a successful `create()` call:
@@ -678,6 +745,7 @@ mod tests {
             settings,
             sessions,
             Arc::new(local_db),
+            Arc::new(RecordingDocuments::default()),
         );
         client
             .login("alice", "correct horse battery staple", "device")
@@ -685,5 +753,94 @@ mod tests {
             .unwrap();
 
         client.logout().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn logout_stops_a_running_sync() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_login()
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        mock_grpc
+            .expect_finish_login()
+            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key())));
+        mock_grpc.expect_logout().times(1).returning(|| Ok(()));
+
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_set()
+            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .returning(|_| Ok(Some("a-token".to_string())));
+        let settings: Arc<dyn SettingsService> = Arc::new(settings);
+        let sessions = Arc::new(SessionsClient::new(settings.clone()));
+
+        let mut local_db = MockLocalDatabase::new();
+        local_db.expect_wipe().returning(|| Ok(()));
+
+        let documents = Arc::new(RecordingDocuments::default());
+
+        let client = UsersClient::with_deps(
+            mock_grpc,
+            opaque_for_login(b"the-request", b"the-upload"),
+            settings,
+            sessions,
+            Arc::new(local_db),
+            documents.clone(),
+        );
+        client
+            .login("alice", "correct horse battery staple", "device")
+            .await
+            .unwrap();
+
+        client.logout().await.unwrap();
+
+        assert!(
+            documents
+                .stop_sync_called
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_does_not_stop_sync_without_an_open_session() {
+        let mock_grpc = MockFydeClient::new();
+        let opaque = MockOpaqueClient::new();
+
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .times(1)
+            .returning(|_| Ok(None));
+        let settings: Arc<dyn SettingsService> = Arc::new(settings);
+        let sessions = Arc::new(SessionsClient::new(settings.clone()));
+        let mut local_db = MockLocalDatabase::new();
+        local_db.expect_wipe().returning(|| Ok(()));
+        let documents = Arc::new(RecordingDocuments::default());
+
+        let client = UsersClient::with_deps(
+            mock_grpc,
+            opaque,
+            settings,
+            sessions,
+            Arc::new(local_db),
+            documents.clone(),
+        );
+
+        client.logout().await.unwrap();
+
+        assert!(
+            !documents
+                .stop_sync_called
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 }
