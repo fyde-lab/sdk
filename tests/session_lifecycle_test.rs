@@ -26,7 +26,7 @@ async fn session_lifecycle() {
                 .err()
                 .context("upload should fail before any session is open")?;
             ensure!(
-                err.to_string().contains("missing authorization token"),
+                err.to_string().contains("no master key found"),
                 "unexpected error before authentication: {err}"
             );
             Ok(())
@@ -102,7 +102,7 @@ async fn session_lifecycle() {
                 .err()
                 .context("upload should fail once the session is closed")?;
             ensure!(
-                err.to_string().contains("missing authorization token"),
+                err.to_string().contains("no master key found"),
                 "unexpected error after logout: {err}"
             );
             Ok(())

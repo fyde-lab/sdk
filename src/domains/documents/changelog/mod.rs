@@ -66,9 +66,10 @@ pub(super) trait Service: Send + Sync {
 /// shared `channel`, and uses `pool` to cache documents materialized from
 /// consumed events directly into the local `documents` table, `settings`
 /// to persist the changelog cursor consumed so far (see
-/// [`storage_settings::SettingsCursorStorage`]), and `sessions` to attach
-/// the session token as a bearer `authorization` header on every outgoing
-/// call once a session is opened (see
+/// [`storage_settings::SettingsCursorStorage`]) and to read the account
+/// master key `crypto` derives every event's KEK from, and `sessions` to
+/// attach the session token as a bearer `authorization` header on every
+/// outgoing call once a session is opened (see
 /// [`crate::domains::sessions::Service::authenticated_request`]).
 pub(super) async fn init(
     channel: Channel,
@@ -78,13 +79,14 @@ pub(super) async fn init(
     server_state: Arc<dyn ServerStateService>,
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool);
-    let cursor_storage = storage_settings::SettingsCursorStorage::new(settings);
+    let cursor_storage = storage_settings::SettingsCursorStorage::new(settings.clone());
     let client = service::ChangelogClient::new(
         channel,
         document_storage,
         cursor_storage,
         sessions,
         server_state,
+        settings,
     )
     .await
     .context("failed to create changelog client")?;

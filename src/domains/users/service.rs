@@ -10,15 +10,11 @@ use crate::domains::settings::Service as SettingsService;
 use crate::sql::LocalDatabase;
 use crate::{Error, ErrorContext as _, Result};
 
-use super::Service;
 use super::crypto::{
     DefaultOpaqueClient, OpaqueClient, generate_and_wrap_master_key, unwrap_master_key,
 };
 use super::grpc_client::{FydeClient, GrpcClient};
-
-/// The settings key under which a newly created account's encrypted
-/// master key is persisted.
-const MASTER_KEY_SETTING: &str = "master_key";
+use super::{MASTER_KEY_SETTING, Service};
 
 /// A client for the fyde server's users service. Persists the session
 /// token opened by the most recent `create`/`login` call via

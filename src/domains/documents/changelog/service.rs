@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::domains::documents::{Document, Metadata, Storage as DocumentStorage};
 use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
+use crate::domains::settings::Service as SettingsService;
 use crate::{Error, ErrorContext as _, Result};
 
 use super::Service;
@@ -16,10 +17,15 @@ use super::grpc_client::{ChangelogEvent as ProtoChangelogEvent, FydeClient, Grpc
 use super::models::{ChangelogEvent, EventType};
 use super::storage::CursorStorage;
 
-impl TryFrom<ProtoChangelogEvent> for ChangelogEvent {
-    type Error = Error;
-
-    fn try_from(proto: ProtoChangelogEvent) -> Result<Self> {
+impl ChangelogEvent {
+    /// Decrypts a proto event received from the server into its domain
+    /// representation. Not a `TryFrom` impl since decryption needs an
+    /// async round trip to `settings` to derive the KEK (see
+    /// [`crypto::decrypt_event`]).
+    async fn from_proto(
+        proto: ProtoChangelogEvent,
+        settings: &dyn SettingsService,
+    ) -> Result<Self> {
         let id = Uuid::parse_str(&proto.id).with_context(|| {
             format!(
                 "invalid changelog event id {:?} returned by server",
@@ -28,7 +34,8 @@ impl TryFrom<ProtoChangelogEvent> for ChangelogEvent {
         })?;
 
         let (event_type, document_id, content, metadata) =
-            crypto::decrypt_event(&proto.encrypted_content)
+            crypto::decrypt_event(settings, &proto.encrypted_content)
+                .await
                 .with_context(|| format!("failed to decrypt changelog event {id}"))?;
 
         Ok(Self {
@@ -60,6 +67,7 @@ pub(super) struct ChangelogClient<D: DocumentStorage, O: CursorStorage> {
     document_storage: D,
     cursor_storage: O,
     server_state: Arc<dyn ServerStateService>,
+    settings: Arc<dyn SettingsService>,
 }
 
 /// Delay between reachability checks in [`ChangelogClient::consume_once`]
@@ -71,21 +79,24 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
     /// Creates a client for the changelog service using the shared
     /// `channel` connection to the fyde server, using `document_storage` to
     /// cache documents materialized by [`Service::consume`],
-    /// `cursor_storage` to track its progress through the changelog, and
+    /// `cursor_storage` to track its progress through the changelog,
     /// `server_state` to wait for the server to be reachable before opening
-    /// a changelog stream.
+    /// a changelog stream, and `settings` to read the account master key
+    /// [`crypto`] derives every event's KEK from.
     pub(super) async fn new(
         channel: Channel,
         document_storage: D,
         cursor_storage: O,
         sessions: Arc<SessionsClient>,
         server_state: Arc<dyn ServerStateService>,
+        settings: Arc<dyn SettingsService>,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(channel, sessions)),
             document_storage,
             cursor_storage,
             server_state,
+            settings,
         })
     }
 
@@ -98,12 +109,14 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
         document_storage: D,
         cursor_storage: O,
         server_state: Arc<dyn ServerStateService>,
+        settings: Arc<dyn SettingsService>,
     ) -> Self {
         Self {
             grpc: Box::new(grpc),
             document_storage,
             cursor_storage,
             server_state,
+            settings,
         }
     }
 
@@ -138,7 +151,7 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
 
         while let Some(proto_event) = stream.next().await {
             let proto_event = proto_event.context("failed to read next changelog event")?;
-            let event = ChangelogEvent::try_from(proto_event)?;
+            let event = ChangelogEvent::from_proto(proto_event, &*self.settings).await?;
 
             match event.event_type {
                 EventType::Created => {
@@ -201,8 +214,10 @@ impl<D: DocumentStorage, O: CursorStorage> Service for ChangelogClient<D, O> {
         content: Option<&[u8]>,
         metadata: Option<&Metadata>,
     ) -> Result<()> {
-        let encrypted_content = crypto::encrypt_event(event_type, document_id, content, metadata)
-            .context("failed to encrypt changelog event")?;
+        let encrypted_content =
+            crypto::encrypt_event(&*self.settings, event_type, document_id, content, metadata)
+                .await
+                .context("failed to encrypt changelog event")?;
 
         self.grpc
             .record_event(encrypted_content)
@@ -232,12 +247,24 @@ mod tests {
     use super::*;
     use crate::domains::documents::{FakeMetadata, MockStorage};
     use crate::domains::server_state::MockService as MockServerState;
+    use crate::domains::settings::MockService as MockSettingsService;
 
     /// A [`ServerStateService`] mock reporting the server as always
     /// reachable, for tests where reachability isn't under test.
     fn reachable_server_state() -> Arc<dyn ServerStateService> {
         let mut mock = MockServerState::new();
         mock.expect_is_server_reachable().returning(|| Ok(true));
+        Arc::new(mock)
+    }
+
+    /// A [`SettingsService`] mock with a fixed master key set under
+    /// [`crate::domains::users::MASTER_KEY_SETTING`], for tests exercising
+    /// real `crypto::encrypt_event`/`decrypt_event` calls.
+    fn fake_settings() -> Arc<dyn SettingsService> {
+        let mut mock = MockSettingsService::new();
+        mock.expect_get()
+            .withf(|key| key == crate::domains::users::MASTER_KEY_SETTING)
+            .returning(|_| Ok(Some("the-account-master-key".to_string())));
         Arc::new(mock)
     }
 
@@ -250,12 +277,13 @@ mod tests {
         document_id: Uuid,
         event_type: EventType,
     ) -> ProtoChangelogEvent {
-        let encrypted_content = crypto::encrypt_event(
+        let encrypted_content = futures::executor::block_on(crypto::encrypt_event(
+            &*fake_settings(),
             event_type,
             document_id,
             Some(b"content"),
             Some(&FakeMetadata::new().build()),
-        )
+        ))
         .unwrap();
         ProtoChangelogEvent {
             id: id.to_string(),
@@ -298,6 +326,7 @@ mod tests {
             document_storage,
             cursor_storage,
             reachable_server_state(),
+            fake_settings(),
         );
 
         let received = std::sync::Arc::new(Mutex::new(Vec::new()));
@@ -350,6 +379,7 @@ mod tests {
             document_storage,
             cursor_storage,
             Arc::new(server_state),
+            fake_settings(),
         );
 
         let mut callback = |_| {};
@@ -410,6 +440,7 @@ mod tests {
             document_storage,
             cursor_storage,
             reachable_server_state(),
+            fake_settings(),
         );
 
         client.consume_once(&mut |_| {}).await.unwrap();
@@ -452,6 +483,7 @@ mod tests {
             document_storage,
             cursor_storage,
             reachable_server_state(),
+            fake_settings(),
         );
 
         client.consume_once(&mut |_| {}).await.unwrap();
@@ -462,8 +494,14 @@ mod tests {
         let document_id = Uuid::now_v7();
         let event_id = Uuid::now_v7();
 
-        let encrypted_content =
-            crypto::encrypt_event(EventType::Created, document_id, None, None).unwrap();
+        let encrypted_content = futures::executor::block_on(crypto::encrypt_event(
+            &*fake_settings(),
+            EventType::Created,
+            document_id,
+            None,
+            None,
+        ))
+        .unwrap();
 
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc.expect_consume_since().returning(move |_| {
@@ -488,6 +526,7 @@ mod tests {
             document_storage,
             cursor_storage,
             reachable_server_state(),
+            fake_settings(),
         );
 
         let result = client.consume_once(&mut |_| {}).await;
@@ -529,6 +568,7 @@ mod tests {
             document_storage,
             cursor_storage,
             reachable_server_state(),
+            fake_settings(),
         );
 
         client.consume_once(&mut |_| {}).await.unwrap();
@@ -566,6 +606,7 @@ mod tests {
             document_storage,
             cursor_storage,
             reachable_server_state(),
+            fake_settings(),
         );
 
         let consume_fut = client.consume(Box::new(|_| {}));
@@ -590,8 +631,10 @@ mod tests {
         mock_grpc
             .expect_record_event()
             .withf(move |encrypted_content| {
-                let (event_type, id, content, decrypted_metadata) =
-                    crypto::decrypt_event(encrypted_content).unwrap();
+                let (event_type, id, content, decrypted_metadata) = futures::executor::block_on(
+                    crypto::decrypt_event(&*fake_settings(), encrypted_content),
+                )
+                .unwrap();
                 event_type == EventType::Created
                     && id == document_id
                     && content == Some(b"body".to_vec())
@@ -604,6 +647,7 @@ mod tests {
             MockStorage::new(),
             MockCursorStorage::new(),
             reachable_server_state(),
+            fake_settings(),
         );
 
         client

@@ -9,14 +9,14 @@ use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::{ErrorContext as _, Result};
 
 /// Generated protobuf/gRPC bindings for the `users` service, compiled from
-/// `../api-protos/users.proto` by `build.rs`.
+/// `../api-protos/users/v1/users.proto` by `build.rs`.
 mod proto {
-    tonic::include_proto!("users");
+    tonic::include_proto!("users.v1");
 }
 
 use proto::{
-    LoginFinishRequest, LoginStartRequest, LogoutRequest, RegistrationFinishRequest,
-    RegistrationStartRequest, users_client::UsersClient as GeneratedUsersClient,
+    FinishLoginRequest, FinishRegistrationRequest, LogoutRequest, StartLoginRequest,
+    StartRegistrationRequest, users_service_client::UsersServiceClient as GeneratedUsersClient,
 };
 
 /// A gRPC transport for talking to the fyde server's users service. Knows
@@ -109,7 +109,7 @@ impl FydeClient for GrpcClient {
     async fn start_registration(&self, username: &str, opaque_request: &[u8]) -> Result<Vec<u8>> {
         let request = self
             .sessions
-            .authenticated_request(RegistrationStartRequest {
+            .authenticated_request(StartRegistrationRequest {
                 username: username.to_string(),
                 opaque_request: opaque_request.to_vec(),
             })
@@ -134,7 +134,7 @@ impl FydeClient for GrpcClient {
     ) -> Result<String> {
         let request = self
             .sessions
-            .authenticated_request(RegistrationFinishRequest {
+            .authenticated_request(FinishRegistrationRequest {
                 username: username.to_string(),
                 opaque_upload: opaque_upload.to_vec(),
                 device_name: device_name.to_string(),
@@ -159,7 +159,7 @@ impl FydeClient for GrpcClient {
     ) -> Result<(String, Vec<u8>)> {
         let request = self
             .sessions
-            .authenticated_request(LoginStartRequest {
+            .authenticated_request(StartLoginRequest {
                 username: username.to_string(),
                 opaque_request: opaque_request.to_vec(),
             })
@@ -183,7 +183,7 @@ impl FydeClient for GrpcClient {
     ) -> Result<(String, Vec<u8>)> {
         let request = self
             .sessions
-            .authenticated_request(LoginFinishRequest {
+            .authenticated_request(FinishLoginRequest {
                 login_id: login_id.to_string(),
                 opaque_upload: opaque_upload.to_vec(),
                 device_name: device_name.to_string(),

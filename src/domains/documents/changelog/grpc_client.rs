@@ -11,14 +11,14 @@ use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::{ErrorContext as _, Result};
 
 /// Generated protobuf/gRPC bindings for the `changelog` service, compiled
-/// from `../api-protos/changelog.proto` by `build.rs`.
+/// from `../api-protos/changelog/v1/changelog.proto` by `build.rs`.
 mod proto {
-    tonic::include_proto!("changelog");
+    tonic::include_proto!("changelog.v1");
 }
 
-pub(super) use proto::ChangelogEvent;
+pub(super) use proto::ConsumeSinceResponse as ChangelogEvent;
 
-use proto::changelog_client::ChangelogClient;
+use proto::changelog_service_client::ChangelogServiceClient as ChangelogClient;
 use proto::{ConsumeSinceRequest, RecordEventRequest};
 
 /// A stream of raw changelog events as received from the server, opened by

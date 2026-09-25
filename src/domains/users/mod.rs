@@ -14,6 +14,12 @@ use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
 use crate::sql::LocalDatabase;
 
+/// The settings key under which a newly created account's encrypted
+/// master key is persisted, and under which
+/// [`crate::domains::documents::changelog::crypto`] reads it back to derive
+/// the key-encryption-key (KEK) that wraps every changelog event's DEK.
+pub(crate) const MASTER_KEY_SETTING: &str = "master_key";
+
 /// Manages account creation and session lifecycle against the fyde
 /// server's users service, authenticating via the OPAQUE
 /// asymmetric password-authenticated key exchange protocol (RFC 9807) —
