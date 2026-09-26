@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::fs::File;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -59,6 +60,18 @@ fn successor(id: Uuid) -> Uuid {
     Uuid::from_u128(id.as_u128().wrapping_add(1))
 }
 
+/// Path to the advisory lock file arbitrating write access to the local
+/// document cache across processes consuming the same changelog: only the
+/// process holding this lock is allowed to persist documents/metadata via
+/// [`ChangelogClient::consume_once`] (see [`ChangelogClient::write_lock`]'s
+/// doc comment). Lives in the OS default temporary directory, shared by
+/// every process on the machine, rather than under the per-account SQLite
+/// database, since the lock's purpose is to arbitrate across processes, not
+/// accounts.
+fn write_lock_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("fyde-changelog-consume.lock")
+}
+
 /// A client for the fyde server's changelog service. Generic over the
 /// [`DocumentStorage`] implementation used by [`Service::consume`] to cache
 /// documents materialized from consumed events, and the [`CursorStorage`]
@@ -75,6 +88,24 @@ pub(super) struct ChangelogClient<D: DocumentStorage, O: CursorStorage> {
     /// `stop_consume_job()` call is never lost even if it lands before the
     /// task starts watching it or between two of its passes.
     stop: watch::Sender<bool>,
+    /// Path to this client's advisory write lock file — [`write_lock_path`]
+    /// for a real, `pub(super)::new`-constructed client, or a unique
+    /// per-instance path under test (see [`Self::with_grpc`]) so parallel
+    /// tests each arbitrate their own lock rather than contending over one
+    /// shared file.
+    lock_path: std::path::PathBuf,
+    /// Holds the open, OS-locked handle to [`Self::lock_path`] for as long
+    /// as this process has exclusive write permission over the local
+    /// document cache, acquired by [`Service::start_consume_job`] and
+    /// released by [`Service::stop_consume_job`]. `None` whenever another
+    /// process already holds it — in which case [`Self::consume_once`]
+    /// still consumes every event and still invokes the caller's callback,
+    /// but skips persisting the document/metadata locally, since only the
+    /// lock holder is allowed to write. The OS releases the underlying
+    /// `flock` automatically if the process exits without calling
+    /// [`Service::stop_consume_job`] (e.g. a crash), so the lock can never
+    /// outlive the process holding it.
+    write_lock: Mutex<Option<File>>,
 }
 
 /// Delay between reachability checks in [`ChangelogClient::consume_once`]
@@ -105,6 +136,8 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
             server_state,
             settings,
             stop: watch::Sender::new(false),
+            lock_path: write_lock_path(),
+            write_lock: Mutex::new(None),
         })
     }
 
@@ -126,7 +159,57 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
             server_state,
             settings,
             stop: watch::Sender::new(false),
+            lock_path: std::env::temp_dir()
+                .join(format!("fyde-changelog-consume-{}.lock", Uuid::new_v4())),
+            write_lock: Mutex::new(None),
         }
+    }
+
+    /// Attempts to take exclusive ownership of [`Self::lock_path`], storing
+    /// the locked handle in `self.write_lock` on success. Never fails the
+    /// caller: if the file can't be opened or is already locked by another
+    /// process, this just leaves `self.write_lock` as `None` and logs why,
+    /// so [`Self::consume_once`] falls back to read-only consumption
+    /// instead of erroring out of [`Service::start_consume_job`] entirely.
+    fn acquire_write_lock(&self) {
+        let path = &self.lock_path;
+
+        let file = match File::create(path) {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::warn!(
+                    "failed to open changelog write lock file {path:?}, \
+                     falling back to read-only consumption: {err:?}"
+                );
+                return;
+            }
+        };
+
+        match file.try_lock() {
+            Ok(()) => {
+                *self.write_lock.lock().unwrap() = Some(file);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "changelog write lock {path:?} already held by another process, \
+                     falling back to read-only consumption: {err:?}"
+                );
+            }
+        }
+    }
+
+    /// Releases the write lock taken by [`Self::acquire_write_lock`], if
+    /// this process is holding it. Idempotent, and safe to call whether or
+    /// not the lock was ever successfully acquired.
+    fn release_write_lock(&self) {
+        self.write_lock.lock().unwrap().take();
+    }
+
+    /// Whether this process currently holds [`Self::lock_path`], and is
+    /// therefore allowed to persist documents/metadata locally in
+    /// [`Self::consume_once`].
+    fn has_write_permission(&self) -> bool {
+        self.write_lock.lock().unwrap().is_some()
     }
 
     /// One pass of the consume loop spawned by [`Service::start_consume_job`]:
@@ -172,14 +255,16 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
                         )));
                     };
 
-                    let document =
-                        Document::new(event.document_id, content.clone(), metadata.clone());
-                    self.document_storage
-                        .save_document(&document)
-                        .await
-                        .with_context(|| {
-                            format!("failed to cache document {} locally", event.document_id)
-                        })?;
+                    if self.has_write_permission() {
+                        let document =
+                            Document::new(event.document_id, content.clone(), metadata.clone());
+                        self.document_storage
+                            .save_document(&document)
+                            .await
+                            .with_context(|| {
+                                format!("failed to cache document {} locally", event.document_id)
+                            })?;
+                    }
                 }
                 EventType::UpdateMetadata => {
                     let Some(metadata) = &event.metadata else {
@@ -189,15 +274,17 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
                         )));
                     };
 
-                    self.document_storage
-                        .update_metadata(event.document_id, metadata)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to update cached document {} locally",
-                                event.document_id
-                            )
-                        })?;
+                    if self.has_write_permission() {
+                        self.document_storage
+                            .update_metadata(event.document_id, metadata)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "failed to update cached document {} locally",
+                                    event.document_id
+                                )
+                            })?;
+                    }
                 }
                 EventType::Deleted => {}
             }
@@ -270,6 +357,10 @@ impl<D: DocumentStorage + 'static, O: CursorStorage + 'static> Service for Chang
         // return immediately without ever streaming.
         self.stop.send_replace(false);
 
+        // Re-acquired on every start, since a prior `stop_consume_job` call
+        // released it (see `write_lock`'s doc comment).
+        self.acquire_write_lock();
+
         tokio::spawn(async move { self.run_consume_loop(&mut *callback).await });
 
         Ok(())
@@ -283,6 +374,7 @@ impl<D: DocumentStorage + 'static, O: CursorStorage + 'static> Service for Chang
         // updates the value unconditionally, so a task that starts
         // afterwards still sees it immediately via `subscribe`.
         self.stop.send_replace(true);
+        self.release_write_lock();
     }
 }
 
@@ -378,6 +470,7 @@ mod tests {
             reachable_server_state(),
             fake_settings(),
         );
+        client.acquire_write_lock();
 
         let received = std::sync::Arc::new(Mutex::new(Vec::new()));
         let received_in_callback = received.clone();
@@ -389,6 +482,118 @@ mod tests {
         assert_eq!(received[0].id, event_id);
         assert_eq!(received[0].document_id, document_id);
         assert_eq!(received[0].event_type, EventType::Created);
+    }
+
+    #[tokio::test]
+    async fn consume_still_invokes_the_callback_but_skips_saving_without_the_write_lock() {
+        let document_id = Uuid::now_v7();
+        let event_id = Uuid::now_v7();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(vec![Ok(proto_event(event_id, document_id))]).boxed())
+        });
+
+        // No `expect_save_document()` set up: the mock panics if it's
+        // called, which is how this test proves the document is never
+        // persisted locally when this client doesn't hold the write lock.
+        let document_storage = MockStorage::new();
+
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+        cursor_storage
+            .expect_save_cursor()
+            .withf(move |id| *id == successor(event_id))
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            cursor_storage,
+            reachable_server_state(),
+            fake_settings(),
+        );
+        // No `acquire_write_lock()` call: this client never holds the lock.
+
+        let received = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let received_in_callback = received.clone();
+        let mut callback = move |event| received_in_callback.lock().unwrap().push(event);
+        client.consume_once(&mut callback).await.unwrap();
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].document_id, document_id);
+    }
+
+    #[tokio::test]
+    async fn a_second_client_holding_the_same_lock_path_fails_to_acquire_it() {
+        let mock_grpc = MockFydeClient::new();
+        let document_storage = MockStorage::new();
+        let cursor_storage = MockCursorStorage::new();
+
+        let first = ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            cursor_storage,
+            reachable_server_state(),
+            fake_settings(),
+        );
+        first.acquire_write_lock();
+        assert!(first.has_write_permission());
+
+        // Build a second client pointed at the same lock file as `first`,
+        // simulating a second process/client instance racing for it.
+        let mut second = ChangelogClient::with_grpc(
+            MockFydeClient::new(),
+            MockStorage::new(),
+            MockCursorStorage::new(),
+            reachable_server_state(),
+            fake_settings(),
+        );
+        second.lock_path = first.lock_path.clone();
+
+        second.acquire_write_lock();
+        assert!(!second.has_write_permission());
+
+        first.release_write_lock();
+        second.acquire_write_lock();
+        assert!(second.has_write_permission());
+    }
+
+    #[tokio::test]
+    async fn start_consume_job_acquires_the_write_lock_and_stop_consume_job_releases_it() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_consume_since()
+            .returning(|_| Ok(futures::stream::pending().boxed()));
+
+        let document_storage = MockStorage::new();
+
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+
+        let client = Arc::new(ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            cursor_storage,
+            reachable_server_state(),
+            fake_settings(),
+        ));
+
+        client
+            .clone()
+            .start_consume_job(Box::new(|_| {}))
+            .await
+            .unwrap();
+        assert!(client.has_write_permission());
+
+        client.stop_consume_job();
+        assert!(!client.has_write_permission());
     }
 
     #[tokio::test(start_paused = true)]
@@ -535,6 +740,7 @@ mod tests {
             reachable_server_state(),
             fake_settings(),
         );
+        client.acquire_write_lock();
 
         client.consume_once(&mut |_| {}).await.unwrap();
     }

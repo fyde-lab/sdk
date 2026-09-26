@@ -63,18 +63,29 @@ pub(super) trait Service: Send + Sync {
     /// naturally paces the retries if the failure was caused by the server
     /// being unreachable. If a pass ends cleanly (the server closes the
     /// stream), it's also retried immediately.
+    ///
+    /// Also attempts to take an exclusive, `flock`-backed lock on a file in
+    /// the OS default temporary directory, shared by every process on the
+    /// machine consuming this changelog. Only the process holding that lock
+    /// has permission to persist consumed documents/metadata into local
+    /// storage; every other process still consumes every event and still
+    /// invokes `callback` for it, but skips the local write. The lock is
+    /// released by [`Self::stop_consume_job`], or automatically by the OS
+    /// if this process exits without calling it.
     async fn start_consume_job(
         self: Arc<Self>,
         callback: Box<dyn FnMut(ChangelogEvent) + Send>,
     ) -> Result<()>;
 
-    /// Signals a running [`Self::start_consume_job`] task to return.
-    /// Idempotent, and safe to call before [`Self::start_consume_job`] has
-    /// started its task (in which case that task returns immediately
-    /// without ever opening a stream) or after it has already returned (a
-    /// no-op). Interrupts the consume loop promptly even while it's parked
-    /// awaiting the next event on an otherwise idle stream, rather than
-    /// only being checked between passes.
+    /// Signals a running [`Self::start_consume_job`] task to return, and
+    /// releases the write lock it took (if any) — see
+    /// [`Self::start_consume_job`]'s doc comment. Idempotent, and safe to
+    /// call before [`Self::start_consume_job`] has started its task (in
+    /// which case that task returns immediately without ever opening a
+    /// stream) or after it has already returned (a no-op). Interrupts the
+    /// consume loop promptly even while it's parked awaiting the next event
+    /// on an otherwise idle stream, rather than only being checked between
+    /// passes.
     fn stop_consume_job(&self);
 }
 
