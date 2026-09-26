@@ -36,14 +36,16 @@ pub(super) trait FydeClient: Send + Sync {
 
     /// Second and final step of registration: sends the serialized OPAQUE
     /// `RegistrationUpload` for `username`, the master key encrypted
-    /// client-side under a key derived from the OPAQUE export key, and
-    /// opens a session for `device_name`, returning its session token.
+    /// client-side under a key derived from the OPAQUE export key, and the
+    /// account's preferred interface language, and opens a session for
+    /// `device_name`, returning its session token.
     async fn finish_registration(
         &self,
         username: &str,
         opaque_upload: &[u8],
         device_name: &str,
         encrypted_master_key: &[u8],
+        language: &str,
     ) -> Result<String>;
 
     /// First step of logging in: forwards a serialized OPAQUE
@@ -150,6 +152,7 @@ impl FydeClient for GrpcClient {
         opaque_upload: &[u8],
         device_name: &str,
         encrypted_master_key: &[u8],
+        language: &str,
     ) -> Result<String> {
         let request = self
             .sessions
@@ -158,6 +161,7 @@ impl FydeClient for GrpcClient {
                 opaque_upload: opaque_upload.to_vec(),
                 device_name: device_name.to_string(),
                 encrypted_master_key: encrypted_master_key.to_vec(),
+                language: language.to_string(),
             })
             .await?;
 

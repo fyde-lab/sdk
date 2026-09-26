@@ -18,6 +18,23 @@ use super::crypto::{
 use super::grpc_client::{FydeClient, GrpcClient};
 use super::{MASTER_KEY_SETTING, Service, decode_master_key, encode_master_key};
 
+/// The device's preferred interface language as a short code (e.g. "en",
+/// "fr"), read from the `LC_ALL`/`LC_MESSAGES`/`LANG` environment variables
+/// (checked in that order, matching POSIX locale precedence) and falling
+/// back to `"en"` if none is set or parses to something unexpected (e.g.
+/// the POSIX default `"C"`/`"POSIX"`). Sent to the server by `create` so it
+/// doesn't need to be asked for.
+fn system_language() -> String {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .find_map(|var| std::env::var(var).ok())
+        .and_then(|value| {
+            let code = value.split(['_', '.']).next().unwrap_or("").to_lowercase();
+            (code.len() == 2).then_some(code)
+        })
+        .unwrap_or_else(|| "en".to_string())
+}
+
 /// A client for the fyde server's users service. Persists the session
 /// token opened by the most recent `create`/`login` call via
 /// [`SessionsClient::save_new_session`] under
@@ -112,6 +129,7 @@ impl Service for UsersClient {
                 &opaque_upload,
                 device_name,
                 wrapped_master_key.as_bytes(),
+                &system_language(),
             )
             .await
             .context("failed to finish registration")?;
@@ -401,10 +419,10 @@ mod tests {
             .returning(|_, _| Ok(b"the-response".to_vec()));
         mock_grpc
             .expect_finish_registration()
-            .withf(|username, upload, device_name, _| {
+            .withf(|username, upload, device_name, _, _| {
                 username == "alice" && upload == b"the-upload" && device_name == "Pierre's iPhone"
             })
-            .returning(|_, _, _, _| Ok("a-token".to_string()));
+            .returning(|_, _, _, _, _| Ok("a-token".to_string()));
 
         let mut settings = MockSettingsService::new();
         settings
@@ -441,7 +459,7 @@ mod tests {
         let sent_master_key: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
         let capture = sent_master_key.clone();
         mock_grpc.expect_finish_registration().times(1).returning(
-            move |_, _, _, encrypted_master_key| {
+            move |_, _, _, encrypted_master_key, _| {
                 *capture.lock().unwrap() = Some(encrypted_master_key.to_vec());
                 Ok("a-token".to_string())
             },
@@ -494,7 +512,7 @@ mod tests {
             .returning(|_, _| Ok(b"the-response".to_vec()));
         mock_grpc
             .expect_finish_registration()
-            .returning(|_, _, _, _| Ok("a-token".to_string()));
+            .returning(|_, _, _, _, _| Ok("a-token".to_string()));
 
         // Captures what `create` persists so it can be read back and
         // asserted on below, without a generic key/value store.
@@ -541,7 +559,7 @@ mod tests {
             .returning(|_, _| Ok(b"the-response".to_vec()));
         mock_grpc
             .expect_finish_registration()
-            .returning(|_, _, _, _| Ok("a-token".to_string()));
+            .returning(|_, _, _, _, _| Ok("a-token".to_string()));
 
         // Captures what `create` persists under `SESSION_TOKEN_SETTING` so
         // it can be read back and asserted on below.
