@@ -69,10 +69,11 @@ pub(super) struct ChangelogClient<D: DocumentStorage, O: CursorStorage> {
     cursor_storage: O,
     server_state: Arc<dyn ServerStateService>,
     settings: Arc<dyn SettingsService>,
-    /// Signals [`Service::stop`] to a running [`Service::consume`] call. A
-    /// `watch` channel (rather than [`tokio::sync::Notify`]) so the signal
-    /// is level-triggered: a `stop()` call is never lost even if it lands
-    /// before `consume` starts watching it or between two of its passes.
+    /// Signals [`Service::stop_consume_job`] to the task spawned by
+    /// [`Service::start_consume_job`]. A `watch` channel (rather than
+    /// [`tokio::sync::Notify`]) so the signal is level-triggered: a
+    /// `stop_consume_job()` call is never lost even if it lands before the
+    /// task starts watching it or between two of its passes.
     stop: watch::Sender<bool>,
 }
 
@@ -128,7 +129,8 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
         }
     }
 
-    /// One pass of [`Service::consume`]: opens a stream from the persisted
+    /// One pass of the consume loop spawned by [`Service::start_consume_job`]:
+    /// opens a stream from the persisted
     /// cursor and processes events until the stream ends or an error
     /// occurs. Split out as an inherent method (rather than inlined in
     /// `consume`) so it can be retried in a loop without re-implementing
@@ -211,10 +213,33 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
 
         Ok(())
     }
+
+    /// The retry loop spawned by [`Service::start_consume_job`] onto its own
+    /// background task: repeats [`Self::consume_once`] from the persisted
+    /// cursor, logging and immediately retrying on either an error or a
+    /// clean end of stream, until [`Service::stop_consume_job`] signals it
+    /// to return. Split out as its own inherent method (rather than inlined
+    /// in `start_consume_job`'s spawned task) so tests can exercise the loop
+    /// directly, synchronously, without needing to observe a detached task's
+    /// completion.
+    async fn run_consume_loop(&self, callback: &mut (dyn FnMut(ChangelogEvent) + Send)) {
+        let mut stop = self.stop.subscribe();
+
+        while !*stop.borrow() {
+            tokio::select! {
+                result = self.consume_once(callback) => {
+                    if let Err(err) = result {
+                        tracing::error!("changelog consume failed, retrying: {err:?}");
+                    }
+                }
+                _ = stop.changed() => {}
+            }
+        }
+    }
 }
 
 #[async_trait]
-impl<D: DocumentStorage, O: CursorStorage> Service for ChangelogClient<D, O> {
+impl<D: DocumentStorage + 'static, O: CursorStorage + 'static> Service for ChangelogClient<D, O> {
     async fn send(
         &self,
         event_type: EventType,
@@ -235,30 +260,22 @@ impl<D: DocumentStorage, O: CursorStorage> Service for ChangelogClient<D, O> {
         Ok(())
     }
 
-    async fn consume(&self, mut callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
-        let mut stop = self.stop.subscribe();
-
-        while !*stop.borrow() {
-            tokio::select! {
-                result = self.consume_once(&mut *callback) => {
-                    if let Err(err) = result {
-                        tracing::error!("changelog consume failed, retrying: {err:?}");
-                    }
-                }
-                _ = stop.changed() => {}
-            }
-        }
+    async fn start_consume_job(
+        self: Arc<Self>,
+        mut callback: Box<dyn FnMut(ChangelogEvent) + Send>,
+    ) -> Result<()> {
+        tokio::spawn(async move { self.run_consume_loop(&mut *callback).await });
 
         Ok(())
     }
 
-    fn stop(&self) {
+    fn stop_consume_job(&self) {
         // `send_replace`, not `send`: `send` is a no-op (doesn't even
         // update the value) when there are currently no receivers, which
-        // is exactly the case where `stop` is called before `consume` has
-        // subscribed — `send_replace` updates the value unconditionally,
-        // so a `consume` call that starts afterwards still sees it
-        // immediately via `subscribe`.
+        // is exactly the case where `stop_consume_job` is called before
+        // `start_consume_job`'s task has subscribed — `send_replace`
+        // updates the value unconditionally, so a task that starts
+        // afterwards still sees it immediately via `subscribe`.
         self.stop.send_replace(true);
     }
 }
@@ -602,7 +619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_never_returns_and_retries_after_an_error() {
+    async fn run_consume_loop_never_returns_and_retries_after_an_error() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let attempts = Arc::new(AtomicU32::new(0));
@@ -636,12 +653,13 @@ mod tests {
             fake_settings(),
         );
 
-        let consume_fut = client.consume(Box::new(|_| {}));
+        let mut callback = |_| {};
+        let consume_fut = client.run_consume_loop(&mut callback);
         tokio::pin!(consume_fut);
 
-        // The first attempt fails immediately, and with no retry delay
-        // `consume` should retry right away — parking in the second
-        // attempt's never-ending stream rather than returning.
+        // The first attempt fails immediately, and with no retry delay the
+        // loop should retry right away — parking in the second attempt's
+        // never-ending stream rather than returning.
         tokio::time::timeout(std::time::Duration::from_millis(0), &mut consume_fut)
             .await
             .unwrap_err();
@@ -649,7 +667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_interrupts_a_consume_call_parked_on_an_idle_stream() {
+    async fn stop_consume_job_interrupts_a_loop_parked_on_an_idle_stream() {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_consume_since()
@@ -670,28 +688,27 @@ mod tests {
             fake_settings(),
         ));
 
-        let consume_client = client.clone();
-        let consume_task =
-            tokio::spawn(async move { consume_client.consume(Box::new(|_| {})).await });
+        let loop_client = client.clone();
+        let loop_task =
+            tokio::spawn(async move { loop_client.run_consume_loop(&mut |_| {}).await });
 
-        // Give `consume` a chance to actually start and park on the
+        // Give the loop a chance to actually start and park on the
         // never-ending stream before stopping it.
         tokio::task::yield_now().await;
 
-        client.stop();
+        client.stop_consume_job();
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), consume_task)
+        tokio::time::timeout(std::time::Duration::from_secs(1), loop_task)
             .await
-            .expect("consume did not return promptly after stop()")
-            .unwrap()
+            .expect("run_consume_loop did not return promptly after stop_consume_job()")
             .unwrap();
     }
 
     #[tokio::test]
-    async fn stop_called_before_consume_makes_it_return_immediately() {
+    async fn stop_consume_job_called_before_the_loop_starts_makes_it_return_immediately() {
         // No `expect_consume_since()`: the mock panics if it's called,
-        // which is how this test proves `consume` never opens a stream
-        // when it's already been stopped.
+        // which is how this test proves the loop never opens a stream when
+        // it's already been stopped.
         let mock_grpc = MockFydeClient::new();
         let document_storage = MockStorage::new();
         let cursor_storage = MockCursorStorage::new();
@@ -704,15 +721,52 @@ mod tests {
             fake_settings(),
         );
 
-        client.stop();
+        client.stop_consume_job();
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            client.consume(Box::new(|_| {})),
+            client.run_consume_loop(&mut |_| {}),
         )
         .await
-        .expect("consume did not return promptly")
+        .expect("run_consume_loop did not return promptly");
+    }
+
+    #[tokio::test]
+    async fn start_consume_job_returns_as_soon_as_the_loop_is_spawned() {
+        // The stream never yields anything and never closes, so if
+        // `start_consume_job` awaited the loop inline instead of spawning
+        // it onto its own task, this test would time out.
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_consume_since()
+            .returning(|_| Ok(futures::stream::pending().boxed()));
+
+        let document_storage = MockStorage::new();
+
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+
+        let client = Arc::new(ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            cursor_storage,
+            reachable_server_state(),
+            fake_settings(),
+        ));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.clone().start_consume_job(Box::new(|_| {})),
+        )
+        .await
+        .expect("start_consume_job did not return promptly")
         .unwrap();
+
+        // Stop the background task the call above spawned, so it doesn't
+        // keep running after the test ends.
+        client.stop_consume_job();
     }
 
     #[tokio::test]

@@ -129,11 +129,11 @@ impl<S: Storage> Service for DocumentsClient<S> {
     }
 
     async fn sync(&self, callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
-        self.changelog.consume(callback).await
+        self.changelog.clone().start_consume_job(callback).await
     }
 
     fn stop_sync(&self) {
-        self.changelog.stop();
+        self.changelog.stop_consume_job();
     }
 }
 
@@ -152,8 +152,8 @@ mod tests {
 
     /// A [`ChangelogService`] fake recording every event passed to
     /// [`ChangelogService::send`], and replaying `to_consume` through
-    /// [`ChangelogService::consume`]'s callback, for tests that don't need
-    /// a live server.
+    /// [`ChangelogService::start_consume_job`]'s callback, for tests that
+    /// don't need a live server.
     #[derive(Default)]
     struct RecordingChangelog {
         sent: Mutex<Vec<SentEvent>>,
@@ -179,14 +179,17 @@ mod tests {
             Ok(())
         }
 
-        async fn consume(&self, mut callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
+        async fn start_consume_job(
+            self: Arc<Self>,
+            mut callback: Box<dyn FnMut(ChangelogEvent) + Send>,
+        ) -> Result<()> {
             for event in self.to_consume.lock().unwrap().drain(..) {
                 callback(event);
             }
             Ok(())
         }
 
-        fn stop(&self) {
+        fn stop_consume_job(&self) {
             self.stopped
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }

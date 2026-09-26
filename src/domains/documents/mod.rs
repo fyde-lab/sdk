@@ -68,19 +68,21 @@ pub trait Service: Send + Sync {
     /// storage before invoking `callback`, so it becomes visible to
     /// [`Self::get`]/[`Self::list`].
     ///
-    /// Delegates entirely to the internal changelog service's `consume` —
-    /// the changelog itself is private to this domain, this is the only
-    /// way to reach it from outside.
+    /// Delegates entirely to the internal changelog service's
+    /// `start_consume_job` — the changelog itself is private to this
+    /// domain, this is the only way to reach it from outside.
     ///
-    /// Runs until the server closes the stream or an error occurs.
+    /// Returns as soon as the background consume task is spawned, not when
+    /// it stops. That task itself runs until the server closes the stream
+    /// or an error occurs, retrying immediately either way.
     async fn sync(&self, callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()>;
 
-    /// Signals a running [`Self::sync`] call to return. Idempotent, and
-    /// safe to call before [`Self::sync`] has started (in which case that
-    /// call returns immediately) or after it has already returned (a
-    /// no-op). Delegates to the internal changelog service's `stop` — see
-    /// [`Self::sync`]'s own doc comment for why that's the only way to
-    /// reach it.
+    /// Signals the task spawned by a prior [`Self::sync`] call to return.
+    /// Idempotent, and safe to call before [`Self::sync`] has started its
+    /// task (in which case that task returns immediately) or after it has
+    /// already returned (a no-op). Delegates to the internal changelog
+    /// service's `stop_consume_job` — see [`Self::sync`]'s own doc comment
+    /// for why that's the only way to reach it.
     fn stop_sync(&self);
 }
 
