@@ -264,6 +264,12 @@ impl<D: DocumentStorage + 'static, O: CursorStorage + 'static> Service for Chang
         self: Arc<Self>,
         mut callback: Box<dyn FnMut(ChangelogEvent) + Send>,
     ) -> Result<()> {
+        // Reset in case a previous job on this same client was stopped: the
+        // `stop` signal is level-triggered (see the field's doc comment)
+        // and would otherwise still read as `true` here, making this job
+        // return immediately without ever streaming.
+        self.stop.send_replace(false);
+
         tokio::spawn(async move { self.run_consume_loop(&mut *callback).await });
 
         Ok(())

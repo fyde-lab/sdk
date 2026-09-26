@@ -21,13 +21,26 @@ pub(super) const PDF_CONTENT_TYPE: &str = "application/pdf";
 pub(super) struct DocumentsClient<S: Storage> {
     storage: S,
     changelog: Arc<dyn ChangelogService>,
+    /// Invoked once per event by [`Service::start_sync`]'s consume job, when
+    /// set — see [`crate::ClientConfig::on_document_change`].
+    on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 }
 
 impl<S: Storage> DocumentsClient<S> {
     /// Creates a documents client using `storage` to cache documents
-    /// locally, and `changelog` to publish new ones.
-    pub(super) fn new(storage: S, changelog: Arc<dyn ChangelogService>) -> Self {
-        Self { storage, changelog }
+    /// locally, `changelog` to publish new ones and drive
+    /// [`Service::start_sync`], and `on_document_change` as the callback
+    /// [`Service::start_sync`] invokes per consumed event.
+    pub(super) fn new(
+        storage: S,
+        changelog: Arc<dyn ChangelogService>,
+        on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
+    ) -> Self {
+        Self {
+            storage,
+            changelog,
+            on_document_change,
+        }
     }
 }
 
@@ -128,7 +141,14 @@ impl<S: Storage> Service for DocumentsClient<S> {
         Ok(())
     }
 
-    async fn sync(&self, callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()> {
+    async fn start_sync(&self) -> Result<()> {
+        let on_document_change = self.on_document_change.clone();
+        let callback: Box<dyn FnMut(ChangelogEvent) + Send> = Box::new(move |event| {
+            if let Some(on_document_change) = &on_document_change {
+                on_document_change(event);
+            }
+        });
+
         self.changelog.clone().start_consume_job(callback).await
     }
 
@@ -212,7 +232,7 @@ mod tests {
         let file = write_temp_file("pdf", &pdf);
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(MockStorage::new(), changelog.clone());
+        let client = DocumentsClient::new(MockStorage::new(), changelog.clone(), None);
 
         client.upload(file.path()).await.unwrap();
 
@@ -244,8 +264,11 @@ mod tests {
     #[tokio::test]
     async fn upload_rejects_non_pdf_extensions() {
         let file = write_temp_file("txt", b"hello world");
-        let client =
-            DocumentsClient::new(MockStorage::new(), Arc::new(RecordingChangelog::default()));
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            Arc::new(RecordingChangelog::default()),
+            None,
+        );
 
         let result = client.upload(file.path()).await;
 
@@ -278,7 +301,7 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(Some(expected.clone())));
 
-        let client = DocumentsClient::new(storage, Arc::new(RecordingChangelog::default()));
+        let client = DocumentsClient::new(storage, Arc::new(RecordingChangelog::default()), None);
 
         assert_eq!(client.get(id).await.unwrap(), Some(document));
     }
@@ -325,7 +348,7 @@ mod tests {
             .times(1)
             .returning(move |_, _| Ok(expected_page.clone()));
 
-        let client = DocumentsClient::new(storage, Arc::new(RecordingChangelog::default()));
+        let client = DocumentsClient::new(storage, Arc::new(RecordingChangelog::default()), None);
 
         let page = client.list(1, 2).await.unwrap();
 
@@ -352,7 +375,7 @@ mod tests {
         };
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(MockStorage::new(), changelog.clone());
+        let client = DocumentsClient::new(MockStorage::new(), changelog.clone(), None);
 
         client
             .update_name(metadata, "new.pdf".to_string())
@@ -372,31 +395,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_delegates_to_the_changelog_services_consume() {
+    async fn start_sync_invokes_on_document_change_for_every_consumed_event() {
         let event = super::super::FakeChangelogEvent::new().build();
 
         let changelog = Arc::new(RecordingChangelog {
             to_consume: Mutex::new(vec![event.clone()]),
             ..Default::default()
         });
-        let client = DocumentsClient::new(MockStorage::new(), changelog);
 
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_in_callback = received.clone();
-        client
-            .sync(Box::new(move |event| {
-                received_in_callback.lock().unwrap().push(event)
-            }))
-            .await
-            .unwrap();
+        let on_document_change: Arc<dyn Fn(ChangelogEvent) + Send + Sync> =
+            Arc::new(move |event| received_in_callback.lock().unwrap().push(event));
+        let client = DocumentsClient::new(MockStorage::new(), changelog, Some(on_document_change));
+
+        client.start_sync().await.unwrap();
 
         assert_eq!(*received.lock().unwrap(), vec![event]);
     }
 
     #[tokio::test]
-    async fn stop_sync_delegates_to_the_changelog_services_stop() {
+    async fn start_sync_does_not_require_an_on_document_change_callback() {
+        let event = super::super::FakeChangelogEvent::new().build();
+
+        let changelog = Arc::new(RecordingChangelog {
+            to_consume: Mutex::new(vec![event]),
+            ..Default::default()
+        });
+        let client = DocumentsClient::new(MockStorage::new(), changelog, None);
+
+        client.start_sync().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_sync_delegates_to_the_changelog_services_stop_consume_job() {
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(MockStorage::new(), changelog.clone());
+        let client = DocumentsClient::new(MockStorage::new(), changelog.clone(), None);
 
         client.stop_sync();
 

@@ -41,10 +41,9 @@ async fn document_lifecycle() {
         })
         .await;
 
-    // `sync` runs forever, so it has to be in the background from here on;
+    // `create` above already started the background changelog sync job;
     // every later step polls `get`/`list` (which only ever read the local
-    // cache `sync` populates) rather than awaiting it directly.
-    scenario.start_sync();
+    // cache that job populates) rather than awaiting anything directly.
 
     scenario
         .step("upload document", || async {
@@ -193,9 +192,8 @@ async fn document_lifecycle() {
         .await;
 
     // `logout` wiped the local changelog cursor along with the document
-    // cache, so this replays the account's whole history from scratch.
-    scenario.start_sync();
-
+    // cache, and `login` above already restarted the sync job, so this
+    // replays the account's whole history from scratch.
     scenario
         .step("resyncing after login restores the document", || async {
             let id = document_id.get();

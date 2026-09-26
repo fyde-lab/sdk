@@ -39,8 +39,8 @@ impl UsersClient {
     /// connection to the fyde server, persisting newly created accounts'
     /// master keys in `settings`, the session token and authenticating
     /// outgoing calls via `sessions`, wiping `local_db` on `logout`, and
-    /// stopping any running changelog consumption on `documents` on
-    /// `logout`.
+    /// starting/stopping changelog consumption on `documents` from
+    /// `create`/`login`/`logout`.
     pub(super) async fn new(
         channel: Channel,
         settings: Arc<dyn SettingsService>,
@@ -122,6 +122,11 @@ impl Service for UsersClient {
             .await
             .context("failed to persist master key")?;
 
+        self.documents
+            .start_sync()
+            .await
+            .context("failed to start changelog sync")?;
+
         Ok(token)
     }
 
@@ -160,6 +165,11 @@ impl Service for UsersClient {
             .set(MASTER_KEY_SETTING, &wrapped_master_key)
             .await
             .context("failed to persist master key")?;
+
+        self.documents
+            .start_sync()
+            .await
+            .context("failed to start changelog sync")?;
 
         Ok(token)
     }
@@ -211,11 +221,13 @@ mod tests {
         )
     }
 
-    /// A [`DocumentsService`] fake recording whether [`Service::stop_sync`]
-    /// was called, for tests that don't need a live changelog. Every other
+    /// A [`DocumentsService`] fake recording whether
+    /// [`DocumentsService::start_sync`]/[`DocumentsService::stop_sync`] were
+    /// called, for tests that don't need a live changelog. Every other
     /// method is unused by [`UsersClient`], so left unimplemented.
     #[derive(Default)]
     struct RecordingDocuments {
+        start_sync_called: std::sync::atomic::AtomicBool,
         stop_sync_called: std::sync::atomic::AtomicBool,
     }
 
@@ -248,11 +260,10 @@ mod tests {
             unimplemented!()
         }
 
-        async fn sync(
-            &self,
-            _callback: Box<dyn FnMut(crate::domains::documents::ChangelogEvent) + Send>,
-        ) -> Result<()> {
-            unimplemented!()
+        async fn start_sync(&self) -> Result<()> {
+            self.start_sync_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
 
         fn stop_sync(&self) {

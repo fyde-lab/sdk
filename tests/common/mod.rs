@@ -8,7 +8,6 @@
 
 use std::future::Future;
 use std::io::Write as _;
-use std::sync::Arc;
 
 use fyde_sdk::{Client, ClientConfig, LogLevel, Storage};
 use lopdf::content::{Content, Operation};
@@ -46,15 +45,16 @@ impl TestServer {
 /// the same way a real client would use the SDK over time, rather than
 /// each assertion getting a fresh connection.
 ///
-/// `client` is `Arc`-wrapped (unlike a bare `Client`, which isn't `Clone`)
-/// so steps can hand a handle to `Client::documents().sync`'s
-/// long-running background task, per [`Self::start_sync`].
+/// `#[allow(dead_code)]`: see [`wait_for`]'s doc comment — this one skips
+/// `reconnect_lifecycle_test.rs`, which drives `Client`/`TestServer`
+/// directly since it needs two independently-`init`ed clients.
+#[allow(dead_code)]
 pub struct Scenario {
-    #[allow(dead_code)]
     server: TestServer,
-    pub client: Arc<Client>,
+    pub client: Client,
 }
 
+#[allow(dead_code)]
 impl Scenario {
     pub async fn start() -> Self {
         let server = TestServer::start();
@@ -64,14 +64,12 @@ impl Scenario {
             storage: Storage::Memory,
             log_level: LogLevel::Off,
             on_log: None,
+            on_document_change: None,
         })
         .await
         .expect("failed to connect the sdk client to the test server");
 
-        Self {
-            server,
-            client: Arc::new(client),
-        }
+        Self { server, client }
     }
 
     /// Runs one named, fallible step, printing its outcome and panicking
@@ -99,36 +97,17 @@ impl Scenario {
             }
         }
     }
-
-    /// Spawns `client`'s changelog sync loop in the background so
-    /// documents published through it materialize in its local cache.
-    /// `sync` never returns on its own (it retries forever, mirroring a
-    /// long-lived client), so callers must poll for the effect they're
-    /// waiting for (see [`wait_for`]) instead of awaiting this directly.
-    /// Never joined: it only stops when the test's `tokio` runtime is torn
-    /// down, or once the session it's using is closed by `logout` (at
-    /// which point it errors out and exits on its own).
-    ///
-    /// `#[allow(dead_code)]`: `tests/common/mod.rs` is compiled fresh into
-    /// each test binary in this directory, so an item only some of them
-    /// use (this one skips `session_lifecycle_test.rs`, which never
-    /// exercises `sync`) is flagged dead in that binary's copy.
-    #[allow(dead_code)]
-    pub fn start_sync(&self) {
-        let client = self.client.clone();
-        tokio::spawn(async move {
-            let _ = client.documents().sync(Box::new(|_event| {})).await;
-        });
-    }
 }
 
 /// Polls `predicate` every 50ms until it returns `Some`, or panics once
-/// `timeout` elapses. Used to wait for an effect of a background `sync`
-/// (or any other eventually-consistent state), which has no other
-/// completion signal.
+/// `timeout` elapses. Used to wait for an effect of the changelog sync job
+/// `UsersService::create`/`login` start automatically (or any other
+/// eventually-consistent state), which has no other completion signal.
 ///
-/// See [`Scenario::start_sync`]'s doc comment for why this carries the same
-/// `#[allow(dead_code)]`.
+/// `#[allow(dead_code)]`: `tests/common/mod.rs` is compiled fresh into each
+/// test binary in this directory, so an item only some of them use (this
+/// one skips `session_lifecycle_test.rs`, which never waits on sync) is
+/// flagged dead in that binary's copy.
 #[allow(dead_code)]
 pub async fn wait_for<T, F, Fut>(timeout: std::time::Duration, mut predicate: F) -> T
 where

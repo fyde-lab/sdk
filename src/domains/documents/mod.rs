@@ -31,7 +31,8 @@ use crate::{ErrorContext as _, Result};
 
 /// Uploads documents by publishing them as encrypted changelog events, and
 /// reads back documents materialized locally from consumed events (see
-/// [`Self::sync`]) — there is no server-side document store to fetch from.
+/// [`Self::start_sync`]) — there is no server-side document store to fetch
+/// from.
 #[async_trait]
 pub trait Service: Send + Sync {
     /// Reads the file at `path`, encrypts it and its metadata, then
@@ -44,7 +45,7 @@ pub trait Service: Send + Sync {
     async fn upload(&self, path: &Path) -> Result<Uuid>;
 
     /// Fetches a document previously cached in local storage by
-    /// [`Self::sync`], or `None` if it doesn't exist.
+    /// [`Self::start_sync`], or `None` if it doesn't exist.
     async fn get(&self, id: Uuid) -> Result<Option<Document>>;
 
     /// Lists documents previously cached in local storage, oldest first,
@@ -59,48 +60,62 @@ pub trait Service: Send + Sync {
     /// changelog event.
     async fn update_name(&self, metadata: Metadata, new_name: String) -> Result<()>;
 
-    /// Streams and decrypts every changelog event since the last consumed
-    /// id, oldest first, invoking `callback` once per event (replaying
-    /// persisted history, then continuing with the live tail). Resumes
-    /// from the cursor persisted locally by a previous call, or from the
-    /// beginning of the changelog if it's never been consumed before. For
-    /// each "created" event, caches the resulting document in local
-    /// storage before invoking `callback`, so it becomes visible to
-    /// [`Self::get`]/[`Self::list`].
+    /// Starts a background job that streams and decrypts every changelog
+    /// event since the last consumed id, oldest first (replaying persisted
+    /// history, then continuing with the live tail). Resumes from the
+    /// cursor persisted locally by a previous call, or from the beginning
+    /// of the changelog if it's never been consumed before. For each
+    /// "created"/"update metadata" event, updates local storage before
+    /// invoking the `on_document_change` callback configured on the client
+    /// (see [`crate::ClientConfig`]), so it's already visible via
+    /// [`Self::get`]/[`Self::list`] by the time that callback runs.
+    /// [`crate::domains::users::Service::create`]/`login` call this
+    /// automatically once a session is open; most callers never need to
+    /// call it directly.
     ///
     /// Delegates entirely to the internal changelog service's
     /// `start_consume_job` — the changelog itself is private to this
     /// domain, this is the only way to reach it from outside.
     ///
-    /// Returns as soon as the background consume task is spawned, not when
-    /// it stops. That task itself runs until the server closes the stream
-    /// or an error occurs, retrying immediately either way.
-    async fn sync(&self, callback: Box<dyn FnMut(ChangelogEvent) + Send>) -> Result<()>;
+    /// Returns as soon as the background job is spawned, not when it stops.
+    /// The job itself runs until the server closes the stream or an error
+    /// occurs, retrying immediately either way, until
+    /// [`Self::stop_sync`] signals it to return.
+    async fn start_sync(&self) -> Result<()>;
 
-    /// Signals the task spawned by a prior [`Self::sync`] call to return.
-    /// Idempotent, and safe to call before [`Self::sync`] has started its
-    /// task (in which case that task returns immediately) or after it has
-    /// already returned (a no-op). Delegates to the internal changelog
-    /// service's `stop_consume_job` — see [`Self::sync`]'s own doc comment
-    /// for why that's the only way to reach it.
+    /// Signals the job started by a prior [`Self::start_sync`] call to
+    /// return. Idempotent, and safe to call before [`Self::start_sync`] has
+    /// started its job (in which case that job returns immediately) or
+    /// after it has already returned (a no-op).
+    /// [`crate::domains::users::Service::logout`] calls this automatically.
+    /// Delegates to the internal changelog service's `stop_consume_job` —
+    /// see [`Self::start_sync`]'s own doc comment for why that's the only
+    /// way to reach it.
     fn stop_sync(&self);
 }
 
 /// Initializes the documents service: connects the internal changelog
 /// service to the fyde server over `channel` (see `changelog::init`), wires
 /// up local SQLite-backed caching (via `pool`) of documents materialized
-/// from its consumed events, and publishes new documents through it.
+/// from its consumed events, publishes new documents through it, and calls
+/// `on_document_change` (see [`crate::ClientConfig`]) for every event
+/// [`Service::start_sync`] consumes.
 pub(crate) async fn init(
     channel: Channel,
     pool: SqlitePool,
     settings: Arc<dyn SettingsService>,
     sessions: Arc<SessionsClient>,
     server_state: Arc<dyn ServerStateService>,
+    on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Result<Arc<dyn Service>> {
     let storage = storage_sqlite::SqliteStorage::new(pool.clone());
     let changelog = changelog::init(channel, pool, settings, sessions, server_state)
         .await
         .context("failed to initialize changelog service")?;
 
-    Ok(Arc::new(service::DocumentsClient::new(storage, changelog)))
+    Ok(Arc::new(service::DocumentsClient::new(
+        storage,
+        changelog,
+        on_document_change,
+    )))
 }

@@ -20,7 +20,7 @@ pub use domains::settings::Service as SettingsService;
 pub use domains::users::Service as UsersService;
 pub use log::LogLevel;
 
-use domains::sessions::SessionsClient;
+use domains::sessions::{Service as SessionsService, SessionsClient};
 use log::CallbackLayer;
 use sql::SqliteClient;
 use tonic::transport::Endpoint;
@@ -128,6 +128,15 @@ pub struct ClientConfig {
     /// terminal/stderr to inspect (in particular FFI callers like the Kotlin
     /// Multiplatform app).
     pub on_log: Option<Arc<dyn Fn(LogLevel, String) + Send + Sync>>,
+    /// Called once for every changelog event consumed by the background
+    /// sync job that `UsersService::create`/`login` start automatically
+    /// (replaying persisted history, then continuing with the live tail —
+    /// see `DocumentsService::start_sync`). Each `Created`/`UpdateMetadata`
+    /// event is already reflected in local storage (readable via
+    /// `DocumentsService::get`/`list`) by the time this is called; use it
+    /// to react to changes rather than to populate the cache. `None` if the
+    /// caller doesn't need to observe individual events.
+    pub on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 }
 
 /// A connection to a fyde server.
@@ -184,6 +193,7 @@ impl Client {
             settings.clone(),
             sessions.clone(),
             server_state.clone(),
+            config.on_document_change,
         )
         .await
         .context("failed to initialize documents service")?;
@@ -196,6 +206,17 @@ impl Client {
         )
         .await
         .context("failed to initialize users service")?;
+
+        // A session may already be open from a previous run (the token is
+        // persisted in `settings`, not just held in memory — see
+        // `users::mod`'s doc comment) — in that case `create`/`login` won't
+        // run again to start it, so start it here instead.
+        if sessions.is_connected().await? {
+            documents
+                .start_sync()
+                .await
+                .context("failed to start changelog sync")?;
+        }
 
         Ok(Self {
             documents,
@@ -285,6 +306,7 @@ mod tests {
             storage: Storage::Memory,
             log_level: LogLevel::Off,
             on_log: None,
+            on_document_change: None,
         };
 
         let err = match Client::init(config).await {

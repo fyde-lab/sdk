@@ -49,7 +49,9 @@ pub trait Service: Send + Sync {
     /// `master_key`. The server's response carries only the new session's
     /// token (see `../api-protos/users.proto`), so there is no user payload
     /// to return here. Fails with [`crate::Error::Grpc`] (`ALREADY_EXISTS`)
-    /// if the username is already taken.
+    /// if the username is already taken. Once the session and master key are
+    /// persisted, starts changelog consumption via
+    /// [`DocumentsService::start_sync`].
     async fn create(&self, username: &str, password: &str, device_name: &str) -> Result<String>;
 
     /// Verifies `username`/`password` and opens a session for the device
@@ -58,7 +60,9 @@ pub trait Service: Send + Sync {
     /// password is often detected locally, without a round trip to the
     /// server, and fails with [`crate::Error::InvalidCredentials`] in that
     /// case; failure detected by the server instead surfaces the usual way,
-    /// as [`crate::Error::Grpc`] (`UNAUTHENTICATED`).
+    /// as [`crate::Error::Grpc`] (`UNAUTHENTICATED`). Once the session and
+    /// master key are persisted, starts changelog consumption via
+    /// [`DocumentsService::start_sync`].
     async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String>;
 
     /// Closes the session opened by the most recent `create`/`login` call
@@ -73,9 +77,10 @@ pub trait Service: Send + Sync {
 /// persist the session token (read back by every other service's gRPC
 /// transport, via `sessions`, to authenticate their own calls) and where
 /// `create` also persists the master key it generates for a new account.
-/// `local_db` is wiped by `logout` to clear local state, and `documents`'
-/// [`DocumentsService::stop_sync`] is called by `logout` to stop any
-/// running changelog consumption.
+/// `local_db` is wiped by `logout` to clear local state. `documents`'
+/// [`DocumentsService::start_sync`] is called by `create`/`login` once a
+/// session is open, and [`DocumentsService::stop_sync`] is called by
+/// `logout` to stop that consumption again.
 pub(crate) async fn init(
     channel: Channel,
     settings: Arc<dyn SettingsService>,

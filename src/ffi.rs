@@ -209,15 +209,17 @@ impl From<FfiClientConfig> for ClientConfig {
             storage: config.storage.into(),
             log_level: config.log_level.into(),
             on_log: None,
+            on_document_change: None,
         }
     }
 }
 
-/// Callback interface for [`FydeClient::sync`], implemented by foreign
-/// (Kotlin/Swift) callers and invoked once per [`FfiChangelogEvent`]
-/// encountered during changelog catch-up and live streaming.
+/// Callback interface for [`FydeClient::init`]'s `on_document_change`
+/// parameter, implemented by foreign (Kotlin/Swift) callers and invoked once
+/// per [`FfiChangelogEvent`] the SDK's automatic changelog sync consumes
+/// (started internally by `create_user`/`login`, stopped by `logout`).
 #[uniffi::export(callback_interface)]
-pub trait ChangelogListener: Send + Sync {
+pub trait DocumentChangeListener: Send + Sync {
     fn on_event(&self, event: FfiChangelogEvent);
 }
 
@@ -238,12 +240,18 @@ impl FydeClient {
     pub async fn init(
         config: FfiClientConfig,
         on_log: Option<Box<dyn LogListener>>,
+        on_document_change: Option<Box<dyn DocumentChangeListener>>,
     ) -> Result<Arc<Self>, FfiError> {
         let mut config: ClientConfig = config.into();
         config.on_log = on_log.map(|listener| -> Arc<dyn Fn(LogLevel, String) + Send + Sync> {
             let listener: Arc<dyn LogListener> = Arc::from(listener);
             Arc::new(move |level, line| listener.on_log(level.into(), line))
         });
+        config.on_document_change =
+            on_document_change.map(|listener| -> Arc<dyn Fn(ChangelogEvent) + Send + Sync> {
+                let listener: Arc<dyn DocumentChangeListener> = Arc::from(listener);
+                Arc::new(move |event| listener.on_event(event.into()))
+            });
 
         let inner = Client::init(config).await?;
         Ok(Arc::new(Self { inner }))
@@ -324,9 +332,9 @@ impl FydeClient {
         Ok(id.to_string())
     }
 
-    /// Fetches a document previously cached locally by
-    /// [`FydeClient::consume`], or `None` if it doesn't exist. Mirrors
-    /// [`crate::DocumentsService::get`].
+    /// Fetches a document previously cached locally by the SDK's automatic
+    /// changelog sync (see [`FydeClient::init`]'s `on_document_change`), or
+    /// `None` if it doesn't exist. Mirrors [`crate::DocumentsService::get`].
     pub async fn get_document(&self, id: String) -> Result<Option<FfiDocument>, FfiError> {
         let id = parse_uuid(&id)?;
         let document = self.inner.documents().get(id).await?;
@@ -342,20 +350,6 @@ impl FydeClient {
     ) -> Result<Vec<FfiDocument>, FfiError> {
         let documents = self.inner.documents().list(offset, limit).await?;
         Ok(documents.into_iter().map(FfiDocument::from).collect())
-    }
-
-    /// Streams and decrypts every changelog event since the last consumed
-    /// id, invoking `listener` once for each (replaying history, then
-    /// continuing with the live tail). Resumes from the cursor persisted
-    /// locally by a previous call, or from the beginning of the changelog
-    /// if there is none. Runs until the server closes the stream or an
-    /// error occurs. Mirrors [`crate::DocumentsService::sync`].
-    pub async fn sync(&self, listener: Box<dyn ChangelogListener>) -> Result<(), FfiError> {
-        self.inner
-            .documents()
-            .sync(Box::new(move |event| listener.on_event(event.into())))
-            .await?;
-        Ok(())
     }
 }
 
