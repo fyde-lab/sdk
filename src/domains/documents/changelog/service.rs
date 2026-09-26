@@ -399,14 +399,15 @@ mod tests {
         Arc::new(mock)
     }
 
-    /// A [`SettingsService`] mock with a fixed master key set under
-    /// [`crate::domains::users::MASTER_KEY_SETTING`], for tests exercising
-    /// real `crypto::encrypt_event`/`decrypt_event` calls.
+    /// A [`SettingsService`] mock with a fixed raw master key set under
+    /// [`crate::domains::users::MASTER_KEY_SETTING`], for tests
+    /// exercising real `crypto::encrypt_event`/`decrypt_event` calls.
     fn fake_settings() -> Arc<dyn SettingsService> {
         let mut mock = MockSettingsService::new();
+        let encoded = crate::domains::users::encode_master_key(b"the-account-master-key").unwrap();
         mock.expect_get()
             .withf(|key| key == crate::domains::users::MASTER_KEY_SETTING)
-            .returning(|_| Ok(Some("the-account-master-key".to_string())));
+            .returning(move |_| Ok(Some(encoded.clone())));
         Arc::new(mock)
     }
 

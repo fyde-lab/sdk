@@ -9,17 +9,37 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tonic::transport::Channel;
 
-use crate::Result;
 use crate::domains::documents::Service as DocumentsService;
 use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
 use crate::sql::LocalDatabase;
+use crate::{ErrorContext as _, Result};
 
-/// The settings key under which a newly created account's encrypted
-/// master key is persisted, and under which
-/// [`crate::domains::documents::changelog::crypto`] reads it back to derive
-/// the key-encryption-key (KEK) that wraps every changelog event's DEK.
+/// The settings key under which the account master key's *raw, decrypted*
+/// bytes are cached locally (JSON-encoded, see [`encode_master_key`]/
+/// [`decode_master_key`]), once `create`/`login` have decrypted it (and
+/// re-read as-is by `change_password`, which never changes the underlying
+/// key, only what protects it on the server). Deliberately never the
+/// wrapped/encrypted form the server stores and returns: the SDK only ever
+/// needs that ciphertext transiently, to send over the wire, and never has
+/// a reason to persist it locally — see
+/// [`crate::domains::documents::changelog::crypto`]'s `derive_kek`, which
+/// reads this key to derive the KEK protecting every changelog event, and
+/// would otherwise desync every time the wrapped form's nonce/ciphertext
+/// changed (e.g. on a `change_password`) even though the raw key underneath
+/// it didn't.
 pub(crate) const MASTER_KEY_SETTING: &str = "master_key";
+
+/// JSON-encodes `master_key`'s raw bytes for storage under
+/// [`MASTER_KEY_SETTING`].
+pub(crate) fn encode_master_key(master_key: &[u8]) -> Result<String> {
+    serde_json::to_string(master_key).context("failed to serialize master key")
+}
+
+/// Decodes a value previously stored by [`encode_master_key`].
+pub(crate) fn decode_master_key(encoded: &str) -> Result<Vec<u8>> {
+    serde_json::from_str(encoded).context("failed to parse master key")
+}
 
 /// Manages account creation and session lifecycle against the fyde
 /// server's users service, authenticating via the OPAQUE
@@ -70,6 +90,32 @@ pub trait Service: Send + Sync {
     /// state (documents, settings — including the session token itself —
     /// and the changelog offset). A no-op if there is no open session.
     async fn logout(&self) -> Result<()>;
+
+    /// Changes the password of the account behind the current session,
+    /// identified by `username` (needed to verify `old_password`; the
+    /// session itself is what authenticates the change server-side — see
+    /// below). Verifies `old_password` the same way `login` verifies a
+    /// password: the local half of an OPAQUE login exchange, which fails
+    /// with [`crate::Error::InvalidCredentials`] on a mismatch without ever
+    /// calling the server's `FinishLogin` (so, unlike a real `login()`
+    /// call, this never opens an extra session). Then drives a two-step
+    /// OPAQUE registration exchange for `new_password`
+    /// (`StartChangePassword`/`FinishChangePassword`) — the same shape as
+    /// `create`'s, but authenticated against the existing session rather
+    /// than opening a new one. The master key itself never changes, only
+    /// what protects it: this reads the raw key already cached locally
+    /// under [`MASTER_KEY_SETTING`] (never the wrapped form — see that
+    /// constant's doc) and wraps that same key fresh under the new
+    /// password's export key, to send the server in place of its previous
+    /// wrapped copy — so every document encrypted under the old password
+    /// stays decryptable, and there is nothing to update in local settings
+    /// once the server confirms the change.
+    async fn change_password(
+        &self,
+        username: &str,
+        old_password: &str,
+        new_password: &str,
+    ) -> Result<()>;
 }
 
 /// Initializes the users service: connects to the fyde server's users

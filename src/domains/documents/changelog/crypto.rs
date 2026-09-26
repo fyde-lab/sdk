@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::domains::documents::Metadata;
 use crate::domains::settings::Service as SettingsService;
-use crate::domains::users::MASTER_KEY_SETTING;
+use crate::domains::users::{MASTER_KEY_SETTING, decode_master_key};
 use crate::{Error, ErrorContext as _, Result};
 
 use super::models::EventType;
@@ -47,12 +47,16 @@ fn generate_dek() -> [u8; KEY_LEN] {
 }
 
 /// Derives the key-encryption-key (KEK) that wraps every changelog event's
-/// DEK from the account's master key, persisted locally under
-/// [`MASTER_KEY_SETTING`] by `users::Service::create`/`login`. Fails with
+/// DEK from the account's raw master key, persisted locally under
+/// [`MASTER_KEY_SETTING`] by `users::Service::create`/`login` (see that
+/// constant's doc for why only the raw key is ever cached locally, never
+/// the wrapped/encrypted form the server stores — a `change_password` call
+/// never touches this value, since the raw key it derives from never
+/// changes, only what protects it server-side). Fails with
 /// [`Error::Encryption`] if no master key is on hand yet — i.e. before any
 /// account has been created or logged into on this device.
 async fn derive_kek(settings: &dyn SettingsService) -> Result<[u8; KEY_LEN]> {
-    let master_key = settings
+    let encoded_master_key = settings
         .get(MASTER_KEY_SETTING)
         .await
         .context("failed to read master key from local settings")?
@@ -61,9 +65,11 @@ async fn derive_kek(settings: &dyn SettingsService) -> Result<[u8; KEY_LEN]> {
                 "no master key found in local settings; log in or create an account first".into(),
             )
         })?;
+    let master_key = decode_master_key(&encoded_master_key)
+        .context("failed to decode master key from local settings")?;
 
     let mut hasher = Sha256::new();
-    hasher.update(master_key.as_bytes());
+    hasher.update(&master_key);
     Ok(hasher.finalize().into())
 }
 
@@ -182,16 +188,18 @@ mod tests {
     use super::*;
     use crate::domains::documents::FakeMetadata;
     use crate::domains::settings::MockService as MockSettingsService;
+    use crate::domains::users::encode_master_key;
 
-    /// A [`SettingsService`] fixture with a fixed master key set under
-    /// [`MASTER_KEY_SETTING`], for exercising real KEK derivation without
-    /// depending on `users::Service::create`/`login`.
+    /// A [`SettingsService`] fixture with a fixed raw master key set under
+    /// [`MASTER_KEY_SETTING`], for exercising real KEK derivation
+    /// without depending on `users::Service::create`/`login`.
     fn settings_with_master_key() -> MockSettingsService {
         let mut settings = MockSettingsService::new();
+        let encoded = encode_master_key(b"the-account-master-key").unwrap();
         settings
             .expect_get()
             .withf(|key| key == MASTER_KEY_SETTING)
-            .returning(|_| Ok(Some("the-account-master-key".to_string())));
+            .returning(move |_| Ok(Some(encoded.clone())));
         settings
     }
 

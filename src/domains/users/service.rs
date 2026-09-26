@@ -13,9 +13,10 @@ use crate::{Error, ErrorContext as _, Result};
 
 use super::crypto::{
     DefaultOpaqueClient, OpaqueClient, generate_and_wrap_master_key, unwrap_master_key,
+    wrap_master_key,
 };
 use super::grpc_client::{FydeClient, GrpcClient};
-use super::{MASTER_KEY_SETTING, Service};
+use super::{MASTER_KEY_SETTING, Service, decode_master_key, encode_master_key};
 
 /// A client for the fyde server's users service. Persists the session
 /// token opened by the most recent `create`/`login` call via
@@ -101,7 +102,7 @@ impl Service for UsersClient {
             .finish_registration(state, password, &opaque_response)
             .context("failed to finish OPAQUE registration")?;
 
-        let wrapped_master_key =
+        let (raw_master_key, wrapped_master_key) =
             generate_and_wrap_master_key(&export_key).context("failed to generate master key")?;
 
         let token = self
@@ -118,7 +119,7 @@ impl Service for UsersClient {
         self.sessions.save_new_session(&token).await?;
 
         self.settings
-            .set(MASTER_KEY_SETTING, &wrapped_master_key)
+            .set(MASTER_KEY_SETTING, &encode_master_key(&raw_master_key)?)
             .await
             .context("failed to persist master key")?;
 
@@ -158,11 +159,11 @@ impl Service for UsersClient {
         let wrapped_master_key = String::from_utf8(encrypted_master_key)
             .map_err(|_| Error::Encryption("server returned a non-UTF-8 master key".into()))
             .context("failed to decode master key returned by the server")?;
-        unwrap_master_key(&export_key, &wrapped_master_key)
+        let raw_master_key = unwrap_master_key(&export_key, &wrapped_master_key)
             .context("failed to unwrap master key returned by the server")?;
 
         self.settings
-            .set(MASTER_KEY_SETTING, &wrapped_master_key)
+            .set(MASTER_KEY_SETTING, &encode_master_key(&raw_master_key)?)
             .await
             .context("failed to persist master key")?;
 
@@ -187,6 +188,73 @@ impl Service for UsersClient {
             .wipe()
             .await
             .context("failed to wipe local database")?;
+
+        Ok(())
+    }
+
+    async fn change_password(
+        &self,
+        username: &str,
+        old_password: &str,
+        new_password: &str,
+    ) -> Result<()> {
+        // Verifying `old_password` only needs the local half of an OPAQUE
+        // login exchange: `finish_login` fails with
+        // `Error::InvalidCredentials` if it can't open the account's
+        // envelope, without a round trip to the server's `FinishLogin` —
+        // so this never opens a session, unlike a real `login()` call. The
+        // resulting export key isn't needed for anything else: the master
+        // key is read back raw from local settings below, not decrypted
+        // from a wrapped form that would need it.
+        let (login_state, login_request) = self
+            .opaque
+            .start_login(old_password)
+            .context("failed to start OPAQUE login")?;
+        let (_login_id, login_response) = self
+            .grpc
+            .start_login(username, &login_request)
+            .await
+            .context("failed to start login")?;
+        self.opaque
+            .finish_login(login_state, old_password, &login_response)
+            .context("failed to verify current password")?;
+
+        let (state, opaque_request) = self
+            .opaque
+            .start_registration(new_password)
+            .context("failed to start OPAQUE registration")?;
+
+        let opaque_response = self
+            .grpc
+            .start_change_password(&opaque_request)
+            .await
+            .context("failed to start change password")?;
+
+        let (opaque_upload, new_export_key) = self
+            .opaque
+            .finish_registration(state, new_password, &opaque_response)
+            .context("failed to finish OPAQUE registration")?;
+
+        let raw_master_key = self
+            .settings
+            .get(MASTER_KEY_SETTING)
+            .await
+            .context("failed to read current master key")?
+            .ok_or_else(|| {
+                Error::Encryption(
+                    "no master key found in local settings; log in or create an account first"
+                        .into(),
+                )
+            })
+            .and_then(|encoded| decode_master_key(&encoded))?;
+
+        let new_wrapped_master_key = wrap_master_key(&raw_master_key, &new_export_key)
+            .context("failed to wrap master key under the new export key")?;
+
+        self.grpc
+            .finish_change_password(&opaque_upload, new_wrapped_master_key.as_bytes())
+            .await
+            .context("failed to finish change password")?;
 
         Ok(())
     }
@@ -319,6 +387,7 @@ mod tests {
     fn login_master_key() -> Vec<u8> {
         super::super::crypto::generate_and_wrap_master_key(LOGIN_EXPORT_KEY)
             .unwrap()
+            .1
             .into_bytes()
     }
 
@@ -360,7 +429,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_sends_the_master_key_wrapped_under_the_export_key_to_the_server() {
+    async fn create_persists_the_same_raw_master_key_it_sends_wrapped_to_the_server() {
         let opaque = opaque_for_create(b"the-request", b"the-upload", b"the-export-key");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
@@ -400,9 +469,20 @@ mod tests {
             .await
             .unwrap();
 
+        // What's sent to the server is the *wrapped* form (opaque to it);
+        // what's persisted locally is the *raw* key underneath — never the
+        // wrapped form itself (see `MASTER_KEY_SETTING`'s doc). Unwrapping
+        // the sent bytes under the export key `opaque_for_create` produced
+        // must yield exactly what was persisted.
         let sent = sent_master_key.lock().unwrap().clone().unwrap();
+        let sent_wrapped = String::from_utf8(sent).unwrap();
+        let unwrapped_from_sent =
+            super::super::crypto::unwrap_master_key(b"the-export-key", &sent_wrapped).unwrap();
+
         let persisted = persisted_master_key.lock().unwrap().clone().unwrap();
-        assert_eq!(sent, persisted.into_bytes());
+        let persisted_raw = decode_master_key(&persisted).unwrap();
+
+        assert_eq!(unwrapped_from_sent, persisted_raw);
     }
 
     #[tokio::test]
@@ -578,14 +658,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_persists_the_master_key_the_server_returns() {
+    async fn login_persists_the_raw_master_key_it_unwraps_from_the_server() {
         let opaque = opaque_for_login(b"the-request", b"the-upload");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_start_login()
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
-        let master_key = login_master_key();
-        let returned_master_key = master_key.clone();
+        let wrapped_master_key = login_master_key();
+        let returned_master_key = wrapped_master_key.clone();
         mock_grpc
             .expect_finish_login()
             .returning(move |_, _, _| Ok(("a-token".to_string(), returned_master_key.clone())));
@@ -614,10 +694,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            persisted_master_key.lock().unwrap().clone(),
-            Some(String::from_utf8(master_key).unwrap())
-        );
+        // What the server returned is the *wrapped* form; what must be
+        // persisted locally is the raw key underneath it, unwrapped under
+        // the login's export key — never the wrapped form itself (see
+        // `MASTER_KEY_SETTING`'s doc).
+        let expected_raw = super::super::crypto::unwrap_master_key(
+            LOGIN_EXPORT_KEY,
+            &String::from_utf8(wrapped_master_key).unwrap(),
+        )
+        .unwrap();
+        let persisted = persisted_master_key.lock().unwrap().clone().unwrap();
+        assert_eq!(decode_master_key(&persisted).unwrap(), expected_raw);
     }
 
     #[tokio::test]
@@ -853,5 +940,159 @@ mod tests {
                 .stop_sync_called
                 .load(std::sync::atomic::Ordering::SeqCst)
         );
+    }
+
+    const OLD_EXPORT_KEY: &[u8] = b"the-old-export-key";
+    const NEW_EXPORT_KEY: &[u8] = b"the-new-export-key";
+
+    /// A [`MockOpaqueClient`] wired up for a successful `change_password()`
+    /// call: verifying the old password locally (`start_login`/
+    /// `finish_login`, never reaching the server's `FinishLogin`) and
+    /// registering the new one (`start_registration`/`finish_registration`),
+    /// regardless of what either is called with, so real OPAQUE/Argon2
+    /// never runs in these tests.
+    fn opaque_for_change_password() -> MockOpaqueClient {
+        let mut opaque = MockOpaqueClient::new();
+        opaque
+            .expect_start_login()
+            .times(1)
+            .returning(|_| Ok((fake_login_state(), b"the-login-request".to_vec())));
+        opaque
+            .expect_finish_login()
+            .times(1)
+            .returning(|_, _, _| Ok((b"the-login-upload".to_vec(), OLD_EXPORT_KEY.to_vec())));
+        opaque
+            .expect_start_registration()
+            .times(1)
+            .returning(|_| Ok((fake_registration_state(), b"the-new-request".to_vec())));
+        opaque
+            .expect_finish_registration()
+            .times(1)
+            .returning(|_, _, _| Ok((b"the-new-upload".to_vec(), NEW_EXPORT_KEY.to_vec())));
+        opaque
+    }
+
+    #[tokio::test]
+    async fn change_password_sends_the_raw_master_key_wrapped_under_the_new_export_key() {
+        let opaque = opaque_for_change_password();
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_login()
+            .withf(|username, request| username == "alice" && request == b"the-login-request")
+            .times(1)
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-login-response".to_vec())));
+        mock_grpc
+            .expect_start_change_password()
+            .withf(|request| request == b"the-new-request")
+            .times(1)
+            .returning(|_| Ok(b"the-registration-response".to_vec()));
+
+        // Captures what `change_password` sends the server as the new
+        // `encrypted_master_key`, so it can be checked against the raw key
+        // read back from local settings below.
+        let sent_master_key: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let capture = sent_master_key.clone();
+        mock_grpc
+            .expect_finish_change_password()
+            .withf(|upload, key| upload == b"the-new-upload" && !key.is_empty())
+            .times(1)
+            .returning(move |_, key| {
+                *capture.lock().unwrap() = Some(key.to_vec());
+                Ok(())
+            });
+
+        let raw_master_key = b"the-raw-master-key--------------".to_vec();
+        let encoded_master_key = encode_master_key(&raw_master_key).unwrap();
+
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == MASTER_KEY_SETTING)
+            .times(1)
+            .returning(move |_| Ok(Some(encoded_master_key.clone())));
+        // No `expect_set()` set up: the mock panics if it's called, proving
+        // `change_password` never touches local settings — the raw key it
+        // already cached stays untouched, since only what protects it
+        // server-side changes.
+
+        let client = client_with_deps(mock_grpc, opaque, settings);
+
+        client
+            .change_password("alice", "old password", "new password")
+            .await
+            .unwrap();
+
+        let sent = sent_master_key.lock().unwrap().clone().unwrap();
+        let sent_wrapped = String::from_utf8(sent).unwrap();
+        let unwrapped_from_sent =
+            super::super::crypto::unwrap_master_key(NEW_EXPORT_KEY, &sent_wrapped).unwrap();
+        assert_eq!(unwrapped_from_sent, raw_master_key);
+    }
+
+    #[tokio::test]
+    async fn change_password_fails_on_the_wrong_old_password_without_registering_a_new_one() {
+        let mut opaque = MockOpaqueClient::new();
+        opaque
+            .expect_start_login()
+            .times(1)
+            .returning(|_| Ok((fake_login_state(), b"the-login-request".to_vec())));
+        opaque
+            .expect_finish_login()
+            .times(1)
+            .returning(|_, _, _| Err(Error::InvalidCredentials));
+        // No `expect_start_registration()`/`expect_finish_registration()`
+        // set up: the mock panics if either is called, proving a wrong old
+        // password never reaches the new-password registration exchange.
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_login()
+            .times(1)
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-login-response".to_vec())));
+        // No `expect_start_change_password()`/`expect_finish_change_password()`
+        // set up either: the mock panics if either is called.
+
+        let settings = MockSettingsService::new();
+        let client = client_with_deps(mock_grpc, opaque, settings);
+
+        let err = client
+            .change_password("alice", "wrong password", "new password")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Context { .. }));
+    }
+
+    #[tokio::test]
+    async fn change_password_fails_without_a_master_key_in_settings() {
+        let opaque = opaque_for_change_password();
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_login()
+            .times(1)
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-login-response".to_vec())));
+        mock_grpc
+            .expect_start_change_password()
+            .times(1)
+            .returning(|_| Ok(b"the-registration-response".to_vec()));
+        // No `expect_finish_change_password()` set up: the mock panics if
+        // it's called, proving a missing local master key is caught before
+        // ever sending the new registration record to the server.
+
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == MASTER_KEY_SETTING)
+            .times(1)
+            .returning(|_| Ok(None));
+
+        let client = client_with_deps(mock_grpc, opaque, settings);
+
+        let err = client
+            .change_password("alice", "old password", "new password")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Encryption(_)));
     }
 }

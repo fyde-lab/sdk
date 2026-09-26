@@ -268,11 +268,19 @@ fn derive_wrapping_key(export_key: &[u8]) -> Result<[u8; KEY_LEN]> {
     Ok(key)
 }
 
-/// Generates a fresh random master key and encrypts it under a key derived
-/// from `export_key` (AES-256-GCM, random nonce), returning the result
-/// JSON-serialized and ready to persist as a settings value.
-pub(super) fn generate_and_wrap_master_key(export_key: &[u8]) -> Result<String> {
-    let master_key = generate_master_key();
+/// Encrypts `master_key` under a key derived from `export_key`
+/// (AES-256-GCM, random nonce), returning the result JSON-serialized and
+/// ready to send to the server as `encrypted_master_key`. The server is the
+/// only place this wrapped form is ever persisted — see
+/// [`crate::domains::users::MASTER_KEY_SETTING`] for why the SDK itself
+/// caches only the raw key locally, never this wrapped form. Used both by
+/// [`generate_and_wrap_master_key`] and directly by `change_password`,
+/// which already has the raw key on hand (read back from local settings)
+/// and only needs to wrap it fresh under the new password's export key.
+pub(super) fn wrap_master_key(master_key: &[u8], export_key: &[u8]) -> Result<String> {
+    let master_key: &[u8; KEY_LEN] = master_key
+        .try_into()
+        .map_err(|_| Error::Encryption("master key has an invalid length".into()))?;
 
     let wrapping_key =
         derive_wrapping_key(export_key).context("failed to derive master key wrapping key")?;
@@ -292,6 +300,17 @@ pub(super) fn generate_and_wrap_master_key(export_key: &[u8]) -> Result<String> 
     };
 
     serde_json::to_string(&wrapped).context("failed to serialize wrapped master key")
+}
+
+/// Generates a fresh random master key and wraps it under a key derived
+/// from `export_key` (see [`wrap_master_key`]), returning both the raw key
+/// — the only form the SDK persists locally, under
+/// [`crate::domains::users::MASTER_KEY_SETTING`] — and the wrapped form
+/// sent to the server, which is the only place it's ever stored.
+pub(super) fn generate_and_wrap_master_key(export_key: &[u8]) -> Result<(Vec<u8>, String)> {
+    let master_key = generate_master_key();
+    let wrapped = wrap_master_key(&master_key, export_key)?;
+    Ok((master_key.to_vec(), wrapped))
 }
 
 /// Decrypts a [`generate_and_wrap_master_key`]-produced wrapped master key
@@ -442,21 +461,23 @@ mod tests {
     fn generate_and_wrap_master_key_roundtrips_under_the_same_export_key() {
         let export_key = b"a-fake-64-byte-export-key-------------------------------------";
 
-        let wrapped = generate_and_wrap_master_key(export_key).unwrap();
+        let (raw_master_key, wrapped) = generate_and_wrap_master_key(export_key).unwrap();
 
         let master_key = unwrap_master_key(export_key, &wrapped).unwrap();
 
         assert_eq!(master_key.len(), KEY_LEN);
+        assert_eq!(master_key, raw_master_key);
     }
 
     #[test]
     fn generate_and_wrap_master_key_produces_a_fresh_key_and_nonce_each_call() {
         let export_key = b"a-fake-64-byte-export-key-------------------------------------";
 
-        let first = generate_and_wrap_master_key(export_key).unwrap();
-        let second = generate_and_wrap_master_key(export_key).unwrap();
+        let (first_raw, first) = generate_and_wrap_master_key(export_key).unwrap();
+        let (second_raw, second) = generate_and_wrap_master_key(export_key).unwrap();
 
         assert_ne!(first, second);
+        assert_ne!(first_raw, second_raw);
         let first_key = unwrap_master_key(export_key, &first).unwrap();
         let second_key = unwrap_master_key(export_key, &second).unwrap();
         assert_ne!(first_key, second_key);
@@ -465,9 +486,31 @@ mod tests {
     #[test]
     fn wrapped_master_key_cannot_be_unwrapped_with_the_wrong_export_key() {
         let export_key = b"a-fake-64-byte-export-key-------------------------------------";
-        let wrapped = generate_and_wrap_master_key(export_key).unwrap();
+        let (_, wrapped) = generate_and_wrap_master_key(export_key).unwrap();
 
         let err = unwrap_master_key(b"a-different-export-key", &wrapped).unwrap_err();
+
+        assert!(matches!(err, Error::Encryption(_)));
+    }
+
+    #[test]
+    fn wrap_master_key_lets_a_raw_key_be_rewrapped_under_a_different_export_key() {
+        let old_export_key = b"a-fake-64-byte-export-key-------------------------------------";
+        let new_export_key = b"a-different-64-byte-export-key--------------------------------";
+        let (raw_master_key, wrapped) = generate_and_wrap_master_key(old_export_key).unwrap();
+
+        let rewrapped = wrap_master_key(&raw_master_key, new_export_key).unwrap();
+
+        assert_ne!(rewrapped, wrapped);
+        let unwrapped_under_new_key = unwrap_master_key(new_export_key, &rewrapped).unwrap();
+        assert_eq!(unwrapped_under_new_key, raw_master_key);
+    }
+
+    #[test]
+    fn wrap_master_key_rejects_a_key_of_the_wrong_length() {
+        let export_key = b"a-fake-64-byte-export-key-------------------------------------";
+
+        let err = wrap_master_key(b"too-short", export_key).unwrap_err();
 
         assert!(matches!(err, Error::Encryption(_)));
     }

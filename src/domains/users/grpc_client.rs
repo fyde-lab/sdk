@@ -15,8 +15,9 @@ mod proto {
 }
 
 use proto::{
-    FinishLoginRequest, FinishRegistrationRequest, LogoutRequest, StartLoginRequest,
-    StartRegistrationRequest, users_service_client::UsersServiceClient as GeneratedUsersClient,
+    FinishChangePasswordRequest, FinishLoginRequest, FinishRegistrationRequest, LogoutRequest,
+    StartChangePasswordRequest, StartLoginRequest, StartRegistrationRequest,
+    users_service_client::UsersServiceClient as GeneratedUsersClient,
 };
 
 /// A gRPC transport for talking to the fyde server's users service. Knows
@@ -68,6 +69,24 @@ pub(super) trait FydeClient: Send + Sync {
     /// Closes the session currently authenticating outgoing calls (see
     /// [`crate::domains::sessions::Service::authenticated_request`]).
     async fn logout(&self) -> Result<()>;
+
+    /// First step of changing the password of the account behind the
+    /// currently authenticated session: forwards a serialized OPAQUE
+    /// `RegistrationRequest` derived from the new password and returns the
+    /// server's serialized `RegistrationResponse`. The account to change is
+    /// derived server-side from the session, not a username field.
+    async fn start_change_password(&self, opaque_request: &[u8]) -> Result<Vec<u8>>;
+
+    /// Second and final step of changing password: sends the serialized
+    /// OPAQUE `RegistrationUpload` derived from the new password, plus the
+    /// master key re-encrypted client-side under a key derived from the new
+    /// password's export key, replacing the account's previous
+    /// registration record and encrypted master key.
+    async fn finish_change_password(
+        &self,
+        opaque_upload: &[u8],
+        encrypted_master_key: &[u8],
+    ) -> Result<()>;
 }
 
 /// The production [`FydeClient`] implementation, backed by a tonic
@@ -210,6 +229,45 @@ impl FydeClient for GrpcClient {
             .logout(request)
             .await
             .context("failed to log out")?;
+
+        Ok(())
+    }
+
+    async fn start_change_password(&self, opaque_request: &[u8]) -> Result<Vec<u8>> {
+        let request = self
+            .sessions
+            .authenticated_request(StartChangePasswordRequest {
+                opaque_request: opaque_request.to_vec(),
+            })
+            .await?;
+
+        let response = self
+            .client()
+            .start_change_password(request)
+            .await
+            .context("failed to start change password")?
+            .into_inner();
+
+        Ok(response.opaque_response)
+    }
+
+    async fn finish_change_password(
+        &self,
+        opaque_upload: &[u8],
+        encrypted_master_key: &[u8],
+    ) -> Result<()> {
+        let request = self
+            .sessions
+            .authenticated_request(FinishChangePasswordRequest {
+                opaque_upload: opaque_upload.to_vec(),
+                encrypted_master_key: encrypted_master_key.to_vec(),
+            })
+            .await?;
+
+        self.client()
+            .finish_change_password(request)
+            .await
+            .context("failed to finish change password")?;
 
         Ok(())
     }
