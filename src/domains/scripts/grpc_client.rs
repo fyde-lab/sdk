@@ -1,0 +1,223 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+#[cfg(test)]
+use mockall::automock;
+use tonic::transport::Channel;
+use uuid::Uuid;
+
+use crate::domains::sessions::{Service as SessionsService, SessionsClient};
+use crate::{ErrorContext as _, Result};
+
+use super::Script;
+
+/// Generated protobuf/gRPC bindings for the `scripts` service, compiled
+/// from `../api-protos/scripts/v1/scripts.proto` by `build.rs`.
+mod proto {
+    tonic::include_proto!("scripts.v1");
+}
+
+use proto::{
+    CreateScriptRequest, DisableScriptRequest, EnableScriptRequest, FetchScriptRequest,
+    ListUserScriptsRequest, scripts_service_client::ScriptsServiceClient as GeneratedScriptsClient,
+};
+
+/// A gRPC transport for talking to the fyde server's scripts service. Knows
+/// nothing about scripts business logic beyond translating between raw
+/// proto messages and the domain [`Script`] type. Abstracted as a trait so
+/// callers can be tested against [`MockFydeClient`] instead of a live
+/// server.
+#[cfg_attr(test, automock)]
+#[async_trait]
+pub(super) trait FydeClient: Send + Sync {
+    /// Creates a new script owned by the authenticated user, at version 1.
+    async fn create_script(
+        &self,
+        name: &str,
+        is_public: bool,
+        icon: Vec<u8>,
+        script: &str,
+    ) -> Result<Script>;
+
+    /// Fetches the script matching `id`.
+    async fn fetch_script(&self, id: Uuid) -> Result<Script>;
+
+    /// Enables `script_id` for the authenticated user.
+    async fn enable_script(&self, script_id: Uuid) -> Result<()>;
+
+    /// Disables `script_id` for the authenticated user.
+    async fn disable_script(&self, script_id: Uuid) -> Result<()>;
+
+    /// Lists the scripts currently enabled for the authenticated user.
+    async fn list_user_scripts(&self) -> Result<Vec<Script>>;
+}
+
+/// The production [`FydeClient`] implementation, backed by a tonic
+/// [`Channel`] shared with every other domain's gRPC client (see
+/// [`crate::Client::init`]). Cloning a [`Channel`] is cheap — it's just a
+/// handle to the same underlying connection — so a fresh generated client
+/// is created per call. Every call is authenticated by attaching the
+/// session token currently persisted in settings (if any) as a bearer
+/// `authorization` header (see
+/// [`crate::domains::sessions::Service::authenticated_request`]).
+pub(super) struct GrpcClient {
+    channel: Channel,
+    sessions: Arc<SessionsClient>,
+}
+
+impl GrpcClient {
+    /// Creates a client for the scripts service using the shared `channel`
+    /// connection to the fyde server, authenticating every call via
+    /// `sessions`.
+    pub fn new(channel: Channel, sessions: Arc<SessionsClient>) -> Self {
+        Self { channel, sessions }
+    }
+
+    /// Returns a generated client wrapping the shared connection.
+    fn client(&self) -> GeneratedScriptsClient<Channel> {
+        GeneratedScriptsClient::new(self.channel.clone())
+    }
+}
+
+/// Converts a generated `proto::Script` into the domain [`Script`] type,
+/// parsing its canonical UUIDv7 string id.
+fn into_domain(script: proto::Script) -> Result<Script> {
+    Ok(Script {
+        id: script
+            .id
+            .parse()
+            .context("failed to parse script id returned by the server")?,
+        name: script.name,
+        is_public: script.is_public,
+        icon: script.icon,
+        version: script.version,
+        script: script.script,
+        last_updated: script.last_updated,
+    })
+}
+
+#[async_trait]
+impl FydeClient for GrpcClient {
+    async fn create_script(
+        &self,
+        name: &str,
+        is_public: bool,
+        icon: Vec<u8>,
+        script: &str,
+    ) -> Result<Script> {
+        let request = self
+            .sessions
+            .authenticated_request(CreateScriptRequest {
+                name: name.to_string(),
+                is_public,
+                icon,
+                script: script.to_string(),
+            })
+            .await?;
+
+        let response = self
+            .client()
+            .create_script(request)
+            .await
+            .context("failed to create script")?
+            .into_inner();
+
+        into_domain(response.script.ok_or_else(|| {
+            crate::Error::InvalidResponse("create script response had no script".to_string())
+        })?)
+    }
+
+    async fn fetch_script(&self, id: Uuid) -> Result<Script> {
+        let request = self
+            .sessions
+            .authenticated_request(FetchScriptRequest { id: id.to_string() })
+            .await?;
+
+        let response = self
+            .client()
+            .fetch_script(request)
+            .await
+            .context("failed to fetch script")?
+            .into_inner();
+
+        into_domain(response.script.ok_or_else(|| {
+            crate::Error::InvalidResponse("fetch script response had no script".to_string())
+        })?)
+    }
+
+    async fn enable_script(&self, script_id: Uuid) -> Result<()> {
+        let request = self
+            .sessions
+            .authenticated_request(EnableScriptRequest {
+                script_id: script_id.to_string(),
+            })
+            .await?;
+
+        self.client()
+            .enable_script(request)
+            .await
+            .context("failed to enable script")?;
+
+        Ok(())
+    }
+
+    async fn disable_script(&self, script_id: Uuid) -> Result<()> {
+        let request = self
+            .sessions
+            .authenticated_request(DisableScriptRequest {
+                script_id: script_id.to_string(),
+            })
+            .await?;
+
+        self.client()
+            .disable_script(request)
+            .await
+            .context("failed to disable script")?;
+
+        Ok(())
+    }
+
+    async fn list_user_scripts(&self) -> Result<Vec<Script>> {
+        let request = self
+            .sessions
+            .authenticated_request(ListUserScriptsRequest {})
+            .await?;
+
+        let response = self
+            .client()
+            .list_user_scripts(request)
+            .await
+            .context("failed to list user scripts")?
+            .into_inner();
+
+        response.scripts.into_iter().map(into_domain).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tonic::transport::Endpoint;
+
+    use super::*;
+    use crate::Error;
+    use crate::domains::settings::MockService as MockSettingsService;
+
+    fn sessions() -> Arc<SessionsClient> {
+        let mut settings = MockSettingsService::new();
+        settings.expect_get().returning(|_| Ok(None));
+        Arc::new(SessionsClient::new(Arc::new(settings)))
+    }
+
+    #[tokio::test]
+    async fn new_does_not_connect_to_the_server() {
+        // A syntactically valid but unreachable address, connected lazily:
+        // if `client()` dialed eagerly at construction, this would fail
+        // here rather than on first use below.
+        let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let grpc = GrpcClient::new(channel, sessions());
+
+        let err = grpc.list_user_scripts().await.unwrap_err();
+
+        assert!(matches!(err, Error::Context { .. }));
+    }
+}

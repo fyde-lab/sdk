@@ -210,7 +210,7 @@ impl Client {
         )
         .await
         .context("failed to initialize users service")?;
-        let scripts = domains::scripts::init();
+        let scripts = domains::scripts::init(channel.clone(), sessions.clone());
 
         // A session may already be open from a previous run (the token is
         // persisted in `settings`, not just held in memory — see

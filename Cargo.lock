@@ -1085,6 +1085,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "futures",
+ "fyde-server",
  "hkdf 0.12.4",
  "lopdf",
  "mlua",
@@ -1113,6 +1114,31 @@ dependencies = [
  "uniffi",
  "uuid",
  "xdg",
+]
+
+[[package]]
+name = "fyde-server"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "http",
+ "opaque-ke",
+ "prost",
+ "rand 0.8.8",
+ "rand_core 0.6.4",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-health",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1748,6 +1774,15 @@ checksum = "1db548b001f0b7da416daf0ffae963912bae6cad1799fa9f4eaba09da6dba837"
 dependencies = [
  "cc",
  "which",
+]
+
+[[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
 ]
 
 [[package]]
@@ -3365,10 +3400,14 @@ version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
 dependencies = [
+ "matchers",
  "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
  "sharded-slab",
  "smallvec",
  "thread_local",
+ "tracing",
  "tracing-core",
  "tracing-log",
 ]
