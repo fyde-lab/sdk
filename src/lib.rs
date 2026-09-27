@@ -15,6 +15,7 @@ pub use ffi::{FfiError, FydeClient};
 use std::sync::Arc;
 
 pub use domains::documents::{ChangelogEvent, Document, Service as DocumentsService};
+pub use domains::scripts::Service as ScriptsService;
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
 pub use domains::users::Service as UsersService;
@@ -49,6 +50,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("pdf error: {0}")]
     Pdf(#[from] lopdf::Error),
+    #[error("lua error: {0}")]
+    Lua(#[from] mlua::Error),
     #[error("unsupported document extension {0:?}: only .pdf is supported")]
     UnsupportedDocumentExtension(String),
     #[error("document {0} not found in local cache")]
@@ -142,6 +145,7 @@ pub struct ClientConfig {
 /// A connection to a fyde server.
 pub struct Client {
     documents: Arc<dyn DocumentsService>,
+    scripts: Arc<dyn ScriptsService>,
     server_state: Arc<dyn ServerStateService>,
     sessions: Arc<SessionsClient>,
     settings: Arc<dyn SettingsService>,
@@ -206,6 +210,7 @@ impl Client {
         )
         .await
         .context("failed to initialize users service")?;
+        let scripts = domains::scripts::init();
 
         // A session may already be open from a previous run (the token is
         // persisted in `settings`, not just held in memory — see
@@ -220,6 +225,7 @@ impl Client {
 
         Ok(Self {
             documents,
+            scripts,
             server_state,
             sessions,
             settings,
@@ -245,6 +251,11 @@ impl Client {
     /// Returns a reference to the client's server_state service.
     pub fn server_state(&self) -> &dyn ServerStateService {
         self.server_state.as_ref()
+    }
+
+    /// Returns a reference to the client's scripts service.
+    pub fn scripts(&self) -> &dyn ScriptsService {
+        self.scripts.as_ref()
     }
 
     /// Returns a reference to the client's sessions service. Returns the

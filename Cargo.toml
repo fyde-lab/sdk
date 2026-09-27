@@ -13,6 +13,13 @@ async-trait = "0.1.92"
 futures = "0.3.34"
 hkdf = "0.12.4"
 lopdf = "0.39"
+# `vendored` builds Lua from source rather than requiring a system install —
+# needed since this crate cross-compiles to Android/iOS (see `../CLAUDE.md`'s
+# `application/` entry) where no system Lua exists.
+# `error-send` makes `mlua::Error` itself `Send + Sync`, required since it's
+# wrapped into this crate's `Error` enum, which is held across `.await`
+# points throughout the SDK.
+mlua = { version = "0.12.1", features = ["lua54", "vendored", "error-send"] }
 opaque-ke = { version = "4.0.1", features = ["argon2"] }
 prost = "0.14.4"
 rand = "0.10.2"
