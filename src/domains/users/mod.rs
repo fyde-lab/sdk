@@ -30,6 +30,15 @@ use crate::{ErrorContext as _, Result};
 /// it didn't.
 pub(crate) const MASTER_KEY_SETTING: &str = "master_key";
 
+/// The settings key under which this device's UI language preference (see
+/// [`Service::set_language`]) is persisted. Distinct from the `language`
+/// sent once to the server by `create` (via `system_language`): that one
+/// tells the server what language to use for account-related
+/// communication, while this is a local-only preference this device's own
+/// UI reads to pick which resource bundle to render — never sent to the
+/// server.
+pub(crate) const LANGUAGE_SETTING: &str = "language";
+
 /// JSON-encodes `master_key`'s raw bytes for storage under
 /// [`MASTER_KEY_SETTING`].
 pub(crate) fn encode_master_key(master_key: &[u8]) -> Result<String> {
@@ -116,6 +125,19 @@ pub trait Service: Send + Sync {
         old_password: &str,
         new_password: &str,
     ) -> Result<()>;
+
+    /// Persists `language` (a short code, e.g. "en", "fr") as this device's
+    /// UI language preference, read back by [`Service::get_language`].
+    /// Purely local: unlike the `language` `create` sends the server once
+    /// at registration (see [`LANGUAGE_SETTING`]'s doc), this is never
+    /// synced there.
+    async fn set_language(&self, language: &str) -> Result<()>;
+
+    /// Returns this device's UI language preference previously persisted by
+    /// [`Service::set_language`], or `None` if never set — callers should
+    /// fall back to the platform's own locale in that case rather than
+    /// assuming a language.
+    async fn get_language(&self) -> Result<Option<String>>;
 }
 
 /// Initializes the users service: connects to the fyde server's users

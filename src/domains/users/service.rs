@@ -16,7 +16,7 @@ use super::crypto::{
     wrap_master_key,
 };
 use super::grpc_client::{FydeClient, GrpcClient};
-use super::{MASTER_KEY_SETTING, Service, decode_master_key, encode_master_key};
+use super::{LANGUAGE_SETTING, MASTER_KEY_SETTING, Service, decode_master_key, encode_master_key};
 
 /// The device's preferred interface language as a short code (e.g. "en",
 /// "fr"), read from the `LC_ALL`/`LC_MESSAGES`/`LANG` environment variables
@@ -275,6 +275,20 @@ impl Service for UsersClient {
             .context("failed to finish change password")?;
 
         Ok(())
+    }
+
+    async fn set_language(&self, language: &str) -> Result<()> {
+        self.settings
+            .set(LANGUAGE_SETTING, language)
+            .await
+            .context("failed to persist language preference")
+    }
+
+    async fn get_language(&self) -> Result<Option<String>> {
+        self.settings
+            .get(LANGUAGE_SETTING)
+            .await
+            .context("failed to read language preference")
     }
 }
 
@@ -1112,5 +1126,47 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, Error::Encryption(_)));
+    }
+
+    #[tokio::test]
+    async fn set_language_persists_it_under_language_setting() {
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_set()
+            .withf(|key, value| key == LANGUAGE_SETTING && value == "fr")
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let client = client_with_deps(MockFydeClient::new(), MockOpaqueClient::new(), settings);
+
+        client.set_language("fr").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_language_returns_the_persisted_value() {
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == LANGUAGE_SETTING)
+            .times(1)
+            .returning(|_| Ok(Some("fr".to_string())));
+
+        let client = client_with_deps(MockFydeClient::new(), MockOpaqueClient::new(), settings);
+
+        assert_eq!(client.get_language().await.unwrap(), Some("fr".to_string()));
+    }
+
+    #[tokio::test]
+    async fn get_language_returns_none_when_never_set() {
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == LANGUAGE_SETTING)
+            .times(1)
+            .returning(|_| Ok(None));
+
+        let client = client_with_deps(MockFydeClient::new(), MockOpaqueClient::new(), settings);
+
+        assert_eq!(client.get_language().await.unwrap(), None);
     }
 }

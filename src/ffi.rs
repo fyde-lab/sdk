@@ -351,6 +351,20 @@ impl FydeClient {
         let documents = self.inner.documents().list(offset, limit).await?;
         Ok(documents.into_iter().map(FfiDocument::from).collect())
     }
+
+    /// Persists `language` as this device's UI language preference. Mirrors
+    /// [`crate::UsersService::set_language`].
+    pub async fn set_language(&self, language: String) -> Result<(), FfiError> {
+        self.inner.users().set_language(&language).await?;
+        Ok(())
+    }
+
+    /// Returns this device's UI language preference, or `None` if never
+    /// set. Mirrors [`crate::UsersService::get_language`].
+    pub async fn get_language(&self) -> Result<Option<String>, FfiError> {
+        let language = self.inner.users().get_language().await?;
+        Ok(language)
+    }
 }
 
 #[cfg(test)]
