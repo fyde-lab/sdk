@@ -12,6 +12,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::domains::documents::{EventType, Metadata};
+use crate::domains::scripts::Script;
 use crate::domains::sessions::Service as SessionsService;
 use crate::{ChangelogEvent, Client, ClientConfig, Document, Error, LogLevel, Storage};
 
@@ -84,6 +85,33 @@ impl From<Document> for FfiDocument {
             id: document.id().to_string(),
             content: document.content().to_vec(),
             metadata: document.metadata().clone().into(),
+        }
+    }
+}
+
+/// A user-authored script, mirroring [`Script`] across the FFI boundary.
+/// `id` crosses as a string since UniFFI has no native UUID type.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiScript {
+    pub id: String,
+    pub name: String,
+    pub is_public: bool,
+    pub icon: Vec<u8>,
+    pub version: u64,
+    pub script: String,
+    pub last_updated: i64,
+}
+
+impl From<Script> for FfiScript {
+    fn from(script: Script) -> Self {
+        Self {
+            id: script.id().to_string(),
+            name: script.name().to_string(),
+            is_public: script.is_public(),
+            icon: script.icon().to_vec(),
+            version: script.version(),
+            script: script.script().to_string(),
+            last_updated: script.last_updated(),
         }
     }
 }
@@ -365,12 +393,61 @@ impl FydeClient {
         let language = self.inner.users().get_language().await?;
         Ok(language)
     }
+
+    /// Creates a new script owned by the authenticated user, at version 1.
+    /// Mirrors [`crate::ScriptsService::create_script`].
+    pub async fn create_script(
+        &self,
+        name: String,
+        is_public: bool,
+        icon: Vec<u8>,
+        script: String,
+    ) -> Result<FfiScript, FfiError> {
+        let script = self
+            .inner
+            .scripts()
+            .create_script(&name, is_public, icon, &script)
+            .await?;
+        Ok(script.into())
+    }
+
+    /// Fetches the script matching `id`. Mirrors
+    /// [`crate::ScriptsService::fetch_script`].
+    pub async fn fetch_script(&self, id: String) -> Result<FfiScript, FfiError> {
+        let id = parse_uuid(&id)?;
+        let script = self.inner.scripts().fetch_script(id).await?;
+        Ok(script.into())
+    }
+
+    /// Enables `script_id` for the authenticated user. Mirrors
+    /// [`crate::ScriptsService::enable_script`].
+    pub async fn enable_script(&self, script_id: String) -> Result<(), FfiError> {
+        let script_id = parse_uuid(&script_id)?;
+        self.inner.scripts().enable_script(script_id).await?;
+        Ok(())
+    }
+
+    /// Disables `script_id` for the authenticated user. Mirrors
+    /// [`crate::ScriptsService::disable_script`].
+    pub async fn disable_script(&self, script_id: String) -> Result<(), FfiError> {
+        let script_id = parse_uuid(&script_id)?;
+        self.inner.scripts().disable_script(script_id).await?;
+        Ok(())
+    }
+
+    /// Lists the scripts currently enabled for the authenticated user.
+    /// Mirrors [`crate::ScriptsService::list_user_scripts`].
+    pub async fn list_user_scripts(&self) -> Result<Vec<FfiScript>, FfiError> {
+        let scripts = self.inner.scripts().list_user_scripts().await?;
+        Ok(scripts.into_iter().map(FfiScript::from).collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domains::documents::{EventType, FakeChangelogEvent, FakeDocument, FakeMetadata};
+    use crate::domains::scripts::FakeScript;
 
     #[test]
     fn parse_uuid_accepts_a_canonical_uuid() {
@@ -411,6 +488,21 @@ mod tests {
         assert_eq!(ffi.id, document.id().to_string());
         assert_eq!(ffi.content, document.content());
         assert_eq!(ffi.metadata.name, document.metadata().name());
+    }
+
+    #[test]
+    fn script_conversion_preserves_every_field() {
+        let script = FakeScript::new().build();
+
+        let ffi: FfiScript = script.clone().into();
+
+        assert_eq!(ffi.id, script.id().to_string());
+        assert_eq!(ffi.name, script.name());
+        assert_eq!(ffi.is_public, script.is_public());
+        assert_eq!(ffi.icon, script.icon());
+        assert_eq!(ffi.version, script.version());
+        assert_eq!(ffi.script, script.script());
+        assert_eq!(ffi.last_updated, script.last_updated());
     }
 
     #[test]
