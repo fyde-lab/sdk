@@ -28,8 +28,9 @@ use crate::domains::sessions::SessionsClient;
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Service: Send + Sync {
-    /// Starts a sandboxed Lua VM scoped to `document` and runs it. Doesn't
-    /// do anything with the VM yet beyond constructing it.
+    /// Fetches the scripts currently enabled for the authenticated user and
+    /// runs each of them, in its own freshly-constructed sandboxed Lua VM,
+    /// scoped to `document`.
     async fn run_for_document(&self, document: &Document) -> Result<()>;
 
     /// Creates a new script owned by the authenticated user, at version 1.

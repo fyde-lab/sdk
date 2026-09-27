@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
-use crate::Result;
 use crate::domains::documents::Document;
 use crate::domains::sessions::SessionsClient;
+use crate::{ErrorContext as _, Result};
 
 use super::Script;
 use super::Service;
@@ -42,7 +42,15 @@ impl ScriptsClient {
 #[async_trait]
 impl Service for ScriptsClient {
     async fn run_for_document(&self, _document: &Document) -> Result<()> {
-        let _lua = vm::sandboxed()?;
+        let scripts = self.grpc.list_user_scripts().await?;
+
+        for script in &scripts {
+            let lua = vm::sandboxed()?;
+            lua.load(script.script())
+                .exec()
+                .context("failed to run script")?;
+        }
+
         Ok(())
     }
 
@@ -81,11 +89,36 @@ mod tests {
     use crate::domains::scripts::grpc_client::MockFydeClient;
 
     #[tokio::test]
-    async fn run_for_document_succeeds() {
-        let client = ScriptsClient::with_grpc(MockFydeClient::new());
+    async fn run_for_document_runs_every_enabled_script() {
+        let scripts = vec![
+            FakeScript::new().with_script("return 1 + 1").build(),
+            FakeScript::new().with_script("return 2 + 2").build(),
+        ];
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_list_user_scripts()
+            .times(1)
+            .returning(move || Ok(scripts.clone()));
+
+        let client = ScriptsClient::with_grpc(mock_grpc);
         let document = FakeDocument::new().build();
 
         client.run_for_document(&document).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_for_document_fails_if_a_script_errors() {
+        let scripts = vec![FakeScript::new().with_script("this is not valid lua").build()];
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_list_user_scripts()
+            .times(1)
+            .returning(move || Ok(scripts.clone()));
+
+        let client = ScriptsClient::with_grpc(mock_grpc);
+        let document = FakeDocument::new().build();
+
+        client.run_for_document(&document).await.unwrap_err();
     }
 
     #[tokio::test]

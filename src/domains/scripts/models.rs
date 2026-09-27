@@ -71,6 +71,11 @@ impl FakeScript {
         }
     }
 
+    pub(crate) fn with_script(mut self, script: &str) -> Self {
+        self.script.script = script.to_string();
+        self
+    }
+
     pub(crate) fn build(self) -> Script {
         self.script
     }

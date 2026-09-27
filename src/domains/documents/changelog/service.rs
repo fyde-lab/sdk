@@ -431,6 +431,7 @@ mod tests {
         ProtoChangelogEvent {
             id: id.to_string(),
             encrypted_content,
+            previous_id: String::new(),
         }
     }
 
@@ -765,6 +766,7 @@ mod tests {
             Ok(futures::stream::iter(vec![Ok(ProtoChangelogEvent {
                 id: event_id.to_string(),
                 encrypted_content: encrypted_content.clone(),
+                previous_id: String::new(),
             })])
             .boxed())
         });
