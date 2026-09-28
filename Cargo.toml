@@ -23,9 +23,11 @@ opaque-ke = { version = "4.0.1", features = ["argon2"] }
 # Pinned: 0.3.78+ requires `office_oxide ^0.1.9`, and every 0.1.9+ release of
 # `office_oxide` published so far fails to build against pdf_oxide's usage
 # (a missing-field compile error in `DocumentIR` construction) — an upstream
-# semver break. 0.3.77 is the last version compatible with office_oxide 0.1.8,
-# the last working release.
+# semver break. 0.3.77 itself only requires `office_oxide "0.1.8"` (a caret
+# range, so Cargo can still resolve the same broken 0.1.9+ releases unless
+# pinned directly below), and 0.1.8 is the last working release.
 pdf_oxide = "=0.3.77"
+office_oxide = "=0.1.8"
 prost = "0.14.4"
 rand = "0.10.2"
 # `opaque-ke` itself depends on `rand 0.8` with no features enabled;

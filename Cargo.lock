@@ -1318,6 +1318,7 @@ dependencies = [
  "lopdf",
  "mlua",
  "mockall",
+ "office_oxide",
  "opaque-ke",
  "pdf_oxide",
  "prost",
