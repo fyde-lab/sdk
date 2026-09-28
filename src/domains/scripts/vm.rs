@@ -1,9 +1,7 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use mlua::{Lua, LuaOptions, StdLib};
+use uuid::Uuid;
 
-use crate::domains::documents::Document;
+use crate::domains::documents::{Document, Metadata};
 use crate::{ErrorContext as _, Result};
 
 /// Builds a fully sandboxed Lua VM: no `io`, `os`, `package` (so no
@@ -33,24 +31,41 @@ pub(super) fn sandboxed() -> Result<Lua> {
     Ok(lua)
 }
 
-/// Exposes `document` as a read-only-by-convention global table in `lua`,
-/// scoping a script's access to the document it's being run against: its raw
-/// `content` plus a `metadata` sub-table mirroring [`Metadata`]'s fields, and
-/// a `set_name` method a script can call to rename the document. Nothing
-/// beyond this document's own data is reachable from a script's Lua state.
-///
-/// `set_name` never touches `document`, and this function never clones it or
-/// its [`Metadata`]: it only records the last name a script passed to
-/// `set_name` in the returned cell, which the caller compares against
-/// `document.metadata().name()` once the script has finished running to see
-/// whether a rename actually happened.
-///
-/// [`Metadata`]: crate::domains::documents::Metadata
-pub(super) fn expose_document(
-    lua: &Lua,
-    document: &Document,
-) -> Result<Rc<RefCell<Option<String>>>> {
-    let metadata = document.metadata();
+/// Exposes `document` as a global table in `lua`, scoping a script's access
+/// to the document it's being run against: its raw `content` plus a
+/// `metadata` sub-table mirroring every [`Metadata`] field. A script mutates
+/// the document by assigning directly into `document.metadata` (e.g.
+/// `document.metadata.name = "new-name.pdf"`); [`read_metadata`] reads the
+/// table back out once the script has finished running so the caller can see
+/// which fields, if any, changed. Nothing beyond this document's own data is
+/// reachable from a script's Lua state.
+pub(super) fn expose_document(lua: &Lua, document: &Document) -> Result<()> {
+    let metadata_table = metadata_to_table(lua, document.metadata())?;
+
+    let document_table = lua
+        .create_table()
+        .context("failed to create the document lua table")?;
+    document_table
+        .set("id", document.id().to_string())
+        .context("failed to set document.id")?;
+    let content = lua
+        .create_string(document.content())
+        .context("failed to create document.content lua string")?;
+    document_table
+        .set("content", content)
+        .context("failed to set document.content")?;
+    document_table
+        .set("metadata", metadata_table)
+        .context("failed to set document.metadata")?;
+
+    lua.globals()
+        .set("document", document_table)
+        .context("failed to expose document to the sandboxed lua vm")?;
+
+    Ok(())
+}
+
+fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
     let metadata_table = lua
         .create_table()
         .context("failed to create the document.metadata lua table")?;
@@ -78,41 +93,76 @@ pub(super) fn expose_document(
     metadata_table
         .set("transcript", metadata.transcript())
         .context("failed to set document.metadata.transcript")?;
+    metadata_table
+        .set("type", metadata.r#type())
+        .context("failed to set document.metadata.type")?;
+    metadata_table
+        .set("source_category", metadata.source_category())
+        .context("failed to set document.metadata.source_category")?;
+    metadata_table
+        .set("source_sub_category", metadata.source_sub_category())
+        .context("failed to set document.metadata.source_sub_category")?;
+    metadata_table
+        .set("subject", metadata.subject())
+        .context("failed to set document.metadata.subject")?;
+    metadata_table
+        .set("qualification", metadata.qualification())
+        .context("failed to set document.metadata.qualification")?;
 
-    let document_table = lua
-        .create_table()
-        .context("failed to create the document lua table")?;
-    document_table
-        .set("id", document.id().to_string())
-        .context("failed to set document.id")?;
-    let content = lua
-        .create_string(document.content())
-        .context("failed to create document.content lua string")?;
-    document_table
-        .set("content", content)
-        .context("failed to set document.content")?;
-    document_table
-        .set("metadata", metadata_table)
-        .context("failed to set document.metadata")?;
+    Ok(metadata_table)
+}
 
-    let new_name: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
-    let set_name = {
-        let new_name = Rc::clone(&new_name);
-        lua.create_function(move |_, name: String| {
-            *new_name.borrow_mut() = Some(name);
-            Ok(())
-        })
-        .context("failed to create document.set_name lua function")?
-    };
-    document_table
-        .set("set_name", set_name)
-        .context("failed to set document.set_name")?;
+/// Reads `document.metadata` back out of `lua` into a [`Metadata`], mirroring
+/// every field [`expose_document`] wrote into it, except `original_name`,
+/// `content_type`, `size`, `checksum`, and `transcript` — those describe the
+/// underlying file rather than user-editable metadata, so a script can't
+/// change them: they're always taken from `original` regardless of what a
+/// script assigned into the table. Called once a script has finished
+/// running, so the caller can compare the result against `original` to see
+/// which fields, if any, the script changed.
+pub(super) fn read_metadata(lua: &Lua, original: &Metadata) -> Result<Metadata> {
+    let document_table: mlua::Table = lua
+        .globals()
+        .get("document")
+        .context("failed to read the document lua global back")?;
+    let metadata_table: mlua::Table = document_table
+        .get("metadata")
+        .context("failed to read document.metadata back")?;
 
-    lua.globals()
-        .set("document", document_table)
-        .context("failed to expose document to the sandboxed lua vm")?;
+    let id: String = metadata_table
+        .get("id")
+        .context("failed to read document.metadata.id back")?;
+    let id = Uuid::parse_str(&id).context("script left document.metadata.id as an invalid uuid")?;
 
-    Ok(new_name)
+    Ok(Metadata {
+        id,
+        name: metadata_table
+            .get("name")
+            .context("failed to read document.metadata.name back")?,
+        original_name: original.original_name().to_string(),
+        content_type: original.content_type().to_string(),
+        created_at: metadata_table
+            .get("created_at")
+            .context("failed to read document.metadata.created_at back")?,
+        size: original.size(),
+        checksum: original.checksum().to_string(),
+        transcript: original.transcript().to_string(),
+        r#type: metadata_table
+            .get("type")
+            .context("failed to read document.metadata.type back")?,
+        source_category: metadata_table
+            .get("source_category")
+            .context("failed to read document.metadata.source_category back")?,
+        source_sub_category: metadata_table
+            .get("source_sub_category")
+            .context("failed to read document.metadata.source_sub_category back")?,
+        subject: metadata_table
+            .get("subject")
+            .context("failed to read document.metadata.subject back")?,
+        qualification: metadata_table
+            .get("qualification")
+            .context("failed to read document.metadata.qualification back")?,
+    })
 }
 
 #[cfg(test)]
@@ -166,43 +216,77 @@ mod tests {
     }
 
     #[test]
-    fn expose_document_leaves_the_pending_name_empty_when_set_name_is_never_called() {
+    fn read_metadata_matches_the_original_when_a_script_makes_no_changes() {
         let lua = sandboxed().unwrap();
         let document = FakeDocument::new().build();
 
-        let new_name = expose_document(&lua, &document).unwrap();
+        expose_document(&lua, &document).unwrap();
 
-        assert_eq!(*new_name.borrow(), None);
+        let metadata = read_metadata(&lua, document.metadata()).unwrap();
+
+        assert_eq!(metadata, *document.metadata());
     }
 
     #[test]
-    fn expose_document_records_the_name_passed_to_set_name() {
+    fn read_metadata_reflects_a_field_a_script_assigned() {
         let lua = sandboxed().unwrap();
         let document = FakeDocument::new().build();
 
-        let new_name = expose_document(&lua, &document).unwrap();
-        lua.load(r#"document.set_name("new-name.pdf")"#)
+        expose_document(&lua, &document).unwrap();
+        lua.load(r#"document.metadata.name = "new-name.pdf""#)
             .exec()
             .unwrap();
 
-        assert_eq!(new_name.borrow().as_deref(), Some("new-name.pdf"));
+        let metadata = read_metadata(&lua, document.metadata()).unwrap();
+
+        assert_eq!(metadata.name, "new-name.pdf");
+        assert_eq!(metadata.transcript, document.metadata().transcript());
     }
 
     #[test]
-    fn expose_document_keeps_the_latest_name_across_multiple_set_name_calls() {
+    fn read_metadata_keeps_the_latest_value_across_multiple_assignments() {
         let lua = sandboxed().unwrap();
         let document = FakeDocument::new().build();
 
-        let new_name = expose_document(&lua, &document).unwrap();
+        expose_document(&lua, &document).unwrap();
         lua.load(
             r#"
-            document.set_name("first.pdf")
-            document.set_name("second.pdf")
+            document.metadata.name = "first.pdf"
+            document.metadata.name = "second.pdf"
             "#,
         )
         .exec()
         .unwrap();
 
-        assert_eq!(new_name.borrow().as_deref(), Some("second.pdf"));
+        let metadata = read_metadata(&lua, document.metadata()).unwrap();
+
+        assert_eq!(metadata.name, "second.pdf");
+    }
+
+    #[test]
+    fn read_metadata_ignores_script_writes_to_immutable_fields() {
+        let lua = sandboxed().unwrap();
+        let document = FakeDocument::new().build();
+
+        expose_document(&lua, &document).unwrap();
+        lua.load(
+            r#"
+            document.metadata.original_name = "hacked.pdf"
+            document.metadata.content_type = "application/x-hacked"
+            document.metadata.size = 999999
+            document.metadata.checksum = "hacked"
+            document.metadata.transcript = "hacked transcript"
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        let metadata = read_metadata(&lua, document.metadata()).unwrap();
+
+        assert_eq!(metadata.original_name, document.metadata().original_name());
+        assert_eq!(metadata.content_type, document.metadata().content_type());
+        assert_eq!(metadata.size, document.metadata().size());
+        assert_eq!(metadata.checksum, document.metadata().checksum());
+        assert_eq!(metadata.transcript, document.metadata().transcript());
     }
 }

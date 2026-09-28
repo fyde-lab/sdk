@@ -72,7 +72,8 @@ pub trait Service: Send + Sync {
 
 /// Initializes the scripts service: talks to the fyde server's scripts
 /// service over the shared `channel` connection, authenticating every call
-/// via `sessions`, and publishes renames a script makes through `documents`.
+/// via `sessions`, and publishes metadata changes a script makes through
+/// `documents`.
 pub(crate) fn init(
     channel: Channel,
     sessions: Arc<SessionsClient>,

@@ -54,27 +54,21 @@ impl Service for ScriptsClient {
         let scripts = self.grpc.list_user_scripts().await?;
 
         for script in &scripts {
-            let new_name = {
+            let updated_metadata = {
                 let lua = vm::sandboxed()?;
-                let new_name = vm::expose_document(&lua, document)?;
+                vm::expose_document(&lua, document)?;
                 lua.load(script.script())
                     .exec()
                     .context("failed to run script")?;
 
-                new_name.borrow().clone()
+                vm::read_metadata(&lua, document.metadata())?
             };
 
-            if let Some(new_name) = new_name
-                && new_name != document.metadata().name()
-            {
-                let metadata = crate::domains::documents::Metadata {
-                    name: new_name,
-                    ..document.metadata().clone()
-                };
+            if updated_metadata != *document.metadata() {
                 self.documents
-                    .update_metadata(metadata)
+                    .update_metadata(updated_metadata)
                     .await
-                    .context("failed to publish the document name a script set")?;
+                    .context("failed to publish the metadata changes a script made")?;
             }
         }
 
@@ -209,7 +203,7 @@ mod tests {
     async fn run_for_document_updates_the_name_when_a_script_renames_the_document() {
         let scripts = vec![
             FakeScript::new()
-                .with_script(r#"document.set_name("renamed.pdf")"#)
+                .with_script(r#"document.metadata.name = "renamed.pdf""#)
                 .build(),
         ];
         let mut mock_grpc = MockFydeClient::new();
@@ -260,7 +254,7 @@ mod tests {
         let same_name = document.metadata().name().to_string();
         let scripts = vec![
             FakeScript::new()
-                .with_script(&format!("document.set_name({same_name:?})"))
+                .with_script(&format!("document.metadata.name = {same_name:?}"))
                 .build(),
         ];
         let mut mock_grpc = MockFydeClient::new();
