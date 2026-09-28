@@ -441,6 +441,21 @@ impl FydeClient {
         let scripts = self.inner.scripts().list_user_scripts().await?;
         Ok(scripts.into_iter().map(FfiScript::from).collect())
     }
+
+    /// Runs every script currently enabled for the authenticated user
+    /// against the document matching `document_id`. Mirrors
+    /// [`crate::ScriptsService::run_for_document`].
+    pub async fn run_scripts_for_document(&self, document_id: String) -> Result<(), FfiError> {
+        let id = parse_uuid(&document_id)?;
+        let document = self
+            .inner
+            .documents()
+            .get(id)
+            .await?
+            .ok_or(Error::DocumentNotFound(id))?;
+        self.inner.scripts().run_for_document(&document).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

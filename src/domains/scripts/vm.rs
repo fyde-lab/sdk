@@ -1,5 +1,6 @@
 use mlua::{Lua, LuaOptions, StdLib};
 
+use crate::domains::documents::Document;
 use crate::{ErrorContext as _, Result};
 
 /// Builds a fully sandboxed Lua VM: no `io`, `os`, `package` (so no
@@ -29,11 +30,72 @@ pub(super) fn sandboxed() -> Result<Lua> {
     Ok(lua)
 }
 
+/// Exposes `document` as a read-only-by-convention global table in `lua`,
+/// scoping a script's access to the document it's being run against: its raw
+/// `content` plus a `metadata` sub-table mirroring [`Metadata`]'s fields.
+/// Nothing beyond this document's own data is reachable from a script's Lua
+/// state.
+///
+/// [`Metadata`]: crate::domains::documents::Metadata
+pub(super) fn expose_document(lua: &Lua, document: &Document) -> Result<()> {
+    let metadata = document.metadata();
+    let metadata_table = lua
+        .create_table()
+        .context("failed to create the document.metadata lua table")?;
+    metadata_table
+        .set("id", metadata.id().to_string())
+        .context("failed to set document.metadata.id")?;
+    metadata_table
+        .set("name", metadata.name())
+        .context("failed to set document.metadata.name")?;
+    metadata_table
+        .set("original_name", metadata.original_name())
+        .context("failed to set document.metadata.original_name")?;
+    metadata_table
+        .set("content_type", metadata.content_type())
+        .context("failed to set document.metadata.content_type")?;
+    metadata_table
+        .set("created_at", metadata.created_at())
+        .context("failed to set document.metadata.created_at")?;
+    metadata_table
+        .set("size", metadata.size())
+        .context("failed to set document.metadata.size")?;
+    metadata_table
+        .set("checksum", metadata.checksum())
+        .context("failed to set document.metadata.checksum")?;
+    metadata_table
+        .set("transcript", metadata.transcript())
+        .context("failed to set document.metadata.transcript")?;
+
+    let document_table = lua
+        .create_table()
+        .context("failed to create the document lua table")?;
+    document_table
+        .set("id", document.id().to_string())
+        .context("failed to set document.id")?;
+    let content = lua
+        .create_string(document.content())
+        .context("failed to create document.content lua string")?;
+    document_table
+        .set("content", content)
+        .context("failed to set document.content")?;
+    document_table
+        .set("metadata", metadata_table)
+        .context("failed to set document.metadata")?;
+
+    lua.globals()
+        .set("document", document_table)
+        .context("failed to expose document to the sandboxed lua vm")?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use mlua::Value;
 
     use super::*;
+    use crate::domains::documents::FakeDocument;
 
     #[test]
     fn sandboxed_vm_has_no_filesystem_or_process_access() {
@@ -56,5 +118,25 @@ mod tests {
         let sum: i64 = lua.load("return 1 + 41").eval().unwrap();
 
         assert_eq!(sum, 42);
+    }
+
+    #[test]
+    fn expose_document_sets_content_and_metadata_globals() {
+        let lua = sandboxed().unwrap();
+        let document = FakeDocument::new().build();
+
+        expose_document(&lua, &document).unwrap();
+
+        let content: mlua::LuaString = lua.load("return document.content").eval().unwrap();
+        assert_eq!(content.as_bytes().to_vec(), document.content());
+
+        let name: String = lua.load("return document.metadata.name").eval().unwrap();
+        assert_eq!(name, document.metadata().name());
+
+        let transcript: String = lua
+            .load("return document.metadata.transcript")
+            .eval()
+            .unwrap();
+        assert_eq!(transcript, document.metadata().transcript());
     }
 }

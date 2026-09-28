@@ -41,11 +41,12 @@ impl ScriptsClient {
 
 #[async_trait]
 impl Service for ScriptsClient {
-    async fn run_for_document(&self, _document: &Document) -> Result<()> {
+    async fn run_for_document(&self, document: &Document) -> Result<()> {
         let scripts = self.grpc.list_user_scripts().await?;
 
         for script in &scripts {
             let lua = vm::sandboxed()?;
+            vm::expose_document(&lua, document)?;
             lua.load(script.script())
                 .exec()
                 .context("failed to run script")?;
