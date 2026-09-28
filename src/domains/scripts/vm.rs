@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use mlua::{Lua, LuaOptions, StdLib};
 
 use crate::domains::documents::Document;
@@ -32,12 +35,21 @@ pub(super) fn sandboxed() -> Result<Lua> {
 
 /// Exposes `document` as a read-only-by-convention global table in `lua`,
 /// scoping a script's access to the document it's being run against: its raw
-/// `content` plus a `metadata` sub-table mirroring [`Metadata`]'s fields.
-/// Nothing beyond this document's own data is reachable from a script's Lua
-/// state.
+/// `content` plus a `metadata` sub-table mirroring [`Metadata`]'s fields, and
+/// a `set_name` method a script can call to rename the document. Nothing
+/// beyond this document's own data is reachable from a script's Lua state.
+///
+/// `set_name` never touches `document`, and this function never clones it or
+/// its [`Metadata`]: it only records the last name a script passed to
+/// `set_name` in the returned cell, which the caller compares against
+/// `document.metadata().name()` once the script has finished running to see
+/// whether a rename actually happened.
 ///
 /// [`Metadata`]: crate::domains::documents::Metadata
-pub(super) fn expose_document(lua: &Lua, document: &Document) -> Result<()> {
+pub(super) fn expose_document(
+    lua: &Lua,
+    document: &Document,
+) -> Result<Rc<RefCell<Option<String>>>> {
     let metadata = document.metadata();
     let metadata_table = lua
         .create_table()
@@ -83,11 +95,24 @@ pub(super) fn expose_document(lua: &Lua, document: &Document) -> Result<()> {
         .set("metadata", metadata_table)
         .context("failed to set document.metadata")?;
 
+    let new_name: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let set_name = {
+        let new_name = Rc::clone(&new_name);
+        lua.create_function(move |_, name: String| {
+            *new_name.borrow_mut() = Some(name);
+            Ok(())
+        })
+        .context("failed to create document.set_name lua function")?
+    };
+    document_table
+        .set("set_name", set_name)
+        .context("failed to set document.set_name")?;
+
     lua.globals()
         .set("document", document_table)
         .context("failed to expose document to the sandboxed lua vm")?;
 
-    Ok(())
+    Ok(new_name)
 }
 
 #[cfg(test)]
@@ -138,5 +163,46 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(transcript, document.metadata().transcript());
+    }
+
+    #[test]
+    fn expose_document_leaves_the_pending_name_empty_when_set_name_is_never_called() {
+        let lua = sandboxed().unwrap();
+        let document = FakeDocument::new().build();
+
+        let new_name = expose_document(&lua, &document).unwrap();
+
+        assert_eq!(*new_name.borrow(), None);
+    }
+
+    #[test]
+    fn expose_document_records_the_name_passed_to_set_name() {
+        let lua = sandboxed().unwrap();
+        let document = FakeDocument::new().build();
+
+        let new_name = expose_document(&lua, &document).unwrap();
+        lua.load(r#"document.set_name("new-name.pdf")"#)
+            .exec()
+            .unwrap();
+
+        assert_eq!(new_name.borrow().as_deref(), Some("new-name.pdf"));
+    }
+
+    #[test]
+    fn expose_document_keeps_the_latest_name_across_multiple_set_name_calls() {
+        let lua = sandboxed().unwrap();
+        let document = FakeDocument::new().build();
+
+        let new_name = expose_document(&lua, &document).unwrap();
+        lua.load(
+            r#"
+            document.set_name("first.pdf")
+            document.set_name("second.pdf")
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        assert_eq!(new_name.borrow().as_deref(), Some("second.pdf"));
     }
 }

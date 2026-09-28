@@ -17,6 +17,7 @@ pub use models::Script;
 
 use crate::Result;
 use crate::domains::documents::Document;
+use crate::domains::documents::Service as DocumentsService;
 use crate::domains::sessions::SessionsClient;
 
 /// Runs Lua scripts against a document inside a fully sandboxed VM (see
@@ -71,7 +72,11 @@ pub trait Service: Send + Sync {
 
 /// Initializes the scripts service: talks to the fyde server's scripts
 /// service over the shared `channel` connection, authenticating every call
-/// via `sessions`.
-pub(crate) fn init(channel: Channel, sessions: Arc<SessionsClient>) -> Arc<dyn Service> {
-    Arc::new(service::ScriptsClient::new(channel, sessions))
+/// via `sessions`, and publishes renames a script makes through `documents`.
+pub(crate) fn init(
+    channel: Channel,
+    sessions: Arc<SessionsClient>,
+    documents: Arc<dyn DocumentsService>,
+) -> Arc<dyn Service> {
+    Arc::new(service::ScriptsClient::new(channel, sessions, documents))
 }
