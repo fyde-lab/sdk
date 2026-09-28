@@ -242,11 +242,10 @@ mod tests {
         let (event_type, _id, content, metadata) = &sent[0];
         assert_eq!(*event_type, EventType::Created);
         assert_eq!(content.as_deref(), Some(pdf.as_slice()));
-        assert_eq!(
+        assert!(
             metadata
                 .as_ref()
-                .map(|metadata| metadata.transcript.as_str()),
-            Some("hello world\n")
+                .is_some_and(|metadata| metadata.transcript.contains("hello world"))
         );
         let file_stem = file.path().file_stem().unwrap().to_str().unwrap();
         let file_name = file.path().file_name().unwrap().to_str().unwrap();

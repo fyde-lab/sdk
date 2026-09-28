@@ -49,7 +49,7 @@ pub enum Error {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("pdf error: {0}")]
-    Pdf(#[from] lopdf::Error),
+    Pdf(#[from] pdf_oxide::Error),
     #[error("lua error: {0}")]
     Lua(#[from] mlua::Error),
     #[error("unsupported document extension {0:?}: only .pdf is supported")]

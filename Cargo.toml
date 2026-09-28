@@ -12,7 +12,6 @@ argon2 = "0.5.3"
 async-trait = "0.1.92"
 futures = "0.3.34"
 hkdf = "0.12.4"
-lopdf = "0.39"
 # `vendored` builds Lua from source rather than requiring a system install —
 # needed since this crate cross-compiles to Android/iOS (see `../CLAUDE.md`'s
 # `application/` entry) where no system Lua exists.
@@ -21,6 +20,12 @@ lopdf = "0.39"
 # points throughout the SDK.
 mlua = { version = "0.12.1", features = ["lua54", "vendored", "error-send"] }
 opaque-ke = { version = "4.0.1", features = ["argon2"] }
+# Pinned: 0.3.78+ requires `office_oxide ^0.1.9`, and every 0.1.9+ release of
+# `office_oxide` published so far fails to build against pdf_oxide's usage
+# (a missing-field compile error in `DocumentIR` construction) — an upstream
+# semver break. 0.3.77 is the last version compatible with office_oxide 0.1.8,
+# the last working release.
+pdf_oxide = "=0.3.77"
 prost = "0.14.4"
 rand = "0.10.2"
 # `opaque-ke` itself depends on `rand 0.8` with no features enabled;
@@ -75,6 +80,9 @@ anyhow = "1.0.104"
 # other direction, which is a supported cargo pattern since neither side's
 # regular dependencies (only their dev-dependencies) form the cycle.
 fyde-server = { path = "../server" }
+# Only used to hand-build minimal PDF fixtures for `documents/transcript.rs`
+# tests; extraction itself uses `pdf_oxide` (a regular dependency).
+lopdf = "0.39"
 mockall = "0.15.0"
 # Only used to force the `tests/` end-to-end suite to run serially (see
 # `tests/common/mod.rs` and the sdk CLAUDE.md's "must run serially" note) —
