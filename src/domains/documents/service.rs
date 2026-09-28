@@ -108,6 +108,11 @@ impl<S: Storage> Service for DocumentsClient<S> {
                 .map(|byte| format!("{byte:02x}"))
                 .collect(),
             transcript: doc_transcript,
+            r#type: String::new(),
+            source_category: String::new(),
+            source_sub_category: None,
+            subject: String::new(),
+            qualification: String::new(),
         };
 
         self.changelog
@@ -290,6 +295,11 @@ mod tests {
                 size: 5,
                 checksum: "deadbeef".to_string(),
                 transcript: String::new(),
+                r#type: String::new(),
+                source_category: String::new(),
+                source_sub_category: None,
+                subject: String::new(),
+                qualification: String::new(),
             },
         };
 
@@ -322,6 +332,11 @@ mod tests {
                     size: 0,
                     checksum: String::new(),
                     transcript: String::new(),
+                    r#type: String::new(),
+                    source_category: String::new(),
+                    source_sub_category: None,
+                    subject: String::new(),
+                    qualification: String::new(),
                 },
             },
             Document {
@@ -336,6 +351,11 @@ mod tests {
                     size: 0,
                     checksum: String::new(),
                     transcript: String::new(),
+                    r#type: String::new(),
+                    source_category: String::new(),
+                    source_sub_category: None,
+                    subject: String::new(),
+                    qualification: String::new(),
                 },
             },
         ];
@@ -372,6 +392,11 @@ mod tests {
             size: 5,
             checksum: "deadbeef".to_string(),
             transcript: String::new(),
+            r#type: String::new(),
+            source_category: String::new(),
+            source_sub_category: None,
+            subject: String::new(),
+            qualification: String::new(),
         };
 
         let changelog = Arc::new(RecordingChangelog::default());

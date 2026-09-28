@@ -23,8 +23,8 @@ impl SqliteStorage {
 impl Storage for SqliteStorage {
     async fn save_document(&self, document: &Document) -> Result<()> {
         sqlx::query(
-            "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subject, qualification)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )
         .bind(document.id.to_string())
         .bind(&document.metadata.name)
@@ -34,6 +34,11 @@ impl Storage for SqliteStorage {
         .bind(&document.metadata.checksum)
         .bind(document.metadata.created_at)
         .bind(&document.metadata.transcript)
+        .bind(&document.metadata.r#type)
+        .bind(&document.metadata.source_category)
+        .bind(&document.metadata.source_sub_category)
+        .bind(&document.metadata.subject)
+        .bind(&document.metadata.qualification)
         .execute(&self.pool)
         .await
         .with_context(|| format!("failed to save document {} to local database", document.id))?;
@@ -43,7 +48,7 @@ impl Storage for SqliteStorage {
 
     async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
         let row = sqlx::query(
-            "SELECT name, original_name, content_type, content, checksum, created_at, transcript FROM documents WHERE id = ?1",
+            "SELECT name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subject, qualification FROM documents WHERE id = ?1",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -67,6 +72,11 @@ impl Storage for SqliteStorage {
                 size: content.len() as u64,
                 checksum: row.get("checksum"),
                 transcript: row.get("transcript"),
+                r#type: row.get("type"),
+                source_category: row.get("source_category"),
+                source_sub_category: row.get("source_sub_category"),
+                subject: row.get("subject"),
+                qualification: row.get("qualification"),
             },
             content,
         }))
@@ -74,7 +84,7 @@ impl Storage for SqliteStorage {
 
     async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
         let rows = sqlx::query(
-            "SELECT id, name, original_name, content_type, content, checksum, created_at, transcript FROM documents
+            "SELECT id, name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subject, qualification FROM documents
              ORDER BY created_at ASC, id ASC
              LIMIT ?1 OFFSET ?2",
         )
@@ -102,6 +112,11 @@ impl Storage for SqliteStorage {
                         size: content.len() as u64,
                         checksum: row.get("checksum"),
                         transcript: row.get("transcript"),
+                        r#type: row.get("type"),
+                        source_category: row.get("source_category"),
+                        source_sub_category: row.get("source_sub_category"),
+                        subject: row.get("subject"),
+                        qualification: row.get("qualification"),
                     },
                     content,
                 })
@@ -112,8 +127,8 @@ impl Storage for SqliteStorage {
     async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()> {
         sqlx::query(
             "UPDATE documents
-             SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6
-             WHERE id = ?7",
+             SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6, type = ?7, source_category = ?8, source_sub_category = ?9, subject = ?10, qualification = ?11
+             WHERE id = ?12",
         )
         .bind(&metadata.name)
         .bind(&metadata.original_name)
@@ -121,6 +136,11 @@ impl Storage for SqliteStorage {
         .bind(&metadata.checksum)
         .bind(metadata.created_at)
         .bind(&metadata.transcript)
+        .bind(&metadata.r#type)
+        .bind(&metadata.source_category)
+        .bind(&metadata.source_sub_category)
+        .bind(&metadata.subject)
+        .bind(&metadata.qualification)
         .bind(id.to_string())
         .execute(&self.pool)
         .await
@@ -177,6 +197,11 @@ mod tests {
                     size: 5,
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
+                    r#type: String::new(),
+                    source_category: String::new(),
+                    source_sub_category: None,
+                    subject: String::new(),
+                    qualification: String::new(),
                 },
             })
             .await
@@ -198,6 +223,11 @@ mod tests {
                     size: 5,
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
+                    r#type: String::new(),
+                    source_category: String::new(),
+                    source_sub_category: None,
+                    subject: String::new(),
+                    qualification: String::new(),
                 },
             }
         );
@@ -221,6 +251,11 @@ mod tests {
                     size: 3,
                     checksum: "checksum-one".to_string(),
                     transcript: String::new(),
+                    r#type: String::new(),
+                    source_category: String::new(),
+                    source_sub_category: None,
+                    subject: String::new(),
+                    qualification: String::new(),
                 },
             })
             .await
@@ -238,6 +273,11 @@ mod tests {
                     size: 3,
                     checksum: "checksum-two".to_string(),
                     transcript: String::new(),
+                    r#type: String::new(),
+                    source_category: String::new(),
+                    source_sub_category: None,
+                    subject: String::new(),
+                    qualification: String::new(),
                 },
             })
             .await
@@ -265,6 +305,11 @@ mod tests {
                         size: 0,
                         checksum: String::new(),
                         transcript: String::new(),
+                        r#type: String::new(),
+                        source_category: String::new(),
+                        source_sub_category: None,
+                        subject: String::new(),
+                        qualification: String::new(),
                     },
                 })
                 .await
@@ -329,6 +374,11 @@ mod tests {
                     size: 5,
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
+                    r#type: String::new(),
+                    source_category: String::new(),
+                    source_sub_category: None,
+                    subject: String::new(),
+                    qualification: String::new(),
                 },
             })
             .await
@@ -346,6 +396,11 @@ mod tests {
                     size: 0,
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
+                    r#type: String::new(),
+                    source_category: String::new(),
+                    source_sub_category: None,
+                    subject: String::new(),
+                    qualification: String::new(),
                 },
             )
             .await
@@ -372,6 +427,11 @@ mod tests {
                     size: 0,
                     checksum: String::new(),
                     transcript: String::new(),
+                    r#type: String::new(),
+                    source_category: String::new(),
+                    source_sub_category: None,
+                    subject: String::new(),
+                    qualification: String::new(),
                 },
             )
             .await;

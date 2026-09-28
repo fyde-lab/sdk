@@ -17,6 +17,11 @@ pub struct Metadata {
     /// Plaintext transcript of the document's PDF text content, extracted
     /// on upload.
     pub(super) transcript: String,
+    pub(super) r#type: String,
+    pub(super) source_category: String,
+    pub(super) source_sub_category: Option<String>,
+    pub(super) subject: String,
+    pub(super) qualification: String,
 }
 
 impl Metadata {
@@ -50,6 +55,26 @@ impl Metadata {
 
     pub fn transcript(&self) -> &str {
         &self.transcript
+    }
+
+    pub fn r#type(&self) -> &str {
+        &self.r#type
+    }
+
+    pub fn source_category(&self) -> &str {
+        &self.source_category
+    }
+
+    pub fn source_sub_category(&self) -> Option<&str> {
+        self.source_sub_category.as_deref()
+    }
+
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub fn qualification(&self) -> &str {
+        &self.qualification
     }
 }
 
@@ -112,6 +137,11 @@ impl FakeMetadata {
                     "This is a fake transcript about {}.",
                     crate::testing::random_word()
                 ),
+                r#type: crate::testing::random_word().to_string(),
+                source_category: crate::testing::random_word().to_string(),
+                source_sub_category: Some(crate::testing::random_word().to_string()),
+                subject: crate::testing::random_word().to_string(),
+                qualification: crate::testing::random_word().to_string(),
             },
         }
     }
@@ -153,6 +183,34 @@ impl FakeMetadata {
 
     pub(crate) fn with_transcript(mut self, transcript: impl Into<String>) -> Self {
         self.metadata.transcript = transcript.into();
+        self
+    }
+
+    pub(crate) fn with_type(mut self, r#type: impl Into<String>) -> Self {
+        self.metadata.r#type = r#type.into();
+        self
+    }
+
+    pub(crate) fn with_source_category(mut self, source_category: impl Into<String>) -> Self {
+        self.metadata.source_category = source_category.into();
+        self
+    }
+
+    pub(crate) fn with_source_sub_category(
+        mut self,
+        source_sub_category: impl Into<Option<String>>,
+    ) -> Self {
+        self.metadata.source_sub_category = source_sub_category.into();
+        self
+    }
+
+    pub(crate) fn with_subject(mut self, subject: impl Into<String>) -> Self {
+        self.metadata.subject = subject.into();
+        self
+    }
+
+    pub(crate) fn with_qualification(mut self, qualification: impl Into<String>) -> Self {
+        self.metadata.qualification = qualification.into();
         self
     }
 
@@ -227,6 +285,11 @@ mod tests {
             .with_size(42)
             .with_checksum("deadbeef")
             .with_transcript("hello world")
+            .with_type("invoice")
+            .with_source_category("finance")
+            .with_source_sub_category(Some("billing".to_string()))
+            .with_subject("Q1 report")
+            .with_qualification("verified")
             .build();
 
         assert_eq!(metadata.id, id);
@@ -237,6 +300,11 @@ mod tests {
         assert_eq!(metadata.size, 42);
         assert_eq!(metadata.checksum, "deadbeef");
         assert_eq!(metadata.transcript, "hello world");
+        assert_eq!(metadata.r#type, "invoice");
+        assert_eq!(metadata.source_category, "finance");
+        assert_eq!(metadata.source_sub_category.as_deref(), Some("billing"));
+        assert_eq!(metadata.subject, "Q1 report");
+        assert_eq!(metadata.qualification, "verified");
     }
 
     #[test]

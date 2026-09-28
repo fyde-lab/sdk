@@ -1,0 +1,5 @@
+ALTER TABLE documents ADD COLUMN type TEXT NOT NULL DEFAULT '';
+ALTER TABLE documents ADD COLUMN source_category TEXT NOT NULL DEFAULT '';
+ALTER TABLE documents ADD COLUMN source_sub_category TEXT;
+ALTER TABLE documents ADD COLUMN subject TEXT NOT NULL DEFAULT '';
+ALTER TABLE documents ADD COLUMN qualification TEXT NOT NULL DEFAULT '';

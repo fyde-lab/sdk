@@ -53,6 +53,11 @@ pub struct FfiMetadata {
     pub size: u64,
     pub checksum: String,
     pub transcript: String,
+    pub r#type: String,
+    pub source_category: String,
+    pub source_sub_category: Option<String>,
+    pub subject: String,
+    pub qualification: String,
 }
 
 impl From<Metadata> for FfiMetadata {
@@ -66,6 +71,11 @@ impl From<Metadata> for FfiMetadata {
             size: metadata.size(),
             checksum: metadata.checksum().to_string(),
             transcript: metadata.transcript().to_string(),
+            r#type: metadata.r#type().to_string(),
+            source_category: metadata.source_category().to_string(),
+            source_sub_category: metadata.source_sub_category().map(str::to_string),
+            subject: metadata.subject().to_string(),
+            qualification: metadata.qualification().to_string(),
         }
     }
 }
@@ -508,6 +518,14 @@ mod tests {
         assert_eq!(ffi.size, metadata.size());
         assert_eq!(ffi.checksum, metadata.checksum());
         assert_eq!(ffi.transcript, metadata.transcript());
+        assert_eq!(ffi.r#type, metadata.r#type());
+        assert_eq!(ffi.source_category, metadata.source_category());
+        assert_eq!(
+            ffi.source_sub_category.as_deref(),
+            metadata.source_sub_category()
+        );
+        assert_eq!(ffi.subject, metadata.subject());
+        assert_eq!(ffi.qualification, metadata.qualification());
     }
 
     #[test]
