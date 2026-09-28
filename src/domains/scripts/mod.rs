@@ -45,6 +45,18 @@ pub trait Service: Send + Sync {
     /// Fetches the script matching `id`.
     async fn fetch_script(&self, id: Uuid) -> Result<Script>;
 
+    /// Updates a script owned by the authenticated user, incrementing its
+    /// version. Fails if the script doesn't exist or the authenticated user
+    /// isn't its owner.
+    async fn update_script(
+        &self,
+        id: Uuid,
+        name: &str,
+        is_public: bool,
+        icon: Vec<u8>,
+        script: &str,
+    ) -> Result<Script>;
+
     /// Enables `script_id` for the authenticated user. Enabling an
     /// already-enabled script is a no-op.
     async fn enable_script(&self, script_id: Uuid) -> Result<()>;

@@ -19,7 +19,8 @@ mod proto {
 
 use proto::{
     CreateScriptRequest, DisableScriptRequest, EnableScriptRequest, FetchScriptRequest,
-    ListUserScriptsRequest, scripts_service_client::ScriptsServiceClient as GeneratedScriptsClient,
+    ListUserScriptsRequest, UpdateScriptRequest,
+    scripts_service_client::ScriptsServiceClient as GeneratedScriptsClient,
 };
 
 /// A gRPC transport for talking to the fyde server's scripts service. Knows
@@ -41,6 +42,17 @@ pub(super) trait FydeClient: Send + Sync {
 
     /// Fetches the script matching `id`.
     async fn fetch_script(&self, id: Uuid) -> Result<Script>;
+
+    /// Updates a script owned by the authenticated user, incrementing its
+    /// version.
+    async fn update_script(
+        &self,
+        id: Uuid,
+        name: &str,
+        is_public: bool,
+        icon: Vec<u8>,
+        script: &str,
+    ) -> Result<Script>;
 
     /// Enables `script_id` for the authenticated user.
     async fn enable_script(&self, script_id: Uuid) -> Result<()>;
@@ -142,6 +154,37 @@ impl FydeClient for GrpcClient {
 
         into_domain(response.script.ok_or_else(|| {
             crate::Error::InvalidResponse("fetch script response had no script".to_string())
+        })?)
+    }
+
+    async fn update_script(
+        &self,
+        id: Uuid,
+        name: &str,
+        is_public: bool,
+        icon: Vec<u8>,
+        script: &str,
+    ) -> Result<Script> {
+        let request = self
+            .sessions
+            .authenticated_request(UpdateScriptRequest {
+                id: id.to_string(),
+                name: name.to_string(),
+                is_public,
+                icon,
+                script: script.to_string(),
+            })
+            .await?;
+
+        let response = self
+            .client()
+            .update_script(request)
+            .await
+            .context("failed to update script")?
+            .into_inner();
+
+        into_domain(response.script.ok_or_else(|| {
+            crate::Error::InvalidResponse("update script response had no script".to_string())
         })?)
     }
 

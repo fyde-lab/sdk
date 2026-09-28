@@ -69,6 +69,19 @@ impl Service for ScriptsClient {
         self.grpc.fetch_script(id).await
     }
 
+    async fn update_script(
+        &self,
+        id: Uuid,
+        name: &str,
+        is_public: bool,
+        icon: Vec<u8>,
+        script: &str,
+    ) -> Result<Script> {
+        self.grpc
+            .update_script(id, name, is_public, icon, script)
+            .await
+    }
+
     async fn enable_script(&self, script_id: Uuid) -> Result<()> {
         self.grpc.enable_script(script_id).await
     }
@@ -160,6 +173,34 @@ mod tests {
         let client = ScriptsClient::with_grpc(mock_grpc);
 
         assert_eq!(client.fetch_script(id).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn update_script_delegates_to_grpc() {
+        let expected = FakeScript::new().build();
+        let id = expected.id();
+        let returned = expected.clone();
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_update_script()
+            .withf(move |requested_id, name, is_public, icon, script| {
+                *requested_id == id
+                    && name == "my-script"
+                    && *is_public
+                    && icon == b"icon-bytes"
+                    && script == "return 1"
+            })
+            .times(1)
+            .returning(move |_, _, _, _, _| Ok(returned.clone()));
+
+        let client = ScriptsClient::with_grpc(mock_grpc);
+
+        let script = client
+            .update_script(id, "my-script", true, b"icon-bytes".to_vec(), "return 1")
+            .await
+            .unwrap();
+
+        assert_eq!(script, expected);
     }
 
     #[tokio::test]

@@ -419,6 +419,25 @@ impl FydeClient {
         Ok(script.into())
     }
 
+    /// Updates a script owned by the authenticated user, incrementing its
+    /// version. Mirrors [`crate::ScriptsService::update_script`].
+    pub async fn update_script(
+        &self,
+        id: String,
+        name: String,
+        is_public: bool,
+        icon: Vec<u8>,
+        script: String,
+    ) -> Result<FfiScript, FfiError> {
+        let id = parse_uuid(&id)?;
+        let script = self
+            .inner
+            .scripts()
+            .update_script(id, &name, is_public, icon, &script)
+            .await?;
+        Ok(script.into())
+    }
+
     /// Enables `script_id` for the authenticated user. Mirrors
     /// [`crate::ScriptsService::enable_script`].
     pub async fn enable_script(&self, script_id: String) -> Result<(), FfiError> {
