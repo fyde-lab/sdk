@@ -67,8 +67,12 @@ impl Service for ScriptsClient {
             if let Some(new_name) = new_name
                 && new_name != document.metadata().name()
             {
+                let metadata = crate::domains::documents::Metadata {
+                    name: new_name,
+                    ..document.metadata().clone()
+                };
                 self.documents
-                    .update_name(document.metadata().clone(), new_name)
+                    .update_metadata(metadata)
                     .await
                     .context("failed to publish the document name a script set")?;
             }
@@ -127,16 +131,13 @@ mod tests {
     use crate::domains::scripts::FakeScript;
     use crate::domains::scripts::grpc_client::MockFydeClient;
 
-    /// A single `update_name` call recorded by [`RecordingDocuments`].
-    type UpdateNameCall = (Metadata, String);
-
     /// A [`DocumentsService`] fake recording every call to
-    /// [`DocumentsService::update_name`], for tests that don't need a live
-    /// changelog. Every other method is unused by [`ScriptsClient`], so left
-    /// unimplemented.
+    /// [`DocumentsService::update_metadata`], for tests that don't need a
+    /// live changelog. Every other method is unused by [`ScriptsClient`], so
+    /// left unimplemented.
     #[derive(Default)]
     struct RecordingDocuments {
-        update_name_calls: Mutex<Vec<UpdateNameCall>>,
+        update_metadata_calls: Mutex<Vec<Metadata>>,
     }
 
     #[async_trait]
@@ -153,11 +154,8 @@ mod tests {
             unimplemented!()
         }
 
-        async fn update_name(&self, metadata: Metadata, new_name: String) -> Result<()> {
-            self.update_name_calls
-                .lock()
-                .unwrap()
-                .push((metadata, new_name));
+        async fn update_metadata(&self, metadata: Metadata) -> Result<()> {
+            self.update_metadata_calls.lock().unwrap().push(metadata);
             Ok(())
         }
 
@@ -226,11 +224,16 @@ mod tests {
 
         client.run_for_document(&document).await.unwrap();
 
-        let calls = documents.update_name_calls.lock().unwrap();
+        let calls = documents.update_metadata_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        let (metadata, new_name) = &calls[0];
-        assert_eq!(*metadata, *document.metadata());
-        assert_eq!(new_name, "renamed.pdf");
+        let metadata = &calls[0];
+        assert_eq!(
+            *metadata,
+            Metadata {
+                name: "renamed.pdf".to_string(),
+                ..document.metadata().clone()
+            }
+        );
     }
 
     #[tokio::test]
@@ -248,7 +251,7 @@ mod tests {
 
         client.run_for_document(&document).await.unwrap();
 
-        assert!(documents.update_name_calls.lock().unwrap().is_empty());
+        assert!(documents.update_metadata_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -271,7 +274,7 @@ mod tests {
 
         client.run_for_document(&document).await.unwrap();
 
-        assert!(documents.update_name_calls.lock().unwrap().is_empty());
+        assert!(documents.update_metadata_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

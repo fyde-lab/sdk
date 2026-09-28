@@ -80,6 +80,28 @@ impl From<Metadata> for FfiMetadata {
     }
 }
 
+impl TryFrom<FfiMetadata> for Metadata {
+    type Error = FfiError;
+
+    fn try_from(metadata: FfiMetadata) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: parse_uuid(&metadata.id)?,
+            name: metadata.name,
+            original_name: metadata.original_name,
+            content_type: metadata.content_type,
+            created_at: metadata.created_at,
+            size: metadata.size,
+            checksum: metadata.checksum,
+            transcript: metadata.transcript,
+            r#type: metadata.r#type,
+            source_category: metadata.source_category,
+            source_sub_category: metadata.source_sub_category,
+            subject: metadata.subject,
+            qualification: metadata.qualification,
+        })
+    }
+}
+
 /// A document, mirroring [`Document`] across the FFI boundary. `id` crosses
 /// as a string since UniFFI has no native UUID type.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -390,6 +412,16 @@ impl FydeClient {
         Ok(documents.into_iter().map(FfiDocument::from).collect())
     }
 
+    /// Encrypts `metadata` as given and publishes it as an "update metadata"
+    /// changelog event, replacing whatever metadata was previously
+    /// associated with `metadata.id`. Mirrors
+    /// [`crate::DocumentsService::update_metadata`].
+    pub async fn update_document_metadata(&self, metadata: FfiMetadata) -> Result<(), FfiError> {
+        let metadata = Metadata::try_from(metadata)?;
+        self.inner.documents().update_metadata(metadata).await?;
+        Ok(())
+    }
+
     /// Persists `language` as this device's UI language preference. Mirrors
     /// [`crate::UsersService::set_language`].
     pub async fn set_language(&self, language: String) -> Result<(), FfiError> {
@@ -526,6 +558,24 @@ mod tests {
         );
         assert_eq!(ffi.subject, metadata.subject());
         assert_eq!(ffi.qualification, metadata.qualification());
+    }
+
+    #[test]
+    fn metadata_conversion_roundtrips_through_ffi() {
+        let metadata = FakeMetadata::new().build();
+
+        let ffi: FfiMetadata = metadata.clone().into();
+        let roundtripped = Metadata::try_from(ffi).unwrap();
+
+        assert_eq!(roundtripped, metadata);
+    }
+
+    #[test]
+    fn metadata_conversion_rejects_a_malformed_id() {
+        let mut ffi: FfiMetadata = FakeMetadata::new().build().into();
+        ffi.id = "not-a-uuid".to_string();
+
+        assert!(Metadata::try_from(ffi).is_err());
     }
 
     #[test]

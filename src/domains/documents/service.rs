@@ -131,12 +131,8 @@ impl<S: Storage> Service for DocumentsClient<S> {
         self.storage.list_documents(offset, limit).await
     }
 
-    async fn update_name(&self, metadata: Metadata, new_name: String) -> Result<()> {
+    async fn update_metadata(&self, metadata: Metadata) -> Result<()> {
         let id = metadata.id;
-        let metadata = Metadata {
-            name: new_name,
-            ..metadata
-        };
 
         self.changelog
             .send(EventType::UpdateMetadata, id, None, Some(&metadata))
@@ -381,31 +377,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_name_publishes_an_update_metadata_event_with_the_new_name() {
-        let id = Uuid::now_v7();
-        let metadata = Metadata {
-            id,
-            name: "old.pdf".to_string(),
-            original_name: "old.pdf".to_string(),
-            content_type: PDF_CONTENT_TYPE.to_string(),
-            created_at: 1_700_000_000,
-            size: 5,
-            checksum: "deadbeef".to_string(),
-            transcript: String::new(),
-            r#type: String::new(),
-            source_category: String::new(),
-            source_sub_category: None,
-            subject: String::new(),
-            qualification: String::new(),
-        };
+    async fn update_metadata_publishes_an_update_metadata_event_with_the_given_metadata() {
+        let metadata = super::super::FakeMetadata::new()
+            .with_name("new.pdf")
+            .with_subject("new-subject")
+            .build();
+        let id = metadata.id;
 
         let changelog = Arc::new(RecordingChangelog::default());
         let client = DocumentsClient::new(MockStorage::new(), changelog.clone(), None);
 
-        client
-            .update_name(metadata, "new.pdf".to_string())
-            .await
-            .unwrap();
+        client.update_metadata(metadata).await.unwrap();
 
         let sent = changelog.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
@@ -415,8 +397,7 @@ mod tests {
         assert_eq!(*content, None);
         let metadata = metadata.as_ref().unwrap();
         assert_eq!(metadata.name, "new.pdf");
-        assert_eq!(metadata.original_name, "old.pdf");
-        assert_eq!(metadata.checksum, "deadbeef");
+        assert_eq!(metadata.subject, "new-subject");
     }
 
     #[tokio::test]

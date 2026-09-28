@@ -98,10 +98,14 @@ async fn document_lifecycle() {
                 .context("failed to read document before renaming")?
                 .context("document missing from local cache before renaming")?;
 
+            let metadata = fyde_sdk::Metadata {
+                name: "renamed.pdf".to_string(),
+                ..document.metadata().clone()
+            };
             scenario
                 .client
                 .documents()
-                .update_name(document.metadata().clone(), "renamed.pdf".to_string())
+                .update_metadata(metadata)
                 .await
                 .context("failed to rename document")?;
             Ok(())

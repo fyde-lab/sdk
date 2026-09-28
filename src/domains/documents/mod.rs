@@ -55,10 +55,12 @@ pub trait Service: Send + Sync {
     /// length until it comes back shorter than `limit`.
     async fn list(&self, offset: i64, limit: i64) -> Result<Vec<Document>>;
 
-    /// Renames a document: replaces `metadata`'s `name` with `new_name`,
-    /// encrypts the result, and publishes it as an "update metadata"
-    /// changelog event.
-    async fn update_name(&self, metadata: Metadata, new_name: String) -> Result<()>;
+    /// Encrypts `metadata` as given and publishes it as an "update metadata"
+    /// changelog event, replacing whatever metadata was previously
+    /// associated with `metadata.id`. The caller is responsible for
+    /// constructing the full replacement `Metadata` (its fields are public
+    /// for this purpose).
+    async fn update_metadata(&self, metadata: Metadata) -> Result<()>;
 
     /// Starts a background job that streams and decrypts every changelog
     /// event since the last consumed id, oldest first (replaying persisted

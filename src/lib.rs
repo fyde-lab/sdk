@@ -14,7 +14,7 @@ pub use ffi::{FfiError, FydeClient};
 
 use std::sync::Arc;
 
-pub use domains::documents::{ChangelogEvent, Document, Service as DocumentsService};
+pub use domains::documents::{ChangelogEvent, Document, Metadata, Service as DocumentsService};
 pub use domains::scripts::Service as ScriptsService;
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;

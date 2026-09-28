@@ -5,23 +5,23 @@ use uuid::Uuid;
 /// decrypted back out of it on download.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Metadata {
-    pub(super) id: Uuid,
-    pub(super) name: String,
+    pub id: Uuid,
+    pub name: String,
     /// The file name as originally uploaded. Unlike `name`, this never
     /// changes after creation.
-    pub(super) original_name: String,
-    pub(super) content_type: String,
-    pub(super) created_at: i64,
-    pub(super) size: u64,
-    pub(super) checksum: String,
+    pub original_name: String,
+    pub content_type: String,
+    pub created_at: i64,
+    pub size: u64,
+    pub checksum: String,
     /// Plaintext transcript of the document's PDF text content, extracted
     /// on upload.
-    pub(super) transcript: String,
-    pub(super) r#type: String,
-    pub(super) source_category: String,
-    pub(super) source_sub_category: Option<String>,
-    pub(super) subject: String,
-    pub(super) qualification: String,
+    pub transcript: String,
+    pub r#type: String,
+    pub source_category: String,
+    pub source_sub_category: Option<String>,
+    pub subject: String,
+    pub qualification: String,
 }
 
 impl Metadata {

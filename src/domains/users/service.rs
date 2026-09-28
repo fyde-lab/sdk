@@ -352,10 +352,9 @@ mod tests {
             unimplemented!()
         }
 
-        async fn update_name(
+        async fn update_metadata(
             &self,
             _metadata: crate::domains::documents::Metadata,
-            _new_name: String,
         ) -> Result<()> {
             unimplemented!()
         }
