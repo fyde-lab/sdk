@@ -4,6 +4,7 @@ mod service;
 mod storage;
 mod storage_sqlite;
 mod transcript;
+mod vm;
 
 #[cfg(test)]
 pub(crate) use changelog::FakeChangelogEvent;

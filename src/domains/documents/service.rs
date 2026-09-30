@@ -6,12 +6,12 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::domains::scripts::{Service as ScriptsService, vm};
+use crate::domains::scripts::Service as ScriptsService;
 use crate::{Error, ErrorContext as _, Result};
 
 use super::changelog::{ChangelogEvent, EventType, Service as ChangelogService};
 use super::storage::Storage;
-use super::{Document, Metadata, Service, transcript};
+use super::{Document, Metadata, Service, transcript, vm};
 
 /// The only content type [`Service::upload`] currently accepts.
 pub(super) const PDF_CONTENT_TYPE: &str = "application/pdf";

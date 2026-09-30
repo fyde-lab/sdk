@@ -1,7 +1,6 @@
 mod grpc_client;
 mod models;
 mod service;
-pub(crate) mod vm;
 
 use std::sync::Arc;
 
@@ -21,10 +20,10 @@ use crate::domains::sessions::SessionsClient;
 /// Manages user-authored scripts against the fyde server's scripts service
 /// (see `grpc_client.rs`): creating them, fetching them by id,
 /// enabling/disabling them for the authenticated user, and listing the ones
-/// currently enabled. Running scripts against a document is done by callers
-/// directly, using [`Service::list_user_scripts`] together with the `vm`
-/// module. Trait methods take `&self` (not `&mut self`) so implementations
-/// can be shared behind `Arc<dyn Service>`.
+/// currently enabled. Running scripts against a document is done by the
+/// `documents` domain, using [`Service::list_user_scripts`] together with
+/// its own `vm` module. Trait methods take `&self` (not `&mut self`) so
+/// implementations can be shared behind `Arc<dyn Service>`.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Service: Send + Sync {

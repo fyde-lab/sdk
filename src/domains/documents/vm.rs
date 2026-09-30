@@ -16,7 +16,7 @@ use crate::{ErrorContext as _, Result};
 /// (direct filesystem access) and `load` (arbitrary/binary chunk loading)
 /// are stripped from the globals table by hand afterwards to close that
 /// gap.
-pub(crate) fn sandboxed() -> Result<Lua> {
+pub(super) fn sandboxed() -> Result<Lua> {
     let libs = StdLib::TABLE | StdLib::STRING | StdLib::MATH;
     let lua =
         Lua::new_with(libs, LuaOptions::new()).context("failed to create sandboxed lua vm")?;
@@ -39,7 +39,7 @@ pub(crate) fn sandboxed() -> Result<Lua> {
 /// table back out once the script has finished running so the caller can see
 /// which fields, if any, changed. Nothing beyond this document's own data is
 /// reachable from a script's Lua state.
-pub(crate) fn expose_document(lua: &Lua, document: &Document) -> Result<()> {
+pub(super) fn expose_document(lua: &Lua, document: &Document) -> Result<()> {
     let metadata_table = metadata_to_table(lua, document.metadata())?;
 
     let document_table = lua
@@ -120,7 +120,7 @@ fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
 /// script assigned into the table. Called once a script has finished
 /// running, so the caller can compare the result against `original` to see
 /// which fields, if any, the script changed.
-pub(crate) fn read_metadata(lua: &Lua, original: &Metadata) -> Result<Metadata> {
+pub(super) fn read_metadata(lua: &Lua, original: &Metadata) -> Result<Metadata> {
     let document_table: mlua::Table = lua
         .globals()
         .get("document")
