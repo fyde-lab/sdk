@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::{ErrorContext as _, Result};
 
 use super::storage::Storage;
-use super::{Document, Metadata};
+use super::{Document, Metadata, SourceCategory, SourceSubCategory};
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
 /// `documents` table).
@@ -17,6 +17,37 @@ impl SqliteStorage {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+}
+
+/// The `source_category` column has no NULL state (`NOT NULL DEFAULT ''`),
+/// so an unclassified document is stored as an empty string.
+fn source_category_to_column(source_category: Option<SourceCategory>) -> String {
+    source_category.map_or_else(String::new, |category| category.as_str().to_string())
+}
+
+fn source_category_from_column(column: String) -> Result<Option<SourceCategory>> {
+    if column.is_empty() {
+        return Ok(None);
+    }
+
+    column
+        .parse()
+        .map(Some)
+        .with_context(|| format!("invalid source category in local database: {column}"))
+}
+
+fn source_sub_category_to_column(source_sub_category: Option<SourceSubCategory>) -> Option<String> {
+    source_sub_category.map(|category| category.as_str().to_string())
+}
+
+fn source_sub_category_from_column(column: Option<String>) -> Result<Option<SourceSubCategory>> {
+    column
+        .map(|column| {
+            column
+                .parse()
+                .with_context(|| format!("invalid source sub-category in local database: {column}"))
+        })
+        .transpose()
 }
 
 #[async_trait]
@@ -35,8 +66,10 @@ impl Storage for SqliteStorage {
         .bind(document.metadata.created_at)
         .bind(&document.metadata.transcript)
         .bind(&document.metadata.r#type)
-        .bind(&document.metadata.source_category)
-        .bind(&document.metadata.source_sub_category)
+        .bind(source_category_to_column(document.metadata.source_category))
+        .bind(source_sub_category_to_column(
+            document.metadata.source_sub_category,
+        ))
         .bind(&document.metadata.subject)
         .bind(&document.metadata.qualification)
         .execute(&self.pool)
@@ -73,8 +106,10 @@ impl Storage for SqliteStorage {
                 checksum: row.get("checksum"),
                 transcript: row.get("transcript"),
                 r#type: row.get("type"),
-                source_category: row.get("source_category"),
-                source_sub_category: row.get("source_sub_category"),
+                source_category: source_category_from_column(row.get("source_category"))?,
+                source_sub_category: source_sub_category_from_column(
+                    row.get("source_sub_category"),
+                )?,
                 subject: row.get("subject"),
                 qualification: row.get("qualification"),
             },
@@ -113,8 +148,10 @@ impl Storage for SqliteStorage {
                         checksum: row.get("checksum"),
                         transcript: row.get("transcript"),
                         r#type: row.get("type"),
-                        source_category: row.get("source_category"),
-                        source_sub_category: row.get("source_sub_category"),
+                        source_category: source_category_from_column(row.get("source_category"))?,
+                        source_sub_category: source_sub_category_from_column(
+                            row.get("source_sub_category"),
+                        )?,
                         subject: row.get("subject"),
                         qualification: row.get("qualification"),
                     },
@@ -137,8 +174,10 @@ impl Storage for SqliteStorage {
         .bind(metadata.created_at)
         .bind(&metadata.transcript)
         .bind(&metadata.r#type)
-        .bind(&metadata.source_category)
-        .bind(&metadata.source_sub_category)
+        .bind(source_category_to_column(metadata.source_category))
+        .bind(source_sub_category_to_column(
+            metadata.source_sub_category,
+        ))
         .bind(&metadata.subject)
         .bind(&metadata.qualification)
         .bind(id.to_string())
@@ -198,7 +237,7 @@ mod tests {
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
                     r#type: String::new(),
-                    source_category: String::new(),
+                    source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
                     qualification: String::new(),
@@ -224,7 +263,7 @@ mod tests {
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
                     r#type: String::new(),
-                    source_category: String::new(),
+                    source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
                     qualification: String::new(),
@@ -252,7 +291,7 @@ mod tests {
                     checksum: "checksum-one".to_string(),
                     transcript: String::new(),
                     r#type: String::new(),
-                    source_category: String::new(),
+                    source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
                     qualification: String::new(),
@@ -274,7 +313,7 @@ mod tests {
                     checksum: "checksum-two".to_string(),
                     transcript: String::new(),
                     r#type: String::new(),
-                    source_category: String::new(),
+                    source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
                     qualification: String::new(),
@@ -306,7 +345,7 @@ mod tests {
                         checksum: String::new(),
                         transcript: String::new(),
                         r#type: String::new(),
-                        source_category: String::new(),
+                        source_category: None,
                         source_sub_category: None,
                         subject: String::new(),
                         qualification: String::new(),
@@ -375,7 +414,7 @@ mod tests {
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
                     r#type: String::new(),
-                    source_category: String::new(),
+                    source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
                     qualification: String::new(),
@@ -397,7 +436,7 @@ mod tests {
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
                     r#type: String::new(),
-                    source_category: String::new(),
+                    source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
                     qualification: String::new(),
@@ -428,7 +467,7 @@ mod tests {
                     checksum: String::new(),
                     transcript: String::new(),
                     r#type: String::new(),
-                    source_category: String::new(),
+                    source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
                     qualification: String::new(),

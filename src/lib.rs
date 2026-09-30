@@ -61,6 +61,10 @@ pub enum Error {
     ScriptNotFound(uuid::Uuid),
     #[error("invalid changelog event: {0}")]
     InvalidChangelogEvent(String),
+    #[error("invalid source category: {0:?}")]
+    InvalidSourceCategory(String),
+    #[error("invalid source sub-category: {0:?}")]
+    InvalidSourceSubCategory(String),
     #[error("invalid server response: {0}")]
     InvalidResponse(String),
     #[error("encryption error: {0}")]

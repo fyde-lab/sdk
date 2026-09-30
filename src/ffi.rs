@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::domains::documents::{EventType, Metadata};
+use crate::domains::documents::{EventType, Metadata, SourceCategory, SourceSubCategory};
 use crate::domains::scripts::Script;
 use crate::domains::sessions::Service as SessionsService;
 use crate::{ChangelogEvent, Client, ClientConfig, Document, Error, LogLevel, Storage};
@@ -41,6 +41,136 @@ fn parse_uuid(id: &str) -> Result<Uuid, FfiError> {
     Ok(Uuid::parse_str(id)?)
 }
 
+/// The business domain a document's issuer belongs to, mirroring
+/// [`SourceCategory`] across the FFI boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSourceCategory {
+    Bank,
+    Insurance,
+    Retail,
+    Telecom,
+    Energy,
+    Water,
+    Health,
+    Gov,
+    Association,
+    Education,
+    Employer,
+    Transport,
+    Goods,
+    Alimentation,
+    Building,
+    RealEstate,
+    Web,
+    Individual,
+    Shopping,
+}
+
+impl From<SourceCategory> for FfiSourceCategory {
+    fn from(category: SourceCategory) -> Self {
+        match category {
+            SourceCategory::Bank => Self::Bank,
+            SourceCategory::Insurance => Self::Insurance,
+            SourceCategory::Retail => Self::Retail,
+            SourceCategory::Telecom => Self::Telecom,
+            SourceCategory::Energy => Self::Energy,
+            SourceCategory::Water => Self::Water,
+            SourceCategory::Health => Self::Health,
+            SourceCategory::Gov => Self::Gov,
+            SourceCategory::Association => Self::Association,
+            SourceCategory::Education => Self::Education,
+            SourceCategory::Employer => Self::Employer,
+            SourceCategory::Transport => Self::Transport,
+            SourceCategory::Goods => Self::Goods,
+            SourceCategory::Alimentation => Self::Alimentation,
+            SourceCategory::Building => Self::Building,
+            SourceCategory::RealEstate => Self::RealEstate,
+            SourceCategory::Web => Self::Web,
+            SourceCategory::Individual => Self::Individual,
+            SourceCategory::Shopping => Self::Shopping,
+        }
+    }
+}
+
+impl From<FfiSourceCategory> for SourceCategory {
+    fn from(category: FfiSourceCategory) -> Self {
+        match category {
+            FfiSourceCategory::Bank => Self::Bank,
+            FfiSourceCategory::Insurance => Self::Insurance,
+            FfiSourceCategory::Retail => Self::Retail,
+            FfiSourceCategory::Telecom => Self::Telecom,
+            FfiSourceCategory::Energy => Self::Energy,
+            FfiSourceCategory::Water => Self::Water,
+            FfiSourceCategory::Health => Self::Health,
+            FfiSourceCategory::Gov => Self::Gov,
+            FfiSourceCategory::Association => Self::Association,
+            FfiSourceCategory::Education => Self::Education,
+            FfiSourceCategory::Employer => Self::Employer,
+            FfiSourceCategory::Transport => Self::Transport,
+            FfiSourceCategory::Goods => Self::Goods,
+            FfiSourceCategory::Alimentation => Self::Alimentation,
+            FfiSourceCategory::Building => Self::Building,
+            FfiSourceCategory::RealEstate => Self::RealEstate,
+            FfiSourceCategory::Web => Self::Web,
+            FfiSourceCategory::Individual => Self::Individual,
+            FfiSourceCategory::Shopping => Self::Shopping,
+        }
+    }
+}
+
+/// A finer-grained classification within a document's [`FfiSourceCategory`],
+/// mirroring [`SourceSubCategory`] across the FFI boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSourceSubCategory {
+    CivilRegistration,
+    Immigration,
+    Transport,
+    Family,
+    Tax,
+    Health,
+    RealEstate,
+    Mobile,
+    Internet,
+    Citizen,
+    Sport,
+}
+
+impl From<SourceSubCategory> for FfiSourceSubCategory {
+    fn from(category: SourceSubCategory) -> Self {
+        match category {
+            SourceSubCategory::CivilRegistration => Self::CivilRegistration,
+            SourceSubCategory::Immigration => Self::Immigration,
+            SourceSubCategory::Transport => Self::Transport,
+            SourceSubCategory::Family => Self::Family,
+            SourceSubCategory::Tax => Self::Tax,
+            SourceSubCategory::Health => Self::Health,
+            SourceSubCategory::RealEstate => Self::RealEstate,
+            SourceSubCategory::Mobile => Self::Mobile,
+            SourceSubCategory::Internet => Self::Internet,
+            SourceSubCategory::Citizen => Self::Citizen,
+            SourceSubCategory::Sport => Self::Sport,
+        }
+    }
+}
+
+impl From<FfiSourceSubCategory> for SourceSubCategory {
+    fn from(category: FfiSourceSubCategory) -> Self {
+        match category {
+            FfiSourceSubCategory::CivilRegistration => Self::CivilRegistration,
+            FfiSourceSubCategory::Immigration => Self::Immigration,
+            FfiSourceSubCategory::Transport => Self::Transport,
+            FfiSourceSubCategory::Family => Self::Family,
+            FfiSourceSubCategory::Tax => Self::Tax,
+            FfiSourceSubCategory::Health => Self::Health,
+            FfiSourceSubCategory::RealEstate => Self::RealEstate,
+            FfiSourceSubCategory::Mobile => Self::Mobile,
+            FfiSourceSubCategory::Internet => Self::Internet,
+            FfiSourceSubCategory::Citizen => Self::Citizen,
+            FfiSourceSubCategory::Sport => Self::Sport,
+        }
+    }
+}
+
 /// A document's cleartext metadata, mirroring [`Metadata`] across the FFI
 /// boundary.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -54,8 +184,8 @@ pub struct FfiMetadata {
     pub checksum: String,
     pub transcript: String,
     pub r#type: String,
-    pub source_category: String,
-    pub source_sub_category: Option<String>,
+    pub source_category: Option<FfiSourceCategory>,
+    pub source_sub_category: Option<FfiSourceSubCategory>,
     pub subject: String,
     pub qualification: String,
 }
@@ -72,8 +202,10 @@ impl From<Metadata> for FfiMetadata {
             checksum: metadata.checksum().to_string(),
             transcript: metadata.transcript().to_string(),
             r#type: metadata.r#type().to_string(),
-            source_category: metadata.source_category().to_string(),
-            source_sub_category: metadata.source_sub_category().map(str::to_string),
+            source_category: metadata.source_category().map(FfiSourceCategory::from),
+            source_sub_category: metadata
+                .source_sub_category()
+                .map(FfiSourceSubCategory::from),
             subject: metadata.subject().to_string(),
             qualification: metadata.qualification().to_string(),
         }
@@ -94,8 +226,8 @@ impl TryFrom<FfiMetadata> for Metadata {
             checksum: metadata.checksum,
             transcript: metadata.transcript,
             r#type: metadata.r#type,
-            source_category: metadata.source_category,
-            source_sub_category: metadata.source_sub_category,
+            source_category: metadata.source_category.map(SourceCategory::from),
+            source_sub_category: metadata.source_sub_category.map(SourceSubCategory::from),
             subject: metadata.subject,
             qualification: metadata.qualification,
         })
@@ -556,10 +688,15 @@ mod tests {
         assert_eq!(ffi.checksum, metadata.checksum());
         assert_eq!(ffi.transcript, metadata.transcript());
         assert_eq!(ffi.r#type, metadata.r#type());
-        assert_eq!(ffi.source_category, metadata.source_category());
         assert_eq!(
-            ffi.source_sub_category.as_deref(),
-            metadata.source_sub_category()
+            ffi.source_category,
+            metadata.source_category().map(FfiSourceCategory::from)
+        );
+        assert_eq!(
+            ffi.source_sub_category,
+            metadata
+                .source_sub_category()
+                .map(FfiSourceSubCategory::from)
         );
         assert_eq!(ffi.subject, metadata.subject());
         assert_eq!(ffi.qualification, metadata.qualification());

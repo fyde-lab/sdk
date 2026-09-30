@@ -60,7 +60,7 @@ impl Service for ParserClient {
                 .collect(),
             transcript: doc_transcript,
             r#type: String::new(),
-            source_category: String::new(),
+            source_category: None,
             source_sub_category: None,
             subject: String::new(),
             qualification: String::new(),
@@ -82,13 +82,15 @@ impl Service for ParserClient {
             let lua = vm::sandboxed()?;
             let working_document =
                 Document::new(document.id(), document.content().to_vec(), metadata);
-            vm::expose_document(&lua, &working_document)?;
-            vm::expose_pdf_conversions(&lua, working_document.content())?;
+            let source_metadata = vm::expose_document(&lua, &working_document)?;
+            vm::expose_pdf_conversions(&lua, document.content())?;
+            vm::expose_set_source(&lua, source_metadata.clone())?;
             lua.load(script.script())
                 .exec()
                 .context("failed to run script")?;
 
-            metadata = vm::read_metadata(&lua, working_document.metadata())?;
+            metadata =
+                vm::read_metadata(&lua, working_document.metadata(), &source_metadata.borrow())?;
         }
 
         Ok(metadata)

@@ -1,9 +1,12 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use mlua::{Lua, LuaOptions, StdLib};
 use pdf_oxide::PdfDocument;
 use pdf_oxide::converters::ConversionOptions;
 use uuid::Uuid;
 
-use crate::domains::documents::{Document, Metadata};
+use crate::domains::documents::{Document, Metadata, SourceCategory, SourceSubCategory};
 use crate::{ErrorContext as _, Result};
 
 /// Builds a fully sandboxed Lua VM: no `io`, `os`, `package` (so no
@@ -41,8 +44,15 @@ pub(super) fn sandboxed() -> Result<Lua> {
 /// table back out once the script has finished running so the caller can see
 /// which fields, if any, changed. Nothing beyond this document's own data is
 /// reachable from a script's Lua state.
-pub(super) fn expose_document(lua: &Lua, document: &Document) -> Result<()> {
-    let metadata_table = metadata_to_table(lua, document.metadata())?;
+///
+/// Returns a shared handle to `document`'s metadata, initialized to a clone
+/// of `document.metadata()`: [`expose_set_source`] writes straight into it
+/// (in addition to `document.metadata`'s table copy) so its validated
+/// `source_category`/`source_sub_category` are available to Rust code
+/// without waiting for [`read_metadata`] to re-parse them back out of Lua.
+pub(super) fn expose_document(lua: &Lua, document: &Document) -> Result<Rc<RefCell<Metadata>>> {
+    let metadata = Rc::new(RefCell::new(document.metadata().clone()));
+    let metadata_table = metadata_to_table(lua, &metadata.borrow())?;
 
     let document_table = lua
         .create_table()
@@ -64,7 +74,7 @@ pub(super) fn expose_document(lua: &Lua, document: &Document) -> Result<()> {
         .set("document", document_table)
         .context("failed to expose document to the sandboxed lua vm")?;
 
-    Ok(())
+    Ok(metadata)
 }
 
 /// Exposes `pdf_as_markdown()` and `pdf_as_html()` as global functions in
@@ -105,6 +115,57 @@ pub(super) fn expose_pdf_conversions(lua: &Lua, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Exposes `set_source(category, sub_category)` as a global function in
+/// `lua`, letting a script set `document.metadata.source_category` and
+/// `document.metadata.source_sub_category` with immediate validation: an
+/// unknown category or sub-category name raises a Lua error right away,
+/// rather than leaving an invalid value sitting in `document.metadata` to
+/// only be caught later by [`read_metadata`], after the script has already
+/// finished running. `sub_category` is optional — omitting it (or passing
+/// `nil`) clears `document.metadata.source_sub_category`.
+///
+/// `metadata` is the same handle [`expose_document`] returned for this
+/// document: a call writes the parsed category/sub-category into it
+/// directly, alongside the `document.metadata` table, so the original
+/// [`Metadata`] is updated immediately rather than only once
+/// [`read_metadata`] re-parses the table at the end of the script.
+pub(super) fn expose_set_source(lua: &Lua, metadata: Rc<RefCell<Metadata>>) -> Result<()> {
+    let set_source = lua
+        .create_function(
+            move |lua, (category, sub_category): (String, Option<String>)| {
+                let category = category
+                    .parse::<SourceCategory>()
+                    .map_err(mlua::Error::external)?;
+                let sub_category = sub_category
+                    .map(|value| value.parse::<SourceSubCategory>())
+                    .transpose()
+                    .map_err(mlua::Error::external)?;
+
+                {
+                    let mut metadata = metadata.borrow_mut();
+                    metadata.source_category = Some(category);
+                    metadata.source_sub_category = sub_category;
+                }
+
+                let document_table: mlua::Table = lua.globals().get("document")?;
+                let metadata_table: mlua::Table = document_table.get("metadata")?;
+                metadata_table.set("source_category", category.as_str())?;
+                metadata_table.set(
+                    "source_sub_category",
+                    sub_category.map(|sub_category| sub_category.as_str()),
+                )?;
+
+                Ok(())
+            },
+        )
+        .context("failed to create the set_source lua function")?;
+    lua.globals()
+        .set("set_source", set_source)
+        .context("failed to expose set_source to the sandboxed lua vm")?;
+
+    Ok(())
+}
+
 fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
     let metadata_table = lua
         .create_table()
@@ -137,10 +198,20 @@ fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
         .set("type", metadata.r#type())
         .context("failed to set document.metadata.type")?;
     metadata_table
-        .set("source_category", metadata.source_category())
+        .set(
+            "source_category",
+            metadata
+                .source_category()
+                .map_or("", |category| category.as_str()),
+        )
         .context("failed to set document.metadata.source_category")?;
     metadata_table
-        .set("source_sub_category", metadata.source_sub_category())
+        .set(
+            "source_sub_category",
+            metadata
+                .source_sub_category()
+                .map(|category| category.as_str()),
+        )
         .context("failed to set document.metadata.source_sub_category")?;
     metadata_table
         .set("subject", metadata.subject())
@@ -157,10 +228,14 @@ fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
 /// `content_type`, `size`, `checksum`, and `transcript` — those describe the
 /// underlying file rather than user-editable metadata, so a script can't
 /// change them: they're always taken from `original` regardless of what a
-/// script assigned into the table. Called once a script has finished
-/// running, so the caller can compare the result against `original` to see
-/// which fields, if any, the script changed.
-pub(super) fn read_metadata(lua: &Lua, original: &Metadata) -> Result<Metadata> {
+/// script assigned into the table. `source_category`/`source_sub_category`
+/// are likewise taken from `source` (the [`expose_document`]-returned handle
+/// [`expose_set_source`] writes into) rather than re-parsed out of the
+/// table, since that handle is already validated and is the only way those
+/// two fields can change. Called once a script has finished running, so the
+/// caller can compare the result against `original` to see which fields, if
+/// any, the script changed.
+pub(super) fn read_metadata(lua: &Lua, original: &Metadata, source: &Metadata) -> Result<Metadata> {
     let document_table: mlua::Table = lua
         .globals()
         .get("document")
@@ -190,12 +265,8 @@ pub(super) fn read_metadata(lua: &Lua, original: &Metadata) -> Result<Metadata> 
         r#type: metadata_table
             .get("type")
             .context("failed to read document.metadata.type back")?,
-        source_category: metadata_table
-            .get("source_category")
-            .context("failed to read document.metadata.source_category back")?,
-        source_sub_category: metadata_table
-            .get("source_sub_category")
-            .context("failed to read document.metadata.source_sub_category back")?,
+        source_category: source.source_category(),
+        source_sub_category: source.source_sub_category(),
         subject: metadata_table
             .get("subject")
             .context("failed to read document.metadata.subject back")?,
@@ -240,7 +311,7 @@ mod tests {
         let lua = sandboxed().unwrap();
         let document = FakeDocument::new().build();
 
-        expose_document(&lua, &document).unwrap();
+        let _metadata = expose_document(&lua, &document).unwrap();
 
         let content: mlua::LuaString = lua.load("return document.content").eval().unwrap();
         assert_eq!(content.as_bytes().to_vec(), document.content());
@@ -260,9 +331,9 @@ mod tests {
         let lua = sandboxed().unwrap();
         let document = FakeDocument::new().build();
 
-        expose_document(&lua, &document).unwrap();
+        let source_metadata = expose_document(&lua, &document).unwrap();
 
-        let metadata = read_metadata(&lua, document.metadata()).unwrap();
+        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
 
         assert_eq!(metadata, *document.metadata());
     }
@@ -272,12 +343,12 @@ mod tests {
         let lua = sandboxed().unwrap();
         let document = FakeDocument::new().build();
 
-        expose_document(&lua, &document).unwrap();
+        let source_metadata = expose_document(&lua, &document).unwrap();
         lua.load(r#"document.metadata.name = "new-name.pdf""#)
             .exec()
             .unwrap();
 
-        let metadata = read_metadata(&lua, document.metadata()).unwrap();
+        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
 
         assert_eq!(metadata.name, "new-name.pdf");
         assert_eq!(metadata.transcript, document.metadata().transcript());
@@ -288,7 +359,7 @@ mod tests {
         let lua = sandboxed().unwrap();
         let document = FakeDocument::new().build();
 
-        expose_document(&lua, &document).unwrap();
+        let source_metadata = expose_document(&lua, &document).unwrap();
         lua.load(
             r#"
             document.metadata.name = "first.pdf"
@@ -298,7 +369,7 @@ mod tests {
         .exec()
         .unwrap();
 
-        let metadata = read_metadata(&lua, document.metadata()).unwrap();
+        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
 
         assert_eq!(metadata.name, "second.pdf");
     }
@@ -326,11 +397,78 @@ mod tests {
     }
 
     #[test]
+    fn set_source_sets_the_category_and_sub_category() {
+        let lua = sandboxed().unwrap();
+        let document = FakeDocument::new().build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        expose_set_source(&lua, source_metadata.clone()).unwrap();
+        lua.load(r#"set_source("bank", "tax")"#).exec().unwrap();
+
+        assert_eq!(
+            source_metadata.borrow().source_category,
+            Some(SourceCategory::Bank)
+        );
+        assert_eq!(
+            source_metadata.borrow().source_sub_category,
+            Some(SourceSubCategory::Tax)
+        );
+
+        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
+
+        assert_eq!(metadata.source_category, Some(SourceCategory::Bank));
+        assert_eq!(metadata.source_sub_category, Some(SourceSubCategory::Tax));
+    }
+
+    #[test]
+    fn set_source_accepts_a_nil_sub_category() {
+        let lua = sandboxed().unwrap();
+        let document = FakeDocument::new().build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        expose_set_source(&lua, source_metadata.clone()).unwrap();
+        lua.load(r#"set_source("bank")"#).exec().unwrap();
+
+        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
+
+        assert_eq!(metadata.source_category, Some(SourceCategory::Bank));
+        assert_eq!(metadata.source_sub_category, None);
+    }
+
+    #[test]
+    fn set_source_errors_on_an_unknown_category() {
+        let lua = sandboxed().unwrap();
+        let document = FakeDocument::new().build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        expose_set_source(&lua, source_metadata).unwrap();
+
+        let result = lua.load(r#"set_source("not-a-category")"#).exec();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn set_source_errors_on_an_unknown_sub_category() {
+        let lua = sandboxed().unwrap();
+        let document = FakeDocument::new().build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        expose_set_source(&lua, source_metadata).unwrap();
+
+        let result = lua
+            .load(r#"set_source("bank", "not-a-sub-category")"#)
+            .exec();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn read_metadata_ignores_script_writes_to_immutable_fields() {
         let lua = sandboxed().unwrap();
         let document = FakeDocument::new().build();
 
-        expose_document(&lua, &document).unwrap();
+        let source_metadata = expose_document(&lua, &document).unwrap();
         lua.load(
             r#"
             document.metadata.original_name = "hacked.pdf"
@@ -343,7 +481,7 @@ mod tests {
         .exec()
         .unwrap();
 
-        let metadata = read_metadata(&lua, document.metadata()).unwrap();
+        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
 
         assert_eq!(metadata.original_name, document.metadata().original_name());
         assert_eq!(metadata.content_type, document.metadata().content_type());

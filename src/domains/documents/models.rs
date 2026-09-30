@@ -1,5 +1,198 @@
+use std::fmt;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::Error;
+
+/// The business domain a document's issuer belongs to (e.g. a bank, an
+/// insurer, a retailer), as filled in by a user's classification script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCategory {
+    Bank,
+    Insurance,
+    Retail,
+    Telecom,
+    Energy,
+    Water,
+    Health,
+    Gov,
+    Association,
+    Education,
+    Employer,
+    Transport,
+    Goods,
+    Alimentation,
+    Building,
+    RealEstate,
+    Web,
+    Individual,
+    Shopping,
+}
+
+impl SourceCategory {
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [SourceCategory] = &[
+        Self::Bank,
+        Self::Insurance,
+        Self::Retail,
+        Self::Telecom,
+        Self::Energy,
+        Self::Water,
+        Self::Health,
+        Self::Gov,
+        Self::Association,
+        Self::Education,
+        Self::Employer,
+        Self::Transport,
+        Self::Goods,
+        Self::Alimentation,
+        Self::Building,
+        Self::RealEstate,
+        Self::Web,
+        Self::Individual,
+        Self::Shopping,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Bank => "bank",
+            Self::Insurance => "insurance",
+            Self::Retail => "retail",
+            Self::Telecom => "telecom",
+            Self::Energy => "energy",
+            Self::Water => "water",
+            Self::Health => "health",
+            Self::Gov => "gov",
+            Self::Association => "association",
+            Self::Education => "education",
+            Self::Employer => "employer",
+            Self::Transport => "transport",
+            Self::Goods => "goods",
+            Self::Alimentation => "alimentation",
+            Self::Building => "building",
+            Self::RealEstate => "real_estate",
+            Self::Web => "web",
+            Self::Individual => "individual",
+            Self::Shopping => "shopping",
+        }
+    }
+}
+
+impl fmt::Display for SourceCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SourceCategory {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "bank" => Ok(Self::Bank),
+            "insurance" => Ok(Self::Insurance),
+            "retail" => Ok(Self::Retail),
+            "telecom" => Ok(Self::Telecom),
+            "energy" => Ok(Self::Energy),
+            "water" => Ok(Self::Water),
+            "health" => Ok(Self::Health),
+            "gov" => Ok(Self::Gov),
+            "association" => Ok(Self::Association),
+            "education" => Ok(Self::Education),
+            "employer" => Ok(Self::Employer),
+            "transport" => Ok(Self::Transport),
+            "goods" => Ok(Self::Goods),
+            "alimentation" => Ok(Self::Alimentation),
+            "building" => Ok(Self::Building),
+            "real_estate" => Ok(Self::RealEstate),
+            "web" => Ok(Self::Web),
+            "individual" => Ok(Self::Individual),
+            "shopping" => Ok(Self::Shopping),
+            other => Err(Error::InvalidSourceCategory(other.to_string())),
+        }
+    }
+}
+
+/// A finer-grained classification within a document's [`SourceCategory`],
+/// as filled in by a user's classification script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceSubCategory {
+    CivilRegistration,
+    Immigration,
+    Transport,
+    Family,
+    Tax,
+    Health,
+    RealEstate,
+    Mobile,
+    Internet,
+    Citizen,
+    Sport,
+}
+
+impl SourceSubCategory {
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [SourceSubCategory] = &[
+        Self::CivilRegistration,
+        Self::Immigration,
+        Self::Transport,
+        Self::Family,
+        Self::Tax,
+        Self::Health,
+        Self::RealEstate,
+        Self::Mobile,
+        Self::Internet,
+        Self::Citizen,
+        Self::Sport,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CivilRegistration => "civil_registration",
+            Self::Immigration => "immigration",
+            Self::Transport => "transport",
+            Self::Family => "family",
+            Self::Tax => "tax",
+            Self::Health => "health",
+            Self::RealEstate => "real_estate",
+            Self::Mobile => "mobile",
+            Self::Internet => "internet",
+            Self::Citizen => "citizen",
+            Self::Sport => "sport",
+        }
+    }
+}
+
+impl fmt::Display for SourceSubCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SourceSubCategory {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "civil_registration" => Ok(Self::CivilRegistration),
+            "immigration" => Ok(Self::Immigration),
+            "transport" => Ok(Self::Transport),
+            "family" => Ok(Self::Family),
+            "tax" => Ok(Self::Tax),
+            "health" => Ok(Self::Health),
+            "real_estate" => Ok(Self::RealEstate),
+            "mobile" => Ok(Self::Mobile),
+            "internet" => Ok(Self::Internet),
+            "citizen" => Ok(Self::Citizen),
+            "sport" => Ok(Self::Sport),
+            other => Err(Error::InvalidSourceSubCategory(other.to_string())),
+        }
+    }
+}
 
 /// Cleartext metadata encrypted under a document's DEK before upload, and
 /// decrypted back out of it on download.
@@ -18,8 +211,11 @@ pub struct Metadata {
     /// on upload.
     pub transcript: String,
     pub r#type: String,
-    pub source_category: String,
-    pub source_sub_category: Option<String>,
+    /// `None` until a classification script sets it — scripts never
+    /// persist anything themselves, so a freshly parsed document has no
+    /// category yet.
+    pub source_category: Option<SourceCategory>,
+    pub source_sub_category: Option<SourceSubCategory>,
     pub subject: String,
     pub qualification: String,
 }
@@ -61,12 +257,12 @@ impl Metadata {
         &self.r#type
     }
 
-    pub fn source_category(&self) -> &str {
-        &self.source_category
+    pub fn source_category(&self) -> Option<SourceCategory> {
+        self.source_category
     }
 
-    pub fn source_sub_category(&self) -> Option<&str> {
-        self.source_sub_category.as_deref()
+    pub fn source_sub_category(&self) -> Option<SourceSubCategory> {
+        self.source_sub_category
     }
 
     pub fn subject(&self) -> &str {
@@ -140,8 +336,14 @@ impl FakeMetadata {
                     crate::testing::random_word()
                 ),
                 r#type: crate::testing::random_word().to_string(),
-                source_category: crate::testing::random_word().to_string(),
-                source_sub_category: Some(crate::testing::random_word().to_string()),
+                source_category: Some(
+                    SourceCategory::ALL
+                        [crate::testing::random_u64(SourceCategory::ALL.len() as u64) as usize],
+                ),
+                source_sub_category: Some(
+                    SourceSubCategory::ALL
+                        [crate::testing::random_u64(SourceSubCategory::ALL.len() as u64) as usize],
+                ),
                 subject: crate::testing::random_word().to_string(),
                 qualification: crate::testing::random_word().to_string(),
             },
@@ -193,14 +395,17 @@ impl FakeMetadata {
         self
     }
 
-    pub(crate) fn with_source_category(mut self, source_category: impl Into<String>) -> Self {
+    pub(crate) fn with_source_category(
+        mut self,
+        source_category: impl Into<Option<SourceCategory>>,
+    ) -> Self {
         self.metadata.source_category = source_category.into();
         self
     }
 
     pub(crate) fn with_source_sub_category(
         mut self,
-        source_sub_category: impl Into<Option<String>>,
+        source_sub_category: impl Into<Option<SourceSubCategory>>,
     ) -> Self {
         self.metadata.source_sub_category = source_sub_category.into();
         self
@@ -288,8 +493,8 @@ mod tests {
             .with_checksum("deadbeef")
             .with_transcript("hello world")
             .with_type("invoice")
-            .with_source_category("finance")
-            .with_source_sub_category(Some("billing".to_string()))
+            .with_source_category(SourceCategory::Bank)
+            .with_source_sub_category(SourceSubCategory::Tax)
             .with_subject("Q1 report")
             .with_qualification("verified")
             .build();
@@ -303,8 +508,8 @@ mod tests {
         assert_eq!(metadata.checksum, "deadbeef");
         assert_eq!(metadata.transcript, "hello world");
         assert_eq!(metadata.r#type, "invoice");
-        assert_eq!(metadata.source_category, "finance");
-        assert_eq!(metadata.source_sub_category.as_deref(), Some("billing"));
+        assert_eq!(metadata.source_category, Some(SourceCategory::Bank));
+        assert_eq!(metadata.source_sub_category, Some(SourceSubCategory::Tax));
         assert_eq!(metadata.subject, "Q1 report");
         assert_eq!(metadata.qualification, "verified");
     }
