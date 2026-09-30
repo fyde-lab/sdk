@@ -1,20 +1,15 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::domains::scripts::Service as ScriptsService;
 use crate::{Error, ErrorContext as _, Result};
 
 use super::changelog::{ChangelogEvent, EventType, Service as ChangelogService};
+use super::parser::Service as ParserService;
 use super::storage::Storage;
-use super::{Document, Metadata, Service, transcript, vm};
-
-/// The only content type [`Service::upload`] currently accepts.
-pub(super) const PDF_CONTENT_TYPE: &str = "application/pdf";
+use super::{Document, Metadata, Service};
 
 /// The default [`Service`] implementation: publishes new documents as
 /// encrypted changelog events via an injected [`ChangelogService`], and
@@ -22,7 +17,7 @@ pub(super) const PDF_CONTENT_TYPE: &str = "application/pdf";
 pub(super) struct DocumentsClient<S: Storage> {
     storage: S,
     changelog: Arc<dyn ChangelogService>,
-    scripts: Arc<dyn ScriptsService>,
+    parser: Arc<dyn ParserService>,
     /// Invoked once per event by [`Service::start_sync`]'s consume job, when
     /// set — see [`crate::ClientConfig::on_document_change`].
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
@@ -31,73 +26,22 @@ pub(super) struct DocumentsClient<S: Storage> {
 impl<S: Storage> DocumentsClient<S> {
     /// Creates a documents client using `storage` to cache documents
     /// locally, `changelog` to publish new ones and drive
-    /// [`Service::start_sync`], `scripts` to fill in a newly uploaded
-    /// document's classification metadata (see [`Self::parse_content`]), and
-    /// `on_document_change` as the callback [`Service::start_sync`] invokes
-    /// per consumed event.
+    /// [`Service::start_sync`], `parser` to derive a newly uploaded
+    /// document's metadata and to fill in its classification metadata (see
+    /// [`Service::run_scripts`]), and `on_document_change` as the callback
+    /// [`Service::start_sync`] invokes per consumed event.
     pub(super) fn new(
         storage: S,
         changelog: Arc<dyn ChangelogService>,
-        scripts: Arc<dyn ScriptsService>,
+        parser: Arc<dyn ParserService>,
         on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
     ) -> Self {
         Self {
             storage,
             changelog,
-            scripts,
+            parser,
             on_document_change,
         }
-    }
-
-    /// Builds the [`Metadata`] for a freshly uploaded PDF `content`,
-    /// originally named `original_name`: derives its checksum, size, and
-    /// transcript, then runs every script currently enabled for the
-    /// authenticated user against it (see [`Service::run_scripts`]) to fill
-    /// in its classification fields (`type`, `source_category`,
-    /// `source_sub_category`, `subject`, `qualification`) — left empty
-    /// otherwise, since scripts never persist anything themselves.
-    async fn parse_content(&self, content: &[u8], original_name: &str) -> Result<Metadata> {
-        let name = Path::new(original_name)
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
-
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let mut hasher = Sha256::new();
-        hasher.update(content);
-
-        let doc_transcript =
-            transcript::extract(content).context("failed to extract document transcript")?;
-
-        let id = Uuid::now_v7();
-
-        let metadata = Metadata {
-            id,
-            original_name: original_name.to_string(),
-            name,
-            content_type: PDF_CONTENT_TYPE.to_string(),
-            created_at,
-            size: content.len() as u64,
-            checksum: hasher
-                .finalize()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
-            transcript: doc_transcript,
-            r#type: String::new(),
-            source_category: String::new(),
-            source_sub_category: None,
-            subject: String::new(),
-            qualification: String::new(),
-        };
-
-        let document = Document::new(id, content.to_vec(), metadata);
-        self.run_scripts(&document).await
     }
 }
 
@@ -133,7 +77,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .unwrap_or_default()
             .to_string();
 
-        let metadata = self.parse_content(&content, &original_name).await?;
+        let metadata = self.parser.parse_content(&content, &original_name).await?;
         let id = metadata.id;
 
         self.changelog
@@ -153,26 +97,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
     }
 
     async fn run_scripts(&self, document: &Document) -> Result<Metadata> {
-        let scripts = self
-            .scripts
-            .list_user_scripts()
-            .await
-            .context("failed to list the scripts enabled for the authenticated user")?;
-
-        let mut metadata = document.metadata().clone();
-        for script in &scripts {
-            let lua = vm::sandboxed()?;
-            let working_document =
-                Document::new(document.id(), document.content().to_vec(), metadata);
-            vm::expose_document(&lua, &working_document)?;
-            lua.load(script.script())
-                .exec()
-                .context("failed to run script")?;
-
-            metadata = vm::read_metadata(&lua, working_document.metadata())?;
-        }
-
-        Ok(metadata)
+        self.parser.run_scripts(document).await
     }
 
     async fn update_metadata(&self, metadata: Metadata) -> Result<()> {
@@ -209,150 +134,42 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
+    use super::super::parser::MockService as MockParserService;
     use super::super::storage::MockStorage;
     use super::*;
-    use crate::domains::scripts::{FakeScript, MockService as MockScriptsService};
 
-    /// A [`ScriptsService`] fake with no scripts enabled, so
-    /// [`Service::run_scripts`] returns a document's metadata back
-    /// unchanged, for tests that don't care about script behavior.
-    fn no_op_scripts() -> Arc<dyn ScriptsService> {
-        let mut scripts = MockScriptsService::new();
-        scripts
-            .expect_list_user_scripts()
-            .returning(|| Ok(Vec::new()));
-        Arc::new(scripts)
+    /// A [`ParserService`] fake that's never expected to be called, for
+    /// tests that don't exercise document parsing/script running.
+    fn no_op_parser() -> Arc<dyn ParserService> {
+        Arc::new(MockParserService::new())
     }
 
     #[tokio::test]
-    async fn run_scripts_runs_every_enabled_script() {
-        let scripts = vec![
-            FakeScript::new().with_script("return 1 + 1").build(),
-            FakeScript::new().with_script("return 2 + 2").build(),
-        ];
-        let mut mock_scripts = MockScriptsService::new();
-        mock_scripts
-            .expect_list_user_scripts()
+    async fn run_scripts_delegates_to_the_parser_service() {
+        let document = super::super::FakeDocument::new().build();
+        let expected = super::super::FakeMetadata::new().build();
+
+        let mut parser = MockParserService::new();
+        let returned = expected.clone();
+        parser
+            .expect_run_scripts()
+            .withf({
+                let expected_id = document.id();
+                move |queried_document| queried_document.id() == expected_id
+            })
             .times(1)
-            .returning(move || Ok(scripts.clone()));
+            .returning(move |_| Ok(returned.clone()));
 
         let client = DocumentsClient::new(
             MockStorage::new(),
             Arc::new(RecordingChangelog::default()),
-            Arc::new(mock_scripts),
+            Arc::new(parser),
             None,
         );
-        let document = super::super::FakeDocument::new().build();
-
-        client.run_scripts(&document).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn run_scripts_fails_if_a_script_errors() {
-        let scripts = vec![
-            FakeScript::new()
-                .with_script("this is not valid lua")
-                .build(),
-        ];
-        let mut mock_scripts = MockScriptsService::new();
-        mock_scripts
-            .expect_list_user_scripts()
-            .times(1)
-            .returning(move || Ok(scripts.clone()));
-
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            Arc::new(RecordingChangelog::default()),
-            Arc::new(mock_scripts),
-            None,
-        );
-        let document = super::super::FakeDocument::new().build();
-
-        client.run_scripts(&document).await.unwrap_err();
-    }
-
-    #[tokio::test]
-    async fn run_scripts_returns_the_metadata_a_script_rename_produces() {
-        let scripts = vec![
-            FakeScript::new()
-                .with_script(r#"document.metadata.name = "renamed.pdf""#)
-                .build(),
-        ];
-        let mut mock_scripts = MockScriptsService::new();
-        mock_scripts
-            .expect_list_user_scripts()
-            .times(1)
-            .returning(move || Ok(scripts.clone()));
-
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            Arc::new(RecordingChangelog::default()),
-            Arc::new(mock_scripts),
-            None,
-        );
-        let document = super::super::FakeDocument::new().build();
 
         let metadata = client.run_scripts(&document).await.unwrap();
 
-        assert_eq!(
-            metadata,
-            Metadata {
-                name: "renamed.pdf".to_string(),
-                ..document.metadata().clone()
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn run_scripts_keeps_the_original_metadata_when_no_script_changes_it() {
-        let scripts = vec![FakeScript::new().with_script("return 1 + 1").build()];
-        let mut mock_scripts = MockScriptsService::new();
-        mock_scripts
-            .expect_list_user_scripts()
-            .times(1)
-            .returning(move || Ok(scripts.clone()));
-
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            Arc::new(RecordingChangelog::default()),
-            Arc::new(mock_scripts),
-            None,
-        );
-        let document = super::super::FakeDocument::new().build();
-
-        let metadata = client.run_scripts(&document).await.unwrap();
-
-        assert_eq!(metadata, *document.metadata());
-    }
-
-    #[tokio::test]
-    async fn run_scripts_chains_each_scripts_changes_into_the_next() {
-        let scripts = vec![
-            FakeScript::new()
-                .with_script(r#"document.metadata.name = "first.pdf""#)
-                .build(),
-            FakeScript::new()
-                .with_script(r#"document.metadata.subject = document.metadata.name .. "-subject""#)
-                .build(),
-        ];
-        let mut mock_scripts = MockScriptsService::new();
-        mock_scripts
-            .expect_list_user_scripts()
-            .times(1)
-            .returning(move || Ok(scripts.clone()));
-
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            Arc::new(RecordingChangelog::default()),
-            Arc::new(mock_scripts),
-            None,
-        );
-        let document = super::super::FakeDocument::new().build();
-
-        let metadata = client.run_scripts(&document).await.unwrap();
-
-        assert_eq!(metadata.name, "first.pdf");
-        assert_eq!(metadata.subject, "first.pdf-subject");
+        assert_eq!(metadata, expected);
     }
 
     /// A single `send` call recorded by [`RecordingChangelog`].
@@ -416,37 +233,47 @@ mod tests {
 
     #[tokio::test]
     async fn upload_publishes_a_created_event_for_the_document() {
-        let pdf = super::super::transcript::tests::build_pdf("hello world");
+        let pdf = b"hello world".to_vec();
         let file = write_temp_file("pdf", &pdf);
+        let file_name = file
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let metadata = super::super::FakeMetadata::new().build();
+        let expected_content = pdf.clone();
+        let expected_name = file_name.clone();
+        let returned_metadata = metadata.clone();
+        let mut parser = MockParserService::new();
+        parser
+            .expect_parse_content()
+            .withf(move |content, original_name| {
+                content == expected_content.as_slice() && original_name == expected_name
+            })
+            .times(1)
+            .returning(move |_, _| Ok(returned_metadata.clone()));
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client =
-            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_scripts(), None);
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            changelog.clone(),
+            Arc::new(parser),
+            None,
+        );
 
-        client.upload(file.path()).await.unwrap();
+        let id = client.upload(file.path()).await.unwrap();
 
+        assert_eq!(id, metadata.id);
         let sent = changelog.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
-        let (event_type, _id, content, metadata) = &sent[0];
+        let (event_type, document_id, content, sent_metadata) = &sent[0];
         assert_eq!(*event_type, EventType::Created);
+        assert_eq!(*document_id, metadata.id);
         assert_eq!(content.as_deref(), Some(pdf.as_slice()));
-        assert!(
-            metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.transcript.contains("hello world"))
-        );
-        let file_stem = file.path().file_stem().unwrap().to_str().unwrap();
-        let file_name = file.path().file_name().unwrap().to_str().unwrap();
-        assert_eq!(
-            metadata.as_ref().map(|metadata| metadata.name.as_str()),
-            Some(file_stem)
-        );
-        assert_eq!(
-            metadata
-                .as_ref()
-                .map(|metadata| metadata.original_name.as_str()),
-            Some(file_name)
-        );
+        assert_eq!(sent_metadata.as_ref(), Some(&metadata));
     }
 
     #[tokio::test]
@@ -455,7 +282,7 @@ mod tests {
         let client = DocumentsClient::new(
             MockStorage::new(),
             Arc::new(RecordingChangelog::default()),
-            no_op_scripts(),
+            no_op_parser(),
             None,
         );
 
@@ -474,7 +301,7 @@ mod tests {
                 id,
                 name: "report.pdf".to_string(),
                 original_name: "report.pdf".to_string(),
-                content_type: PDF_CONTENT_TYPE.to_string(),
+                content_type: super::super::parser::PDF_CONTENT_TYPE.to_string(),
                 created_at: 1_700_000_000,
                 size: 5,
                 checksum: "deadbeef".to_string(),
@@ -498,7 +325,7 @@ mod tests {
         let client = DocumentsClient::new(
             storage,
             Arc::new(RecordingChangelog::default()),
-            no_op_scripts(),
+            no_op_parser(),
             None,
         );
 
@@ -516,7 +343,7 @@ mod tests {
                     id: id_two,
                     name: "two".to_string(),
                     original_name: "two".to_string(),
-                    content_type: PDF_CONTENT_TYPE.to_string(),
+                    content_type: super::super::parser::PDF_CONTENT_TYPE.to_string(),
                     created_at: 1_700_000_001,
                     size: 0,
                     checksum: String::new(),
@@ -535,7 +362,7 @@ mod tests {
                     id: id_three,
                     name: "three".to_string(),
                     original_name: "three".to_string(),
-                    content_type: PDF_CONTENT_TYPE.to_string(),
+                    content_type: super::super::parser::PDF_CONTENT_TYPE.to_string(),
                     created_at: 1_700_000_002,
                     size: 0,
                     checksum: String::new(),
@@ -560,7 +387,7 @@ mod tests {
         let client = DocumentsClient::new(
             storage,
             Arc::new(RecordingChangelog::default()),
-            no_op_scripts(),
+            no_op_parser(),
             None,
         );
 
@@ -584,7 +411,7 @@ mod tests {
 
         let changelog = Arc::new(RecordingChangelog::default());
         let client =
-            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_scripts(), None);
+            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_parser(), None);
 
         client.update_metadata(metadata).await.unwrap();
 
@@ -615,7 +442,7 @@ mod tests {
         let client = DocumentsClient::new(
             MockStorage::new(),
             changelog,
-            no_op_scripts(),
+            no_op_parser(),
             Some(on_document_change),
         );
 
@@ -632,7 +459,7 @@ mod tests {
             to_consume: Mutex::new(vec![event]),
             ..Default::default()
         });
-        let client = DocumentsClient::new(MockStorage::new(), changelog, no_op_scripts(), None);
+        let client = DocumentsClient::new(MockStorage::new(), changelog, no_op_parser(), None);
 
         client.start_sync().await.unwrap();
     }
@@ -641,7 +468,7 @@ mod tests {
     async fn stop_sync_delegates_to_the_changelog_services_stop_consume_job() {
         let changelog = Arc::new(RecordingChangelog::default());
         let client =
-            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_scripts(), None);
+            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_parser(), None);
 
         client.stop_sync();
 

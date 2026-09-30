@@ -1,10 +1,9 @@
 mod changelog;
 mod models;
+mod parser;
 mod service;
 mod storage;
 mod storage_sqlite;
-mod transcript;
-mod vm;
 
 #[cfg(test)]
 pub(crate) use changelog::FakeChangelogEvent;
@@ -110,11 +109,11 @@ pub trait Service: Send + Sync {
 /// Initializes the documents service: connects the internal changelog
 /// service to the fyde server over `channel` (see `changelog::init`), wires
 /// up local SQLite-backed caching (via `pool`) of documents materialized
-/// from its consumed events, publishes new documents through it, runs
-/// `scripts` against every newly uploaded document to fill in its
-/// classification metadata (see `service::DocumentsClient::parse_content`),
-/// and calls `on_document_change` (see [`crate::ClientConfig`]) for every
-/// event [`Service::start_sync`] consumes.
+/// from its consumed events, publishes new documents through it, initializes
+/// the internal parser service (see `parser::init`) with `scripts` to derive
+/// a newly uploaded document's metadata and fill in its classification
+/// fields, and calls `on_document_change` (see [`crate::ClientConfig`]) for
+/// every event [`Service::start_sync`] consumes.
 pub(crate) async fn init(
     channel: Channel,
     pool: SqlitePool,
@@ -128,11 +127,12 @@ pub(crate) async fn init(
     let changelog = changelog::init(channel, pool, settings, sessions, server_state)
         .await
         .context("failed to initialize changelog service")?;
+    let parser = parser::init(scripts);
 
     Ok(Arc::new(service::DocumentsClient::new(
         storage,
         changelog,
-        scripts,
+        parser,
         on_document_change,
     )))
 }

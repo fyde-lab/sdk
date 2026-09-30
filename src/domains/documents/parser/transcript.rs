@@ -11,8 +11,7 @@ use crate::{ErrorContext as _, Result};
 /// paragraphs, and tables keep the layout structure of the source PDF.
 ///
 /// Callers are expected to have already verified `content` is a PDF (see
-/// [`super::service::PDF_CONTENT_TYPE`]) — this always attempts to parse it
-/// as one.
+/// [`super::PDF_CONTENT_TYPE`]) — this always attempts to parse it as one.
 pub(super) fn extract(content: &[u8]) -> Result<String> {
     let pdf = PdfDocument::from_bytes(content.to_vec()).context("failed to parse PDF document")?;
     let transcript = pdf
