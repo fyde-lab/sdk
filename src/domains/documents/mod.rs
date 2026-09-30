@@ -63,6 +63,15 @@ pub trait Service: Send + Sync {
     /// for this purpose).
     async fn update_metadata(&self, metadata: Metadata) -> Result<()>;
 
+    /// Fetches the scripts currently enabled for the authenticated user and
+    /// runs each of them, in its own freshly-constructed sandboxed Lua VM,
+    /// scoped to `document`, folding each script's changes into the next's
+    /// starting point. Returns the resulting metadata without publishing or
+    /// otherwise persisting it anywhere — a script only ever computes new
+    /// metadata, it never updates the document itself; that's left to the
+    /// caller to do (or not).
+    async fn run_scripts(&self, document: &Document) -> Result<Metadata>;
+
     /// Starts a background job that streams and decrypts every changelog
     /// event since the last consumed id, oldest first (replaying persisted
     /// history, then continuing with the live tail). Resumes from the

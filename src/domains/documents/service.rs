@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::domains::scripts::Service as ScriptsService;
+use crate::domains::scripts::{Service as ScriptsService, vm};
 use crate::{Error, ErrorContext as _, Result};
 
 use super::changelog::{ChangelogEvent, EventType, Service as ChangelogService};
@@ -52,8 +52,8 @@ impl<S: Storage> DocumentsClient<S> {
     /// Builds the [`Metadata`] for a freshly uploaded PDF `content`,
     /// originally named `original_name`: derives its checksum, size, and
     /// transcript, then runs every script currently enabled for the
-    /// authenticated user against it (see [`ScriptsService::run_for_document`])
-    /// to fill in its classification fields (`type`, `source_category`,
+    /// authenticated user against it (see [`Service::run_scripts`]) to fill
+    /// in its classification fields (`type`, `source_category`,
     /// `source_sub_category`, `subject`, `qualification`) — left empty
     /// otherwise, since scripts never persist anything themselves.
     async fn parse_content(&self, content: &[u8], original_name: &str) -> Result<Metadata> {
@@ -97,10 +97,7 @@ impl<S: Storage> DocumentsClient<S> {
         };
 
         let document = Document::new(id, content.to_vec(), metadata);
-        self.scripts
-            .run_for_document(&document)
-            .await
-            .context("failed to run scripts against the document")
+        self.run_scripts(&document).await
     }
 }
 
@@ -155,6 +152,29 @@ impl<S: Storage> Service for DocumentsClient<S> {
         self.storage.list_documents(offset, limit).await
     }
 
+    async fn run_scripts(&self, document: &Document) -> Result<Metadata> {
+        let scripts = self
+            .scripts
+            .list_user_scripts()
+            .await
+            .context("failed to list the scripts enabled for the authenticated user")?;
+
+        let mut metadata = document.metadata().clone();
+        for script in &scripts {
+            let lua = vm::sandboxed()?;
+            let working_document =
+                Document::new(document.id(), document.content().to_vec(), metadata);
+            vm::expose_document(&lua, &working_document)?;
+            lua.load(script.script())
+                .exec()
+                .context("failed to run script")?;
+
+            metadata = vm::read_metadata(&lua, working_document.metadata())?;
+        }
+
+        Ok(metadata)
+    }
+
     async fn update_metadata(&self, metadata: Metadata) -> Result<()> {
         let id = metadata.id;
 
@@ -191,16 +211,148 @@ mod tests {
 
     use super::super::storage::MockStorage;
     use super::*;
-    use crate::domains::scripts::MockService as MockScriptsService;
+    use crate::domains::scripts::{FakeScript, MockService as MockScriptsService};
 
-    /// A [`ScriptsService`] fake that returns a document's metadata back
+    /// A [`ScriptsService`] fake with no scripts enabled, so
+    /// [`Service::run_scripts`] returns a document's metadata back
     /// unchanged, for tests that don't care about script behavior.
     fn no_op_scripts() -> Arc<dyn ScriptsService> {
         let mut scripts = MockScriptsService::new();
         scripts
-            .expect_run_for_document()
-            .returning(|document| Ok(document.metadata().clone()));
+            .expect_list_user_scripts()
+            .returning(|| Ok(Vec::new()));
         Arc::new(scripts)
+    }
+
+    #[tokio::test]
+    async fn run_scripts_runs_every_enabled_script() {
+        let scripts = vec![
+            FakeScript::new().with_script("return 1 + 1").build(),
+            FakeScript::new().with_script("return 2 + 2").build(),
+        ];
+        let mut mock_scripts = MockScriptsService::new();
+        mock_scripts
+            .expect_list_user_scripts()
+            .times(1)
+            .returning(move || Ok(scripts.clone()));
+
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            Arc::new(RecordingChangelog::default()),
+            Arc::new(mock_scripts),
+            None,
+        );
+        let document = super::super::FakeDocument::new().build();
+
+        client.run_scripts(&document).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_scripts_fails_if_a_script_errors() {
+        let scripts = vec![
+            FakeScript::new()
+                .with_script("this is not valid lua")
+                .build(),
+        ];
+        let mut mock_scripts = MockScriptsService::new();
+        mock_scripts
+            .expect_list_user_scripts()
+            .times(1)
+            .returning(move || Ok(scripts.clone()));
+
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            Arc::new(RecordingChangelog::default()),
+            Arc::new(mock_scripts),
+            None,
+        );
+        let document = super::super::FakeDocument::new().build();
+
+        client.run_scripts(&document).await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn run_scripts_returns_the_metadata_a_script_rename_produces() {
+        let scripts = vec![
+            FakeScript::new()
+                .with_script(r#"document.metadata.name = "renamed.pdf""#)
+                .build(),
+        ];
+        let mut mock_scripts = MockScriptsService::new();
+        mock_scripts
+            .expect_list_user_scripts()
+            .times(1)
+            .returning(move || Ok(scripts.clone()));
+
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            Arc::new(RecordingChangelog::default()),
+            Arc::new(mock_scripts),
+            None,
+        );
+        let document = super::super::FakeDocument::new().build();
+
+        let metadata = client.run_scripts(&document).await.unwrap();
+
+        assert_eq!(
+            metadata,
+            Metadata {
+                name: "renamed.pdf".to_string(),
+                ..document.metadata().clone()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn run_scripts_keeps_the_original_metadata_when_no_script_changes_it() {
+        let scripts = vec![FakeScript::new().with_script("return 1 + 1").build()];
+        let mut mock_scripts = MockScriptsService::new();
+        mock_scripts
+            .expect_list_user_scripts()
+            .times(1)
+            .returning(move || Ok(scripts.clone()));
+
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            Arc::new(RecordingChangelog::default()),
+            Arc::new(mock_scripts),
+            None,
+        );
+        let document = super::super::FakeDocument::new().build();
+
+        let metadata = client.run_scripts(&document).await.unwrap();
+
+        assert_eq!(metadata, *document.metadata());
+    }
+
+    #[tokio::test]
+    async fn run_scripts_chains_each_scripts_changes_into_the_next() {
+        let scripts = vec![
+            FakeScript::new()
+                .with_script(r#"document.metadata.name = "first.pdf""#)
+                .build(),
+            FakeScript::new()
+                .with_script(r#"document.metadata.subject = document.metadata.name .. "-subject""#)
+                .build(),
+        ];
+        let mut mock_scripts = MockScriptsService::new();
+        mock_scripts
+            .expect_list_user_scripts()
+            .times(1)
+            .returning(move || Ok(scripts.clone()));
+
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            Arc::new(RecordingChangelog::default()),
+            Arc::new(mock_scripts),
+            None,
+        );
+        let document = super::super::FakeDocument::new().build();
+
+        let metadata = client.run_scripts(&document).await.unwrap();
+
+        assert_eq!(metadata.name, "first.pdf");
+        assert_eq!(metadata.subject, "first.pdf-subject");
     }
 
     /// A single `send` call recorded by [`RecordingChangelog`].

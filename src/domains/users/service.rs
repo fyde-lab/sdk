@@ -359,6 +359,13 @@ mod tests {
             unimplemented!()
         }
 
+        async fn run_scripts(
+            &self,
+            _document: &crate::domains::documents::Document,
+        ) -> Result<crate::domains::documents::Metadata> {
+            unimplemented!()
+        }
+
         async fn start_sync(&self) -> Result<()> {
             self.start_sync_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);

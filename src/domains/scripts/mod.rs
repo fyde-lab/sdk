@@ -1,7 +1,7 @@
 mod grpc_client;
 mod models;
 mod service;
-mod vm;
+pub(crate) mod vm;
 
 use std::sync::Arc;
 
@@ -16,27 +16,18 @@ pub(crate) use models::FakeScript;
 pub use models::Script;
 
 use crate::Result;
-use crate::domains::documents::{Document, Metadata};
 use crate::domains::sessions::SessionsClient;
 
-/// Runs Lua scripts against a document inside a fully sandboxed VM (see
-/// `service.rs`), and manages user-authored scripts against the fyde
-/// server's scripts service (see `grpc_client.rs`): creating them, fetching
-/// them by id, enabling/disabling them for the authenticated user, and
-/// listing the ones currently enabled. Trait methods take `&self` (not
-/// `&mut self`) so implementations can be shared behind `Arc<dyn Service>`.
+/// Manages user-authored scripts against the fyde server's scripts service
+/// (see `grpc_client.rs`): creating them, fetching them by id,
+/// enabling/disabling them for the authenticated user, and listing the ones
+/// currently enabled. Running scripts against a document is done by callers
+/// directly, using [`Service::list_user_scripts`] together with the `vm`
+/// module. Trait methods take `&self` (not `&mut self`) so implementations
+/// can be shared behind `Arc<dyn Service>`.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Service: Send + Sync {
-    /// Fetches the scripts currently enabled for the authenticated user and
-    /// runs each of them, in its own freshly-constructed sandboxed Lua VM,
-    /// scoped to `document`, folding each script's changes into the next's
-    /// starting point. Returns the resulting metadata without publishing or
-    /// otherwise persisting it anywhere — a script only ever computes new
-    /// metadata, it never updates the document itself; that's left to the
-    /// caller to do (or not).
-    async fn run_for_document(&self, document: &Document) -> Result<Metadata>;
-
     /// Creates a new script owned by the authenticated user, at version 1.
     async fn create_script(
         &self,

@@ -506,7 +506,7 @@ impl FydeClient {
     /// Runs every script currently enabled for the authenticated user
     /// against the document matching `document_id`, then publishes the
     /// resulting metadata if any script changed it. Mirrors
-    /// [`crate::ScriptsService::run_for_document`], which only computes the
+    /// [`crate::DocumentsService::run_scripts`], which only computes the
     /// updated metadata and never persists it itself.
     pub async fn run_scripts_for_document(&self, document_id: String) -> Result<(), FfiError> {
         let id = parse_uuid(&document_id)?;
@@ -516,7 +516,7 @@ impl FydeClient {
             .get(id)
             .await?
             .ok_or(Error::DocumentNotFound(id))?;
-        let metadata = self.inner.scripts().run_for_document(&document).await?;
+        let metadata = self.inner.documents().run_scripts(&document).await?;
         if metadata != *document.metadata() {
             self.inner.documents().update_metadata(metadata).await?;
         }
