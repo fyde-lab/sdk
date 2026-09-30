@@ -56,6 +56,8 @@ pub enum Error {
     UnsupportedDocumentExtension(String),
     #[error("document {0} not found in local cache")]
     DocumentNotFound(uuid::Uuid),
+    #[error("script {0} not found")]
+    ScriptNotFound(uuid::Uuid),
     #[error("invalid changelog event: {0}")]
     InvalidChangelogEvent(String),
     #[error("invalid server response: {0}")]

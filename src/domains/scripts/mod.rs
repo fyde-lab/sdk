@@ -1,6 +1,7 @@
 mod grpc_client;
 mod models;
 mod service;
+mod storage_in_memory;
 
 use std::sync::Arc;
 
