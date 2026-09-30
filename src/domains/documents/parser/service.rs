@@ -83,6 +83,7 @@ impl Service for ParserClient {
             let working_document =
                 Document::new(document.id(), document.content().to_vec(), metadata);
             vm::expose_document(&lua, &working_document)?;
+            vm::expose_pdf_conversions(&lua, working_document.content())?;
             lua.load(script.script())
                 .exec()
                 .context("failed to run script")?;

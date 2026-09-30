@@ -1,4 +1,6 @@
 use mlua::{Lua, LuaOptions, StdLib};
+use pdf_oxide::PdfDocument;
+use pdf_oxide::converters::ConversionOptions;
 use uuid::Uuid;
 
 use crate::domains::documents::{Document, Metadata};
@@ -61,6 +63,44 @@ pub(super) fn expose_document(lua: &Lua, document: &Document) -> Result<()> {
     lua.globals()
         .set("document", document_table)
         .context("failed to expose document to the sandboxed lua vm")?;
+
+    Ok(())
+}
+
+/// Exposes `pdf_as_markdown()` and `pdf_as_html()` as global functions in
+/// `lua`, letting a script re-render `content` (the document's own PDF
+/// bytes) as Markdown or HTML on demand — richer structure than the flat
+/// `document.metadata.transcript` string, for scripts whose classification
+/// needs headings, tables, or other layout. Each call re-parses `content`
+/// from scratch rather than caching a decoded [`PdfDocument`] across calls,
+/// since a script calls these at most a handful of times per run and
+/// `PdfDocument` isn't `mlua::UserData`.
+pub(super) fn expose_pdf_conversions(lua: &Lua, content: &[u8]) -> Result<()> {
+    let markdown_content = content.to_vec();
+    let pdf_as_markdown = lua
+        .create_function(move |_, ()| {
+            let pdf =
+                PdfDocument::from_bytes(markdown_content.clone()).map_err(mlua::Error::external)?;
+            pdf.to_markdown_all(&ConversionOptions::default())
+                .map_err(mlua::Error::external)
+        })
+        .context("failed to create the pdf_as_markdown lua function")?;
+    lua.globals()
+        .set("pdf_as_markdown", pdf_as_markdown)
+        .context("failed to expose pdf_as_markdown to the sandboxed lua vm")?;
+
+    let html_content = content.to_vec();
+    let pdf_as_html = lua
+        .create_function(move |_, ()| {
+            let pdf =
+                PdfDocument::from_bytes(html_content.clone()).map_err(mlua::Error::external)?;
+            pdf.to_html_all(&ConversionOptions::default())
+                .map_err(mlua::Error::external)
+        })
+        .context("failed to create the pdf_as_html lua function")?;
+    lua.globals()
+        .set("pdf_as_html", pdf_as_html)
+        .context("failed to expose pdf_as_html to the sandboxed lua vm")?;
 
     Ok(())
 }
@@ -261,6 +301,28 @@ mod tests {
         let metadata = read_metadata(&lua, document.metadata()).unwrap();
 
         assert_eq!(metadata.name, "second.pdf");
+    }
+
+    #[test]
+    fn pdf_as_markdown_renders_the_documents_pdf_content_as_markdown() {
+        let lua = sandboxed().unwrap();
+        let pdf = crate::domains::documents::parser::transcript::tests::build_pdf("Hello World!");
+
+        expose_pdf_conversions(&lua, &pdf).unwrap();
+
+        let markdown: String = lua.load("return pdf_as_markdown()").eval().unwrap();
+        assert!(markdown.contains("Hello World!"));
+    }
+
+    #[test]
+    fn pdf_as_html_renders_the_documents_pdf_content_as_html() {
+        let lua = sandboxed().unwrap();
+        let pdf = crate::domains::documents::parser::transcript::tests::build_pdf("Hello World!");
+
+        expose_pdf_conversions(&lua, &pdf).unwrap();
+
+        let html: String = lua.load("return pdf_as_html()").eval().unwrap();
+        assert!(html.contains("Hello World!"));
     }
 
     #[test]
