@@ -382,8 +382,6 @@ impl<D: DocumentStorage + 'static, O: CursorStorage + 'static> Service for Chang
 mod tests {
     use std::sync::Mutex;
 
-    use futures::StreamExt as _;
-
     use super::super::grpc_client::MockFydeClient;
     use super::super::storage::MockCursorStorage;
     use super::*;
