@@ -14,14 +14,13 @@ use super::Service;
 /// running scripts (e.g. via `documents::Service`'s `run_scripts`) without a
 /// live scripts server. State doesn't survive past the process's lifetime.
 #[derive(Default)]
-pub(crate) struct InMemoryScriptStorage {
+pub struct InMemoryScriptStorage {
     scripts: Mutex<HashMap<Uuid, Script>>,
     enabled: Mutex<HashSet<Uuid>>,
 }
 
 impl InMemoryScriptStorage {
-    #[allow(dead_code)]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 }

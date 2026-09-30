@@ -3,6 +3,8 @@ mod models;
 mod service;
 mod storage_in_memory;
 
+pub use storage_in_memory::InMemoryScriptStorage;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;
