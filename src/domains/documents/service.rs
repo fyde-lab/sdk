@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::domains::scripts::Service as ScriptsService;
 use crate::{Error, ErrorContext as _, Result};
 
 use super::changelog::{ChangelogEvent, EventType, Service as ChangelogService};
@@ -21,6 +22,7 @@ pub(super) const PDF_CONTENT_TYPE: &str = "application/pdf";
 pub(super) struct DocumentsClient<S: Storage> {
     storage: S,
     changelog: Arc<dyn ChangelogService>,
+    scripts: Arc<dyn ScriptsService>,
     /// Invoked once per event by [`Service::start_sync`]'s consume job, when
     /// set — see [`crate::ClientConfig::on_document_change`].
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
@@ -29,18 +31,76 @@ pub(super) struct DocumentsClient<S: Storage> {
 impl<S: Storage> DocumentsClient<S> {
     /// Creates a documents client using `storage` to cache documents
     /// locally, `changelog` to publish new ones and drive
-    /// [`Service::start_sync`], and `on_document_change` as the callback
-    /// [`Service::start_sync`] invokes per consumed event.
+    /// [`Service::start_sync`], `scripts` to fill in a newly uploaded
+    /// document's classification metadata (see [`Self::parse_content`]), and
+    /// `on_document_change` as the callback [`Service::start_sync`] invokes
+    /// per consumed event.
     pub(super) fn new(
         storage: S,
         changelog: Arc<dyn ChangelogService>,
+        scripts: Arc<dyn ScriptsService>,
         on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
     ) -> Self {
         Self {
             storage,
             changelog,
+            scripts,
             on_document_change,
         }
+    }
+
+    /// Builds the [`Metadata`] for a freshly uploaded PDF `content`,
+    /// originally named `original_name`: derives its checksum, size, and
+    /// transcript, then runs every script currently enabled for the
+    /// authenticated user against it (see [`ScriptsService::run_for_document`])
+    /// to fill in its classification fields (`type`, `source_category`,
+    /// `source_sub_category`, `subject`, `qualification`) — left empty
+    /// otherwise, since scripts never persist anything themselves.
+    async fn parse_content(&self, content: &[u8], original_name: &str) -> Result<Metadata> {
+        let name = Path::new(original_name)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+
+        let doc_transcript =
+            transcript::extract(content).context("failed to extract document transcript")?;
+
+        let id = Uuid::now_v7();
+
+        let metadata = Metadata {
+            id,
+            original_name: original_name.to_string(),
+            name,
+            content_type: PDF_CONTENT_TYPE.to_string(),
+            created_at,
+            size: content.len() as u64,
+            checksum: hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            transcript: doc_transcript,
+            r#type: String::new(),
+            source_category: String::new(),
+            source_sub_category: None,
+            subject: String::new(),
+            qualification: String::new(),
+        };
+
+        let document = Document::new(id, content.to_vec(), metadata);
+        self.scripts
+            .run_for_document(&document)
+            .await
+            .context("failed to run scripts against the document")
     }
 }
 
@@ -76,44 +136,8 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .unwrap_or_default()
             .to_string();
 
-        let name = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
-
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-
-        let mut hasher = Sha256::new();
-        hasher.update(&content);
-
-        let doc_transcript =
-            transcript::extract(&content).context("failed to extract document transcript")?;
-
-        let id = Uuid::now_v7();
-
-        let metadata = Metadata {
-            id,
-            original_name,
-            name,
-            content_type: PDF_CONTENT_TYPE.to_string(),
-            created_at,
-            size: content.len() as u64,
-            checksum: hasher
-                .finalize()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
-            transcript: doc_transcript,
-            r#type: String::new(),
-            source_category: String::new(),
-            source_sub_category: None,
-            subject: String::new(),
-            qualification: String::new(),
-        };
+        let metadata = self.parse_content(&content, &original_name).await?;
+        let id = metadata.id;
 
         self.changelog
             .send(EventType::Created, id, Some(&content), Some(&metadata))
@@ -167,6 +191,17 @@ mod tests {
 
     use super::super::storage::MockStorage;
     use super::*;
+    use crate::domains::scripts::MockService as MockScriptsService;
+
+    /// A [`ScriptsService`] fake that returns a document's metadata back
+    /// unchanged, for tests that don't care about script behavior.
+    fn no_op_scripts() -> Arc<dyn ScriptsService> {
+        let mut scripts = MockScriptsService::new();
+        scripts
+            .expect_run_for_document()
+            .returning(|document| Ok(document.metadata().clone()));
+        Arc::new(scripts)
+    }
 
     /// A single `send` call recorded by [`RecordingChangelog`].
     type SentEvent = (EventType, Uuid, Option<Vec<u8>>, Option<Metadata>);
@@ -233,7 +268,8 @@ mod tests {
         let file = write_temp_file("pdf", &pdf);
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(MockStorage::new(), changelog.clone(), None);
+        let client =
+            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_scripts(), None);
 
         client.upload(file.path()).await.unwrap();
 
@@ -267,6 +303,7 @@ mod tests {
         let client = DocumentsClient::new(
             MockStorage::new(),
             Arc::new(RecordingChangelog::default()),
+            no_op_scripts(),
             None,
         );
 
@@ -306,7 +343,12 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(Some(expected.clone())));
 
-        let client = DocumentsClient::new(storage, Arc::new(RecordingChangelog::default()), None);
+        let client = DocumentsClient::new(
+            storage,
+            Arc::new(RecordingChangelog::default()),
+            no_op_scripts(),
+            None,
+        );
 
         assert_eq!(client.get(id).await.unwrap(), Some(document));
     }
@@ -363,7 +405,12 @@ mod tests {
             .times(1)
             .returning(move |_, _| Ok(expected_page.clone()));
 
-        let client = DocumentsClient::new(storage, Arc::new(RecordingChangelog::default()), None);
+        let client = DocumentsClient::new(
+            storage,
+            Arc::new(RecordingChangelog::default()),
+            no_op_scripts(),
+            None,
+        );
 
         let page = client.list(1, 2).await.unwrap();
 
@@ -384,7 +431,8 @@ mod tests {
         let id = metadata.id;
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(MockStorage::new(), changelog.clone(), None);
+        let client =
+            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_scripts(), None);
 
         client.update_metadata(metadata).await.unwrap();
 
@@ -412,7 +460,12 @@ mod tests {
         let received_in_callback = received.clone();
         let on_document_change: Arc<dyn Fn(ChangelogEvent) + Send + Sync> =
             Arc::new(move |event| received_in_callback.lock().unwrap().push(event));
-        let client = DocumentsClient::new(MockStorage::new(), changelog, Some(on_document_change));
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            changelog,
+            no_op_scripts(),
+            Some(on_document_change),
+        );
 
         client.start_sync().await.unwrap();
 
@@ -427,7 +480,7 @@ mod tests {
             to_consume: Mutex::new(vec![event]),
             ..Default::default()
         });
-        let client = DocumentsClient::new(MockStorage::new(), changelog, None);
+        let client = DocumentsClient::new(MockStorage::new(), changelog, no_op_scripts(), None);
 
         client.start_sync().await.unwrap();
     }
@@ -435,7 +488,8 @@ mod tests {
     #[tokio::test]
     async fn stop_sync_delegates_to_the_changelog_services_stop_consume_job() {
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(MockStorage::new(), changelog.clone(), None);
+        let client =
+            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_scripts(), None);
 
         client.stop_sync();
 

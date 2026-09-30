@@ -191,12 +191,14 @@ impl Client {
         let settings = domains::settings::init(sqlite.pool().clone());
         let sessions = domains::sessions::init(settings.clone());
         let server_state = domains::server_state::init(channel.clone());
+        let scripts = domains::scripts::init(channel.clone(), sessions.clone());
         let documents = domains::documents::init(
             channel.clone(),
             sqlite.pool().clone(),
             settings.clone(),
             sessions.clone(),
             server_state.clone(),
+            scripts.clone(),
             config.on_document_change,
         )
         .await
@@ -210,7 +212,6 @@ impl Client {
         )
         .await
         .context("failed to initialize users service")?;
-        let scripts = domains::scripts::init(channel.clone(), sessions.clone(), documents.clone());
 
         // A session may already be open from a previous run (the token is
         // persisted in `settings`, not just held in memory — see

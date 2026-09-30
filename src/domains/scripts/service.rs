@@ -4,8 +4,7 @@ use async_trait::async_trait;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
-use crate::domains::documents::Document;
-use crate::domains::documents::Service as DocumentsService;
+use crate::domains::documents::{Document, Metadata};
 use crate::domains::sessions::SessionsClient;
 use crate::{ErrorContext as _, Result};
 
@@ -16,23 +15,16 @@ use super::vm;
 
 /// The default [`Service`] implementation. Delegates VM construction to
 /// `vm::sandboxed`, which is the only place that decides what a Lua script
-/// is and isn't allowed to touch, composes the injected `grpc` client for
-/// talking to the server's scripts service, and publishes renames scripts
-/// make through the injected `documents` service.
+/// is and isn't allowed to touch, and composes the injected `grpc` client
+/// for talking to the server's scripts service.
 pub(super) struct ScriptsClient {
     grpc: Box<dyn FydeClient>,
-    documents: Arc<dyn DocumentsService>,
 }
 
 impl ScriptsClient {
-    pub(super) fn new(
-        channel: Channel,
-        sessions: Arc<SessionsClient>,
-        documents: Arc<dyn DocumentsService>,
-    ) -> Self {
+    pub(super) fn new(channel: Channel, sessions: Arc<SessionsClient>) -> Self {
         Self {
             grpc: Box::new(GrpcClient::new(channel, sessions)),
-            documents,
         }
     }
 
@@ -40,39 +32,32 @@ impl ScriptsClient {
     /// testing against a [`super::grpc_client::MockFydeClient`] instead of
     /// a live server.
     #[cfg(test)]
-    fn with_grpc(grpc: impl FydeClient + 'static, documents: Arc<dyn DocumentsService>) -> Self {
+    fn with_grpc(grpc: impl FydeClient + 'static) -> Self {
         Self {
             grpc: Box::new(grpc),
-            documents,
         }
     }
 }
 
 #[async_trait]
 impl Service for ScriptsClient {
-    async fn run_for_document(&self, document: &Document) -> Result<()> {
+    async fn run_for_document(&self, document: &Document) -> Result<Metadata> {
         let scripts = self.grpc.list_user_scripts().await?;
 
+        let mut metadata = document.metadata().clone();
         for script in &scripts {
-            let updated_metadata = {
-                let lua = vm::sandboxed()?;
-                vm::expose_document(&lua, document)?;
-                lua.load(script.script())
-                    .exec()
-                    .context("failed to run script")?;
+            let lua = vm::sandboxed()?;
+            let working_document =
+                Document::new(document.id(), document.content().to_vec(), metadata);
+            vm::expose_document(&lua, &working_document)?;
+            lua.load(script.script())
+                .exec()
+                .context("failed to run script")?;
 
-                vm::read_metadata(&lua, document.metadata())?
-            };
-
-            if updated_metadata != *document.metadata() {
-                self.documents
-                    .update_metadata(updated_metadata)
-                    .await
-                    .context("failed to publish the metadata changes a script made")?;
-            }
+            metadata = vm::read_metadata(&lua, working_document.metadata())?;
         }
 
-        Ok(())
+        Ok(metadata)
     }
 
     async fn create_script(
@@ -117,50 +102,10 @@ impl Service for ScriptsClient {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
     use crate::domains::documents::FakeDocument;
-    use crate::domains::documents::Metadata;
     use crate::domains::scripts::FakeScript;
     use crate::domains::scripts::grpc_client::MockFydeClient;
-
-    /// A [`DocumentsService`] fake recording every call to
-    /// [`DocumentsService::update_metadata`], for tests that don't need a
-    /// live changelog. Every other method is unused by [`ScriptsClient`], so
-    /// left unimplemented.
-    #[derive(Default)]
-    struct RecordingDocuments {
-        update_metadata_calls: Mutex<Vec<Metadata>>,
-    }
-
-    #[async_trait]
-    impl DocumentsService for RecordingDocuments {
-        async fn upload(&self, _path: &std::path::Path) -> Result<Uuid> {
-            unimplemented!()
-        }
-
-        async fn get(&self, _id: Uuid) -> Result<Option<Document>> {
-            unimplemented!()
-        }
-
-        async fn list(&self, _offset: i64, _limit: i64) -> Result<Vec<Document>> {
-            unimplemented!()
-        }
-
-        async fn update_metadata(&self, metadata: Metadata) -> Result<()> {
-            self.update_metadata_calls.lock().unwrap().push(metadata);
-            Ok(())
-        }
-
-        async fn start_sync(&self) -> Result<()> {
-            unimplemented!()
-        }
-
-        fn stop_sync(&self) {
-            unimplemented!()
-        }
-    }
 
     #[tokio::test]
     async fn run_for_document_runs_every_enabled_script() {
@@ -174,7 +119,7 @@ mod tests {
             .times(1)
             .returning(move || Ok(scripts.clone()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, Arc::new(RecordingDocuments::default()));
+        let client = ScriptsClient::with_grpc(mock_grpc);
         let document = FakeDocument::new().build();
 
         client.run_for_document(&document).await.unwrap();
@@ -193,14 +138,14 @@ mod tests {
             .times(1)
             .returning(move || Ok(scripts.clone()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, Arc::new(RecordingDocuments::default()));
+        let client = ScriptsClient::with_grpc(mock_grpc);
         let document = FakeDocument::new().build();
 
         client.run_for_document(&document).await.unwrap_err();
     }
 
     #[tokio::test]
-    async fn run_for_document_updates_the_name_when_a_script_renames_the_document() {
+    async fn run_for_document_returns_the_metadata_a_script_rename_produces() {
         let scripts = vec![
             FakeScript::new()
                 .with_script(r#"document.metadata.name = "renamed.pdf""#)
@@ -212,17 +157,13 @@ mod tests {
             .times(1)
             .returning(move || Ok(scripts.clone()));
 
-        let documents = Arc::new(RecordingDocuments::default());
-        let client = ScriptsClient::with_grpc(mock_grpc, documents.clone());
+        let client = ScriptsClient::with_grpc(mock_grpc);
         let document = FakeDocument::new().build();
 
-        client.run_for_document(&document).await.unwrap();
+        let metadata = client.run_for_document(&document).await.unwrap();
 
-        let calls = documents.update_metadata_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        let metadata = &calls[0];
         assert_eq!(
-            *metadata,
+            metadata,
             Metadata {
                 name: "renamed.pdf".to_string(),
                 ..document.metadata().clone()
@@ -231,7 +172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_for_document_does_not_update_the_name_when_no_script_renames_the_document() {
+    async fn run_for_document_keeps_the_original_metadata_when_no_script_changes_it() {
         let scripts = vec![FakeScript::new().with_script("return 1 + 1").build()];
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
@@ -239,22 +180,22 @@ mod tests {
             .times(1)
             .returning(move || Ok(scripts.clone()));
 
-        let documents = Arc::new(RecordingDocuments::default());
-        let client = ScriptsClient::with_grpc(mock_grpc, documents.clone());
+        let client = ScriptsClient::with_grpc(mock_grpc);
         let document = FakeDocument::new().build();
 
-        client.run_for_document(&document).await.unwrap();
+        let metadata = client.run_for_document(&document).await.unwrap();
 
-        assert!(documents.update_metadata_calls.lock().unwrap().is_empty());
+        assert_eq!(metadata, *document.metadata());
     }
 
     #[tokio::test]
-    async fn run_for_document_does_not_update_the_name_when_a_script_sets_the_same_name() {
-        let document = FakeDocument::new().build();
-        let same_name = document.metadata().name().to_string();
+    async fn run_for_document_chains_each_scripts_changes_into_the_next() {
         let scripts = vec![
             FakeScript::new()
-                .with_script(&format!("document.metadata.name = {same_name:?}"))
+                .with_script(r#"document.metadata.name = "first.pdf""#)
+                .build(),
+            FakeScript::new()
+                .with_script(r#"document.metadata.subject = document.metadata.name .. "-subject""#)
                 .build(),
         ];
         let mut mock_grpc = MockFydeClient::new();
@@ -263,12 +204,13 @@ mod tests {
             .times(1)
             .returning(move || Ok(scripts.clone()));
 
-        let documents = Arc::new(RecordingDocuments::default());
-        let client = ScriptsClient::with_grpc(mock_grpc, documents.clone());
+        let client = ScriptsClient::with_grpc(mock_grpc);
+        let document = FakeDocument::new().build();
 
-        client.run_for_document(&document).await.unwrap();
+        let metadata = client.run_for_document(&document).await.unwrap();
 
-        assert!(documents.update_metadata_calls.lock().unwrap().is_empty());
+        assert_eq!(metadata.name, "first.pdf");
+        assert_eq!(metadata.subject, "first.pdf-subject");
     }
 
     #[tokio::test]
@@ -284,7 +226,7 @@ mod tests {
             .times(1)
             .returning(move |_, _, _, _| Ok(returned.clone()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, Arc::new(RecordingDocuments::default()));
+        let client = ScriptsClient::with_grpc(mock_grpc);
 
         let script = client
             .create_script("my-script", true, b"icon-bytes".to_vec(), "return 1")
@@ -306,7 +248,7 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(returned.clone()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, Arc::new(RecordingDocuments::default()));
+        let client = ScriptsClient::with_grpc(mock_grpc);
 
         assert_eq!(client.fetch_script(id).await.unwrap(), expected);
     }
@@ -329,7 +271,7 @@ mod tests {
             .times(1)
             .returning(move |_, _, _, _, _| Ok(returned.clone()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, Arc::new(RecordingDocuments::default()));
+        let client = ScriptsClient::with_grpc(mock_grpc);
 
         let script = client
             .update_script(id, "my-script", true, b"icon-bytes".to_vec(), "return 1")
@@ -349,7 +291,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, Arc::new(RecordingDocuments::default()));
+        let client = ScriptsClient::with_grpc(mock_grpc);
 
         client.enable_script(id).await.unwrap();
     }
@@ -364,7 +306,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, Arc::new(RecordingDocuments::default()));
+        let client = ScriptsClient::with_grpc(mock_grpc);
 
         client.disable_script(id).await.unwrap();
     }
@@ -379,7 +321,7 @@ mod tests {
             .times(1)
             .returning(move || Ok(returned.clone()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, Arc::new(RecordingDocuments::default()));
+        let client = ScriptsClient::with_grpc(mock_grpc);
 
         assert_eq!(client.list_user_scripts().await.unwrap(), expected);
     }

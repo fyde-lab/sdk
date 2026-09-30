@@ -16,8 +16,7 @@ pub(crate) use models::FakeScript;
 pub use models::Script;
 
 use crate::Result;
-use crate::domains::documents::Document;
-use crate::domains::documents::Service as DocumentsService;
+use crate::domains::documents::{Document, Metadata};
 use crate::domains::sessions::SessionsClient;
 
 /// Runs Lua scripts against a document inside a fully sandboxed VM (see
@@ -31,8 +30,12 @@ use crate::domains::sessions::SessionsClient;
 pub trait Service: Send + Sync {
     /// Fetches the scripts currently enabled for the authenticated user and
     /// runs each of them, in its own freshly-constructed sandboxed Lua VM,
-    /// scoped to `document`.
-    async fn run_for_document(&self, document: &Document) -> Result<()>;
+    /// scoped to `document`, folding each script's changes into the next's
+    /// starting point. Returns the resulting metadata without publishing or
+    /// otherwise persisting it anywhere — a script only ever computes new
+    /// metadata, it never updates the document itself; that's left to the
+    /// caller to do (or not).
+    async fn run_for_document(&self, document: &Document) -> Result<Metadata>;
 
     /// Creates a new script owned by the authenticated user, at version 1.
     async fn create_script(
@@ -72,12 +75,7 @@ pub trait Service: Send + Sync {
 
 /// Initializes the scripts service: talks to the fyde server's scripts
 /// service over the shared `channel` connection, authenticating every call
-/// via `sessions`, and publishes metadata changes a script makes through
-/// `documents`.
-pub(crate) fn init(
-    channel: Channel,
-    sessions: Arc<SessionsClient>,
-    documents: Arc<dyn DocumentsService>,
-) -> Arc<dyn Service> {
-    Arc::new(service::ScriptsClient::new(channel, sessions, documents))
+/// via `sessions`.
+pub(crate) fn init(channel: Channel, sessions: Arc<SessionsClient>) -> Arc<dyn Service> {
+    Arc::new(service::ScriptsClient::new(channel, sessions))
 }

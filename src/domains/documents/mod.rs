@@ -24,6 +24,7 @@ use sqlx::SqlitePool;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
+use crate::domains::scripts::Service as ScriptsService;
 use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
@@ -99,15 +100,18 @@ pub trait Service: Send + Sync {
 /// Initializes the documents service: connects the internal changelog
 /// service to the fyde server over `channel` (see `changelog::init`), wires
 /// up local SQLite-backed caching (via `pool`) of documents materialized
-/// from its consumed events, publishes new documents through it, and calls
-/// `on_document_change` (see [`crate::ClientConfig`]) for every event
-/// [`Service::start_sync`] consumes.
+/// from its consumed events, publishes new documents through it, runs
+/// `scripts` against every newly uploaded document to fill in its
+/// classification metadata (see `service::DocumentsClient::parse_content`),
+/// and calls `on_document_change` (see [`crate::ClientConfig`]) for every
+/// event [`Service::start_sync`] consumes.
 pub(crate) async fn init(
     channel: Channel,
     pool: SqlitePool,
     settings: Arc<dyn SettingsService>,
     sessions: Arc<SessionsClient>,
     server_state: Arc<dyn ServerStateService>,
+    scripts: Arc<dyn ScriptsService>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Result<Arc<dyn Service>> {
     let storage = storage_sqlite::SqliteStorage::new(pool.clone());
@@ -118,6 +122,7 @@ pub(crate) async fn init(
     Ok(Arc::new(service::DocumentsClient::new(
         storage,
         changelog,
+        scripts,
         on_document_change,
     )))
 }
