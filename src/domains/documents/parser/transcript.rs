@@ -3,19 +3,16 @@ use pdf_oxide::converters::ConversionOptions;
 
 use crate::{ErrorContext as _, Result};
 
-/// Extracts a Markdown transcript of a PDF's text for storage alongside a
+/// Extracts a raw text transcript of a PDF's text for storage alongside a
 /// document's other encrypted metadata, so its contents can later be
 /// searched without re-decrypting and re-parsing the document itself.
-///
-/// Markdown (rather than flattened plain text) is used so headings,
-/// paragraphs, and tables keep the layout structure of the source PDF.
 ///
 /// Callers are expected to have already verified `content` is a PDF (see
 /// [`super::PDF_CONTENT_TYPE`]) — this always attempts to parse it as one.
 pub(super) fn extract(content: &[u8]) -> Result<String> {
     let pdf = PdfDocument::from_bytes(content.to_vec()).context("failed to parse PDF document")?;
     let transcript = pdf
-        .to_markdown_all(&ConversionOptions::default())
+        .to_plain_text_all(&ConversionOptions::default())
         .context("failed to extract text from PDF document")?;
 
     Ok(transcript)
