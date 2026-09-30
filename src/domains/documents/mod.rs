@@ -1,6 +1,6 @@
 mod changelog;
 mod models;
-mod parser;
+pub(crate) mod parser;
 mod service;
 mod storage;
 mod storage_sqlite;

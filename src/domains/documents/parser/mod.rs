@@ -18,12 +18,14 @@ pub(super) const PDF_CONTENT_TYPE: &str = "application/pdf";
 
 /// Derives a freshly uploaded document's [`Metadata`] and runs a user's
 /// enabled scripts against a document to fill in/update its classification
-/// fields. A private submodule of `documents`, the same way `changelog` is
-/// — nothing outside `documents` references `parser::Service`/`parser::init`
-/// directly.
+/// fields. Unlike `changelog`, this submodule is public: it's also the
+/// service external tooling (e.g. `fyde-scripts`, validating a script against
+/// a placeholder [`Document`] before publishing it) uses to exercise a
+/// script through the same sandboxed Lua VM the server-side pipeline runs,
+/// instead of hand-rolling a syntax-only check.
 #[cfg_attr(test, automock)]
 #[async_trait]
-pub(super) trait Service: Send + Sync {
+pub trait Service: Send + Sync {
     /// Builds the [`Metadata`] for a freshly uploaded PDF `content`,
     /// originally named `original_name`: derives its checksum, size, and
     /// transcript, then runs every script currently enabled for the
@@ -44,6 +46,6 @@ pub(super) trait Service: Send + Sync {
 }
 
 /// Initializes the parser service, delegating script execution to `scripts`.
-pub(super) fn init(scripts: Arc<dyn ScriptsService>) -> Arc<dyn Service> {
+pub fn init(scripts: Arc<dyn ScriptsService>) -> Arc<dyn Service> {
     Arc::new(service::ParserClient::new(scripts))
 }

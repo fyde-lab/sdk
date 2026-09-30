@@ -91,8 +91,10 @@ impl Document {
     /// Constructs a document from already-known parts. Used by other
     /// domains (e.g. `changelog`, materializing a document from a decrypted
     /// event) that need to build one without going through `documents`'s
-    /// own storage/service layer.
-    pub(crate) fn new(id: Uuid, content: Vec<u8>, metadata: Metadata) -> Self {
+    /// own storage/service layer, and by external callers of the public
+    /// `parser` service (e.g. `fyde-scripts`) that need a placeholder
+    /// document to run a script against without a real upload.
+    pub fn new(id: Uuid, content: Vec<u8>, metadata: Metadata) -> Self {
         Self {
             id,
             content,
