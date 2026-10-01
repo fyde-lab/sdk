@@ -228,7 +228,6 @@ pub struct FfiMetadata {
     pub source_category: Option<FfiSourceCategory>,
     pub source_sub_category: Option<FfiSourceSubCategory>,
     pub subject: String,
-    pub qualification: String,
     pub purpose: Option<FfiPurpose>,
 }
 
@@ -249,7 +248,6 @@ impl From<Metadata> for FfiMetadata {
                 .source_sub_category()
                 .map(FfiSourceSubCategory::from),
             subject: metadata.subject().to_string(),
-            qualification: metadata.qualification().to_string(),
             purpose: metadata.purpose().map(FfiPurpose::from),
         }
     }
@@ -272,7 +270,6 @@ impl TryFrom<FfiMetadata> for Metadata {
             source_category: metadata.source_category.map(SourceCategory::from),
             source_sub_category: metadata.source_sub_category.map(SourceSubCategory::from),
             subject: metadata.subject,
-            qualification: metadata.qualification,
             purpose: metadata.purpose.map(Purpose::from),
         })
     }
@@ -743,7 +740,6 @@ mod tests {
                 .map(FfiSourceSubCategory::from)
         );
         assert_eq!(ffi.subject, metadata.subject());
-        assert_eq!(ffi.qualification, metadata.qualification());
         assert_eq!(ffi.purpose, metadata.purpose().map(FfiPurpose::from));
     }
 

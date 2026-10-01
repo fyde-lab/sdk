@@ -279,7 +279,6 @@ pub struct Metadata {
     pub source_category: Option<SourceCategory>,
     pub source_sub_category: Option<SourceSubCategory>,
     pub subject: String,
-    pub qualification: String,
     /// `None` until a classification script sets it — scripts never
     /// persist anything themselves, so a freshly parsed document has no
     /// purpose yet.
@@ -333,10 +332,6 @@ impl Metadata {
 
     pub fn subject(&self) -> &str {
         &self.subject
-    }
-
-    pub fn qualification(&self) -> &str {
-        &self.qualification
     }
 
     pub fn purpose(&self) -> Option<Purpose> {
@@ -415,7 +410,6 @@ impl FakeMetadata {
                         [crate::testing::random_u64(SourceSubCategory::ALL.len() as u64) as usize],
                 ),
                 subject: crate::testing::random_word().to_string(),
-                qualification: crate::testing::random_word().to_string(),
                 purpose: Some(
                     Purpose::ALL[crate::testing::random_u64(Purpose::ALL.len() as u64) as usize],
                 ),
@@ -486,11 +480,6 @@ impl FakeMetadata {
 
     pub(crate) fn with_subject(mut self, subject: impl Into<String>) -> Self {
         self.metadata.subject = subject.into();
-        self
-    }
-
-    pub(crate) fn with_qualification(mut self, qualification: impl Into<String>) -> Self {
-        self.metadata.qualification = qualification.into();
         self
     }
 
@@ -574,7 +563,6 @@ mod tests {
             .with_source_category(SourceCategory::Bank)
             .with_source_sub_category(SourceSubCategory::Tax)
             .with_subject("Q1 report")
-            .with_qualification("verified")
             .with_purpose(Purpose::Invoice)
             .build();
 
@@ -590,7 +578,6 @@ mod tests {
         assert_eq!(metadata.source_category, Some(SourceCategory::Bank));
         assert_eq!(metadata.source_sub_category, Some(SourceSubCategory::Tax));
         assert_eq!(metadata.subject, "Q1 report");
-        assert_eq!(metadata.qualification, "verified");
         assert_eq!(metadata.purpose, Some(Purpose::Invoice));
     }
 

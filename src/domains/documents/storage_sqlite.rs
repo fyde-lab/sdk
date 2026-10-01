@@ -71,8 +71,8 @@ fn purpose_from_column(column: String) -> Result<Option<Purpose>> {
 impl Storage for SqliteStorage {
     async fn save_document(&self, document: &Document) -> Result<()> {
         sqlx::query(
-            "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subject, qualification, purpose)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subject, purpose)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )
         .bind(document.id.to_string())
         .bind(&document.metadata.name)
@@ -88,7 +88,6 @@ impl Storage for SqliteStorage {
             document.metadata.source_sub_category,
         ))
         .bind(&document.metadata.subject)
-        .bind(&document.metadata.qualification)
         .bind(purpose_to_column(document.metadata.purpose))
         .execute(&self.pool)
         .await
@@ -99,7 +98,7 @@ impl Storage for SqliteStorage {
 
     async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
         let row = sqlx::query(
-            "SELECT name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subject, qualification, purpose FROM documents WHERE id = ?1",
+            "SELECT name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subject, purpose FROM documents WHERE id = ?1",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -129,7 +128,6 @@ impl Storage for SqliteStorage {
                     row.get("source_sub_category"),
                 )?,
                 subject: row.get("subject"),
-                qualification: row.get("qualification"),
                 purpose: purpose_from_column(row.get("purpose"))?,
             },
             content,
@@ -138,7 +136,7 @@ impl Storage for SqliteStorage {
 
     async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
         let rows = sqlx::query(
-            "SELECT id, name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subject, qualification, purpose FROM documents
+            "SELECT id, name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subject, purpose FROM documents
              ORDER BY created_at ASC, id ASC
              LIMIT ?1 OFFSET ?2",
         )
@@ -172,7 +170,6 @@ impl Storage for SqliteStorage {
                             row.get("source_sub_category"),
                         )?,
                         subject: row.get("subject"),
-                        qualification: row.get("qualification"),
                         purpose: purpose_from_column(row.get("purpose"))?,
                     },
                     content,
@@ -184,8 +181,8 @@ impl Storage for SqliteStorage {
     async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()> {
         sqlx::query(
             "UPDATE documents
-             SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6, type = ?7, source_category = ?8, source_sub_category = ?9, subject = ?10, qualification = ?11, purpose = ?12
-             WHERE id = ?13",
+             SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6, type = ?7, source_category = ?8, source_sub_category = ?9, subject = ?10, purpose = ?11
+             WHERE id = ?12",
         )
         .bind(&metadata.name)
         .bind(&metadata.original_name)
@@ -199,7 +196,6 @@ impl Storage for SqliteStorage {
             metadata.source_sub_category,
         ))
         .bind(&metadata.subject)
-        .bind(&metadata.qualification)
         .bind(purpose_to_column(metadata.purpose))
         .bind(id.to_string())
         .execute(&self.pool)
@@ -261,7 +257,6 @@ mod tests {
                     source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
-                    qualification: String::new(),
                     purpose: None,
                 },
             })
@@ -288,7 +283,6 @@ mod tests {
                     source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
-                    qualification: String::new(),
                     purpose: None,
                 },
             }
@@ -317,7 +311,6 @@ mod tests {
                     source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
-                    qualification: String::new(),
                     purpose: None,
                 },
             })
@@ -340,7 +333,6 @@ mod tests {
                     source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
-                    qualification: String::new(),
                     purpose: None,
                 },
             })
@@ -373,7 +365,6 @@ mod tests {
                         source_category: None,
                         source_sub_category: None,
                         subject: String::new(),
-                        qualification: String::new(),
                         purpose: None,
                     },
                 })
@@ -443,7 +434,6 @@ mod tests {
                     source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
-                    qualification: String::new(),
                     purpose: None,
                 },
             })
@@ -466,7 +456,6 @@ mod tests {
                     source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
-                    qualification: String::new(),
                     purpose: None,
                 },
             )
@@ -498,7 +487,6 @@ mod tests {
                     source_category: None,
                     source_sub_category: None,
                     subject: String::new(),
-                    qualification: String::new(),
                     purpose: None,
                 },
             )

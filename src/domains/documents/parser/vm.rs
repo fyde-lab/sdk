@@ -249,9 +249,6 @@ fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
         .set("subject", metadata.subject())
         .context("failed to set document.metadata.subject")?;
     metadata_table
-        .set("qualification", metadata.qualification())
-        .context("failed to set document.metadata.qualification")?;
-    metadata_table
         .set(
             "purpose",
             metadata.purpose().map_or("", |purpose| purpose.as_str()),
@@ -309,9 +306,6 @@ pub(super) fn read_metadata(lua: &Lua, original: &Metadata, source: &Metadata) -
         subject: metadata_table
             .get("subject")
             .context("failed to read document.metadata.subject back")?,
-        qualification: metadata_table
-            .get("qualification")
-            .context("failed to read document.metadata.qualification back")?,
         purpose: source.purpose(),
     })
 }

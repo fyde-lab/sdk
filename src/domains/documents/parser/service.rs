@@ -63,7 +63,6 @@ impl Service for ParserClient {
             source_category: None,
             source_sub_category: None,
             subject: String::new(),
-            qualification: String::new(),
             purpose: None,
         };
 
