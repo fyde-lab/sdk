@@ -166,6 +166,38 @@ pub(super) fn expose_set_source(lua: &Lua, metadata: Rc<RefCell<Metadata>>) -> R
     Ok(())
 }
 
+/// Exposes `set_purpose(purpose)` as a global function in `lua`, letting a
+/// script set `document.metadata.purpose` with immediate validation: an
+/// unknown purpose name raises a Lua error right away, rather than leaving
+/// an invalid value sitting in `document.metadata` to only be caught later
+/// by [`read_metadata`], after the script has already finished running.
+///
+/// `metadata` is the same handle [`expose_document`] returned for this
+/// document: a call writes the parsed purpose into it directly, alongside
+/// the `document.metadata` table, so the original [`Metadata`] is updated
+/// immediately rather than only once [`read_metadata`] re-parses the table
+/// at the end of the script.
+pub(super) fn expose_set_purpose(lua: &Lua, metadata: Rc<RefCell<Metadata>>) -> Result<()> {
+    let set_purpose = lua
+        .create_function(move |lua, purpose: String| {
+            let purpose = purpose.parse::<Purpose>().map_err(mlua::Error::external)?;
+
+            metadata.borrow_mut().purpose = Some(purpose);
+
+            let document_table: mlua::Table = lua.globals().get("document")?;
+            let metadata_table: mlua::Table = document_table.get("metadata")?;
+            metadata_table.set("purpose", purpose.as_str())?;
+
+            Ok(())
+        })
+        .context("failed to create the set_purpose lua function")?;
+    lua.globals()
+        .set("set_purpose", set_purpose)
+        .context("failed to expose set_purpose to the sandboxed lua vm")?;
+
+    Ok(())
+}
+
 fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
     let metadata_table = lua
         .create_table()
@@ -235,10 +267,11 @@ fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
 /// underlying file rather than user-editable metadata, so a script can't
 /// change them: they're always taken from `original` regardless of what a
 /// script assigned into the table. `source_category`/`source_sub_category`
-/// are likewise taken from `source` (the [`expose_document`]-returned handle
-/// [`expose_set_source`] writes into) rather than re-parsed out of the
+/// and `purpose` are likewise taken from `source` (the
+/// [`expose_document`]-returned handle [`expose_set_source`]/
+/// [`expose_set_purpose`] write into) rather than re-parsed out of the
 /// table, since that handle is already validated and is the only way those
-/// two fields can change. Called once a script has finished running, so the
+/// fields can change. Called once a script has finished running, so the
 /// caller can compare the result against `original` to see which fields, if
 /// any, the script changed.
 pub(super) fn read_metadata(lua: &Lua, original: &Metadata, source: &Metadata) -> Result<Metadata> {
@@ -279,20 +312,7 @@ pub(super) fn read_metadata(lua: &Lua, original: &Metadata, source: &Metadata) -
         qualification: metadata_table
             .get("qualification")
             .context("failed to read document.metadata.qualification back")?,
-        purpose: {
-            let purpose: String = metadata_table
-                .get("purpose")
-                .context("failed to read document.metadata.purpose back")?;
-            if purpose.is_empty() {
-                None
-            } else {
-                Some(
-                    purpose
-                        .parse::<Purpose>()
-                        .context("script left document.metadata.purpose as an invalid value")?,
-                )
-            }
-        },
+        purpose: source.purpose(),
     })
 }
 
@@ -301,7 +321,7 @@ mod tests {
     use mlua::Value;
 
     use super::*;
-    use crate::domains::documents::{FakeDocument, FakeMetadata};
+    use crate::domains::documents::FakeDocument;
 
     #[test]
     fn sandboxed_vm_has_no_filesystem_or_process_access() {
@@ -484,14 +504,15 @@ mod tests {
     }
 
     #[test]
-    fn read_metadata_reflects_a_purpose_a_script_assigned() {
+    fn set_purpose_sets_the_purpose() {
         let lua = sandboxed().unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
-        lua.load(r#"document.metadata.purpose = "invoice""#)
-            .exec()
-            .unwrap();
+        expose_set_purpose(&lua, source_metadata.clone()).unwrap();
+        lua.load(r#"set_purpose("invoice")"#).exec().unwrap();
+
+        assert_eq!(source_metadata.borrow().purpose, Some(Purpose::Invoice));
 
         let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
 
@@ -499,32 +520,14 @@ mod tests {
     }
 
     #[test]
-    fn read_metadata_clears_purpose_when_a_script_sets_it_empty() {
-        let lua = sandboxed().unwrap();
-        let document = FakeMetadata::new().with_purpose(Purpose::Invoice).build();
-        let document = FakeDocument::new().with_metadata(document).build();
-
-        let source_metadata = expose_document(&lua, &document).unwrap();
-        lua.load(r#"document.metadata.purpose = """#)
-            .exec()
-            .unwrap();
-
-        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
-
-        assert_eq!(metadata.purpose, None);
-    }
-
-    #[test]
-    fn read_metadata_errors_on_an_unknown_purpose() {
+    fn set_purpose_errors_on_an_unknown_purpose() {
         let lua = sandboxed().unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
-        lua.load(r#"document.metadata.purpose = "not-a-purpose""#)
-            .exec()
-            .unwrap();
+        expose_set_purpose(&lua, source_metadata).unwrap();
 
-        let result = read_metadata(&lua, document.metadata(), &source_metadata.borrow());
+        let result = lua.load(r#"set_purpose("not-a-purpose")"#).exec();
 
         assert!(result.is_err());
     }

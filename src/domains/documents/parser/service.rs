@@ -86,6 +86,7 @@ impl Service for ParserClient {
             let source_metadata = vm::expose_document(&lua, &working_document)?;
             vm::expose_pdf_conversions(&lua, document.content())?;
             vm::expose_set_source(&lua, source_metadata.clone())?;
+            vm::expose_set_purpose(&lua, source_metadata.clone())?;
             lua.load(script.script())
                 .exec()
                 .context("failed to run script")?;
