@@ -62,7 +62,7 @@ impl Service for ParserClient {
             r#type: String::new(),
             source_category: None,
             source_sub_category: None,
-            subject: String::new(),
+            subjects: Vec::new(),
             purpose: None,
         };
 
@@ -217,7 +217,9 @@ mod tests {
                 .with_script(r#"document.metadata.name = "first.pdf""#)
                 .build(),
             FakeScript::new()
-                .with_script(r#"document.metadata.subject = document.metadata.name .. "-subject""#)
+                .with_script(
+                    r#"document.metadata.subjects = { document.metadata.name .. "-subject" }"#,
+                )
                 .build(),
         ];
         let mut mock_scripts = MockScriptsService::new();
@@ -232,6 +234,6 @@ mod tests {
         let metadata = client.run_scripts(&document).await.unwrap();
 
         assert_eq!(metadata.name, "first.pdf");
-        assert_eq!(metadata.subject, "first.pdf-subject");
+        assert_eq!(metadata.subjects, vec!["first.pdf-subject".to_string()]);
     }
 }

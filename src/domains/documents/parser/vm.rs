@@ -246,8 +246,8 @@ fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
         )
         .context("failed to set document.metadata.source_sub_category")?;
     metadata_table
-        .set("subject", metadata.subject())
-        .context("failed to set document.metadata.subject")?;
+        .set("subjects", metadata.subjects().to_vec())
+        .context("failed to set document.metadata.subjects")?;
     metadata_table
         .set(
             "purpose",
@@ -303,9 +303,9 @@ pub(super) fn read_metadata(lua: &Lua, original: &Metadata, source: &Metadata) -
             .context("failed to read document.metadata.type back")?,
         source_category: source.source_category(),
         source_sub_category: source.source_sub_category(),
-        subject: metadata_table
-            .get("subject")
-            .context("failed to read document.metadata.subject back")?,
+        subjects: metadata_table
+            .get("subjects")
+            .context("failed to read document.metadata.subjects back")?,
         purpose: source.purpose(),
     })
 }

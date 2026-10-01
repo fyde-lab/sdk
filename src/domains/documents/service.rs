@@ -309,7 +309,7 @@ mod tests {
                 r#type: String::new(),
                 source_category: None,
                 source_sub_category: None,
-                subject: String::new(),
+                subjects: Vec::new(),
                 purpose: None,
             },
         };
@@ -351,7 +351,7 @@ mod tests {
                     r#type: String::new(),
                     source_category: None,
                     source_sub_category: None,
-                    subject: String::new(),
+                    subjects: Vec::new(),
                     purpose: None,
                 },
             },
@@ -370,7 +370,7 @@ mod tests {
                     r#type: String::new(),
                     source_category: None,
                     source_sub_category: None,
-                    subject: String::new(),
+                    subjects: Vec::new(),
                     purpose: None,
                 },
             },
@@ -405,7 +405,7 @@ mod tests {
     async fn update_metadata_publishes_an_update_metadata_event_with_the_given_metadata() {
         let metadata = super::super::FakeMetadata::new()
             .with_name("new.pdf")
-            .with_subject("new-subject")
+            .with_subjects(vec!["new-subject".to_string()])
             .build();
         let id = metadata.id;
 
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(*content, None);
         let metadata = metadata.as_ref().unwrap();
         assert_eq!(metadata.name, "new.pdf");
-        assert_eq!(metadata.subject, "new-subject");
+        assert_eq!(metadata.subjects, vec!["new-subject".to_string()]);
     }
 
     #[tokio::test]

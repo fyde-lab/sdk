@@ -50,6 +50,17 @@ fn source_sub_category_from_column(column: Option<String>) -> Result<Option<Sour
         .transpose()
 }
 
+/// The `subjects` column stores a JSON-encoded array, since SQLite has no
+/// native array type.
+fn subjects_to_column(subjects: &[String]) -> String {
+    serde_json::to_string(subjects).expect("serializing a Vec<String> to JSON cannot fail")
+}
+
+fn subjects_from_column(column: String) -> Result<Vec<String>> {
+    serde_json::from_str(&column)
+        .with_context(|| format!("invalid subjects json in local database: {column}"))
+}
+
 /// The `purpose` column has no NULL state (`NOT NULL DEFAULT ''`), so an
 /// unclassified document is stored as an empty string.
 fn purpose_to_column(purpose: Option<Purpose>) -> String {
@@ -71,7 +82,7 @@ fn purpose_from_column(column: String) -> Result<Option<Purpose>> {
 impl Storage for SqliteStorage {
     async fn save_document(&self, document: &Document) -> Result<()> {
         sqlx::query(
-            "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subject, purpose)
+            "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subjects, purpose)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )
         .bind(document.id.to_string())
@@ -87,7 +98,7 @@ impl Storage for SqliteStorage {
         .bind(source_sub_category_to_column(
             document.metadata.source_sub_category,
         ))
-        .bind(&document.metadata.subject)
+        .bind(subjects_to_column(&document.metadata.subjects))
         .bind(purpose_to_column(document.metadata.purpose))
         .execute(&self.pool)
         .await
@@ -98,7 +109,7 @@ impl Storage for SqliteStorage {
 
     async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
         let row = sqlx::query(
-            "SELECT name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subject, purpose FROM documents WHERE id = ?1",
+            "SELECT name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subjects, purpose FROM documents WHERE id = ?1",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -127,7 +138,7 @@ impl Storage for SqliteStorage {
                 source_sub_category: source_sub_category_from_column(
                     row.get("source_sub_category"),
                 )?,
-                subject: row.get("subject"),
+                subjects: subjects_from_column(row.get("subjects"))?,
                 purpose: purpose_from_column(row.get("purpose"))?,
             },
             content,
@@ -136,7 +147,7 @@ impl Storage for SqliteStorage {
 
     async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
         let rows = sqlx::query(
-            "SELECT id, name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subject, purpose FROM documents
+            "SELECT id, name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subjects, purpose FROM documents
              ORDER BY created_at ASC, id ASC
              LIMIT ?1 OFFSET ?2",
         )
@@ -169,7 +180,7 @@ impl Storage for SqliteStorage {
                         source_sub_category: source_sub_category_from_column(
                             row.get("source_sub_category"),
                         )?,
-                        subject: row.get("subject"),
+                        subjects: subjects_from_column(row.get("subjects"))?,
                         purpose: purpose_from_column(row.get("purpose"))?,
                     },
                     content,
@@ -181,7 +192,7 @@ impl Storage for SqliteStorage {
     async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()> {
         sqlx::query(
             "UPDATE documents
-             SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6, type = ?7, source_category = ?8, source_sub_category = ?9, subject = ?10, purpose = ?11
+             SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6, type = ?7, source_category = ?8, source_sub_category = ?9, subjects = ?10, purpose = ?11
              WHERE id = ?12",
         )
         .bind(&metadata.name)
@@ -195,7 +206,7 @@ impl Storage for SqliteStorage {
         .bind(source_sub_category_to_column(
             metadata.source_sub_category,
         ))
-        .bind(&metadata.subject)
+        .bind(subjects_to_column(&metadata.subjects))
         .bind(purpose_to_column(metadata.purpose))
         .bind(id.to_string())
         .execute(&self.pool)
@@ -256,7 +267,7 @@ mod tests {
                     r#type: String::new(),
                     source_category: None,
                     source_sub_category: None,
-                    subject: String::new(),
+                    subjects: Vec::new(),
                     purpose: None,
                 },
             })
@@ -282,7 +293,7 @@ mod tests {
                     r#type: String::new(),
                     source_category: None,
                     source_sub_category: None,
-                    subject: String::new(),
+                    subjects: Vec::new(),
                     purpose: None,
                 },
             }
@@ -310,7 +321,7 @@ mod tests {
                     r#type: String::new(),
                     source_category: None,
                     source_sub_category: None,
-                    subject: String::new(),
+                    subjects: Vec::new(),
                     purpose: None,
                 },
             })
@@ -332,7 +343,7 @@ mod tests {
                     r#type: String::new(),
                     source_category: None,
                     source_sub_category: None,
-                    subject: String::new(),
+                    subjects: Vec::new(),
                     purpose: None,
                 },
             })
@@ -364,7 +375,7 @@ mod tests {
                         r#type: String::new(),
                         source_category: None,
                         source_sub_category: None,
-                        subject: String::new(),
+                        subjects: Vec::new(),
                         purpose: None,
                     },
                 })
@@ -433,7 +444,7 @@ mod tests {
                     r#type: String::new(),
                     source_category: None,
                     source_sub_category: None,
-                    subject: String::new(),
+                    subjects: Vec::new(),
                     purpose: None,
                 },
             })
@@ -455,7 +466,7 @@ mod tests {
                     r#type: String::new(),
                     source_category: None,
                     source_sub_category: None,
-                    subject: String::new(),
+                    subjects: Vec::new(),
                     purpose: None,
                 },
             )
@@ -486,7 +497,7 @@ mod tests {
                     r#type: String::new(),
                     source_category: None,
                     source_sub_category: None,
-                    subject: String::new(),
+                    subjects: Vec::new(),
                     purpose: None,
                 },
             )
