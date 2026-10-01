@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::domains::documents::{EventType, Metadata, SourceCategory, SourceSubCategory};
+use crate::domains::documents::{EventType, Metadata, Purpose, SourceCategory, SourceSubCategory};
 use crate::domains::scripts::Script;
 use crate::domains::sessions::Service as SessionsService;
 use crate::{ChangelogEvent, Client, ClientConfig, Document, Error, LogLevel, Storage};
@@ -171,6 +171,47 @@ impl From<FfiSourceSubCategory> for SourceSubCategory {
     }
 }
 
+/// The reason a document was produced, mirroring [`Purpose`] across the FFI
+/// boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiPurpose {
+    Attestation,
+    Contract,
+    Invoice,
+    Report,
+    Description,
+    Evaluation,
+    Employment,
+}
+
+impl From<Purpose> for FfiPurpose {
+    fn from(purpose: Purpose) -> Self {
+        match purpose {
+            Purpose::Attestation => Self::Attestation,
+            Purpose::Contract => Self::Contract,
+            Purpose::Invoice => Self::Invoice,
+            Purpose::Report => Self::Report,
+            Purpose::Description => Self::Description,
+            Purpose::Evaluation => Self::Evaluation,
+            Purpose::Employment => Self::Employment,
+        }
+    }
+}
+
+impl From<FfiPurpose> for Purpose {
+    fn from(purpose: FfiPurpose) -> Self {
+        match purpose {
+            FfiPurpose::Attestation => Self::Attestation,
+            FfiPurpose::Contract => Self::Contract,
+            FfiPurpose::Invoice => Self::Invoice,
+            FfiPurpose::Report => Self::Report,
+            FfiPurpose::Description => Self::Description,
+            FfiPurpose::Evaluation => Self::Evaluation,
+            FfiPurpose::Employment => Self::Employment,
+        }
+    }
+}
+
 /// A document's cleartext metadata, mirroring [`Metadata`] across the FFI
 /// boundary.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -188,6 +229,7 @@ pub struct FfiMetadata {
     pub source_sub_category: Option<FfiSourceSubCategory>,
     pub subject: String,
     pub qualification: String,
+    pub purpose: Option<FfiPurpose>,
 }
 
 impl From<Metadata> for FfiMetadata {
@@ -208,6 +250,7 @@ impl From<Metadata> for FfiMetadata {
                 .map(FfiSourceSubCategory::from),
             subject: metadata.subject().to_string(),
             qualification: metadata.qualification().to_string(),
+            purpose: metadata.purpose().map(FfiPurpose::from),
         }
     }
 }
@@ -230,6 +273,7 @@ impl TryFrom<FfiMetadata> for Metadata {
             source_sub_category: metadata.source_sub_category.map(SourceSubCategory::from),
             subject: metadata.subject,
             qualification: metadata.qualification,
+            purpose: metadata.purpose.map(Purpose::from),
         })
     }
 }
@@ -700,6 +744,7 @@ mod tests {
         );
         assert_eq!(ffi.subject, metadata.subject());
         assert_eq!(ffi.qualification, metadata.qualification());
+        assert_eq!(ffi.purpose, metadata.purpose().map(FfiPurpose::from));
     }
 
     #[test]

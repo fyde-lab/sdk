@@ -6,7 +6,7 @@ use pdf_oxide::PdfDocument;
 use pdf_oxide::converters::ConversionOptions;
 use uuid::Uuid;
 
-use crate::domains::documents::{Document, Metadata, SourceCategory, SourceSubCategory};
+use crate::domains::documents::{Document, Metadata, Purpose, SourceCategory, SourceSubCategory};
 use crate::{ErrorContext as _, Result};
 
 /// Builds a fully sandboxed Lua VM: no `io`, `os`, `package` (so no
@@ -219,6 +219,12 @@ fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
     metadata_table
         .set("qualification", metadata.qualification())
         .context("failed to set document.metadata.qualification")?;
+    metadata_table
+        .set(
+            "purpose",
+            metadata.purpose().map_or("", |purpose| purpose.as_str()),
+        )
+        .context("failed to set document.metadata.purpose")?;
 
     Ok(metadata_table)
 }
@@ -273,6 +279,20 @@ pub(super) fn read_metadata(lua: &Lua, original: &Metadata, source: &Metadata) -
         qualification: metadata_table
             .get("qualification")
             .context("failed to read document.metadata.qualification back")?,
+        purpose: {
+            let purpose: String = metadata_table
+                .get("purpose")
+                .context("failed to read document.metadata.purpose back")?;
+            if purpose.is_empty() {
+                None
+            } else {
+                Some(
+                    purpose
+                        .parse::<Purpose>()
+                        .context("script left document.metadata.purpose as an invalid value")?,
+                )
+            }
+        },
     })
 }
 
@@ -281,7 +301,7 @@ mod tests {
     use mlua::Value;
 
     use super::*;
-    use crate::domains::documents::FakeDocument;
+    use crate::domains::documents::{FakeDocument, FakeMetadata};
 
     #[test]
     fn sandboxed_vm_has_no_filesystem_or_process_access() {
@@ -459,6 +479,52 @@ mod tests {
         let result = lua
             .load(r#"set_source("bank", "not-a-sub-category")"#)
             .exec();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn read_metadata_reflects_a_purpose_a_script_assigned() {
+        let lua = sandboxed().unwrap();
+        let document = FakeDocument::new().build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        lua.load(r#"document.metadata.purpose = "invoice""#)
+            .exec()
+            .unwrap();
+
+        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
+
+        assert_eq!(metadata.purpose, Some(Purpose::Invoice));
+    }
+
+    #[test]
+    fn read_metadata_clears_purpose_when_a_script_sets_it_empty() {
+        let lua = sandboxed().unwrap();
+        let document = FakeMetadata::new().with_purpose(Purpose::Invoice).build();
+        let document = FakeDocument::new().with_metadata(document).build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        lua.load(r#"document.metadata.purpose = """#)
+            .exec()
+            .unwrap();
+
+        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
+
+        assert_eq!(metadata.purpose, None);
+    }
+
+    #[test]
+    fn read_metadata_errors_on_an_unknown_purpose() {
+        let lua = sandboxed().unwrap();
+        let document = FakeDocument::new().build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        lua.load(r#"document.metadata.purpose = "not-a-purpose""#)
+            .exec()
+            .unwrap();
+
+        let result = read_metadata(&lua, document.metadata(), &source_metadata.borrow());
 
         assert!(result.is_err());
     }

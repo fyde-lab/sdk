@@ -8,7 +8,7 @@ mod storage_sqlite;
 #[cfg(test)]
 pub(crate) use changelog::FakeChangelogEvent;
 pub use changelog::{ChangelogEvent, EventType};
-pub use models::{Document, Metadata, SourceCategory, SourceSubCategory};
+pub use models::{Document, Metadata, Purpose, SourceCategory, SourceSubCategory};
 #[cfg(test)]
 pub(crate) use models::{FakeDocument, FakeMetadata};
 #[cfg(test)]

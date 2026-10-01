@@ -64,6 +64,7 @@ impl Service for ParserClient {
             source_sub_category: None,
             subject: String::new(),
             qualification: String::new(),
+            purpose: None,
         };
 
         let document = Document::new(id, content.to_vec(), metadata);

@@ -65,6 +65,8 @@ pub enum Error {
     InvalidSourceCategory(String),
     #[error("invalid source sub-category: {0:?}")]
     InvalidSourceSubCategory(String),
+    #[error("invalid purpose: {0:?}")]
+    InvalidPurpose(String),
     #[error("invalid server response: {0}")]
     InvalidResponse(String),
     #[error("encryption error: {0}")]

@@ -311,6 +311,7 @@ mod tests {
                 source_sub_category: None,
                 subject: String::new(),
                 qualification: String::new(),
+                purpose: None,
             },
         };
 
@@ -353,6 +354,7 @@ mod tests {
                     source_sub_category: None,
                     subject: String::new(),
                     qualification: String::new(),
+                    purpose: None,
                 },
             },
             Document {
@@ -372,6 +374,7 @@ mod tests {
                     source_sub_category: None,
                     subject: String::new(),
                     qualification: String::new(),
+                    purpose: None,
                 },
             },
         ];

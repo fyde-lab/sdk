@@ -194,6 +194,68 @@ impl FromStr for SourceSubCategory {
     }
 }
 
+/// The reason a document was produced, as filled in by a user's
+/// classification script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Purpose {
+    Attestation,
+    Contract,
+    Invoice,
+    Report,
+    Description,
+    Evaluation,
+    Employment,
+}
+
+impl Purpose {
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Purpose] = &[
+        Self::Attestation,
+        Self::Contract,
+        Self::Invoice,
+        Self::Report,
+        Self::Description,
+        Self::Evaluation,
+        Self::Employment,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Attestation => "attestation",
+            Self::Contract => "contract",
+            Self::Invoice => "invoice",
+            Self::Report => "report",
+            Self::Description => "description",
+            Self::Evaluation => "evaluation",
+            Self::Employment => "employment",
+        }
+    }
+}
+
+impl fmt::Display for Purpose {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Purpose {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "attestation" => Ok(Self::Attestation),
+            "contract" => Ok(Self::Contract),
+            "invoice" => Ok(Self::Invoice),
+            "report" => Ok(Self::Report),
+            "description" => Ok(Self::Description),
+            "evaluation" => Ok(Self::Evaluation),
+            "employment" => Ok(Self::Employment),
+            other => Err(Error::InvalidPurpose(other.to_string())),
+        }
+    }
+}
+
 /// Cleartext metadata encrypted under a document's DEK before upload, and
 /// decrypted back out of it on download.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +280,10 @@ pub struct Metadata {
     pub source_sub_category: Option<SourceSubCategory>,
     pub subject: String,
     pub qualification: String,
+    /// `None` until a classification script sets it — scripts never
+    /// persist anything themselves, so a freshly parsed document has no
+    /// purpose yet.
+    pub purpose: Option<Purpose>,
 }
 
 impl Metadata {
@@ -271,6 +337,10 @@ impl Metadata {
 
     pub fn qualification(&self) -> &str {
         &self.qualification
+    }
+
+    pub fn purpose(&self) -> Option<Purpose> {
+        self.purpose
     }
 }
 
@@ -346,6 +416,9 @@ impl FakeMetadata {
                 ),
                 subject: crate::testing::random_word().to_string(),
                 qualification: crate::testing::random_word().to_string(),
+                purpose: Some(
+                    Purpose::ALL[crate::testing::random_u64(Purpose::ALL.len() as u64) as usize],
+                ),
             },
         }
     }
@@ -418,6 +491,11 @@ impl FakeMetadata {
 
     pub(crate) fn with_qualification(mut self, qualification: impl Into<String>) -> Self {
         self.metadata.qualification = qualification.into();
+        self
+    }
+
+    pub(crate) fn with_purpose(mut self, purpose: impl Into<Option<Purpose>>) -> Self {
+        self.metadata.purpose = purpose.into();
         self
     }
 
@@ -497,6 +575,7 @@ mod tests {
             .with_source_sub_category(SourceSubCategory::Tax)
             .with_subject("Q1 report")
             .with_qualification("verified")
+            .with_purpose(Purpose::Invoice)
             .build();
 
         assert_eq!(metadata.id, id);
@@ -512,6 +591,7 @@ mod tests {
         assert_eq!(metadata.source_sub_category, Some(SourceSubCategory::Tax));
         assert_eq!(metadata.subject, "Q1 report");
         assert_eq!(metadata.qualification, "verified");
+        assert_eq!(metadata.purpose, Some(Purpose::Invoice));
     }
 
     #[test]

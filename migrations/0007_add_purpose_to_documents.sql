@@ -1,0 +1,1 @@
+ALTER TABLE documents ADD COLUMN purpose TEXT NOT NULL DEFAULT '';
