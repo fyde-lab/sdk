@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use mlua::{Function, Lua, LuaSerdeExt as _, Table};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::runtime::Handle;
 
 use crate::domains::documents::Service as DocumentsService;
@@ -10,16 +10,19 @@ use crate::{ErrorContext as _, Result};
 
 use super::cookies::{Cookie, Service as CookiesService};
 use super::host;
+use super::reports::{Recorder, Service as ReportsService};
 use super::session::Service as SessionService;
 use super::{ProgressEvent, Service};
 
 /// The default [`Service`] implementation, running scripts in a fresh
 /// `mlua::Lua` VM per call, delegating session/cookie persistence to
-/// injected [`SessionService`]/[`CookiesService`] implementations and
-/// document uploads to an injected [`DocumentsService`].
+/// injected [`SessionService`]/[`CookiesService`] implementations, this
+/// run's debug report to an injected [`ReportsService`], and document
+/// uploads to an injected [`DocumentsService`].
 pub(super) struct ScrapersClient {
     cookies: Arc<dyn CookiesService>,
     session: Arc<dyn SessionService>,
+    reports: Arc<dyn ReportsService>,
     documents: Arc<dyn DocumentsService>,
     on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
     on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
@@ -29,6 +32,7 @@ impl ScrapersClient {
     pub(super) fn new(
         cookies: Arc<dyn CookiesService>,
         session: Arc<dyn SessionService>,
+        reports: Arc<dyn ReportsService>,
         documents: Arc<dyn DocumentsService>,
         on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
         on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
@@ -36,6 +40,7 @@ impl ScrapersClient {
         Self {
             cookies,
             session,
+            reports,
             documents,
             on_progress,
             on_question,
@@ -49,6 +54,8 @@ impl Service for ScrapersClient {
         let cookies = self.cookies.load(name).await?;
         let session_data = self.session.load(name).await?;
         let handle = Handle::current();
+        let recorder = Arc::new(Recorder::new(name));
+        recorder.record("run_started", json!({ "script": name }));
 
         let documents = self.documents.clone();
         let on_progress = self.on_progress.clone();
@@ -72,6 +79,14 @@ impl Service for ScrapersClient {
         .await
         .with_context(|| format!("scraper {name:?} task panicked"))??;
 
+        match &run_result {
+            Ok(()) => recorder.record("run_finished", json!({ "status": "ok" })),
+            Err(err) => recorder.record(
+                "error",
+                json!({ "action": "run", "message": err.to_string() }),
+            ),
+        }
+
         self.session
             .save(name, session_data)
             .await
@@ -80,6 +95,10 @@ impl Service for ScrapersClient {
             .save(name, cookies)
             .await
             .with_context(|| format!("failed to save cookies for scraper {name:?}"))?;
+        self.reports
+            .save(recorder.finish())
+            .await
+            .with_context(|| format!("failed to save report for scraper {name:?}"))?;
 
         run_result
     }
@@ -156,6 +175,7 @@ mod tests {
     use serde_json::json;
 
     use super::super::cookies::{FakeCookie, MockService as MockCookiesService};
+    use super::super::reports::MockService as MockReportsService;
     use super::super::session::MockService as MockSessionService;
     use super::*;
     use crate::domains::documents::MockService as MockDocumentsService;
@@ -167,6 +187,16 @@ mod tests {
         return M
     "#;
 
+    /// A [`MockReportsService`] that accepts exactly one `save` call,
+    /// without asserting anything about the report's contents — the
+    /// `reports::service`/`recorder` tests already cover what gets
+    /// recorded; these tests only care that a run always saves a report.
+    fn any_reports() -> MockReportsService {
+        let mut reports = MockReportsService::new();
+        reports.expect_save().times(1).returning(|_| Ok(()));
+        reports
+    }
+
     fn client(
         cookies: MockCookiesService,
         session: MockSessionService,
@@ -175,6 +205,7 @@ mod tests {
         ScrapersClient::new(
             Arc::new(cookies),
             Arc::new(session),
+            Arc::new(any_reports()),
             Arc::new(documents),
             None,
             None,
@@ -293,6 +324,7 @@ mod tests {
         let client = ScrapersClient::new(
             Arc::new(cookies),
             Arc::new(session),
+            Arc::new(any_reports()),
             Arc::new(MockDocumentsService::new()),
             Some(on_progress),
             None,
