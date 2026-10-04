@@ -57,8 +57,8 @@ pub(crate) fn init(
     on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
     on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
 ) -> Arc<dyn Service> {
-    let cookies = cookies::init(pool.clone());
-    let session = session::init(pool);
+    let cookies = cookies::init(cookies::StorageConfig::Sqlite(pool.clone()));
+    let session = session::init(session::StorageConfig::Sqlite(pool));
 
     Arc::new(service::ScrapersClient::new(
         cookies,

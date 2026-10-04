@@ -8,6 +8,7 @@ pub(super) use models::Cookie;
 #[cfg(test)]
 pub(super) use models::FakeCookie;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -35,9 +36,29 @@ pub(super) trait Service: Send + Sync {
     async fn save(&self, scraper_name: &str, cookies: Vec<Cookie>) -> Result<()>;
 }
 
-/// Initializes the cookies service: uses `pool` to persist cookies in the
-/// local `scraper_cookies` table.
-pub(super) fn init(pool: SqlitePool) -> Arc<dyn Service> {
-    let storage = storage_sqlite::SqliteStorage::new(pool);
-    Arc::new(service::CookiesClient::new(storage))
+/// Selects which [`storage::Storage`] backend [`init`] builds the cookies
+/// service on top of.
+pub(super) enum StorageConfig {
+    /// Persists cookies as one JSON file per scraper under the given
+    /// directory (see [`storage_file::FileStorage`]) — used by `../scripts`'
+    /// standalone CLI runner, which has no local SQLite database of its own.
+    File(PathBuf),
+    /// Persists cookies in the local `scraper_cookies` table of the given
+    /// SQLite pool (see [`storage_sqlite::SqliteStorage`]).
+    Sqlite(SqlitePool),
+}
+
+/// Initializes the cookies service on top of the [`storage::Storage`]
+/// backend selected by `config`.
+pub(super) fn init(config: StorageConfig) -> Arc<dyn Service> {
+    match config {
+        StorageConfig::File(dir) => {
+            let storage = storage_file::FileStorage::new(dir);
+            Arc::new(service::CookiesClient::new(storage))
+        }
+        StorageConfig::Sqlite(pool) => {
+            let storage = storage_sqlite::SqliteStorage::new(pool);
+            Arc::new(service::CookiesClient::new(storage))
+        }
+    }
 }

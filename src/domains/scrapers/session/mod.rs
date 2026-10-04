@@ -3,6 +3,7 @@ mod storage;
 mod storage_file;
 mod storage_sqlite;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -32,9 +33,29 @@ pub(super) trait Service: Send + Sync {
     async fn save(&self, scraper_name: &str, data: Value) -> Result<()>;
 }
 
-/// Initializes the session service: uses `pool` to persist session data in
-/// the local `scraper_sessions` table.
-pub(super) fn init(pool: SqlitePool) -> Arc<dyn Service> {
-    let storage = storage_sqlite::SqliteStorage::new(pool);
-    Arc::new(service::SessionClient::new(storage))
+/// Selects which [`storage::Storage`] backend [`init`] builds the session
+/// service on top of.
+pub(super) enum StorageConfig {
+    /// Persists session data as one JSON file per scraper under the given
+    /// directory (see [`storage_file::FileStorage`]) — used by `../scripts`'
+    /// standalone CLI runner, which has no local SQLite database of its own.
+    File(PathBuf),
+    /// Persists session data in the local `scraper_sessions` table of the
+    /// given SQLite pool (see [`storage_sqlite::SqliteStorage`]).
+    Sqlite(SqlitePool),
+}
+
+/// Initializes the session service on top of the [`storage::Storage`]
+/// backend selected by `config`.
+pub(super) fn init(config: StorageConfig) -> Arc<dyn Service> {
+    match config {
+        StorageConfig::File(dir) => {
+            let storage = storage_file::FileStorage::new(dir);
+            Arc::new(service::SessionClient::new(storage))
+        }
+        StorageConfig::Sqlite(pool) => {
+            let storage = storage_sqlite::SqliteStorage::new(pool);
+            Arc::new(service::SessionClient::new(storage))
+        }
+    }
 }
