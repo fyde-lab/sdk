@@ -17,5 +17,14 @@ pkgs.mkShell {
 
     # required by build.rs to compile ../api-protos/*.proto via tonic-prost-build
     protobuf
+
+    # required to build wreq's vendored, patched BoringSSL (btls-sys), used by the
+    # scrapers domain's fyde.http (see src/domains/scrapers/host/http.rs) for a real
+    # Chrome TLS/HTTP2 fingerprint.
+    cmake
+    perl
+    go
+    # Sets up LIBCLANG_PATH/BINDGEN_EXTRA_CLANG_ARGS correctly for bindgen.
+    rustPlatform.bindgenHook
   ];
 }

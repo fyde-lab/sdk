@@ -18,7 +18,9 @@ hkdf = "0.12.4"
 # `error-send` makes `mlua::Error` itself `Send + Sync`, required since it's
 # wrapped into this crate's `Error` enum, which is held across `.await`
 # points throughout the SDK.
-mlua = { version = "0.12.1", features = ["lua54", "vendored", "error-send"] }
+# `serialize` enables `LuaSerdeExt` (`to_value`/`from_value`), used by the
+# scrapers domain (`domains/scrapers`) to round-trip JSON through Lua tables.
+mlua = { version = "0.12.1", features = ["lua54", "vendored", "error-send", "serialize"] }
 opaque-ke = { version = "4.0.1", features = ["argon2"] }
 # Pinned: 0.3.78+ requires `office_oxide ^0.1.9`, and every 0.1.9+ release of
 # `office_oxide` published so far fails to build against pdf_oxide's usage
@@ -37,6 +39,10 @@ rand = "0.10.2"
 # comes from — nothing in this crate names `rand08` directly.
 rand08 = { package = "rand", version = "0.8.5", features = ["getrandom"] }
 rmp-serde = "1.3.0"
+# `fyde.html.select` (`domains/scrapers/host/html.rs`) — re-parses the given
+# HTML string on every call rather than keeping long-lived document handles,
+# same approach and version as `demo-rust-fyde`.
+scraper = "0.20"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_bytes = "0.11.15"
 serde_json = "1.0.151"
@@ -57,6 +63,15 @@ tonic-health = "0.14.6"
 tonic-prost = "0.14.6"
 uniffi = { version = "=0.32.0", features = ["tokio"] }
 uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
+# `fyde.http` (`domains/scrapers/host/http.rs`) — `wreq` (not `reqwest`) so
+# scraper requests carry a real Chrome TLS/HTTP2 fingerprint
+# (`wreq_util::Profile`) instead of one trivially flagged by fingerprinting
+# middleboxes on sites like impots.gouv.fr. Same crates/versions/features as
+# `demo-rust-fyde`'s own `host/http.rs`, which this is ported from. Building
+# it vendors a patched BoringSSL (`btls-sys`), which needs
+# `cmake`/`perl`/`go`/`libclang` at build time — see `shell.nix`.
+wreq = { version = "0.16.1", features = ["cookies", "charset", "gzip", "brotli", "deflate", "zstd", "form", "webpki-roots"] }
+wreq-util = "0.2.0"
 xdg = "2.5.2"
 
 [build-dependencies]
