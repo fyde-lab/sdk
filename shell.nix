@@ -7,7 +7,8 @@
 }:
 
 let
-  rustToolchain = pkgs.rust-bin.stable."1.97.1".default.override {
+  # wreq/wreq-util (`domains/scrapers/host/http.rs`) require rustc >=1.98.
+  rustToolchain = pkgs.rust-bin.stable."1.98.1".default.override {
     extensions = [ "rust-src" "clippy" "rustfmt" "rust-analyzer" ];
   };
 in
