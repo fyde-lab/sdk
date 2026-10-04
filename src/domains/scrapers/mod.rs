@@ -1,6 +1,7 @@
 mod cookies;
 mod host;
 mod models;
+mod reports;
 mod service;
 mod session;
 
