@@ -6,6 +6,7 @@ mod session;
 
 pub use models::ProgressEvent;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -43,22 +44,48 @@ pub trait Service: Send + Sync {
     async fn run(&self, name: &str, script: &str, parameters: Value) -> Result<()>;
 }
 
-/// Initializes the scrapers service: uses `pool` to persist each scraper's
-/// session data and cookie jar (see the private `session`/`cookies`
-/// sub-domains, each backed by its own sqlite table), `documents` so
-/// `fyde.save_document` can upload a downloaded document through the SDK's
-/// own encrypted upload path, and `on_progress`/`on_question` as the
-/// callbacks `fyde.progress`/`fyde.input` invoke — see
+/// Selects which storage backend [`init`] builds the `session`/`cookies`
+/// sub-domains on top of — propagated down to each sub-domain's own
+/// `StorageConfig` (`session::StorageConfig`, `cookies::StorageConfig`).
+pub(crate) enum StorageConfig {
+    /// Persists session data and cookies as JSON files under the given
+    /// directory (one file per scraper per sub-domain) — used by
+    /// [`crate::init_dev_scrapers`], for a standalone CLI runner with no
+    /// local SQLite database of its own.
+    File(PathBuf),
+    /// Persists session data and cookies in the given SQLite pool's
+    /// `scraper_sessions`/`scraper_cookies` tables — used by a full
+    /// [`crate::Client`].
+    Sqlite(SqlitePool),
+}
+
+/// Initializes the scrapers service: uses `storage` to persist each
+/// scraper's session data and cookie jar (see the private
+/// `session`/`cookies` sub-domains), `documents` so `fyde.save_document`
+/// can upload a downloaded document through the SDK's own encrypted upload
+/// path, and `on_progress`/`on_question` as the callbacks
+/// `fyde.progress`/`fyde.input` invoke — see
 /// [`crate::ClientConfig::on_scraper_progress`]/
 /// [`crate::ClientConfig::on_scraper_question`].
 pub(crate) fn init(
-    pool: SqlitePool,
+    storage: StorageConfig,
     documents: Arc<dyn DocumentsService>,
     on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
     on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
 ) -> Arc<dyn Service> {
-    let cookies = cookies::init(cookies::StorageConfig::Sqlite(pool.clone()));
-    let session = session::init(session::StorageConfig::Sqlite(pool));
+    let (cookies_storage, session_storage) = match storage {
+        StorageConfig::File(dir) => (
+            cookies::StorageConfig::File(dir.clone()),
+            session::StorageConfig::File(dir),
+        ),
+        StorageConfig::Sqlite(pool) => (
+            cookies::StorageConfig::Sqlite(pool.clone()),
+            session::StorageConfig::Sqlite(pool),
+        ),
+    };
+
+    let cookies = cookies::init(cookies_storage);
+    let session = session::init(session_storage);
 
     Arc::new(service::ScrapersClient::new(
         cookies,
