@@ -64,6 +64,10 @@ pub trait Service: Send + Sync {
 
     /// Lists the scripts currently enabled for the authenticated user.
     async fn list_user_scripts(&self) -> Result<Vec<Script>>;
+
+    /// Lists every script marked public, regardless of who owns it or
+    /// whether the authenticated user has it enabled.
+    async fn list_public_scripts(&self) -> Result<Vec<Script>>;
 }
 
 /// Initializes the scripts service: talks to the fyde server's scripts

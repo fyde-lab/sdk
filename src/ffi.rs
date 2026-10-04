@@ -680,6 +680,14 @@ impl FydeClient {
         Ok(scripts.into_iter().map(FfiScript::from).collect())
     }
 
+    /// Lists every script marked public, regardless of who owns it or
+    /// whether the authenticated user has it enabled. Mirrors
+    /// [`crate::ScriptsService::list_public_scripts`].
+    pub async fn list_public_scripts(&self) -> Result<Vec<FfiScript>, FfiError> {
+        let scripts = self.inner.scripts().list_public_scripts().await?;
+        Ok(scripts.into_iter().map(FfiScript::from).collect())
+    }
+
     /// Runs every script currently enabled for the authenticated user
     /// against the document matching `document_id`, then publishes the
     /// resulting metadata if any script changed it. Mirrors
