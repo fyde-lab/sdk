@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 pub use domains::documents::parser::{Service as ParserService, init as init_parser};
 pub use domains::documents::{ChangelogEvent, Document, Metadata, Service as DocumentsService};
+pub use domains::scrapers::{ProgressEvent, Service as ScrapersService};
 pub use domains::scripts::{InMemoryScriptStorage, Service as ScriptsService};
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
@@ -77,6 +78,8 @@ pub enum Error {
     MessagePackEncode(#[from] rmp_serde::encode::Error),
     #[error("messagepack decode error: {0}")]
     MessagePackDecode(#[from] rmp_serde::decode::Error),
+    #[error("scraper task failed: {0}")]
+    TaskJoin(#[from] tokio::task::JoinError),
     #[error("{message}: {source}")]
     Context {
         message: String,
@@ -149,11 +152,25 @@ pub struct ClientConfig {
     /// to react to changes rather than to populate the cache. `None` if the
     /// caller doesn't need to observe individual events.
     pub on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
+    /// Called once for every `fyde.progress.step`/`fyde.progress.update`
+    /// call made by a scraper script running via `ScrapersService::run`, so
+    /// the caller can render its own progress bar. `None` if the caller
+    /// doesn't need to observe scraper progress.
+    pub on_scraper_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
+    /// Called once for every `fyde.input.ask(question)` call made by a
+    /// running scraper script, and must return the answer to show for it —
+    /// the call blocks until it does, so the caller should ask directly on
+    /// screen rather than return immediately with a placeholder. `None`
+    /// means a scraper script calling `fyde.input.ask` fails immediately
+    /// instead of blocking forever waiting for an answer that can never
+    /// come.
+    pub on_scraper_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
 }
 
 /// A connection to a fyde server.
 pub struct Client {
     documents: Arc<dyn DocumentsService>,
+    scrapers: Arc<dyn ScrapersService>,
     scripts: Arc<dyn ScriptsService>,
     server_state: Arc<dyn ServerStateService>,
     sessions: Arc<SessionsClient>,
@@ -221,6 +238,12 @@ impl Client {
         )
         .await
         .context("failed to initialize users service")?;
+        let scrapers = domains::scrapers::init(
+            sqlite.pool().clone(),
+            documents.clone(),
+            config.on_scraper_progress,
+            config.on_scraper_question,
+        );
 
         // A session may already be open from a previous run (the token is
         // persisted in `settings`, not just held in memory — see
@@ -235,6 +258,7 @@ impl Client {
 
         Ok(Self {
             documents,
+            scrapers,
             scripts,
             server_state,
             sessions,
@@ -266,6 +290,11 @@ impl Client {
     /// Returns a reference to the client's scripts service.
     pub fn scripts(&self) -> &dyn ScriptsService {
         self.scripts.as_ref()
+    }
+
+    /// Returns a reference to the client's scrapers service.
+    pub fn scrapers(&self) -> &dyn ScrapersService {
+        self.scrapers.as_ref()
     }
 
     /// Returns a reference to the client's sessions service. Returns the
@@ -328,6 +357,8 @@ mod tests {
             log_level: LogLevel::Off,
             on_log: None,
             on_document_change: None,
+            on_scraper_progress: None,
+            on_scraper_question: None,
         };
 
         let err = match Client::init(config).await {

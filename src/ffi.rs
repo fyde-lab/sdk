@@ -443,6 +443,10 @@ impl From<FfiClientConfig> for ClientConfig {
             log_level: config.log_level.into(),
             on_log: None,
             on_document_change: None,
+            // Not yet exposed over FFI — see `domains::scrapers`, which has
+            // no uniffi bindings yet.
+            on_scraper_progress: None,
+            on_scraper_question: None,
         }
     }
 }

@@ -65,6 +65,8 @@ impl Scenario {
             log_level: LogLevel::Off,
             on_log: None,
             on_document_change: None,
+            on_scraper_progress: None,
+            on_scraper_question: None,
         })
         .await
         .expect("failed to connect the sdk client to the test server");

@@ -1,0 +1,342 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use mlua::{Function, Lua, LuaSerdeExt as _, Table};
+use serde_json::Value;
+use tokio::runtime::Handle;
+
+use crate::domains::documents::Service as DocumentsService;
+use crate::{ErrorContext as _, Result};
+
+use super::cookies::{Cookie, Service as CookiesService};
+use super::host;
+use super::session::Service as SessionService;
+use super::{ProgressEvent, Service};
+
+/// The default [`Service`] implementation, running scripts in a fresh
+/// `mlua::Lua` VM per call, delegating session/cookie persistence to
+/// injected [`SessionService`]/[`CookiesService`] implementations and
+/// document uploads to an injected [`DocumentsService`].
+pub(super) struct ScrapersClient {
+    cookies: Arc<dyn CookiesService>,
+    session: Arc<dyn SessionService>,
+    documents: Arc<dyn DocumentsService>,
+    on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
+    on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
+}
+
+impl ScrapersClient {
+    pub(super) fn new(
+        cookies: Arc<dyn CookiesService>,
+        session: Arc<dyn SessionService>,
+        documents: Arc<dyn DocumentsService>,
+        on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
+        on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
+    ) -> Self {
+        Self {
+            cookies,
+            session,
+            documents,
+            on_progress,
+            on_question,
+        }
+    }
+}
+
+#[async_trait]
+impl Service for ScrapersClient {
+    async fn run(&self, name: &str, script: &str, parameters: Value) -> Result<()> {
+        let cookies = self.cookies.load(name).await?;
+        let session_data = self.session.load(name).await?;
+        let handle = Handle::current();
+
+        let documents = self.documents.clone();
+        let on_progress = self.on_progress.clone();
+        let on_question = self.on_question.clone();
+        let name_owned = name.to_string();
+        let script_owned = script.to_string();
+
+        let (session_data, cookies, run_result) = tokio::task::spawn_blocking(move || {
+            run_script(
+                &name_owned,
+                &script_owned,
+                parameters,
+                session_data,
+                cookies,
+                documents,
+                on_progress,
+                on_question,
+                handle,
+            )
+        })
+        .await
+        .with_context(|| format!("scraper {name:?} task panicked"))??;
+
+        self.session
+            .save(name, session_data)
+            .await
+            .with_context(|| format!("failed to save session for scraper {name:?}"))?;
+        self.cookies
+            .save(name, cookies)
+            .await
+            .with_context(|| format!("failed to save cookies for scraper {name:?}"))?;
+
+        run_result
+    }
+}
+
+/// Runs the whole blocking, synchronous half of a scraper run: builds a
+/// fresh Lua VM, installs the `fyde` host table (see `host::install`),
+/// evaluates `script` and calls its `run(parameters)` entrypoint, then reads
+/// back `fyde.session`'s final contents and every cookie picked up this run
+/// — regardless of whether the script's `run` succeeded or failed, mirroring
+/// `demo-rust-fyde`'s `main.rs`, which saves the session/cookie file either
+/// way. The caller is responsible for persisting the returned session
+/// data/cookies and for propagating `run_result`.
+#[allow(clippy::too_many_arguments)]
+fn run_script(
+    name: &str,
+    script: &str,
+    parameters: Value,
+    session_data: Value,
+    cookies: Vec<Cookie>,
+    documents: Arc<dyn DocumentsService>,
+    on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
+    on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
+    runtime: Handle,
+) -> Result<(Value, Vec<Cookie>, Result<()>)> {
+    let lua = Lua::new();
+    let installed = host::install(
+        &lua,
+        name,
+        session_data,
+        cookies,
+        documents,
+        on_progress,
+        on_question,
+        runtime,
+    )
+    .context("installing host functions into the Lua VM")?;
+
+    let run_result = evaluate_and_run(&lua, name, script, parameters);
+
+    let (session_data, cookies) = installed
+        .drain(&lua)
+        .context("reading back session data and cookies after the scraper run")?;
+
+    Ok((session_data, cookies, run_result))
+}
+
+/// Loads `script` as a module (expecting it to return a table with a single
+/// `run(parameters)` function — the entire contract between the Rust host
+/// and a Lua scraper script, same as `demo-rust-fyde`'s `main.rs`) and calls
+/// it with `parameters`.
+fn evaluate_and_run(lua: &Lua, name: &str, script: &str, parameters: Value) -> Result<()> {
+    let chunk = lua.load(script).set_name(name);
+    let scraper: Table = chunk.eval().context("evaluating Lua scraper script")?;
+
+    let run: Function = scraper
+        .get("run")
+        .context("Lua script must return a table with a `run(parameters)` function")?;
+    let parameters_value = lua
+        .to_value(&parameters)
+        .context("converting parameters to a Lua value")?;
+
+    run.call::<()>(parameters_value)
+        .context("running the scraper's `run` function")?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use mockall::predicate::eq;
+    use serde_json::json;
+
+    use super::super::cookies::{FakeCookie, MockService as MockCookiesService};
+    use super::super::session::MockService as MockSessionService;
+    use super::*;
+    use crate::domains::documents::MockService as MockDocumentsService;
+
+    const TRIVIAL_SCRIPT: &str = r#"
+        local M = {}
+        function M.run(parameters)
+        end
+        return M
+    "#;
+
+    fn client(
+        cookies: MockCookiesService,
+        session: MockSessionService,
+        documents: MockDocumentsService,
+    ) -> ScrapersClient {
+        ScrapersClient::new(
+            Arc::new(cookies),
+            Arc::new(session),
+            Arc::new(documents),
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn run_loads_session_and_cookies_before_running_and_saves_them_after() {
+        let loaded_cookie = FakeCookie::new().build();
+
+        let mut cookies = MockCookiesService::new();
+        let loaded_cookies = vec![loaded_cookie];
+        cookies
+            .expect_load()
+            .with(eq("didaxis"))
+            .times(1)
+            .returning(move |_| Ok(loaded_cookies.clone()));
+        // The trivial script never makes an HTTP call, so no origin is
+        // "visited" this run — a loaded cookie is only re-exported for an
+        // origin `fyde.http` actually visited (see `host::http::export_
+        // cookies`), so the saved set comes back empty here, not unchanged.
+        cookies
+            .expect_save()
+            .withf(|name, saved| name == "didaxis" && saved.is_empty())
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let mut session = MockSessionService::new();
+        session
+            .expect_load()
+            .with(eq("didaxis"))
+            .times(1)
+            .returning(|_| Ok(json!({"cursor": "abc"})));
+        session
+            .expect_save()
+            .withf(|name, data| name == "didaxis" && *data == json!({"cursor": "abc"}))
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let client = client(cookies, session, MockDocumentsService::new());
+
+        client
+            .run("didaxis", TRIVIAL_SCRIPT, json!({}))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_passes_parameters_through_to_the_scripts_run_function() {
+        let mut cookies = MockCookiesService::new();
+        cookies.expect_load().returning(|_| Ok(Vec::new()));
+        cookies.expect_save().returning(|_, _| Ok(()));
+        let mut session = MockSessionService::new();
+        session.expect_load().returning(|_| Ok(json!({})));
+        session.expect_save().returning(|_, _| Ok(()));
+
+        let client = client(cookies, session, MockDocumentsService::new());
+
+        let script = r#"
+            local M = {}
+            function M.run(parameters)
+                assert(parameters.username == "alice", "unexpected username")
+            end
+            return M
+        "#;
+
+        client
+            .run("didaxis", script, json!({"username": "alice"}))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_saves_session_and_cookies_even_when_the_script_fails() {
+        let mut cookies = MockCookiesService::new();
+        cookies.expect_load().returning(|_| Ok(Vec::new()));
+        cookies.expect_save().times(1).returning(|_, _| Ok(()));
+        let mut session = MockSessionService::new();
+        session.expect_load().returning(|_| Ok(json!({})));
+        session
+            .expect_save()
+            .withf(|_, data| *data == json!({"partial": true}))
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let client = client(cookies, session, MockDocumentsService::new());
+
+        let script = r#"
+            local M = {}
+            function M.run(parameters)
+                fyde.session.partial = true
+                error("boom")
+            end
+            return M
+        "#;
+
+        let result = client.run("didaxis", script, json!({})).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_invokes_on_progress_for_every_step_and_update_call() {
+        let mut cookies = MockCookiesService::new();
+        cookies.expect_load().returning(|_| Ok(Vec::new()));
+        cookies.expect_save().returning(|_, _| Ok(()));
+        let mut session = MockSessionService::new();
+        session.expect_load().returning(|_| Ok(json!({})));
+        session.expect_save().returning(|_, _| Ok(()));
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let callback = received.clone();
+        let on_progress: Arc<dyn Fn(ProgressEvent) + Send + Sync> =
+            Arc::new(move |event| callback.lock().unwrap().push(event));
+
+        let client = ScrapersClient::new(
+            Arc::new(cookies),
+            Arc::new(session),
+            Arc::new(MockDocumentsService::new()),
+            Some(on_progress),
+            None,
+        );
+
+        let script = r#"
+            local M = {}
+            function M.run(parameters)
+                fyde.progress.step("Logging in")
+                fyde.progress.update(1, 2, "halfway")
+            end
+            return M
+        "#;
+
+        client.run("didaxis", script, json!({})).await.unwrap();
+
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![
+                ProgressEvent::Step {
+                    name: "Logging in".to_string()
+                },
+                ProgressEvent::Update {
+                    current: 1,
+                    total: 2,
+                    message: "halfway".to_string()
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_fails_when_the_script_has_no_run_function() {
+        let mut cookies = MockCookiesService::new();
+        cookies.expect_load().returning(|_| Ok(Vec::new()));
+        cookies.expect_save().returning(|_, _| Ok(()));
+        let mut session = MockSessionService::new();
+        session.expect_load().returning(|_| Ok(json!({})));
+        session.expect_save().returning(|_, _| Ok(()));
+
+        let client = client(cookies, session, MockDocumentsService::new());
+
+        let result = client.run("didaxis", "return {}", json!({})).await;
+
+        assert!(result.is_err());
+    }
+}

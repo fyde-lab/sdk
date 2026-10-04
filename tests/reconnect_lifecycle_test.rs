@@ -32,6 +32,8 @@ fn config(url: &str, db_path: &std::path::Path) -> ClientConfig {
         log_level: fyde_sdk::LogLevel::Off,
         on_log: None,
         on_document_change: None,
+        on_scraper_progress: None,
+        on_scraper_question: None,
     }
 }
 

@@ -20,6 +20,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(test)]
+use mockall::automock;
 use sqlx::SqlitePool;
 use tonic::transport::Channel;
 use uuid::Uuid;
@@ -34,6 +36,7 @@ use crate::{ErrorContext as _, Result};
 /// reads back documents materialized locally from consumed events (see
 /// [`Self::start_sync`]) — there is no server-side document store to fetch
 /// from.
+#[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Service: Send + Sync {
     /// Reads the file at `path`, encrypts it and its metadata, then
