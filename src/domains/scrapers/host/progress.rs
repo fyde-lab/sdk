@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use mlua::{Lua, Result as LuaResult, Table};
+use serde_json::json;
 
 use super::super::ProgressEvent;
+use super::super::reports::Recorder;
 
 /// `fyde.progress.step(name)` announces a new high-level stage of the scrape
 /// (login, a given document section, ...). `fyde.progress.update(current,
@@ -10,20 +12,24 @@ use super::super::ProgressEvent;
 /// (e.g. "3/12 documents downloaded"). Unlike `demo-rust-fyde`'s
 /// `host/progress.rs` (which just prints to stdout), both forward to
 /// `on_progress` — see [`crate::ClientConfig::on_scraper_progress`] — so the
-/// consuming application can render its own progress bar.
+/// consuming application can render its own progress bar. Both also write a
+/// `progress` entry to `recorder`.
 pub(super) fn table(
     lua: &Lua,
     on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
+    recorder: Arc<Recorder>,
 ) -> LuaResult<Table> {
     let progress = lua.create_table()?;
 
     let step_callback = on_progress.clone();
+    let step_recorder = recorder.clone();
     progress.set(
         "step",
         lua.create_function(move |_, name: String| {
             if let Some(callback) = &step_callback {
-                callback(ProgressEvent::Step { name });
+                callback(ProgressEvent::Step { name: name.clone() });
             }
+            step_recorder.record("progress", json!({ "kind": "step", "name": name }));
             Ok(())
         })?,
     )?;
@@ -36,9 +42,13 @@ pub(super) fn table(
                 callback(ProgressEvent::Update {
                     current,
                     total,
-                    message,
+                    message: message.clone(),
                 });
             }
+            recorder.record(
+                "progress",
+                json!({ "kind": "update", "current": current, "total": total, "message": message }),
+            );
             Ok(())
         })?,
     )?;
@@ -60,8 +70,12 @@ mod tests {
             Arc::new(move |event| callback.lock().unwrap().push(event));
 
         let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
         lua.globals()
-            .set("progress", table(&lua, Some(on_progress)).unwrap())
+            .set(
+                "progress",
+                table(&lua, Some(on_progress), recorder).unwrap(),
+            )
             .unwrap();
         lua.load(r#"progress.step("Logging in")"#).exec().unwrap();
 
@@ -81,8 +95,12 @@ mod tests {
             Arc::new(move |event| callback.lock().unwrap().push(event));
 
         let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
         lua.globals()
-            .set("progress", table(&lua, Some(on_progress)).unwrap())
+            .set(
+                "progress",
+                table(&lua, Some(on_progress), recorder).unwrap(),
+            )
             .unwrap();
         lua.load(r#"progress.update(3, 12, "payslip.pdf")"#)
             .exec()
@@ -101,12 +119,31 @@ mod tests {
     #[test]
     fn calls_are_a_no_op_without_a_callback_configured() {
         let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
         lua.globals()
-            .set("progress", table(&lua, None).unwrap())
+            .set("progress", table(&lua, None, recorder).unwrap())
             .unwrap();
 
         lua.load(r#"progress.step("x"); progress.update(1, 2, "y")"#)
             .exec()
             .unwrap();
+    }
+
+    #[test]
+    fn step_and_update_each_record_a_progress_entry() {
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        lua.globals()
+            .set("progress", table(&lua, None, recorder.clone()).unwrap())
+            .unwrap();
+
+        lua.load(r#"progress.step("Logging in"); progress.update(1, 2, "halfway")"#)
+            .exec()
+            .unwrap();
+
+        let report = recorder.finish();
+        assert_eq!(report.entries.len(), 2);
+        assert_eq!(report.entries[0].event, "progress");
+        assert_eq!(report.entries[1].event, "progress");
     }
 }

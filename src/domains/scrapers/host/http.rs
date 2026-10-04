@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mlua::{Lua, Result as LuaResult, Table};
+use serde_json::json;
 use tokio::runtime::Handle;
 use wreq::Client;
 use wreq::cookie::Jar;
@@ -10,6 +11,7 @@ use wreq::header::{HeaderMap, HeaderName, HeaderValue};
 use wreq_util::Profile;
 
 use super::super::cookies::Cookie;
+use super::super::reports::Recorder;
 
 /// Builds a fresh cookie jar pre-populated from `cookies` (as previously
 /// saved by `cookies::Service` for this scraper), so this run's `fyde.http`
@@ -124,15 +126,22 @@ fn response_to_table(lua: &Lua, runtime: &Handle, resp: wreq::Response) -> LuaRe
 
 /// `fyde.http.get/post_form/download`, ported from `demo-rust-fyde`'s own
 /// `host/http.rs` (same client configuration, cookie jar, and Chrome
-/// TLS/HTTP2 fingerprint via `wreq`/`wreq_util`), minus its debug report.
-/// `runtime` is a handle onto the SDK's ambient tokio runtime — captured by
-/// `service.rs` before the Lua VM moves onto its own blocking thread — used
-/// to drive `wreq`'s async calls from these synchronous Lua callbacks,
-/// instead of demo-rust-fyde's private, per-run `Runtime`.
+/// TLS/HTTP2 fingerprint via `wreq`/`wreq_util`). `runtime` is a handle onto
+/// the SDK's ambient tokio runtime — captured by `service.rs` before the Lua
+/// VM moves onto its own blocking thread — used to drive `wreq`'s async
+/// calls from these synchronous Lua callbacks, instead of demo-rust-fyde's
+/// private, per-run `Runtime`.
+///
+/// Each call writes an `http_request` (or `error`) entry to `recorder` —
+/// method, url, status and timing only, never header values, form values or
+/// body content, since those routinely carry credentials/session cookies
+/// (matching `demo-rust-fyde`'s own default, non-`debug_http_dump` path —
+/// that opt-in full-body dump isn't ported here).
 pub(super) fn table(
     lua: &Lua,
     jar: Arc<Jar>,
     visited_origins: Arc<Mutex<HashSet<String>>>,
+    recorder: Arc<Recorder>,
     runtime: Handle,
 ) -> LuaResult<Table> {
     let client = Client::builder()
@@ -153,38 +162,84 @@ pub(super) fn table(
     let get_client = client.clone();
     let get_runtime = runtime.clone();
     let get_origins = visited_origins.clone();
+    let get_recorder = recorder.clone();
     http.set(
         "get",
         lua.create_function(move |lua, (url, headers): (String, Option<Table>)| {
             track_origin(&get_origins, &url);
             let header_map = to_header_map(headers)?;
-            let resp = get_runtime
-                .block_on(get_client.get(&url).headers(header_map).send())
-                .map_err(mlua::Error::external)?;
-            response_to_table(lua, &get_runtime, resp)
+            let started = Instant::now();
+            let result = get_runtime.block_on(get_client.get(&url).headers(header_map).send());
+            match result {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let out = response_to_table(lua, &get_runtime, resp)?;
+                    get_recorder.record(
+                        "http_request",
+                        json!({
+                            "method": "GET",
+                            "url": url,
+                            "status": status,
+                            "duration_ms": started.elapsed().as_millis(),
+                        }),
+                    );
+                    Ok(out)
+                }
+                Err(err) => {
+                    get_recorder.record(
+                        "error",
+                        json!({ "action": "http.get", "url": url, "message": err.to_string() }),
+                    );
+                    Err(mlua::Error::external(err))
+                }
+            }
         })?,
     )?;
 
     let post_client = client.clone();
     let post_runtime = runtime.clone();
     let post_origins = visited_origins.clone();
+    let post_recorder = recorder.clone();
     http.set(
         "post_form",
         lua.create_function(
             move |lua, (url, form, headers): (String, Table, Option<Table>)| {
                 track_origin(&post_origins, &url);
                 let form_map = table_to_string_map(&form)?;
+                let form_fields: Vec<String> = form_map.keys().cloned().collect();
                 let header_map = to_header_map(headers)?;
-                let resp = post_runtime
-                    .block_on(
-                        post_client
-                            .post(&url)
-                            .headers(header_map)
-                            .form(&form_map)
-                            .send(),
-                    )
-                    .map_err(mlua::Error::external)?;
-                response_to_table(lua, &post_runtime, resp)
+                let started = Instant::now();
+                let result = post_runtime.block_on(
+                    post_client
+                        .post(&url)
+                        .headers(header_map)
+                        .form(&form_map)
+                        .send(),
+                );
+                match result {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let out = response_to_table(lua, &post_runtime, resp)?;
+                        post_recorder.record(
+                            "http_request",
+                            json!({
+                                "method": "POST",
+                                "url": url,
+                                "status": status,
+                                "form_fields": form_fields,
+                                "duration_ms": started.elapsed().as_millis(),
+                            }),
+                        );
+                        Ok(out)
+                    }
+                    Err(err) => {
+                        post_recorder.record(
+                            "error",
+                            json!({ "action": "http.post_form", "url": url, "message": err.to_string() }),
+                        );
+                        Err(mlua::Error::external(err))
+                    }
+                }
             },
         )?,
     )?;
@@ -192,14 +247,25 @@ pub(super) fn table(
     let download_client = client.clone();
     let download_runtime = runtime.clone();
     let download_origins = visited_origins.clone();
+    let download_recorder = recorder;
     http.set(
         "download",
         lua.create_function(move |lua, (url, headers): (String, Option<Table>)| {
             track_origin(&download_origins, &url);
             let header_map = to_header_map(headers)?;
-            let resp = download_runtime
-                .block_on(download_client.get(&url).headers(header_map).send())
-                .map_err(mlua::Error::external)?;
+            let started = Instant::now();
+            let result =
+                download_runtime.block_on(download_client.get(&url).headers(header_map).send());
+            let resp = match result {
+                Ok(resp) => resp,
+                Err(err) => {
+                    download_recorder.record(
+                        "error",
+                        json!({ "action": "http.download", "url": url, "message": err.to_string() }),
+                    );
+                    return Err(mlua::Error::external(err));
+                }
+            };
 
             let status = resp.status().as_u16();
             let content_type = resp
@@ -208,9 +274,28 @@ pub(super) fn table(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            let bytes = download_runtime
-                .block_on(resp.bytes())
-                .map_err(mlua::Error::external)?;
+            let bytes = match download_runtime.block_on(resp.bytes()) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    download_recorder.record(
+                        "error",
+                        json!({ "action": "http.download", "url": url, "message": err.to_string() }),
+                    );
+                    return Err(mlua::Error::external(err));
+                }
+            };
+
+            download_recorder.record(
+                "http_request",
+                json!({
+                    "method": "DOWNLOAD",
+                    "url": url,
+                    "status": status,
+                    "content_type": content_type.clone(),
+                    "bytes_len": bytes.len(),
+                    "duration_ms": started.elapsed().as_millis(),
+                }),
+            );
 
             let out = lua.create_table()?;
             out.set("status", status)?;

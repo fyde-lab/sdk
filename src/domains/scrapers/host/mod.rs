@@ -21,6 +21,7 @@ use crate::{ErrorContext as _, Result};
 
 use super::ProgressEvent;
 use super::cookies::Cookie;
+use super::reports::Recorder;
 
 /// Handle returned by [`install`], letting `service.rs` read back
 /// `fyde.session`'s final contents and every cookie this run's `fyde.http`
@@ -58,8 +59,11 @@ impl Installed {
 /// `fyde.json`, `fyde.progress`, `fyde.input`, `fyde.save_document`,
 /// `fyde.session`. Scripts never reach outside this table — no raw
 /// `io`/`os`/socket access from script code — see `demo-rust-fyde`'s own
-/// `host/mod.rs`, which this is ported from (minus its per-run debug
-/// report).
+/// `host/mod.rs`, which this is ported from. Unlike that port, `fyde.log`,
+/// `fyde.http`, `fyde.progress` and `fyde.input` each also write an entry
+/// to `recorder` — the `reports` sub-domain's per-run debug report,
+/// `demo-rust-fyde`'s `Report` brought back (`service.rs` saves it once the
+/// script's `run` function returns).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn install(
     lua: &Lua,
@@ -69,6 +73,7 @@ pub(super) fn install(
     documents: Arc<dyn DocumentsService>,
     on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
     on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
+    recorder: Arc<Recorder>,
     runtime: Handle,
 ) -> Result<Installed> {
     let cookie_jar = build_jar(&cookies);
@@ -76,7 +81,7 @@ pub(super) fn install(
 
     let fyde = lua.create_table().context("creating the `fyde` table")?;
 
-    fyde.set("log", log::table(lua, scraper_name)?)
+    fyde.set("log", log::table(lua, scraper_name, recorder.clone())?)
         .context("installing fyde.log")?;
     fyde.set(
         "http",
@@ -84,6 +89,7 @@ pub(super) fn install(
             lua,
             cookie_jar.clone(),
             visited_origins.clone(),
+            recorder.clone(),
             runtime.clone(),
         )?,
     )
@@ -92,9 +98,12 @@ pub(super) fn install(
         .context("installing fyde.html")?;
     fyde.set("json", json::table(lua)?)
         .context("installing fyde.json")?;
-    fyde.set("progress", progress::table(lua, on_progress)?)
-        .context("installing fyde.progress")?;
-    fyde.set("input", input::table(lua, on_question)?)
+    fyde.set(
+        "progress",
+        progress::table(lua, on_progress, recorder.clone())?,
+    )
+    .context("installing fyde.progress")?;
+    fyde.set("input", input::table(lua, on_question, recorder)?)
         .context("installing fyde.input")?;
     fyde.set(
         "save_document",

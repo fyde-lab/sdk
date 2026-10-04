@@ -62,6 +62,7 @@ impl Service for ScrapersClient {
         let on_question = self.on_question.clone();
         let name_owned = name.to_string();
         let script_owned = script.to_string();
+        let recorder_for_run = recorder.clone();
 
         let (session_data, cookies, run_result) = tokio::task::spawn_blocking(move || {
             run_script(
@@ -73,6 +74,7 @@ impl Service for ScrapersClient {
                 documents,
                 on_progress,
                 on_question,
+                recorder_for_run,
                 handle,
             )
         })
@@ -122,6 +124,7 @@ fn run_script(
     documents: Arc<dyn DocumentsService>,
     on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
     on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
+    recorder: Arc<Recorder>,
     runtime: Handle,
 ) -> Result<(Value, Vec<Cookie>, Result<()>)> {
     let lua = Lua::new();
@@ -133,6 +136,7 @@ fn run_script(
         documents,
         on_progress,
         on_question,
+        recorder,
         runtime,
     )
     .context("installing host functions into the Lua VM")?;
