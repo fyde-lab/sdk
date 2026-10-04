@@ -49,9 +49,9 @@ pub trait Service: Send + Sync {
 /// `StorageConfig` (`session::StorageConfig`, `cookies::StorageConfig`).
 pub(crate) enum StorageConfig {
     /// Persists session data and cookies as JSON files under the given
-    /// directory (one file per scraper per sub-domain) — used by
-    /// [`crate::init_dev_scrapers`], for a standalone CLI runner with no
-    /// local SQLite database of its own.
+    /// directory (one file per scraper, under a `session`/`cookies`
+    /// subdirectory per sub-domain) — used by [`crate::init_dev_scrapers`],
+    /// for a standalone CLI runner with no local SQLite database of its own.
     File(PathBuf),
     /// Persists session data and cookies in the given SQLite pool's
     /// `scraper_sessions`/`scraper_cookies` tables — used by a full
@@ -74,9 +74,14 @@ pub(crate) fn init(
     on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
 ) -> Arc<dyn Service> {
     let (cookies_storage, session_storage) = match storage {
+        // Separate subdirectories so a cookie file and a session file for
+        // the same scraper name never collide, even though their own
+        // sub-domains already give them distinct extensions
+        // (`<name>.cookies.json` vs. `<name>.json`) — this keeps the two
+        // sub-domains' files visibly separated on disk too.
         StorageConfig::File(dir) => (
-            cookies::StorageConfig::File(dir.clone()),
-            session::StorageConfig::File(dir),
+            cookies::StorageConfig::File(dir.join("cookies")),
+            session::StorageConfig::File(dir.join("session")),
         ),
         StorageConfig::Sqlite(pool) => (
             cookies::StorageConfig::Sqlite(pool.clone()),
