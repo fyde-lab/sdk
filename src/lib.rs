@@ -314,17 +314,26 @@ impl Client {
 ///
 /// Cookies and session data persist in a SQLite database at `storage_path`
 /// (created, and migrated, if missing — same schema [`Client`] uses for
-/// them). Documents a script saves via `fyde.save_document` are written as
-/// plain files under `documents_dir` instead of being encrypted and
-/// uploaded — see [`domains::documents::init_dev`]. `on_progress`/
-/// `on_question` are the same callbacks as
-/// [`ClientConfig::on_scraper_progress`]/[`ClientConfig::on_scraper_question`].
+/// them; unlike [`Client`], the database file's parent directory is also
+/// created if missing, since `storage_path` is caller-chosen rather than
+/// always the XDG data directory). Documents a script saves via
+/// `fyde.save_document` are written as plain files under `documents_dir`
+/// instead of being encrypted and uploaded — see
+/// [`domains::documents::init_dev`]. `on_progress`/`on_question` are the
+/// same callbacks as [`ClientConfig::on_scraper_progress`]/
+/// [`ClientConfig::on_scraper_question`].
 pub async fn init_dev_scrapers(
     storage_path: std::path::PathBuf,
     documents_dir: std::path::PathBuf,
     on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
     on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
 ) -> Result<Arc<dyn ScrapersService>> {
+    if let Some(parent) = storage_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating scraper database directory {}", parent.display()))?;
+    }
+
     let sqlite = SqliteClient::connect_with(&storage_path.to_string_lossy())
         .await
         .context("failed to open local scraper database")?;
