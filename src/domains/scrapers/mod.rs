@@ -42,7 +42,14 @@ pub trait Service: Send + Sync {
     /// `fyde.session`'s contents and every cookie `fyde.http` picked up for
     /// a host it visited — once the script's `run` function returns, whether
     /// it succeeded or failed, so state from a partial run isn't lost.
-    async fn run(&self, name: &str, script: &str, parameters: Value) -> Result<()>;
+    ///
+    /// `debug_http_dump` opts this run's `fyde.http` calls into recording
+    /// full request/response headers and bodies (and form values) into the
+    /// per-run debug report, instead of just method/url/status/timing — see
+    /// `host::http::table`'s doc comment for why this defaults to off
+    /// (header values, form values and body content routinely carry
+    /// credentials/session cookies).
+    async fn run(&self, name: &str, script: &str, parameters: Value, debug_http_dump: bool) -> Result<()>;
 }
 
 /// Selects which storage backend [`init`] builds the `session`/`cookies`/

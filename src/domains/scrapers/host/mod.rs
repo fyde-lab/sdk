@@ -63,7 +63,10 @@ impl Installed {
 /// `fyde.http`, `fyde.progress` and `fyde.input` each also write an entry
 /// to `recorder` — the `reports` sub-domain's per-run debug report,
 /// `demo-rust-fyde`'s `Report` brought back (`service.rs` saves it once the
-/// script's `run` function returns).
+/// script's `run` function returns). `debug_http_dump` is forwarded to
+/// `fyde.http` only (see `host::http::table`) — it opts this run into
+/// recording full request/response headers/bodies instead of just
+/// method/url/status/timing.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn install(
     lua: &Lua,
@@ -75,6 +78,7 @@ pub(super) fn install(
     on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
     recorder: Arc<Recorder>,
     runtime: Handle,
+    debug_http_dump: bool,
 ) -> Result<Installed> {
     let cookie_jar = build_jar(&cookies);
     let visited_origins = Arc::new(Mutex::new(HashSet::new()));
@@ -91,6 +95,7 @@ pub(super) fn install(
             visited_origins.clone(),
             recorder.clone(),
             runtime.clone(),
+            debug_http_dump,
         )?,
     )
     .context("installing fyde.http")?;

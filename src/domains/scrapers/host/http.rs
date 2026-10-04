@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mlua::{Lua, Result as LuaResult, Table};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::runtime::Handle;
 use wreq::Client;
 use wreq::cookie::Jar;
@@ -133,16 +133,20 @@ fn response_to_table(lua: &Lua, runtime: &Handle, resp: wreq::Response) -> LuaRe
 /// private, per-run `Runtime`.
 ///
 /// Each call writes an `http_request` (or `error`) entry to `recorder` —
-/// method, url, status and timing only, never header values, form values or
-/// body content, since those routinely carry credentials/session cookies
-/// (matching `demo-rust-fyde`'s own default, non-`debug_http_dump` path —
-/// that opt-in full-body dump isn't ported here).
+/// method, url, status and timing only by default, never request header
+/// values, form values or any body content, since those routinely carry
+/// credentials/session cookies. Passing `debug_http_dump: true` (ported from
+/// `demo-rust-fyde`'s own opt-in dump, threaded here from `Service::run`'s
+/// `debug_http_dump` parameter) additionally records the *response* body
+/// for `get`/`post_form` (never the request side) — enable it only for a
+/// trusted, local debugging run.
 pub(super) fn table(
     lua: &Lua,
     jar: Arc<Jar>,
     visited_origins: Arc<Mutex<HashSet<String>>>,
     recorder: Arc<Recorder>,
     runtime: Handle,
+    debug_http_dump: bool,
 ) -> LuaResult<Table> {
     let client = Client::builder()
         .cookie_provider(jar)
@@ -174,15 +178,19 @@ pub(super) fn table(
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     let out = response_to_table(lua, &get_runtime, resp)?;
-                    get_recorder.record(
-                        "http_request",
-                        json!({
-                            "method": "GET",
-                            "url": url,
-                            "status": status,
-                            "duration_ms": started.elapsed().as_millis(),
-                        }),
-                    );
+                    let mut entry = json!({
+                        "method": "GET",
+                        "url": url,
+                        "status": status,
+                        "duration_ms": started.elapsed().as_millis(),
+                    });
+                    if debug_http_dump {
+                        let body: String = out.get("body").unwrap_or_default();
+                        if let Value::Object(fields) = &mut entry {
+                            fields.insert("response_body".into(), Value::String(body));
+                        }
+                    }
+                    get_recorder.record("http_request", entry);
                     Ok(out)
                 }
                 Err(err) => {
@@ -220,16 +228,20 @@ pub(super) fn table(
                     Ok(resp) => {
                         let status = resp.status().as_u16();
                         let out = response_to_table(lua, &post_runtime, resp)?;
-                        post_recorder.record(
-                            "http_request",
-                            json!({
-                                "method": "POST",
-                                "url": url,
-                                "status": status,
-                                "form_fields": form_fields,
-                                "duration_ms": started.elapsed().as_millis(),
-                            }),
-                        );
+                        let mut entry = json!({
+                            "method": "POST",
+                            "url": url,
+                            "status": status,
+                            "form_fields": form_fields,
+                            "duration_ms": started.elapsed().as_millis(),
+                        });
+                        if debug_http_dump {
+                            let body: String = out.get("body").unwrap_or_default();
+                            if let Value::Object(fields) = &mut entry {
+                                fields.insert("response_body".into(), Value::String(body));
+                            }
+                        }
+                        post_recorder.record("http_request", entry);
                         Ok(out)
                     }
                     Err(err) => {
@@ -285,6 +297,10 @@ pub(super) fn table(
                 }
             };
 
+            // The body is never dumped here, even under `debug_http_dump`:
+            // downloads are routinely binary (PDFs, images), which wouldn't
+            // round-trip as JSON text anyway, unlike `get`/`post_form`'s
+            // textual response bodies.
             download_recorder.record(
                 "http_request",
                 json!({
