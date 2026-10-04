@@ -307,6 +307,38 @@ impl Client {
     }
 }
 
+/// Builds a standalone [`ScrapersService`] for local/dev use — no
+/// [`Client`], no fyde server connection, no OPAQUE login, no changelog
+/// sync. Meant for a CLI runner (ported from `demo-rust-fyde`) that just
+/// runs Lua scraper scripts and keeps their output on disk.
+///
+/// Cookies and session data persist in a SQLite database at `storage_path`
+/// (created, and migrated, if missing — same schema [`Client`] uses for
+/// them). Documents a script saves via `fyde.save_document` are written as
+/// plain files under `documents_dir` instead of being encrypted and
+/// uploaded — see [`domains::documents::init_dev`]. `on_progress`/
+/// `on_question` are the same callbacks as
+/// [`ClientConfig::on_scraper_progress`]/[`ClientConfig::on_scraper_question`].
+pub async fn init_dev_scrapers(
+    storage_path: std::path::PathBuf,
+    documents_dir: std::path::PathBuf,
+    on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
+    on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
+) -> Result<Arc<dyn ScrapersService>> {
+    let sqlite = SqliteClient::connect_with(&storage_path.to_string_lossy())
+        .await
+        .context("failed to open local scraper database")?;
+
+    let documents = domains::documents::init_dev(documents_dir);
+
+    Ok(domains::scrapers::init(
+        sqlite.pool().clone(),
+        documents,
+        on_progress,
+        on_question,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

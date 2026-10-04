@@ -1,4 +1,5 @@
 mod changelog;
+mod dev;
 mod models;
 pub(crate) mod parser;
 mod service;
@@ -138,4 +139,12 @@ pub(crate) async fn init(
         parser,
         on_document_change,
     )))
+}
+
+/// Initializes a dev [`Service`] for standalone use without a fyde server
+/// connection (see [`crate::init_dev_scrapers`]): [`Service::upload`] just
+/// copies the file to `out_dir` as plain bytes instead of encrypting and
+/// publishing it through the changelog.
+pub(crate) fn init_dev(out_dir: std::path::PathBuf) -> Arc<dyn Service> {
+    Arc::new(dev::DevDocumentsClient::new(out_dir))
 }
