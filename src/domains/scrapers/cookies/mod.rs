@@ -1,6 +1,7 @@
 mod models;
 mod service;
 mod storage;
+mod storage_file;
 mod storage_sqlite;
 
 pub(super) use models::Cookie;

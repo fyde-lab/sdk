@@ -1,5 +1,6 @@
 mod service;
 mod storage;
+mod storage_file;
 mod storage_sqlite;
 
 use std::sync::Arc;
