@@ -75,6 +75,10 @@ impl Service for ScriptsClient {
     async fn list_user_scripts(&self) -> Result<Vec<Script>> {
         self.grpc.list_user_scripts().await
     }
+
+    async fn list_public_scripts(&self) -> Result<Vec<Script>> {
+        self.grpc.list_public_scripts().await
+    }
 }
 
 #[cfg(test)]
@@ -194,5 +198,20 @@ mod tests {
         let client = ScriptsClient::with_grpc(mock_grpc);
 
         assert_eq!(client.list_user_scripts().await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn list_public_scripts_delegates_to_grpc() {
+        let expected = vec![FakeScript::new().build(), FakeScript::new().build()];
+        let returned = expected.clone();
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_list_public_scripts()
+            .times(1)
+            .returning(move || Ok(returned.clone()));
+
+        let client = ScriptsClient::with_grpc(mock_grpc);
+
+        assert_eq!(client.list_public_scripts().await.unwrap(), expected);
     }
 }

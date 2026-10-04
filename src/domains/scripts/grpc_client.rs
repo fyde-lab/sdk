@@ -19,7 +19,7 @@ mod proto {
 
 use proto::{
     CreateScriptRequest, DisableScriptRequest, EnableScriptRequest, FetchScriptRequest,
-    ListUserScriptsRequest, UpdateScriptRequest,
+    ListPublicScriptsRequest, ListUserScriptsRequest, UpdateScriptRequest,
     scripts_service_client::ScriptsServiceClient as GeneratedScriptsClient,
 };
 
@@ -62,6 +62,10 @@ pub(super) trait FydeClient: Send + Sync {
 
     /// Lists the scripts currently enabled for the authenticated user.
     async fn list_user_scripts(&self) -> Result<Vec<Script>>;
+
+    /// Lists every script marked public, regardless of who owns it or
+    /// whether the authenticated user has it enabled.
+    async fn list_public_scripts(&self) -> Result<Vec<Script>>;
 }
 
 /// The production [`FydeClient`] implementation, backed by a tonic
@@ -231,6 +235,22 @@ impl FydeClient for GrpcClient {
             .list_user_scripts(request)
             .await
             .context("failed to list user scripts")?
+            .into_inner();
+
+        response.scripts.into_iter().map(into_domain).collect()
+    }
+
+    async fn list_public_scripts(&self) -> Result<Vec<Script>> {
+        let request = self
+            .sessions
+            .authenticated_request(ListPublicScriptsRequest {})
+            .await?;
+
+        let response = self
+            .client()
+            .list_public_scripts(request)
+            .await
+            .context("failed to list public scripts")?
             .into_inner();
 
         response.scripts.into_iter().map(into_domain).collect()

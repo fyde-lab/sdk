@@ -114,6 +114,17 @@ impl Service for InMemoryScriptStorage {
             .filter_map(|id| scripts.get(id).cloned())
             .collect())
     }
+
+    async fn list_public_scripts(&self) -> Result<Vec<Script>> {
+        Ok(self
+            .scripts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|script| script.is_public)
+            .cloned()
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -204,6 +215,24 @@ mod tests {
 
         assert_eq!(listed, vec![enabled]);
         assert!(!listed.contains(&disabled));
+    }
+
+    #[tokio::test]
+    async fn lists_only_public_scripts() {
+        let storage = InMemoryScriptStorage::new();
+        let public = storage
+            .create_script("public", true, Vec::new(), "return 1")
+            .await
+            .unwrap();
+        let private = storage
+            .create_script("private", false, Vec::new(), "return 2")
+            .await
+            .unwrap();
+
+        let listed = storage.list_public_scripts().await.unwrap();
+
+        assert_eq!(listed, vec![public]);
+        assert!(!listed.contains(&private));
     }
 
     #[tokio::test]
