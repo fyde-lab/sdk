@@ -38,6 +38,7 @@ pkgs.mkShell {
     export TMPDIR="/tmp"
 
     export RUSTC_WRAPPER=${pkgs.sccache}/bin/sccache
+    export SCCACHE_DIR="$HOME/.cache/sccache"
     export CC="${pkgs.sccache}/bin/sccache ${pkgs.clang}/bin/clang"
     export CXX="${pkgs.sccache}/bin/sccache ${pkgs.clang}/bin/clang++"
   '';
