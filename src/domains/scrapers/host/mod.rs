@@ -66,7 +66,9 @@ impl Installed {
 /// script's `run` function returns). `debug_http_dump` is forwarded to
 /// `fyde.http` only (see `host::http::table`) — it opts this run into
 /// recording full request/response headers/bodies instead of just
-/// method/url/status/timing.
+/// method/url/status/timing. `wreq_emulation` is also forwarded to
+/// `fyde.http` only — it toggles `wreq`'s Chrome TLS/HTTP2 fingerprint
+/// emulation.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn install(
     lua: &Lua,
@@ -79,6 +81,7 @@ pub(super) fn install(
     recorder: Arc<Recorder>,
     runtime: Handle,
     debug_http_dump: bool,
+    wreq_emulation: bool,
 ) -> Result<Installed> {
     let cookie_jar = build_jar(&cookies);
     let visited_origins = Arc::new(Mutex::new(HashSet::new()));
@@ -96,6 +99,7 @@ pub(super) fn install(
             recorder.clone(),
             runtime.clone(),
             debug_http_dump,
+            wreq_emulation,
         )?,
     )
     .context("installing fyde.http")?;

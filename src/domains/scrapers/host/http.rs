@@ -140,6 +140,13 @@ fn response_to_table(lua: &Lua, runtime: &Handle, resp: wreq::Response) -> LuaRe
 /// `debug_http_dump` parameter) additionally records the *response* body
 /// for `get`/`post_form` (never the request side) — enable it only for a
 /// trusted, local debugging run.
+///
+/// `wreq_emulation` controls whether the client applies `wreq_util`'s
+/// Chrome TLS/HTTP2 fingerprint emulation (`Profile::Chrome131`) — some
+/// sites' WAFs block `wreq`'s TLS fingerprint outright regardless of
+/// whether emulation is on, so a scraper can opt out per `scripts/<name>/
+/// settings.json`'s `wreq_emulation` field rather than carrying a global
+/// toggle.
 pub(super) fn table(
     lua: &Lua,
     jar: Arc<Jar>,
@@ -147,10 +154,13 @@ pub(super) fn table(
     recorder: Arc<Recorder>,
     runtime: Handle,
     debug_http_dump: bool,
+    wreq_emulation: bool,
 ) -> LuaResult<Table> {
-    let client = Client::builder()
-        .cookie_provider(jar)
-        .emulation(Profile::Chrome131)
+    let mut builder = Client::builder().cookie_provider(jar);
+    if wreq_emulation {
+        builder = builder.emulation(Profile::Chrome131);
+    }
+    let client = builder
         .timeout(Duration::from_secs(30))
         // Unlike `reqwest`, `wreq`'s builder defaults to not following
         // redirects at all (`redirect::Policy::none()`). Scripts rely on a

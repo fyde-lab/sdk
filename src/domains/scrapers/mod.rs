@@ -49,7 +49,20 @@ pub trait Service: Send + Sync {
     /// `host::http::table`'s doc comment for why this defaults to off
     /// (header values, form values and body content routinely carry
     /// credentials/session cookies).
-    async fn run(&self, name: &str, script: &str, parameters: Value, debug_http_dump: bool) -> Result<()>;
+    ///
+    /// `wreq_emulation` toggles `fyde.http`'s Chrome TLS/HTTP2 fingerprint
+    /// emulation (`wreq_util::Profile::Chrome131`) on or off for this run —
+    /// some sites' WAFs block `wreq`'s TLS fingerprint outright regardless
+    /// of emulation, so a caller (conventionally reading a per-scraper
+    /// `settings.json`) can opt a scraper out.
+    async fn run(
+        &self,
+        name: &str,
+        script: &str,
+        parameters: Value,
+        debug_http_dump: bool,
+        wreq_emulation: bool,
+    ) -> Result<()>;
 }
 
 /// Selects which storage backend [`init`] builds the `session`/`cookies`/
