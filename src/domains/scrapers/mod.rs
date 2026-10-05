@@ -55,6 +55,13 @@ pub trait Service: Send + Sync {
     /// some sites' WAFs block `wreq`'s TLS fingerprint outright regardless
     /// of emulation, so a caller (conventionally reading a per-scraper
     /// `settings.json`) can opt a scraper out.
+    ///
+    /// `follow_redirects` toggles whether `fyde.http` automatically follows
+    /// HTTP redirects for this run — on by default for a real-browser-like
+    /// client, but a caller (conventionally reading the same per-scraper
+    /// `settings.json`) can opt a scraper out when it needs to inspect a
+    /// redirect response itself instead of being carried straight to its
+    /// target.
     async fn run(
         &self,
         name: &str,
@@ -62,6 +69,7 @@ pub trait Service: Send + Sync {
         parameters: Value,
         debug_http_dump: bool,
         wreq_emulation: bool,
+        follow_redirects: bool,
     ) -> Result<()>;
 }
 

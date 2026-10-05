@@ -68,7 +68,8 @@ impl Installed {
 /// recording full request/response headers/bodies instead of just
 /// method/url/status/timing. `wreq_emulation` is also forwarded to
 /// `fyde.http` only — it toggles `wreq`'s Chrome TLS/HTTP2 fingerprint
-/// emulation.
+/// emulation. `follow_redirects` is also forwarded to `fyde.http` only — it
+/// toggles whether the client automatically follows HTTP redirects.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn install(
     lua: &Lua,
@@ -82,6 +83,7 @@ pub(super) fn install(
     runtime: Handle,
     debug_http_dump: bool,
     wreq_emulation: bool,
+    follow_redirects: bool,
 ) -> Result<Installed> {
     let cookie_jar = build_jar(&cookies);
     let visited_origins = Arc::new(Mutex::new(HashSet::new()));
@@ -100,6 +102,7 @@ pub(super) fn install(
             runtime.clone(),
             debug_http_dump,
             wreq_emulation,
+            follow_redirects,
         )?,
     )
     .context("installing fyde.http")?;

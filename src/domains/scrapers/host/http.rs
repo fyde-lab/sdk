@@ -124,6 +124,30 @@ fn response_to_table(lua: &Lua, runtime: &Handle, resp: wreq::Response) -> LuaRe
     Ok(out)
 }
 
+/// Records one `http_redirect` entry per hop in `resp`'s redirect chain —
+/// `wreq` stashes it as a [`wreq::redirect::History`] response extension
+/// whenever its (non-`none`) [`wreq::redirect::Policy`] actually follows a
+/// redirect (see `table`'s client builder). Each entry is independent of the
+/// final `http_request` entry `get`/`post_form`/`download` also records, so a
+/// report shows every intermediate hop (e.g. an OAuth/OIDC bounce) even
+/// though the script itself only ever sees the start URL and the final one.
+fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
+    let Some(history) = resp.extensions().get::<wreq::redirect::History>() else {
+        return;
+    };
+    for hop in history {
+        recorder.record(
+            "http_redirect",
+            json!({
+                "method": method,
+                "status": hop.status.as_u16(),
+                "from": hop.previous.to_string(),
+                "to": hop.uri.to_string(),
+            }),
+        );
+    }
+}
+
 /// `fyde.http.get/post_form/download`, ported from `demo-rust-fyde`'s own
 /// `host/http.rs` (same client configuration, cookie jar, and Chrome
 /// TLS/HTTP2 fingerprint via `wreq`/`wreq_util`). `runtime` is a handle onto
@@ -147,6 +171,18 @@ fn response_to_table(lua: &Lua, runtime: &Handle, resp: wreq::Response) -> LuaRe
 /// whether emulation is on, so a scraper can opt out per `scripts/<name>/
 /// settings.json`'s `wreq_emulation` field rather than carrying a global
 /// toggle.
+///
+/// `follow_redirects` controls whether the client follows HTTP redirects at
+/// all. Unlike `reqwest`, `wreq`'s builder defaults to not following
+/// redirects (`redirect::Policy::none()`); scripts generally rely on a
+/// real-browser-like client that follows them (e.g. to pick up cookies set
+/// along an OAuth/OIDC redirect chain before a login POST), so this matches
+/// `reqwest`'s own default (`redirect::Policy::default()`) when `true`. A
+/// scraper can opt out per `scripts/<name>/settings.json`'s
+/// `follow_redirects` field when it needs to inspect a redirect response
+/// itself (e.g. reading a `Location` header) rather than carrying a global
+/// toggle.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn table(
     lua: &Lua,
     jar: Arc<Jar>,
@@ -155,19 +191,20 @@ pub(super) fn table(
     runtime: Handle,
     debug_http_dump: bool,
     wreq_emulation: bool,
+    follow_redirects: bool,
 ) -> LuaResult<Table> {
     let mut builder = Client::builder().cookie_provider(jar);
     if wreq_emulation {
         builder = builder.emulation(Profile::Chrome131);
     }
+    let redirect_policy = if follow_redirects {
+        wreq::redirect::Policy::default()
+    } else {
+        wreq::redirect::Policy::none()
+    };
     let client = builder
         .timeout(Duration::from_secs(30))
-        // Unlike `reqwest`, `wreq`'s builder defaults to not following
-        // redirects at all (`redirect::Policy::none()`). Scripts rely on a
-        // real-browser-like client that follows redirects (e.g. to pick up
-        // cookies set along an OAuth/OIDC redirect chain before a login
-        // POST), so match `reqwest`'s own default here.
-        .redirect(wreq::redirect::Policy::default())
+        .redirect(redirect_policy)
         .build()
         .expect("building the shared HTTP client");
 
@@ -187,6 +224,7 @@ pub(super) fn table(
             match result {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
+                    record_redirects(&get_recorder, "GET", &resp);
                     let out = response_to_table(lua, &get_runtime, resp)?;
                     let mut entry = json!({
                         "method": "GET",
@@ -237,6 +275,7 @@ pub(super) fn table(
                 match result {
                     Ok(resp) => {
                         let status = resp.status().as_u16();
+                        record_redirects(&post_recorder, "POST", &resp);
                         let out = response_to_table(lua, &post_runtime, resp)?;
                         let mut entry = json!({
                             "method": "POST",
@@ -290,6 +329,7 @@ pub(super) fn table(
             };
 
             let status = resp.status().as_u16();
+            record_redirects(&download_recorder, "DOWNLOAD", &resp);
             let content_type = resp
                 .headers()
                 .get(wreq::header::CONTENT_TYPE)

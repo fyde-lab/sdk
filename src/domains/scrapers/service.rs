@@ -57,6 +57,7 @@ impl Service for ScrapersClient {
         parameters: Value,
         debug_http_dump: bool,
         wreq_emulation: bool,
+        follow_redirects: bool,
     ) -> Result<()> {
         let cookies = self.cookies.load(name).await?;
         let session_data = self.session.load(name).await?;
@@ -85,6 +86,7 @@ impl Service for ScrapersClient {
                 handle,
                 debug_http_dump,
                 wreq_emulation,
+                follow_redirects,
             )
         })
         .await
@@ -137,6 +139,7 @@ fn run_script(
     runtime: Handle,
     debug_http_dump: bool,
     wreq_emulation: bool,
+    follow_redirects: bool,
 ) -> Result<(Value, Vec<Cookie>, Result<()>)> {
     let lua = Lua::new();
     let installed = host::install(
@@ -151,6 +154,7 @@ fn run_script(
         runtime,
         debug_http_dump,
         wreq_emulation,
+        follow_redirects,
     )
     .context("installing host functions into the Lua VM")?;
 
@@ -265,7 +269,7 @@ mod tests {
         let client = client(cookies, session, MockDocumentsService::new());
 
         client
-            .run("didaxis", TRIVIAL_SCRIPT, json!({}), false, true)
+            .run("didaxis", TRIVIAL_SCRIPT, json!({}), false, true, true)
             .await
             .unwrap();
     }
@@ -290,7 +294,7 @@ mod tests {
         "#;
 
         client
-            .run("didaxis", script, json!({"username": "alice"}), false, true)
+            .run("didaxis", script, json!({"username": "alice"}), false, true, true)
             .await
             .unwrap();
     }
@@ -319,7 +323,7 @@ mod tests {
             return M
         "#;
 
-        let result = client.run("didaxis", script, json!({}), false, true).await;
+        let result = client.run("didaxis", script, json!({}), false, true, true).await;
 
         assert!(result.is_err());
     }
@@ -357,7 +361,7 @@ mod tests {
         "#;
 
         client
-            .run("didaxis", script, json!({}), false, true)
+            .run("didaxis", script, json!({}), false, true, true)
             .await
             .unwrap();
 
@@ -388,7 +392,7 @@ mod tests {
         let client = client(cookies, session, MockDocumentsService::new());
 
         let result = client
-            .run("didaxis", "return {}", json!({}), false, true)
+            .run("didaxis", "return {}", json!({}), false, true, true)
             .await;
 
         assert!(result.is_err());
