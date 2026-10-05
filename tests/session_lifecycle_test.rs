@@ -7,6 +7,7 @@
 mod common;
 
 use anyhow::{Context as _, ensure};
+use fyde_sdk::UploadRequest;
 use serial_test::serial;
 
 use common::{Scenario, TEST_PASSWORD, random_username, write_temp_pdf};
@@ -26,7 +27,7 @@ async fn session_lifecycle() {
             let err = scenario
                 .client
                 .documents()
-                .upload(file.path())
+                .upload(UploadRequest::from_path(file.path()))
                 .await
                 .err()
                 .context("upload should fail before any session is open")?;
@@ -77,7 +78,7 @@ async fn session_lifecycle() {
             scenario
                 .client
                 .documents()
-                .upload(file.path())
+                .upload(UploadRequest::from_path(file.path()))
                 .await
                 .context("upload should succeed once a session is open")?;
             Ok(())
@@ -102,7 +103,7 @@ async fn session_lifecycle() {
             let err = scenario
                 .client
                 .documents()
-                .upload(file.path())
+                .upload(UploadRequest::from_path(file.path()))
                 .await
                 .err()
                 .context("upload should fail once the session is closed")?;
@@ -177,7 +178,7 @@ async fn session_lifecycle() {
             scenario
                 .client
                 .documents()
-                .upload(file.path())
+                .upload(UploadRequest::from_path(file.path()))
                 .await
                 .context("upload should succeed again once logged back in")?;
             Ok(())

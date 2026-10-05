@@ -10,7 +10,7 @@ mod common;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use fyde_sdk::{Client, ClientConfig, Storage};
+use fyde_sdk::{Client, ClientConfig, Storage, UploadRequest};
 use serial_test::serial;
 
 use common::{TEST_PASSWORD, TestServer, random_username, wait_for, write_temp_pdf};
@@ -62,7 +62,7 @@ async fn reconnecting_with_a_persisted_session_resumes_sync_without_logging_in_a
         let file = write_temp_pdf("persisted across a reconnect");
         client
             .documents()
-            .upload(file.path())
+            .upload(UploadRequest::from_path(file.path()))
             .await
             .context("failed to upload document")
             .unwrap()

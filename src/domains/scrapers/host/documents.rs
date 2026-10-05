@@ -2,18 +2,16 @@ use std::sync::Arc;
 
 use mlua::{Function, Lua, Value};
 use tokio::runtime::Handle;
-use uuid::Uuid;
 
-use crate::domains::documents::Service as DocumentsService;
+use crate::domains::documents::{Service as DocumentsService, UploadRequest};
 
-/// `fyde.save_document(name, content)`: writes `content` (raw bytes, as
-/// returned by `fyde.http.download`'s `body`) to a scratch temporary file and
-/// uploads it through the SDK's own [`DocumentsService::upload`] — unlike
-/// `demo-rust-fyde`, which just writes to a local `--out-dir`, a document
-/// scraped here goes through the same encrypted-upload path as a
-/// user-provided file, so it ends up synced like any other document. `name`
-/// only needs to end in `.pdf` (the only extension `upload` currently
-/// accepts); it's otherwise just a hint for the temporary file's name, not
+/// `fyde.save_document(name, content)`: uploads `content` (raw bytes, as
+/// returned by `fyde.http.download`'s `body`) directly through the SDK's
+/// own [`DocumentsService::upload`] — unlike `demo-rust-fyde`, which just
+/// writes to a local `--out-dir`, a document scraped here goes through the
+/// same encrypted-upload path as a user-provided file, so it ends up synced
+/// like any other document. `name` only needs to end in `.pdf` (the only
+/// extension `upload` currently accepts); it's otherwise just a hint, not
 /// the uploaded document's real identity (that's the id `upload` returns).
 pub(super) fn save_document_fn(
     lua: &Lua,
@@ -21,9 +19,6 @@ pub(super) fn save_document_fn(
     scraper_name: &str,
     runtime: Handle,
 ) -> mlua::Result<Function> {
-    let temp_dir = std::env::temp_dir()
-        .join("fyde-sdk-scrapers")
-        .join(sanitize_path_segment(scraper_name));
     let scraper_name = scraper_name.to_string();
 
     lua.create_function(move |_, (name, content): (String, Value)| {
@@ -37,21 +32,14 @@ pub(super) fn save_document_fn(
             }
         };
 
-        std::fs::create_dir_all(&temp_dir).map_err(mlua::Error::external)?;
-
         let leaf = name.rsplit(['/', '\\']).next().unwrap_or(&name);
-        let path = temp_dir.join(format!(
-            "{}-{}",
-            Uuid::new_v4(),
-            sanitize_path_segment(leaf)
-        ));
-        std::fs::write(&path, &*bytes).map_err(mlua::Error::external)?;
+        let request = UploadRequest::from_raw(sanitize_path_segment(leaf), bytes.to_vec());
 
-        let result = runtime.block_on(documents.upload(&path));
-        let _ = std::fs::remove_file(&path);
+        let id = runtime
+            .block_on(documents.upload(request))
+            .map_err(mlua::Error::external)?;
 
-        let id = result.map_err(mlua::Error::external)?;
-        tracing::info!(
+        tracing::debug!(
             target: "fyde::scrapers",
             scraper = %scraper_name,
             document = %id,
@@ -79,6 +67,8 @@ fn sanitize_path_segment(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
+
     use super::*;
     use crate::domains::documents::MockService as MockDocumentsService;
 
@@ -103,19 +93,19 @@ mod tests {
     // calls work without needing `#[tokio::test]`'s own (potentially
     // reentrant) runtime context.
     #[test]
-    fn save_document_uploads_the_content_as_a_pdf_and_cleans_up_the_temp_file() {
+    fn save_document_uploads_the_raw_content_directly() {
         let id = Uuid::now_v7();
         let mut documents = MockDocumentsService::new();
         documents
             .expect_upload()
-            .withf(|path| path.extension().and_then(|e| e.to_str()) == Some("pdf"))
+            .withf(|request| match &request.source {
+                crate::domains::documents::UploadSource::Raw { name, content } => {
+                    name == "january.pdf" && content == b"the pdf content"
+                }
+                crate::domains::documents::UploadSource::Path(_) => false,
+            })
             .times(1)
-            .returning(move |path| {
-                // The temp file must actually exist (with the right bytes)
-                // at the moment `upload` is called.
-                assert_eq!(std::fs::read(path).unwrap(), b"the pdf content");
-                Ok(id)
-            });
+            .returning(move |_| Ok(id));
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let lua = Lua::new();

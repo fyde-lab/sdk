@@ -361,7 +361,10 @@ mod tests {
 
     #[async_trait]
     impl DocumentsService for RecordingDocuments {
-        async fn upload(&self, _path: &std::path::Path) -> Result<uuid::Uuid> {
+        async fn upload(
+            &self,
+            _request: crate::domains::documents::UploadRequest,
+        ) -> Result<uuid::Uuid> {
             unimplemented!()
         }
 

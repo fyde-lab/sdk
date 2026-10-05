@@ -376,6 +376,70 @@ impl Document {
     }
 }
 
+/// Where [`super::Service::upload`] reads a document's content from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UploadSource {
+    /// Reads the content from the file at this path on disk; the file's
+    /// name (after stripping its path) becomes the document's
+    /// `original_name`, and its extension is what's validated as a
+    /// supported document type.
+    Path(std::path::PathBuf),
+    /// Uploads already-in-memory content directly, under `name` (used in
+    /// place of a path's file name, including for the extension
+    /// validation `Path` would otherwise get from it).
+    Raw { name: String, content: Vec<u8> },
+}
+
+/// Parameters for [`super::Service::upload`]: where to read the document's
+/// content from, plus any of the modifiable [`Metadata`] fields to set
+/// up front. Every field besides `source` is optional — left `None`, it's
+/// derived the same way it always was (from the document itself and
+/// whatever scripts run against it); set, it overrides that derived value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadRequest {
+    pub source: UploadSource,
+    pub name: Option<String>,
+    pub r#type: Option<String>,
+    pub source_category: Option<SourceCategory>,
+    pub source_sub_category: Option<SourceSubCategory>,
+    pub subjects: Option<Vec<String>>,
+    pub purpose: Option<Purpose>,
+}
+
+impl UploadRequest {
+    /// Builds a request to upload the file at `path`, with no metadata
+    /// overrides — equivalent to how [`super::Service::upload`] used to be
+    /// called before it took this struct.
+    pub fn from_path(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            source: UploadSource::Path(path.into()),
+            name: None,
+            r#type: None,
+            source_category: None,
+            source_sub_category: None,
+            subjects: None,
+            purpose: None,
+        }
+    }
+
+    /// Builds a request to upload `content` directly, named `name`, with no
+    /// metadata overrides.
+    pub fn from_raw(name: impl Into<String>, content: impl Into<Vec<u8>>) -> Self {
+        Self {
+            source: UploadSource::Raw {
+                name: name.into(),
+                content: content.into(),
+            },
+            name: None,
+            r#type: None,
+            source_category: None,
+            source_sub_category: None,
+            subjects: None,
+            purpose: None,
+        }
+    }
+}
+
 /// Builds a [`Metadata`] filled with random-but-plausible data, overridable
 /// field by field, for use in tests.
 #[cfg(test)]

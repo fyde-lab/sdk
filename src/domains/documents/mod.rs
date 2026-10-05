@@ -9,7 +9,9 @@ mod storage_sqlite;
 #[cfg(test)]
 pub(crate) use changelog::FakeChangelogEvent;
 pub use changelog::{ChangelogEvent, EventType};
-pub use models::{Document, Metadata, Purpose, SourceCategory, SourceSubCategory};
+pub use models::{
+    Document, Metadata, Purpose, SourceCategory, SourceSubCategory, UploadRequest, UploadSource,
+};
 #[cfg(test)]
 pub(crate) use models::{FakeDocument, FakeMetadata};
 #[cfg(test)]
@@ -17,7 +19,6 @@ pub(crate) use storage::MockStorage;
 pub(crate) use storage::Storage;
 pub(crate) use storage_sqlite::SqliteStorage;
 
-use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -40,14 +41,18 @@ use crate::{ErrorContext as _, Result};
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Service: Send + Sync {
-    /// Reads the file at `path`, encrypts it and its metadata, then
+    /// Reads the content described by `request.source` (either a file on
+    /// disk or already-in-memory bytes), encrypts it and its metadata, then
     /// publishes it as a "created" changelog event, returning its
-    /// generated id.
+    /// generated id. Metadata fields set on `request` (`name`, `type`,
+    /// `source_category`, `source_sub_category`, `subjects`, `purpose`)
+    /// override whatever would otherwise be derived from the document
+    /// itself and any scripts run against it.
     ///
-    /// The file type is determined from `path`'s extension; only `.pdf` is
-    /// currently accepted, anything else is rejected with
+    /// The file type is determined from the source's name's extension;
+    /// only `.pdf` is currently accepted, anything else is rejected with
     /// [`crate::Error::UnsupportedDocumentExtension`].
-    async fn upload(&self, path: &Path) -> Result<Uuid>;
+    async fn upload(&self, request: UploadRequest) -> Result<Uuid>;
 
     /// Fetches a document previously cached in local storage by
     /// [`Self::start_sync`], or `None` if it doesn't exist.

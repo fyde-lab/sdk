@@ -9,6 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 use anyhow::{Context as _, ensure};
+use fyde_sdk::UploadRequest;
 use serial_test::serial;
 use uuid::Uuid;
 
@@ -51,7 +52,7 @@ async fn document_lifecycle() {
             let id = scenario
                 .client
                 .documents()
-                .upload(file.path())
+                .upload(UploadRequest::from_path(file.path()))
                 .await
                 .context("failed to upload document")?;
             document_id.set(id);

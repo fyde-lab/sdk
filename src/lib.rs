@@ -15,7 +15,9 @@ pub use ffi::{FfiError, FydeClient};
 use std::sync::Arc;
 
 pub use domains::documents::parser::{Service as ParserService, init as init_parser};
-pub use domains::documents::{ChangelogEvent, Document, Metadata, Service as DocumentsService};
+pub use domains::documents::{
+    ChangelogEvent, Document, Metadata, Service as DocumentsService, UploadRequest,
+};
 pub use domains::scrapers::{ProgressEvent, Service as ScrapersService};
 pub use domains::scripts::{InMemoryScriptStorage, Service as ScriptsService};
 pub use domains::server_state::Service as ServerStateService;

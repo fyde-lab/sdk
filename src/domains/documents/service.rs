@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,7 +8,7 @@ use crate::{Error, ErrorContext as _, Result};
 use super::changelog::{ChangelogEvent, EventType, Service as ChangelogService};
 use super::parser::Service as ParserService;
 use super::storage::Storage;
-use super::{Document, Metadata, Service};
+use super::{Document, Metadata, Service, UploadRequest, UploadSource};
 
 /// The default [`Service`] implementation: publishes new documents as
 /// encrypted changelog events via an injected [`ChangelogService`], and
@@ -57,27 +56,46 @@ impl<S: Storage> Service for DocumentsClient<S> {
     /// AES-256-GCM, and is itself wrapped under a key-encryption-key before
     /// being sent alongside the ciphertext. Only the wrapped DEK and
     /// ciphertext ever leave this process.
-    async fn upload(&self, path: &Path) -> Result<Uuid> {
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if extension != "pdf" {
-            return Err(Error::UnsupportedDocumentExtension(extension));
+    async fn upload(&self, request: UploadRequest) -> Result<Uuid> {
+        let (content, original_name) = match request.source {
+            UploadSource::Path(path) => {
+                check_extension(&path)?;
+                let content = tokio::fs::read(&path)
+                    .await
+                    .with_context(|| format!("failed to read document at {}", path.display()))?;
+                let original_name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                (content, original_name)
+            }
+            UploadSource::Raw { name, content } => {
+                check_extension(std::path::Path::new(&name))?;
+                (content, name)
+            }
+        };
+
+        let mut metadata = self.parser.parse_content(&content, &original_name).await?;
+        if let Some(name) = request.name {
+            metadata.name = name;
+        }
+        if let Some(r#type) = request.r#type {
+            metadata.r#type = r#type;
+        }
+        if let Some(source_category) = request.source_category {
+            metadata.source_category = Some(source_category);
+        }
+        if let Some(source_sub_category) = request.source_sub_category {
+            metadata.source_sub_category = Some(source_sub_category);
+        }
+        if let Some(subjects) = request.subjects {
+            metadata.subjects = subjects;
+        }
+        if let Some(purpose) = request.purpose {
+            metadata.purpose = Some(purpose);
         }
 
-        let content = tokio::fs::read(path)
-            .await
-            .with_context(|| format!("failed to read document at {}", path.display()))?;
-
-        let original_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
-
-        let metadata = self.parser.parse_content(&content, &original_name).await?;
         let id = metadata.id;
 
         self.changelog
@@ -125,6 +143,20 @@ impl<S: Storage> Service for DocumentsClient<S> {
     fn stop_sync(&self) {
         self.changelog.stop_consume_job();
     }
+}
+
+/// Validates that `name`'s extension is a supported document type; only
+/// `.pdf` is currently accepted.
+fn check_extension(name: &std::path::Path) -> Result<()> {
+    let extension = name
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if extension != "pdf" {
+        return Err(Error::UnsupportedDocumentExtension(extension));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -264,7 +296,10 @@ mod tests {
             None,
         );
 
-        let id = client.upload(file.path()).await.unwrap();
+        let id = client
+            .upload(UploadRequest::from_path(file.path()))
+            .await
+            .unwrap();
 
         assert_eq!(id, metadata.id);
         let sent = changelog.sent.lock().unwrap();
@@ -286,9 +321,67 @@ mod tests {
             None,
         );
 
-        let result = client.upload(file.path()).await;
+        let result = client.upload(UploadRequest::from_path(file.path())).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn upload_applies_metadata_overrides_from_the_request() {
+        let raw = b"hello world".to_vec();
+        let parsed = super::super::FakeMetadata::new()
+            .with_name("original.pdf")
+            .build();
+
+        let expected_content = raw.clone();
+        let returned_metadata = parsed.clone();
+        let mut parser = MockParserService::new();
+        parser
+            .expect_parse_content()
+            .withf(move |content, original_name| {
+                content == expected_content.as_slice() && original_name == "raw.pdf"
+            })
+            .times(1)
+            .returning(move |_, _| Ok(returned_metadata.clone()));
+
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            changelog.clone(),
+            Arc::new(parser),
+            None,
+        );
+
+        let request = UploadRequest {
+            source: super::super::UploadSource::Raw {
+                name: "raw.pdf".to_string(),
+                content: raw.clone(),
+            },
+            name: Some("overridden.pdf".to_string()),
+            r#type: Some("payslip".to_string()),
+            source_category: Some(super::super::SourceCategory::Employer),
+            source_sub_category: None,
+            subjects: Some(vec!["salary".to_string()]),
+            purpose: Some(super::super::Purpose::Employment),
+        };
+
+        client.upload(request).await.unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let (_, _, _, sent_metadata) = &sent[0];
+        let sent_metadata = sent_metadata.as_ref().unwrap();
+        assert_eq!(sent_metadata.name, "overridden.pdf");
+        assert_eq!(sent_metadata.r#type, "payslip");
+        assert_eq!(
+            sent_metadata.source_category,
+            Some(super::super::SourceCategory::Employer)
+        );
+        assert_eq!(sent_metadata.subjects, vec!["salary".to_string()]);
+        assert_eq!(
+            sent_metadata.purpose,
+            Some(super::super::Purpose::Employment)
+        );
     }
 
     #[tokio::test]

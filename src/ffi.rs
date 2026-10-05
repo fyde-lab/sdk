@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::domains::documents::{EventType, Metadata, Purpose, SourceCategory, SourceSubCategory};
+use crate::domains::documents::{
+    EventType, Metadata, Purpose, SourceCategory, SourceSubCategory, UploadRequest,
+};
 use crate::domains::scripts::Script;
 use crate::domains::sessions::Service as SessionsService;
 use crate::{ChangelogEvent, Client, ClientConfig, Document, Error, LogLevel, Storage};
@@ -565,7 +567,11 @@ impl FydeClient {
     /// publishes it as a "created" changelog event, returning its generated
     /// id. Mirrors [`crate::DocumentsService::upload`].
     pub async fn upload_document(&self, path: String) -> Result<String, FfiError> {
-        let id = self.inner.documents().upload(Path::new(&path)).await?;
+        let id = self
+            .inner
+            .documents()
+            .upload(UploadRequest::from_path(Path::new(&path)))
+            .await?;
         Ok(id.to_string())
     }
 
