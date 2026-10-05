@@ -39,6 +39,47 @@ pub(crate) const MASTER_KEY_SETTING: &str = "master_key";
 /// server.
 pub(crate) const LANGUAGE_SETTING: &str = "language";
 
+/// The settings key under which the account's role (see [`Role`]), as
+/// reported by the server's `FinishRegistration`/`FinishLogin` response, is
+/// cached locally by `create`/`login` so [`Service::role`] can report it
+/// without a server round trip.
+pub(crate) const ROLE_SETTING: &str = "role";
+
+/// A user account's privilege level, mirroring `users.v1.Role` in
+/// `../api-protos`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Admin,
+    User,
+}
+
+impl Role {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::User => "user",
+        }
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Role {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "admin" => Ok(Role::Admin),
+            "user" => Ok(Role::User),
+            other => Err(format!("unknown role: {other}")),
+        }
+    }
+}
+
 /// JSON-encodes `master_key`'s raw bytes for storage under
 /// [`MASTER_KEY_SETTING`].
 pub(crate) fn encode_master_key(master_key: &[u8]) -> Result<String> {
@@ -138,6 +179,11 @@ pub trait Service: Send + Sync {
     /// fall back to the platform's own locale in that case rather than
     /// assuming a language.
     async fn get_language(&self) -> Result<Option<String>>;
+
+    /// Returns the role of the account behind the most recent `create`/
+    /// `login` call, cached locally under [`ROLE_SETTING`], or `None` if
+    /// neither has ever been called on this device.
+    async fn role(&self) -> Result<Option<Role>>;
 }
 
 /// Initializes the users service: connects to the fyde server's users

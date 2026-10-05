@@ -8,6 +8,8 @@ use tonic::transport::Channel;
 use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::{ErrorContext as _, Result};
 
+use super::Role;
+
 /// Generated protobuf/gRPC bindings for the `users` service, compiled from
 /// `../api-protos/users/v1/users.proto` by `build.rs`.
 mod proto {
@@ -19,6 +21,18 @@ use proto::{
     StartChangePasswordRequest, StartLoginRequest, StartRegistrationRequest,
     users_service_client::UsersServiceClient as GeneratedUsersClient,
 };
+
+/// Converts the raw `role` field of a `FinishRegistrationResponse`/
+/// `FinishLoginResponse` into [`Role`]. Defaults to [`Role::User`] for
+/// `ROLE_UNSPECIFIED` or any value this client doesn't recognize (e.g. an
+/// older client talking to a server that added a new role), rather than
+/// failing the call over a field that's informational only.
+fn to_role(value: i32) -> Role {
+    match proto::Role::try_from(value) {
+        Ok(proto::Role::Admin) => Role::Admin,
+        Ok(proto::Role::User) | Ok(proto::Role::Unspecified) | Err(_) => Role::User,
+    }
+}
 
 /// A gRPC transport for talking to the fyde server's users service. Knows
 /// nothing about OPAQUE or users semantics beyond the raw proto types —
@@ -38,7 +52,8 @@ pub(super) trait FydeClient: Send + Sync {
     /// `RegistrationUpload` for `username`, the master key encrypted
     /// client-side under a key derived from the OPAQUE export key, and the
     /// account's preferred interface language, and opens a session for
-    /// `device_name`, returning its session token.
+    /// `device_name`, returning its session token alongside the newly
+    /// created account's role.
     async fn finish_registration(
         &self,
         username: &str,
@@ -46,7 +61,7 @@ pub(super) trait FydeClient: Send + Sync {
         device_name: &str,
         encrypted_master_key: &[u8],
         language: &str,
-    ) -> Result<String>;
+    ) -> Result<(String, Role)>;
 
     /// First step of logging in: forwards a serialized OPAQUE
     /// `CredentialRequest` for `username` and returns the server's
@@ -60,13 +75,13 @@ pub(super) trait FydeClient: Send + Sync {
     /// and opens a session for `device_name`, returning its session token
     /// alongside the account's master key, still encrypted client-side
     /// under a key derived from the OPAQUE export key (see
-    /// [`super::crypto::unwrap_master_key`]).
+    /// [`super::crypto::unwrap_master_key`]), and the account's role.
     async fn finish_login(
         &self,
         login_id: &str,
         opaque_upload: &[u8],
         device_name: &str,
-    ) -> Result<(String, Vec<u8>)>;
+    ) -> Result<(String, Vec<u8>, Role)>;
 
     /// Closes the session currently authenticating outgoing calls (see
     /// [`crate::domains::sessions::Service::authenticated_request`]).
@@ -153,7 +168,7 @@ impl FydeClient for GrpcClient {
         device_name: &str,
         encrypted_master_key: &[u8],
         language: &str,
-    ) -> Result<String> {
+    ) -> Result<(String, Role)> {
         let request = self
             .sessions
             .authenticated_request(FinishRegistrationRequest {
@@ -172,7 +187,7 @@ impl FydeClient for GrpcClient {
             .context("failed to finish registration")?
             .into_inner();
 
-        Ok(response.session_token)
+        Ok((response.session_token, to_role(response.role)))
     }
 
     async fn start_login(
@@ -203,7 +218,7 @@ impl FydeClient for GrpcClient {
         login_id: &str,
         opaque_upload: &[u8],
         device_name: &str,
-    ) -> Result<(String, Vec<u8>)> {
+    ) -> Result<(String, Vec<u8>, Role)> {
         let request = self
             .sessions
             .authenticated_request(FinishLoginRequest {
@@ -220,7 +235,11 @@ impl FydeClient for GrpcClient {
             .context("failed to finish login")?
             .into_inner();
 
-        Ok((response.session_token, response.encrypted_master_key))
+        Ok((
+            response.session_token,
+            response.encrypted_master_key,
+            to_role(response.role),
+        ))
     }
 
     async fn logout(&self) -> Result<()> {

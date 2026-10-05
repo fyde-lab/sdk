@@ -16,7 +16,10 @@ use super::crypto::{
     wrap_master_key,
 };
 use super::grpc_client::{FydeClient, GrpcClient};
-use super::{LANGUAGE_SETTING, MASTER_KEY_SETTING, Service, decode_master_key, encode_master_key};
+use super::{
+    LANGUAGE_SETTING, MASTER_KEY_SETTING, ROLE_SETTING, Role, Service, decode_master_key,
+    encode_master_key,
+};
 
 /// The device's preferred interface language as a short code (e.g. "en",
 /// "fr"), read from the `LC_ALL`/`LC_MESSAGES`/`LANG` environment variables
@@ -122,7 +125,7 @@ impl Service for UsersClient {
         let (raw_master_key, wrapped_master_key) =
             generate_and_wrap_master_key(&export_key).context("failed to generate master key")?;
 
-        let token = self
+        let (token, role) = self
             .grpc
             .finish_registration(
                 username,
@@ -140,6 +143,11 @@ impl Service for UsersClient {
             .set(MASTER_KEY_SETTING, &encode_master_key(&raw_master_key)?)
             .await
             .context("failed to persist master key")?;
+
+        self.settings
+            .set(ROLE_SETTING, &role.to_string())
+            .await
+            .context("failed to persist role")?;
 
         self.documents
             .start_sync()
@@ -166,7 +174,7 @@ impl Service for UsersClient {
             .finish_login(state, password, &opaque_response)
             .context("failed to finish OPAQUE login")?;
 
-        let (token, encrypted_master_key) = self
+        let (token, encrypted_master_key, role) = self
             .grpc
             .finish_login(&login_id, &opaque_upload, device_name)
             .await
@@ -184,6 +192,11 @@ impl Service for UsersClient {
             .set(MASTER_KEY_SETTING, &encode_master_key(&raw_master_key)?)
             .await
             .context("failed to persist master key")?;
+
+        self.settings
+            .set(ROLE_SETTING, &role.to_string())
+            .await
+            .context("failed to persist role")?;
 
         self.documents
             .start_sync()
@@ -289,6 +302,21 @@ impl Service for UsersClient {
             .get(LANGUAGE_SETTING)
             .await
             .context("failed to read language preference")
+    }
+
+    async fn role(&self) -> Result<Option<Role>> {
+        let Some(role) = self
+            .settings
+            .get(ROLE_SETTING)
+            .await
+            .context("failed to read cached role")?
+        else {
+            return Ok(None);
+        };
+
+        role.parse()
+            .map(Some)
+            .map_err(|err| Error::InvalidResponse(format!("invalid cached role: {err}")))
     }
 }
 
@@ -442,7 +470,7 @@ mod tests {
             .withf(|username, upload, device_name, _, _| {
                 username == "alice" && upload == b"the-upload" && device_name == "Pierre's iPhone"
             })
-            .returning(|_, _, _, _, _| Ok("a-token".to_string()));
+            .returning(|_, _, _, _, _| Ok(("a-token".to_string(), Role::User)));
 
         let mut settings = MockSettingsService::new();
         settings
@@ -453,6 +481,11 @@ mod tests {
         settings
             .expect_set()
             .withf(|key, _| key == MASTER_KEY_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == ROLE_SETTING)
             .times(1)
             .returning(|_, _| Ok(()));
 
@@ -481,7 +514,7 @@ mod tests {
         mock_grpc.expect_finish_registration().times(1).returning(
             move |_, _, _, encrypted_master_key, _| {
                 *capture.lock().unwrap() = Some(encrypted_master_key.to_vec());
-                Ok("a-token".to_string())
+                Ok(("a-token".to_string(), Role::User))
             },
         );
 
@@ -500,6 +533,11 @@ mod tests {
                 *set_master_key.lock().unwrap() = Some(value.to_string());
                 Ok(())
             });
+        settings
+            .expect_set()
+            .withf(|key, _| key == ROLE_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
 
         let client = client_with_deps(mock_grpc, opaque, settings);
         client
@@ -532,7 +570,7 @@ mod tests {
             .returning(|_, _| Ok(b"the-response".to_vec()));
         mock_grpc
             .expect_finish_registration()
-            .returning(|_, _, _, _, _| Ok("a-token".to_string()));
+            .returning(|_, _, _, _, _| Ok(("a-token".to_string(), Role::User)));
 
         // Captures what `create` persists so it can be read back and
         // asserted on below, without a generic key/value store.
@@ -553,6 +591,11 @@ mod tests {
                 *set_master_key.lock().unwrap() = Some(value.to_string());
                 Ok(())
             });
+        settings
+            .expect_set()
+            .withf(|key, _| key == ROLE_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
 
         let client = client_with_deps(mock_grpc, opaque, settings);
 
@@ -579,7 +622,7 @@ mod tests {
             .returning(|_, _| Ok(b"the-response".to_vec()));
         mock_grpc
             .expect_finish_registration()
-            .returning(|_, _, _, _, _| Ok("a-token".to_string()));
+            .returning(|_, _, _, _, _| Ok(("a-token".to_string(), Role::User)));
 
         // Captures what `create` persists under `SESSION_TOKEN_SETTING` so
         // it can be read back and asserted on below.
@@ -598,6 +641,11 @@ mod tests {
         settings
             .expect_set()
             .withf(|key, _| key == MASTER_KEY_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == ROLE_SETTING)
             .times(1)
             .returning(|_, _| Ok(()));
 
@@ -629,7 +677,7 @@ mod tests {
                     && upload == b"the-upload"
                     && device_name == "Pierre's iPhone"
             })
-            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key())));
+            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
 
         let mut settings = MockSettingsService::new();
         settings
@@ -640,6 +688,11 @@ mod tests {
         settings
             .expect_set()
             .withf(|key, _| key == MASTER_KEY_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == ROLE_SETTING)
             .times(1)
             .returning(|_, _| Ok(()));
 
@@ -662,7 +715,7 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         mock_grpc
             .expect_finish_login()
-            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key())));
+            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
 
         let persisted_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
@@ -679,6 +732,11 @@ mod tests {
         settings
             .expect_set()
             .withf(|key, _| key == MASTER_KEY_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == ROLE_SETTING)
             .times(1)
             .returning(|_, _| Ok(()));
 
@@ -704,9 +762,13 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         let wrapped_master_key = login_master_key();
         let returned_master_key = wrapped_master_key.clone();
-        mock_grpc
-            .expect_finish_login()
-            .returning(move |_, _, _| Ok(("a-token".to_string(), returned_master_key.clone())));
+        mock_grpc.expect_finish_login().returning(move |_, _, _| {
+            Ok((
+                "a-token".to_string(),
+                returned_master_key.clone(),
+                Role::User,
+            ))
+        });
 
         let persisted_master_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
@@ -724,6 +786,11 @@ mod tests {
                 *set_master_key.lock().unwrap() = Some(value.to_string());
                 Ok(())
             });
+        settings
+            .expect_set()
+            .withf(|key, _| key == ROLE_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
 
         let client = client_with_deps(mock_grpc, opaque, settings);
 
@@ -754,7 +821,7 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         mock_grpc
             .expect_finish_login()
-            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key())));
+            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
         let mut settings = MockSettingsService::new();
@@ -765,6 +832,10 @@ mod tests {
         settings
             .expect_set()
             .withf(|key, _| key == MASTER_KEY_SETTING)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == ROLE_SETTING)
             .returning(|_, _| Ok(()));
         settings
             .expect_get()
@@ -808,7 +879,7 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         mock_grpc
             .expect_finish_login()
-            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key())));
+            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
         let mut settings = MockSettingsService::new();
@@ -819,6 +890,10 @@ mod tests {
         settings
             .expect_set()
             .withf(|key, _| key == MASTER_KEY_SETTING)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == ROLE_SETTING)
             .returning(|_, _| Ok(()));
         // Mockall checks the most-recently-defined expectation first, so
         // this "already gone" expectation (defined first, checked last)
@@ -853,7 +928,7 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         mock_grpc
             .expect_finish_login()
-            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key())));
+            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
         let mut settings = MockSettingsService::new();
@@ -864,6 +939,10 @@ mod tests {
         settings
             .expect_set()
             .withf(|key, _| key == MASTER_KEY_SETTING)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == ROLE_SETTING)
             .returning(|_, _| Ok(()));
         settings
             .expect_get()
@@ -899,7 +978,7 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         mock_grpc
             .expect_finish_login()
-            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key())));
+            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
         let mut settings = MockSettingsService::new();
@@ -910,6 +989,10 @@ mod tests {
         settings
             .expect_set()
             .withf(|key, _| key == MASTER_KEY_SETTING)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == ROLE_SETTING)
             .returning(|_, _| Ok(()));
         settings
             .expect_get()
@@ -1174,5 +1257,33 @@ mod tests {
         let client = client_with_deps(MockFydeClient::new(), MockOpaqueClient::new(), settings);
 
         assert_eq!(client.get_language().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn role_returns_the_cached_value() {
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == ROLE_SETTING)
+            .times(1)
+            .returning(|_| Ok(Some("admin".to_string())));
+
+        let client = client_with_deps(MockFydeClient::new(), MockOpaqueClient::new(), settings);
+
+        assert_eq!(client.role().await.unwrap(), Some(Role::Admin));
+    }
+
+    #[tokio::test]
+    async fn role_returns_none_when_never_set() {
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == ROLE_SETTING)
+            .times(1)
+            .returning(|_| Ok(None));
+
+        let client = client_with_deps(MockFydeClient::new(), MockOpaqueClient::new(), settings);
+
+        assert_eq!(client.role().await.unwrap(), None);
     }
 }
