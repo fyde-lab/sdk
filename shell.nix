@@ -26,16 +26,19 @@ pkgs.mkShell {
     cmake
     perl
     go
+    clang
     # Sets up LIBCLANG_PATH/BINDGEN_EXTRA_CLANG_ARGS correctly for bindgen.
     rustPlatform.bindgenHook
   ];
-
-  RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
 
   # direnv (`use nix`) caches the env from the nix-shell invocation that computed it,
   # including the ephemeral TMPDIR nix-shell creates and deletes on exit. Later shells
   # reusing that cached env point sccache at a TMPDIR that's already gone - pin it.
   shellHook = ''
     export TMPDIR="/tmp"
+
+    export RUSTC_WRAPPER=${pkgs.sccache}/bin/sccache
+    export CC="${pkgs.sccache}/bin/sccache ${pkgs.clang}/bin/clang"
+    export CXX="${pkgs.sccache}/bin/sccache ${pkgs.clang}/bin/clang++"
   '';
 }
