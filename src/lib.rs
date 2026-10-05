@@ -320,18 +320,20 @@ impl Client {
 /// database: a standalone CLI runner has no reason to pull in a local
 /// database just for this, unlike [`Client`], which already has one for
 /// everything else it persists. Documents a script saves via
-/// `fyde.save_document` are written as plain files under `documents_dir`
-/// instead of being encrypted and uploaded — see
-/// [`domains::documents::init_dev`]. `on_progress`/`on_question` are the
-/// same callbacks as [`ClientConfig::on_scraper_progress`]/
-/// [`ClientConfig::on_scraper_question`].
+/// `fyde.save_document` are written as plain files under
+/// `documents_dir/scraper_name` instead of being encrypted and uploaded —
+/// see [`domains::documents::init_dev`] — so documents from different
+/// scrapers never collide or mix together under the same `documents_dir`.
+/// `on_progress`/`on_question` are the same callbacks as
+/// [`ClientConfig::on_scraper_progress`]/[`ClientConfig::on_scraper_question`].
 pub async fn init_dev_scrapers(
     storage_dir: std::path::PathBuf,
     documents_dir: std::path::PathBuf,
+    scraper_name: impl Into<String>,
     on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
     on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
 ) -> Result<Arc<dyn ScrapersService>> {
-    let documents = domains::documents::init_dev(documents_dir);
+    let documents = domains::documents::init_dev(documents_dir, scraper_name);
 
     Ok(domains::scrapers::init(
         domains::scrapers::StorageConfig::File(storage_dir),

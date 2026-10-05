@@ -148,8 +148,11 @@ pub(crate) async fn init(
 
 /// Initializes a dev [`Service`] for standalone use without a fyde server
 /// connection (see [`crate::init_dev_scrapers`]): [`Service::upload`] just
-/// copies the file to `out_dir` as plain bytes instead of encrypting and
-/// publishing it through the changelog.
-pub(crate) fn init_dev(out_dir: std::path::PathBuf) -> Arc<dyn Service> {
-    Arc::new(dev::DevDocumentsClient::new(out_dir))
+/// copies the file to `out_dir/scraper_name` as plain bytes instead of
+/// encrypting and publishing it through the changelog.
+pub(crate) fn init_dev(
+    out_dir: std::path::PathBuf,
+    scraper_name: impl Into<String>,
+) -> Arc<dyn Service> {
+    Arc::new(dev::DevDocumentsClient::new(out_dir, scraper_name))
 }
