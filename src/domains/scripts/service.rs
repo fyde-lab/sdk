@@ -43,8 +43,21 @@ impl Service for ScriptsClient {
         is_public: bool,
         icon: Vec<u8>,
         script: &str,
+        description: &str,
+        short_description: &str,
+        logo: Vec<u8>,
     ) -> Result<Script> {
-        self.grpc.create_script(name, is_public, icon, script).await
+        self.grpc
+            .create_script(
+                name,
+                is_public,
+                icon,
+                script,
+                description,
+                short_description,
+                logo,
+            )
+            .await
     }
 
     async fn fetch_script(&self, id: Uuid) -> Result<Script> {
@@ -58,9 +71,21 @@ impl Service for ScriptsClient {
         is_public: bool,
         icon: Vec<u8>,
         script: &str,
+        description: &str,
+        short_description: &str,
+        logo: Vec<u8>,
     ) -> Result<Script> {
         self.grpc
-            .update_script(id, name, is_public, icon, script)
+            .update_script(
+                id,
+                name,
+                is_public,
+                icon,
+                script,
+                description,
+                short_description,
+                logo,
+            )
             .await
     }
 
@@ -94,16 +119,32 @@ mod tests {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_create_script()
-            .withf(|name, is_public, icon, script| {
-                name == "my-script" && *is_public && icon == b"icon-bytes" && script == "return 1"
-            })
+            .withf(
+                |name, is_public, icon, script, description, short_description, logo| {
+                    name == "my-script"
+                        && *is_public
+                        && icon == b"icon-bytes"
+                        && script == "return 1"
+                        && description == "does something"
+                        && short_description == "does a thing"
+                        && logo == b"logo-bytes"
+                },
+            )
             .times(1)
-            .returning(move |_, _, _, _| Ok(returned.clone()));
+            .returning(move |_, _, _, _, _, _, _| Ok(returned.clone()));
 
         let client = ScriptsClient::with_grpc(mock_grpc);
 
         let script = client
-            .create_script("my-script", true, b"icon-bytes".to_vec(), "return 1")
+            .create_script(
+                "my-script",
+                true,
+                b"icon-bytes".to_vec(),
+                "return 1",
+                "does something",
+                "does a thing",
+                b"logo-bytes".to_vec(),
+            )
             .await
             .unwrap();
 
@@ -135,20 +176,34 @@ mod tests {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_update_script()
-            .withf(move |requested_id, name, is_public, icon, script| {
-                *requested_id == id
-                    && name == "my-script"
-                    && *is_public
-                    && icon == b"icon-bytes"
-                    && script == "return 1"
-            })
+            .withf(
+                move |requested_id, name, is_public, icon, script, description, short_description, logo| {
+                    *requested_id == id
+                        && name == "my-script"
+                        && *is_public
+                        && icon == b"icon-bytes"
+                        && script == "return 1"
+                        && description == "does something"
+                        && short_description == "does a thing"
+                        && logo == b"logo-bytes"
+                },
+            )
             .times(1)
-            .returning(move |_, _, _, _, _| Ok(returned.clone()));
+            .returning(move |_, _, _, _, _, _, _, _| Ok(returned.clone()));
 
         let client = ScriptsClient::with_grpc(mock_grpc);
 
         let script = client
-            .update_script(id, "my-script", true, b"icon-bytes".to_vec(), "return 1")
+            .update_script(
+                id,
+                "my-script",
+                true,
+                b"icon-bytes".to_vec(),
+                "return 1",
+                "does something",
+                "does a thing",
+                b"logo-bytes".to_vec(),
+            )
             .await
             .unwrap();
 

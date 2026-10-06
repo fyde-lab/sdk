@@ -40,12 +40,18 @@ impl Service for InMemoryScriptStorage {
         is_public: bool,
         icon: Vec<u8>,
         script: &str,
+        description: &str,
+        short_description: &str,
+        logo: Vec<u8>,
     ) -> Result<Script> {
         let created = Script {
             id: Uuid::now_v7(),
             name: name.to_string(),
+            description: description.to_string(),
+            short_description: short_description.to_string(),
             is_public,
             icon,
+            logo,
             version: 1,
             script: script.to_string(),
             last_updated: now(),
@@ -75,6 +81,9 @@ impl Service for InMemoryScriptStorage {
         is_public: bool,
         icon: Vec<u8>,
         script: &str,
+        description: &str,
+        short_description: &str,
+        logo: Vec<u8>,
     ) -> Result<Script> {
         let mut scripts = self.scripts.lock().unwrap();
 
@@ -83,8 +92,11 @@ impl Service for InMemoryScriptStorage {
         let updated = Script {
             id,
             name: name.to_string(),
+            description: description.to_string(),
+            short_description: short_description.to_string(),
             is_public,
             icon,
+            logo,
             version: existing.version + 1,
             script: script.to_string(),
             last_updated: now(),
@@ -136,7 +148,7 @@ mod tests {
         let storage = InMemoryScriptStorage::new();
 
         let created = storage
-            .create_script("example", true, vec![1, 2, 3], "return 1 + 1")
+            .create_script("example", true, vec![1, 2, 3], "return 1 + 1", "", "", Vec::new())
             .await
             .unwrap();
 
@@ -149,7 +161,7 @@ mod tests {
     async fn fetches_a_previously_created_script() {
         let storage = InMemoryScriptStorage::new();
         let created = storage
-            .create_script("example", true, Vec::new(), "return 1")
+            .create_script("example", true, Vec::new(), "return 1", "", "", Vec::new())
             .await
             .unwrap();
 
@@ -171,12 +183,12 @@ mod tests {
     async fn updating_a_script_increments_its_version() {
         let storage = InMemoryScriptStorage::new();
         let created = storage
-            .create_script("example", false, Vec::new(), "return 1")
+            .create_script("example", false, Vec::new(), "return 1", "", "", Vec::new())
             .await
             .unwrap();
 
         let updated = storage
-            .update_script(created.id, "renamed", true, vec![9], "return 2")
+            .update_script(created.id, "renamed", true, vec![9], "return 2", "", "", Vec::new())
             .await
             .unwrap();
 
@@ -190,7 +202,7 @@ mod tests {
         let storage = InMemoryScriptStorage::new();
 
         let err = storage
-            .update_script(Uuid::now_v7(), "renamed", true, Vec::new(), "return 2")
+            .update_script(Uuid::now_v7(), "renamed", true, Vec::new(), "return 2", "", "", Vec::new())
             .await
             .unwrap_err();
 
@@ -201,11 +213,11 @@ mod tests {
     async fn lists_only_enabled_scripts() {
         let storage = InMemoryScriptStorage::new();
         let enabled = storage
-            .create_script("enabled", true, Vec::new(), "return 1")
+            .create_script("enabled", true, Vec::new(), "return 1", "", "", Vec::new())
             .await
             .unwrap();
         let disabled = storage
-            .create_script("disabled", true, Vec::new(), "return 2")
+            .create_script("disabled", true, Vec::new(), "return 2", "", "", Vec::new())
             .await
             .unwrap();
 
@@ -221,11 +233,11 @@ mod tests {
     async fn lists_only_public_scripts() {
         let storage = InMemoryScriptStorage::new();
         let public = storage
-            .create_script("public", true, Vec::new(), "return 1")
+            .create_script("public", true, Vec::new(), "return 1", "", "", Vec::new())
             .await
             .unwrap();
         let private = storage
-            .create_script("private", false, Vec::new(), "return 2")
+            .create_script("private", false, Vec::new(), "return 2", "", "", Vec::new())
             .await
             .unwrap();
 
@@ -239,7 +251,7 @@ mod tests {
     async fn disabling_a_script_removes_it_from_the_listing() {
         let storage = InMemoryScriptStorage::new();
         let script = storage
-            .create_script("example", true, Vec::new(), "return 1")
+            .create_script("example", true, Vec::new(), "return 1", "", "", Vec::new())
             .await
             .unwrap();
 

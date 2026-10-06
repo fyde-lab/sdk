@@ -31,12 +31,16 @@ use crate::domains::sessions::SessionsClient;
 #[async_trait]
 pub trait Service: Send + Sync {
     /// Creates a new script owned by the authenticated user, at version 1.
+    #[allow(clippy::too_many_arguments)]
     async fn create_script(
         &self,
         name: &str,
         is_public: bool,
         icon: Vec<u8>,
         script: &str,
+        description: &str,
+        short_description: &str,
+        logo: Vec<u8>,
     ) -> Result<Script>;
 
     /// Fetches the script matching `id`.
@@ -45,6 +49,7 @@ pub trait Service: Send + Sync {
     /// Updates a script owned by the authenticated user, incrementing its
     /// version. Fails if the script doesn't exist or the authenticated user
     /// isn't its owner.
+    #[allow(clippy::too_many_arguments)]
     async fn update_script(
         &self,
         id: Uuid,
@@ -52,6 +57,9 @@ pub trait Service: Send + Sync {
         is_public: bool,
         icon: Vec<u8>,
         script: &str,
+        description: &str,
+        short_description: &str,
+        logo: Vec<u8>,
     ) -> Result<Script>;
 
     /// Enables `script_id` for the authenticated user. Enabling an

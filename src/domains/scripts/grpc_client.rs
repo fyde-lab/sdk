@@ -32,12 +32,16 @@ use proto::{
 #[async_trait]
 pub(super) trait FydeClient: Send + Sync {
     /// Creates a new script owned by the authenticated user, at version 1.
+    #[allow(clippy::too_many_arguments)]
     async fn create_script(
         &self,
         name: &str,
         is_public: bool,
         icon: Vec<u8>,
         script: &str,
+        description: &str,
+        short_description: &str,
+        logo: Vec<u8>,
     ) -> Result<Script>;
 
     /// Fetches the script matching `id`.
@@ -45,6 +49,7 @@ pub(super) trait FydeClient: Send + Sync {
 
     /// Updates a script owned by the authenticated user, incrementing its
     /// version.
+    #[allow(clippy::too_many_arguments)]
     async fn update_script(
         &self,
         id: Uuid,
@@ -52,6 +57,9 @@ pub(super) trait FydeClient: Send + Sync {
         is_public: bool,
         icon: Vec<u8>,
         script: &str,
+        description: &str,
+        short_description: &str,
+        logo: Vec<u8>,
     ) -> Result<Script>;
 
     /// Enables `script_id` for the authenticated user.
@@ -104,8 +112,11 @@ fn into_domain(script: proto::Script) -> Result<Script> {
             .parse()
             .context("failed to parse script id returned by the server")?,
         name: script.name,
+        description: script.description,
+        short_description: script.short_description,
         is_public: script.is_public,
         icon: script.icon,
+        logo: script.logo,
         version: script.version,
         script: script.script,
         last_updated: script.last_updated,
@@ -120,6 +131,9 @@ impl FydeClient for GrpcClient {
         is_public: bool,
         icon: Vec<u8>,
         script: &str,
+        description: &str,
+        short_description: &str,
+        logo: Vec<u8>,
     ) -> Result<Script> {
         let request = self
             .sessions
@@ -128,6 +142,9 @@ impl FydeClient for GrpcClient {
                 is_public,
                 icon,
                 script: script.to_string(),
+                description: description.to_string(),
+                short_description: short_description.to_string(),
+                logo,
             })
             .await?;
 
@@ -168,6 +185,9 @@ impl FydeClient for GrpcClient {
         is_public: bool,
         icon: Vec<u8>,
         script: &str,
+        description: &str,
+        short_description: &str,
+        logo: Vec<u8>,
     ) -> Result<Script> {
         let request = self
             .sessions
@@ -177,6 +197,9 @@ impl FydeClient for GrpcClient {
                 is_public,
                 icon,
                 script: script.to_string(),
+                description: description.to_string(),
+                short_description: short_description.to_string(),
+                logo,
             })
             .await?;
 
