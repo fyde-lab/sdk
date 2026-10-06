@@ -1,3 +1,4 @@
+mod browser;
 mod cookies;
 mod host;
 mod models;
@@ -20,7 +21,10 @@ use crate::domains::documents::Service as DocumentsService;
 /// Runs Lua scraper scripts: a sandboxed Lua 5.4 VM with host capabilities
 /// exposed under a single `fyde` global table (`fyde.http`, `fyde.html`,
 /// `fyde.json`, `fyde.log`, `fyde.progress`, `fyde.input`,
-/// `fyde.save_document`, `fyde.session`), ported from `demo-rust-fyde`.
+/// `fyde.save_document`, `fyde.session`, `fyde.browser`), ported from
+/// `demo-rust-fyde`. `fyde.browser` is the one exception not ported from
+/// there — a real, embedded webview (see the private `browser` sub-domain)
+/// for sites a plain `fyde.http` request can't get past.
 /// Scripts loaded here must follow the same contract as
 /// `demo-rust-fyde`'s: return a table with a single `run(parameters)`
 /// function, calling only into `fyde`. Trait methods take `&self` (not

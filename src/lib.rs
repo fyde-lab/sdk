@@ -82,6 +82,8 @@ pub enum Error {
     MessagePackDecode(#[from] rmp_serde::decode::Error),
     #[error("scraper task failed: {0}")]
     TaskJoin(#[from] tokio::task::JoinError),
+    #[error("browser error: {0}")]
+    Browser(String),
     #[error("{message}: {source}")]
     Context {
         message: String,

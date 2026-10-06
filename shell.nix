@@ -29,6 +29,16 @@ pkgs.mkShell {
     clang
     # Sets up LIBCLANG_PATH/BINDGEN_EXTRA_CLANG_ARGS correctly for bindgen.
     rustPlatform.bindgenHook
+
+    # required (via pkg-config) to build wry/tao, the real embedded webview
+    # behind fyde.browser (see src/domains/scrapers/browser/driver.rs and
+    # src/domains/scrapers/host/browser.rs). webkitgtk_4_1/gtk3 are wry's
+    # WebKitGTK backend on Linux; dbus is tao's optional single-instance/
+    # app-id support, pulled in by its "dbus" feature.
+    pkg-config
+    webkitgtk_4_1
+    gtk3
+    dbus
   ];
 
   # direnv (`use nix`) caches the env from the nix-shell invocation that computed it,

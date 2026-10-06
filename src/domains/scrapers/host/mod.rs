@@ -1,3 +1,4 @@
+mod browser;
 mod documents;
 mod html;
 mod http;
@@ -20,6 +21,7 @@ use crate::domains::documents::Service as DocumentsService;
 use crate::{ErrorContext as _, Result};
 
 use super::ProgressEvent;
+use super::browser::Service as BrowserService;
 use super::cookies::Cookie;
 use super::reports::Recorder;
 
@@ -57,15 +59,17 @@ impl Installed {
 /// Wires every host capability a scraper script is allowed to use into a
 /// single `fyde` global table: `fyde.log`, `fyde.http`, `fyde.html`,
 /// `fyde.json`, `fyde.progress`, `fyde.input`, `fyde.save_document`,
-/// `fyde.session`. Scripts never reach outside this table — no raw
-/// `io`/`os`/socket access from script code — see `demo-rust-fyde`'s own
-/// `host/mod.rs`, which this is ported from. Unlike that port, `fyde.log`,
-/// `fyde.http`, `fyde.progress` and `fyde.input` each also write an entry
-/// to `recorder` — the `reports` sub-domain's per-run debug report,
-/// `demo-rust-fyde`'s `Report` brought back (`service.rs` saves it once the
-/// script's `run` function returns). `debug_http_dump` is forwarded to
-/// `fyde.http` only (see `host::http::table`) — it opts this run into
-/// recording full request/response headers/bodies instead of just
+/// `fyde.session`, `fyde.browser`. Scripts never reach outside this table —
+/// no raw `io`/`os`/socket access from script code — see
+/// `demo-rust-fyde`'s own `host/mod.rs`, which this is ported from
+/// (`fyde.browser` is the one exception with no `demo-rust-fyde`
+/// counterpart — see `super::browser`). Unlike that port, `fyde.log`,
+/// `fyde.http`, `fyde.progress`, `fyde.input` and `fyde.browser` each also
+/// write an entry to `recorder` — the `reports` sub-domain's per-run debug
+/// report, `demo-rust-fyde`'s `Report` brought back (`service.rs` saves it
+/// once the script's `run` function returns). `debug_http_dump` is
+/// forwarded to `fyde.http` only (see `host::http::table`) — it opts this
+/// run into recording full request/response headers/bodies instead of just
 /// method/url/status/timing. `wreq_emulation` is also forwarded to
 /// `fyde.http` only — it toggles `wreq`'s Chrome TLS/HTTP2 fingerprint
 /// emulation. `follow_redirects` is also forwarded to `fyde.http` only — it
@@ -77,6 +81,7 @@ pub(super) fn install(
     session_data: JsonValue,
     cookies: Vec<Cookie>,
     documents: Arc<dyn DocumentsService>,
+    browser: Arc<dyn BrowserService>,
     on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
     on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
     recorder: Arc<Recorder>,
@@ -115,13 +120,15 @@ pub(super) fn install(
         progress::table(lua, on_progress, recorder.clone())?,
     )
     .context("installing fyde.progress")?;
-    fyde.set("input", input::table(lua, on_question, recorder)?)
+    fyde.set("input", input::table(lua, on_question, recorder.clone())?)
         .context("installing fyde.input")?;
     fyde.set(
         "save_document",
-        documents::save_document_fn(lua, documents, scraper_name, runtime)?,
+        documents::save_document_fn(lua, documents, scraper_name, runtime.clone())?,
     )
     .context("installing fyde.save_document")?;
+    fyde.set("browser", browser::table(lua, browser, recorder, runtime)?)
+        .context("installing fyde.browser")?;
 
     let session_value = lua
         .to_value(&session_data)

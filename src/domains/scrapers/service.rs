@@ -142,12 +142,20 @@ fn run_script(
     follow_redirects: bool,
 ) -> Result<(Value, Vec<Cookie>, Result<()>)> {
     let lua = Lua::new();
+    // Built fresh per run, same as the Lua VM itself: there's no persisted
+    // state to carry across runs the way `session`/`cookies` have, so the
+    // webview it lazily spawns (see `browser::driver::BrowserDriver`) lives
+    // only as long as this run does, closed via its `Drop` impl once every
+    // `Arc` clone `host::install` handed to `fyde.browser`'s closures goes
+    // out of scope at the end of this function.
+    let browser = super::browser::init();
     let installed = host::install(
         &lua,
         name,
         session_data,
         cookies,
         documents,
+        browser,
         on_progress,
         on_question,
         recorder,
@@ -294,7 +302,14 @@ mod tests {
         "#;
 
         client
-            .run("didaxis", script, json!({"username": "alice"}), false, true, true)
+            .run(
+                "didaxis",
+                script,
+                json!({"username": "alice"}),
+                false,
+                true,
+                true,
+            )
             .await
             .unwrap();
     }
@@ -323,7 +338,9 @@ mod tests {
             return M
         "#;
 
-        let result = client.run("didaxis", script, json!({}), false, true, true).await;
+        let result = client
+            .run("didaxis", script, json!({}), false, true, true)
+            .await;
 
         assert!(result.is_err());
     }

@@ -1,0 +1,550 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, SyncSender, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde_json::Value;
+use tao::event::{Event, WindowEvent};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use tao::platform::run_return::EventLoopExtRunReturn as _;
+use tao::window::WindowBuilder;
+use wry::WebViewBuilder;
+
+use crate::{Error, Result};
+
+use super::Service;
+use super::models::BrowserResponse;
+
+/// One pending `Eval` call's reply slot, keyed by the id embedded in the JS
+/// it sent — see [`BrowserDriver::call`]. Shared between the calling thread
+/// (which inserts, then blocks on the receiving half) and the browser
+/// thread's IPC handler (which looks the id up and fills it in once the
+/// page posts a matching message back).
+type PendingReplies = Arc<Mutex<HashMap<u64, SyncSender<Value>>>>;
+
+/// Sent from a [`BrowserDriver`] method to the dedicated OS thread actually
+/// holding the `tao` event loop and `wry` webview — neither type is `Send`,
+/// so every real interaction with them has to happen as a message over
+/// this channel (via `EventLoopProxy::send_event`) rather than a direct
+/// method call from the caller's own thread.
+enum Command {
+    /// Starts loading a URL — fire-and-forget, see [`Service::open`].
+    Open(String),
+    /// Runs a JS snippet that eventually calls
+    /// `window.ipc.postMessage(JSON.stringify({id, ...}))`, whose `id`
+    /// `call` is already waiting on in `PendingReplies`.
+    Eval(String),
+    /// Exits the event loop, ending the thread.
+    Shutdown,
+}
+
+struct Running {
+    proxy: EventLoopProxy<Command>,
+    pending: PendingReplies,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// The real [`Service`] implementation: a webview embedded in an invisible
+/// `tao` window, running entirely on one dedicated OS thread spawned on
+/// first use (see [`ensure_started`](Self::ensure_started)). Every
+/// `open`/`wait_for`/`fill`/`click`/`submit` call is translated into a [`Command`]
+/// sent over an [`EventLoopProxy`] and, for everything but `open`, a JS
+/// snippet carrying a unique id that the webview's own `window.ipc`
+/// eventually echoes back — see [`call`](Self::call).
+pub(super) struct BrowserDriver {
+    running: Mutex<Option<Running>>,
+    next_id: AtomicU64,
+}
+
+impl BrowserDriver {
+    pub(super) fn new() -> Self {
+        Self {
+            running: Mutex::new(None),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Spawns the dedicated OS thread owning this run's `tao` event loop and
+    /// `wry` webview, the first time any [`Service`] method is actually
+    /// called — never at construction. A scraper script that only ever
+    /// calls `fyde.http`/`fyde.html` (every scraper so far, except whatever
+    /// newly adopts `fyde.browser`) never pays the cost, or the risk, of
+    /// creating a real window: `wry`'s `WebView` needs a live window-system
+    /// connection (X11/Wayland on Linux) that a headless server or CI
+    /// runner may simply not have, and this way that's only ever a problem
+    /// for a run that actually touches `fyde.browser`.
+    fn ensure_started(&self) -> Result<(EventLoopProxy<Command>, PendingReplies)> {
+        let mut guard = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(running) = guard.as_ref() {
+            return Ok((running.proxy.clone(), running.pending.clone()));
+        }
+
+        let pending: PendingReplies = Arc::new(Mutex::new(HashMap::new()));
+        let pending_for_thread = pending.clone();
+
+        // The `tao`/`wry` types involved (`EventLoop`, `WebView`, the GTK
+        // objects underneath them on Linux) are all `!Send`, so none of
+        // them can be built here and then moved into the spawned thread —
+        // `run_event_loop` builds every one of them itself, from scratch,
+        // on the thread that will actually run the event loop. Only the
+        // resulting `EventLoopProxy` (designed from the start to be usable
+        // from other threads) comes back out, over `ready_tx`.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<EventLoopProxy<Command>>>();
+
+        let thread = std::thread::Builder::new()
+            .name("fyde-browser".to_string())
+            .spawn(move || run_event_loop(pending_for_thread, ready_tx))
+            .map_err(|err| Error::Browser(format!("failed to spawn browser thread: {err}")))?;
+
+        // Block until the webview has actually been created (or failed to
+        // be) before handing the proxy back, so a command sent right after
+        // `ensure_started` returns can never race the webview's own setup.
+        let proxy = ready_rx.recv().map_err(|_| {
+            Error::Browser("browser thread exited before it finished starting up".to_string())
+        })??;
+
+        *guard = Some(Running {
+            proxy: proxy.clone(),
+            pending: pending.clone(),
+            thread: Some(thread),
+        });
+
+        Ok((proxy, pending))
+    }
+
+    /// Runs one `Eval` round-trip: allocates an id, registers its reply slot
+    /// in `PendingReplies` *before* sending the command (so the IPC handler
+    /// on the browser thread can never receive a reply for an id nothing is
+    /// waiting on yet), builds the script via `build_js`, sends it, and
+    /// blocks on the reply (or `timeout`). Used by `wait_for`/`fill`/
+    /// `submit` — `open` has no reply to wait for, so it bypasses this.
+    fn call(&self, build_js: impl FnOnce(u64) -> String, timeout: Duration) -> Result<Value> {
+        let (proxy, pending) = self.ensure_started()?;
+        let id = self.next_id();
+
+        let (tx, rx) = sync_channel(1);
+        pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, tx);
+
+        let script = build_js(id);
+        if proxy.send_event(Command::Eval(script)).is_err() {
+            pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
+            return Err(Error::Browser(
+                "browser thread is no longer running".to_string(),
+            ));
+        }
+
+        match rx.recv_timeout(timeout) {
+            Ok(value) => Ok(value),
+            Err(_) => {
+                pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&id);
+                Err(Error::Browser(format!(
+                    "timed out after {timeout:?} waiting for the browser"
+                )))
+            }
+        }
+    }
+}
+
+impl Drop for BrowserDriver {
+    fn drop(&mut self) {
+        let running = self
+            .running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(mut running) = running {
+            let _ = running.proxy.send_event(Command::Shutdown);
+            if let Some(thread) = running.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Service for BrowserDriver {
+    async fn open(&self, url: &str) -> Result<()> {
+        let (proxy, _pending) = self.ensure_started()?;
+        proxy
+            .send_event(Command::Open(url.to_string()))
+            .map_err(|_| Error::Browser("browser thread is no longer running".to_string()))
+    }
+
+    async fn wait_for(&self, selector: &str, timeout: Duration) -> Result<()> {
+        let timeout_ms = timeout.as_millis() as u64;
+        let value = self.call(
+            |id| wait_for_script(id, selector, timeout_ms),
+            timeout + Duration::from_secs(1),
+        )?;
+        parse_ack(value)
+    }
+
+    async fn fill(&self, selector: &str, value: &str) -> Result<()> {
+        let result = self.call(
+            |id| fill_script(id, selector, value),
+            Duration::from_secs(10),
+        )?;
+        parse_ack(result)
+    }
+
+    async fn click(&self, selector: &str) -> Result<()> {
+        let result = self.call(|id| click_script(id, selector), Duration::from_secs(10))?;
+        parse_ack(result)
+    }
+
+    async fn submit(&self, selector: &str, timeout: Duration) -> Result<BrowserResponse> {
+        let value = self.call(
+            |id| submit_script(id, selector),
+            timeout + Duration::from_secs(1),
+        )?;
+        parse_response(value)
+    }
+}
+
+/// Builds the `tao` event loop and `wry` webview and owns them for as long
+/// as this run's [`BrowserDriver`] is alive, entirely on the thread
+/// [`ensure_started`](BrowserDriver::ensure_started) spawned to call this —
+/// `WebView`/`EventLoop` are both `!Send`, so neither can be built anywhere
+/// else and moved in; only the resulting [`EventLoopProxy`] (sent back over
+/// `ready_tx` once setup finishes, successfully or not) is designed to
+/// cross threads. Processes [`Command`]s until `Command::Shutdown` (or the
+/// window's own close button) exits the loop.
+fn run_event_loop(pending: PendingReplies, ready_tx: Sender<Result<EventLoopProxy<Command>>>) {
+    let mut builder = EventLoopBuilder::<Command>::with_user_event();
+    #[cfg(target_os = "linux")]
+    {
+        use tao::platform::unix::EventLoopBuilderExtUnix as _;
+        builder.with_any_thread(true);
+    }
+    let mut event_loop = builder.build();
+    let proxy = event_loop.create_proxy();
+
+    let window = match WindowBuilder::new().with_visible(false).build(&event_loop) {
+        Ok(window) => window,
+        Err(err) => {
+            let _ = ready_tx.send(Err(Error::Browser(format!(
+                "failed to create browser window: {err}"
+            ))));
+            return;
+        }
+    };
+
+    let ipc_handler = move |request: wry::http::Request<String>| {
+        let Ok(parsed) = serde_json::from_str::<Value>(request.body()) else {
+            return;
+        };
+        let Some(id) = parsed.get("id").and_then(Value::as_u64) else {
+            return;
+        };
+        let sender = pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
+        if let Some(sender) = sender {
+            let _ = sender.send(parsed);
+        }
+    };
+
+    let builder = WebViewBuilder::new().with_ipc_handler(ipc_handler);
+
+    #[cfg(target_os = "linux")]
+    let webview = {
+        use tao::platform::unix::WindowExtUnix as _;
+        use wry::WebViewBuilderExtUnix as _;
+        builder.build_gtk(window.gtk_window())
+    };
+    #[cfg(not(target_os = "linux"))]
+    let webview = builder.build(&window);
+
+    let webview = match webview {
+        Ok(webview) => webview,
+        Err(err) => {
+            let _ = ready_tx.send(Err(Error::Browser(format!(
+                "failed to create webview: {err}"
+            ))));
+            return;
+        }
+    };
+
+    if ready_tx.send(Ok(proxy)).is_err() {
+        return;
+    }
+
+    event_loop.run_return(move |event, _target, control_flow| {
+        *control_flow = ControlFlow::Wait;
+        match event {
+            Event::UserEvent(Command::Open(url)) => {
+                let _ = webview.load_url(&url);
+            }
+            Event::UserEvent(Command::Eval(script)) => {
+                let _ = webview.evaluate_script(&script);
+            }
+            Event::UserEvent(Command::Shutdown) => {
+                *control_flow = ControlFlow::Exit;
+            }
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                *control_flow = ControlFlow::Exit;
+            }
+            _ => {}
+        }
+    });
+}
+
+/// JS that polls `document.querySelector(selector)` from inside the
+/// webview's own engine (rather than Rust re-evaluating a check script on a
+/// timer) until it matches or `timeout_ms` elapses, then reports success or
+/// failure back over `window.ipc.postMessage`. Both `selector` and every
+/// other value interpolated into this and the other `*_script` functions
+/// below goes through `serde_json::to_string` to produce a safely-escaped
+/// JS string/number literal — never raw string interpolation of
+/// script-controlled content into the JS source.
+fn wait_for_script(id: u64, selector: &str, timeout_ms: u64) -> String {
+    let selector_json = json_literal(selector);
+    format!(
+        r#"(function(){{
+            var __id = {id};
+            var __deadline = Date.now() + {timeout_ms};
+            function __check(){{
+                try {{
+                    if (document.querySelector({selector_json})) {{
+                        window.ipc.postMessage(JSON.stringify({{id: __id, ok: true}}));
+                        return;
+                    }}
+                }} catch (e) {{
+                    window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: String(e)}}));
+                    return;
+                }}
+                if (Date.now() > __deadline) {{
+                    window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: "timed out waiting for selector"}}));
+                }} else {{
+                    setTimeout(__check, 100);
+                }}
+            }}
+            __check();
+        }})();"#
+    )
+}
+
+/// JS that sets the matched element's `.value` and dispatches `input`/
+/// `change` events on it (see [`Service::fill`]'s doc comment for why),
+/// then reports success or failure back over IPC.
+fn fill_script(id: u64, selector: &str, value: &str) -> String {
+    let selector_json = json_literal(selector);
+    let value_json = json_literal(value);
+    format!(
+        r#"(function(){{
+            var __id = {id};
+            try {{
+                var el = document.querySelector({selector_json});
+                if (!el) {{
+                    window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: "element not found"}}));
+                    return;
+                }}
+                el.value = {value_json};
+                el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                window.ipc.postMessage(JSON.stringify({{id: __id, ok: true}}));
+            }} catch (e) {{
+                window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: String(e)}}));
+            }}
+        }})();"#
+    )
+}
+
+/// JS that calls `.click()` on the matched element (see [`Service::click`]'s
+/// doc comment for why that, rather than synthesizing pointer events), then
+/// reports success or failure back over IPC.
+fn click_script(id: u64, selector: &str) -> String {
+    let selector_json = json_literal(selector);
+    format!(
+        r#"(function(){{
+            var __id = {id};
+            try {{
+                var el = document.querySelector({selector_json});
+                if (!el) {{
+                    window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: "element not found"}}));
+                    return;
+                }}
+                el.click();
+                window.ipc.postMessage(JSON.stringify({{id: __id, ok: true}}));
+            }} catch (e) {{
+                window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: String(e)}}));
+            }}
+        }})();"#
+    )
+}
+
+/// JS that submits the matched `<form>` via `fetch()` instead of a real
+/// navigation (see [`Service::submit`]'s doc comment for why), then reports
+/// the response's status/url/headers/body — or any error — back over IPC.
+fn submit_script(id: u64, selector: &str) -> String {
+    let selector_json = json_literal(selector);
+    format!(
+        r#"(function(){{
+            var __id = {id};
+            try {{
+                var form = document.querySelector({selector_json});
+                if (!form) {{
+                    window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: "element not found"}}));
+                    return;
+                }}
+                var action = form.action || window.location.href;
+                var method = (form.method || 'POST').toUpperCase();
+                var opts = {{ method: method, credentials: 'include' }};
+                if (method !== 'GET' && method !== 'HEAD') {{
+                    opts.body = new URLSearchParams(new FormData(form));
+                }}
+                fetch(action, opts).then(function(res) {{
+                    return res.text().then(function(body) {{
+                        var headers = {{}};
+                        res.headers.forEach(function(v, k) {{ headers[k] = v; }});
+                        window.ipc.postMessage(JSON.stringify({{
+                            id: __id, ok: true, status: res.status, url: res.url,
+                            headers: headers, body: body
+                        }}));
+                    }});
+                }}).catch(function(err) {{
+                    window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: String(err)}}));
+                }});
+            }} catch (e) {{
+                window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: String(e)}}));
+            }}
+        }})();"#
+    )
+}
+
+/// A JS string literal safely encoding `value` — `serde_json`'s string
+/// encoding happens to produce valid JS too (JSON string syntax is a subset
+/// of JS string syntax).
+fn json_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+fn error_message(value: &Value) -> String {
+    value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown browser error")
+        .to_string()
+}
+
+fn parse_ack(value: Value) -> Result<()> {
+    if value.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(Error::Browser(error_message(&value)))
+    }
+}
+
+fn parse_response(value: Value) -> Result<BrowserResponse> {
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(Error::Browser(error_message(&value)));
+    }
+
+    let status = value.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
+    let url = value
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let body = value
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let headers = value
+        .get("headers")
+        .and_then(Value::as_object)
+        .map(|headers| {
+            headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (name.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(BrowserResponse {
+        status,
+        url,
+        headers,
+        body,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_literal_escapes_quotes_and_special_characters() {
+        assert_eq!(json_literal(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(json_literal("a\nb"), "\"a\\nb\"");
+    }
+
+    #[test]
+    fn parse_ack_succeeds_on_an_ok_reply() {
+        assert!(parse_ack(serde_json::json!({"id": 1, "ok": true})).is_ok());
+    }
+
+    #[test]
+    fn parse_ack_fails_with_the_reported_error_message() {
+        let err = parse_ack(serde_json::json!({"id": 1, "ok": false, "error": "no such element"}))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "browser error: no such element");
+    }
+
+    #[test]
+    fn parse_response_extracts_every_field_on_success() {
+        let response = parse_response(serde_json::json!({
+            "id": 1,
+            "ok": true,
+            "status": 200,
+            "url": "https://example.com/login",
+            "headers": {"content-type": "application/json"},
+            "body": "{\"ok\":true}",
+        }))
+        .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.url, "https://example.com/login");
+        assert_eq!(response.body, "{\"ok\":true}");
+        assert_eq!(
+            response.headers,
+            vec![("content-type".to_string(), "application/json".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_response_fails_with_the_reported_error_message() {
+        let err = parse_response(serde_json::json!({
+            "id": 1,
+            "ok": false,
+            "error": "network error"
+        }))
+        .unwrap_err();
+        assert_eq!(err.to_string(), "browser error: network error");
+    }
+}

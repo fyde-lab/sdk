@@ -61,6 +61,16 @@ tracing-subscriber = { version = "0.3.20", features = ["registry", "fmt"] }
 tonic = { version = "0.14.6", features = ["transport"] }
 tonic-health = "0.14.6"
 tonic-prost = "0.14.6"
+# Windows the real webview `fyde.browser` (`domains/scrapers/host/browser.rs`,
+# `domains/scrapers/browser/driver.rs`) drives — `tao` provides the
+# event-loop/window `wry`'s `WebView` attaches to (on Linux via
+# `WebViewBuilder::build_gtk`, pairing with `tao`'s GTK main-loop
+# integration; the plain `winit` crate doesn't drive GTK's own main loop,
+# which WebKitGTK needs). Needs `webkit2gtk-4.1`/`gtk+-3.0`/`dbus-1`
+# (`pkg-config`-discovered) at build time on Linux — see `shell.nix`. Only
+# exercised on Linux while writing this; `wry`'s own docs cover macOS/Windows
+# as a different `build()` call, not `build_gtk()` — see `driver.rs`.
+tao = "0.37"
 uniffi = { version = "=0.32.0", features = ["tokio"] }
 uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
 # `fyde.http` (`domains/scrapers/host/http.rs`) — `wreq` (not `reqwest`) so
@@ -72,6 +82,8 @@ uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
 # `cmake`/`perl`/`go`/`libclang` at build time — see `shell.nix`.
 wreq = { version = "0.16.1", features = ["cookies", "charset", "gzip", "brotli", "deflate", "zstd", "form", "webpki-roots"] }
 wreq-util = "0.2.0"
+# `fyde.browser` (see the `tao` entry above) — the actual webview.
+wry = "0.57"
 xdg = "2.5.2"
 
 [build-dependencies]
