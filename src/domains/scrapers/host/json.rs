@@ -1,4 +1,4 @@
-use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value};
+use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value, serde::SerializeOptions};
 
 /// `fyde.json.decode(text)` turns a JSON string into Lua tables/values, and
 /// `fyde.json.encode(value)` turns Lua tables/values back into a JSON
@@ -12,7 +12,18 @@ pub(super) fn table(lua: &Lua) -> LuaResult<Table> {
         lua.create_function(|lua, text: String| {
             let parsed: serde_json::Value =
                 serde_json::from_str(&text).map_err(mlua::Error::external)?;
-            lua.to_value(&parsed)
+            // mlua defaults to representing a JSON `null` as a special null
+            // "userdata" sentinel distinct from Lua `nil` (so an encode
+            // round-trip can tell an explicit null apart from a missing
+            // key). Scripts here only ever decode, and expect the ordinary
+            // Lua idiom of testing a field with `if value then`, which that
+            // sentinel breaks: it's truthy, since only `nil`/`false` are
+            // falsy in Lua. Decode `null` as real `nil` instead so those
+            // checks see an absent field, matching Lua convention.
+            let options = SerializeOptions::new()
+                .serialize_none_to_null(false)
+                .serialize_unit_to_null(false);
+            lua.to_value_with(&parsed, options)
         })?,
     )?;
 
@@ -43,6 +54,24 @@ mod tests {
 
         assert_eq!(result.get::<i64>("a").unwrap(), 1);
         assert_eq!(result.get::<String>("b").unwrap(), "two");
+    }
+
+    #[test]
+    fn decode_turns_a_json_null_into_lua_nil_not_a_truthy_sentinel() {
+        let lua = Lua::new();
+        lua.globals().set("json", table(&lua).unwrap()).unwrap();
+
+        let result: bool = lua
+            .load(
+                r#"
+                local decoded = json.decode('{"a": null}')
+                return decoded.a == nil and not decoded.a
+                "#,
+            )
+            .eval()
+            .unwrap();
+
+        assert!(result);
     }
 
     #[test]
