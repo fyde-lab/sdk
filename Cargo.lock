@@ -6887,6 +6887,7 @@ dependencies = [
  "pin-project-lite",
  "serde",
  "serde_html_form",
+ "serde_json",
  "socket2",
  "tokio",
  "tokio-btls",

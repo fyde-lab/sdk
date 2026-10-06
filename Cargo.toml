@@ -80,7 +80,7 @@ uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
 # `demo-rust-fyde`'s own `host/http.rs`, which this is ported from. Building
 # it vendors a patched BoringSSL (`btls-sys`), which needs
 # `cmake`/`perl`/`go`/`libclang` at build time — see `shell.nix`.
-wreq = { version = "0.16.1", features = ["cookies", "charset", "gzip", "brotli", "deflate", "zstd", "form", "webpki-roots"] }
+wreq = { version = "0.16.1", features = ["cookies", "charset", "gzip", "brotli", "deflate", "zstd", "form", "json", "webpki-roots"] }
 wreq-util = "0.2.0"
 # `fyde.browser` (see the `tao` entry above) — the actual webview.
 wry = "0.57"

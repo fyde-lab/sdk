@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mlua::{Lua, Result as LuaResult, Table};
+use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
 use wreq::Client;
@@ -148,22 +148,29 @@ fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
     }
 }
 
-/// `fyde.http.get/post_form/download`, ported from `demo-rust-fyde`'s own
-/// `host/http.rs` (same client configuration, cookie jar, and Chrome
-/// TLS/HTTP2 fingerprint via `wreq`/`wreq_util`). `runtime` is a handle onto
-/// the SDK's ambient tokio runtime — captured by `service.rs` before the Lua
-/// VM moves onto its own blocking thread — used to drive `wreq`'s async
-/// calls from these synchronous Lua callbacks, instead of demo-rust-fyde's
-/// private, per-run `Runtime`.
+/// `fyde.http.get/post_form/post_json/download`, ported from
+/// `demo-rust-fyde`'s own `host/http.rs` (same client configuration, cookie
+/// jar, and Chrome TLS/HTTP2 fingerprint via `wreq`/`wreq_util`), plus
+/// `post_json` (not present in `demo-rust-fyde`): some sites' login/session
+/// APIs take a JSON body instead of a form-encoded one (confirmed against a
+/// real login HAR capture for `caf/script.lua`), which `post_form`'s
+/// hardcoded `.form(&form_map)` can't send — `post_json` takes any Lua
+/// value (typically a table), converts it to `serde_json::Value` via
+/// `LuaSerdeExt`, and sends it with `wreq`'s `.json(...)`, which also sets
+/// `Content-Type: application/json` unless `headers` overrides it. `runtime`
+/// is a handle onto the SDK's ambient tokio runtime — captured by
+/// `service.rs` before the Lua VM moves onto its own blocking thread — used
+/// to drive `wreq`'s async calls from these synchronous Lua callbacks,
+/// instead of demo-rust-fyde's private, per-run `Runtime`.
 ///
 /// Each call writes an `http_request` (or `error`) entry to `recorder` —
 /// method, url, status and timing only by default, never request header
-/// values, form values or any body content, since those routinely carry
+/// values, form/JSON body values, since those routinely carry
 /// credentials/session cookies. Passing `debug_http_dump: true` (ported from
 /// `demo-rust-fyde`'s own opt-in dump, threaded here from `Service::run`'s
 /// `debug_http_dump` parameter) additionally records the *response* body
-/// for `get`/`post_form` (never the request side) — enable it only for a
-/// trusted, local debugging run.
+/// for `get`/`post_form`/`post_json` (never the request side) — enable it
+/// only for a trusted, local debugging run.
 ///
 /// `wreq_emulation` controls whether the client applies `wreq_util`'s
 /// Chrome TLS/HTTP2 fingerprint emulation (`Profile::Chrome131`) — some
@@ -297,6 +304,57 @@ pub(super) fn table(
                         post_recorder.record(
                             "error",
                             json!({ "action": "http.post_form", "url": url, "message": err.to_string() }),
+                        );
+                        Err(mlua::Error::external(err))
+                    }
+                }
+            },
+        )?,
+    )?;
+
+    let post_json_client = client.clone();
+    let post_json_runtime = runtime.clone();
+    let post_json_origins = visited_origins.clone();
+    let post_json_recorder = recorder.clone();
+    http.set(
+        "post_json",
+        lua.create_function(
+            move |lua, (url, body, headers): (String, LuaValue, Option<Table>)| {
+                track_origin(&post_json_origins, &url);
+                let body_json: Value = lua.from_value(body)?;
+                let header_map = to_header_map(headers)?;
+                let started = Instant::now();
+                let result = post_json_runtime.block_on(
+                    post_json_client
+                        .post(&url)
+                        .headers(header_map)
+                        .json(&body_json)
+                        .send(),
+                );
+                match result {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        record_redirects(&post_json_recorder, "POST", &resp);
+                        let out = response_to_table(lua, &post_json_runtime, resp)?;
+                        let mut entry = json!({
+                            "method": "POST",
+                            "url": url,
+                            "status": status,
+                            "duration_ms": started.elapsed().as_millis(),
+                        });
+                        if debug_http_dump {
+                            let body: String = out.get("body").unwrap_or_default();
+                            if let Value::Object(fields) = &mut entry {
+                                fields.insert("response_body".into(), Value::String(body));
+                            }
+                        }
+                        post_json_recorder.record("http_request", entry);
+                        Ok(out)
+                    }
+                    Err(err) => {
+                        post_json_recorder.record(
+                            "error",
+                            json!({ "action": "http.post_json", "url": url, "message": err.to_string() }),
                         );
                         Err(mlua::Error::external(err))
                     }
