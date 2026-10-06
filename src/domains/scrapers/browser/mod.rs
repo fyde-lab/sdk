@@ -83,6 +83,12 @@ pub(super) trait Service: Send + Sync {
     /// and then wants `fyde.http` to reuse that session has nothing built
     /// in to do so yet.
     async fn submit(&self, selector: &str, timeout: Duration) -> Result<BrowserResponse>;
+
+    /// Returns the current page's full `document.documentElement.outerHTML`
+    /// — the one way a script (or a developer debugging one) can see what
+    /// the webview actually rendered, since every other method here only
+    /// reports a selector match/mismatch, never the markup itself.
+    async fn html(&self) -> Result<String>;
 }
 
 /// Builds the real, `wry`-backed browser service. Never fails on its own —

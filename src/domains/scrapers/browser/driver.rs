@@ -215,6 +215,11 @@ impl Service for BrowserDriver {
         )?;
         parse_response(value)
     }
+
+    async fn html(&self) -> Result<String> {
+        let value = self.call(html_script, Duration::from_secs(10))?;
+        parse_html(value)
+    }
 }
 
 /// Builds the `tao` event loop and `wry` webview and owns them for as long
@@ -235,7 +240,23 @@ fn run_event_loop(pending: PendingReplies, ready_tx: Sender<Result<EventLoopProx
     let mut event_loop = builder.build();
     let proxy = event_loop.create_proxy();
 
-    let window = match WindowBuilder::new().with_visible(false).build(&event_loop) {
+    let mut window_builder = WindowBuilder::new().with_visible(false);
+    // tao packs a `gtk::Box` into the window by default (for its own GTK layout needs), which
+    // leaves no room for `build_gtk` below to add the webview directly: `GtkApplicationWindow`
+    // is a `GtkBin` subclass and can only ever hold one child, so the two conflict — observed
+    // as a `Gtk-WARNING` and a webview that's constructed but never actually attached (so it
+    // never loads/renders anything, and every `wait_for` call just times out). wry's own docs
+    // for exactly this `build_gtk`-on-`window.gtk_window()` pattern note the same conflict and
+    // recommend packing a `gtk::Fixed` into that default box instead of disabling it — not done
+    // here since this window is never shown or sized (`with_visible(false)` above), so there's
+    // nothing for a `gtk::Fixed`'s layout behavior to do for us; disabling the box entirely is
+    // the simpler fix for a window that's just a headless host for the webview.
+    #[cfg(target_os = "linux")]
+    {
+        use tao::platform::unix::WindowBuilderExtUnix as _;
+        window_builder = window_builder.with_default_vbox(false);
+    }
+    let window = match window_builder.build(&event_loop) {
         Ok(window) => window,
         Err(err) => {
             let _ = ready_tx.send(Err(Error::Browser(format!(
@@ -290,10 +311,14 @@ fn run_event_loop(pending: PendingReplies, ready_tx: Sender<Result<EventLoopProx
         *control_flow = ControlFlow::Wait;
         match event {
             Event::UserEvent(Command::Open(url)) => {
-                let _ = webview.load_url(&url);
+                if let Err(err) = webview.load_url(&url) {
+                    tracing::error!("fyde.browser: load_url({url:?}) failed: {err}");
+                }
             }
             Event::UserEvent(Command::Eval(script)) => {
-                let _ = webview.evaluate_script(&script);
+                if let Err(err) = webview.evaluate_script(&script) {
+                    tracing::error!("fyde.browser: evaluate_script failed: {err}");
+                }
             }
             Event::UserEvent(Command::Shutdown) => {
                 *control_flow = ControlFlow::Exit;
@@ -432,6 +457,21 @@ fn submit_script(id: u64, selector: &str) -> String {
     )
 }
 
+/// JS that reports the current page's full `document.documentElement.outerHTML`
+/// back over IPC — see [`Service::html`].
+fn html_script(id: u64) -> String {
+    format!(
+        r#"(function(){{
+            var __id = {id};
+            try {{
+                window.ipc.postMessage(JSON.stringify({{id: __id, ok: true, html: document.documentElement.outerHTML}}));
+            }} catch (e) {{
+                window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: String(e)}}));
+            }}
+        }})();"#
+    )
+}
+
 /// A JS string literal safely encoding `value` — `serde_json`'s string
 /// encoding happens to produce valid JS too (JSON string syntax is a subset
 /// of JS string syntax).
@@ -494,6 +534,17 @@ fn parse_response(value: Value) -> Result<BrowserResponse> {
     })
 }
 
+fn parse_html(value: Value) -> Result<String> {
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(Error::Browser(error_message(&value)));
+    }
+    Ok(value
+        .get("html")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +597,28 @@ mod tests {
         }))
         .unwrap_err();
         assert_eq!(err.to_string(), "browser error: network error");
+    }
+
+    #[test]
+    fn parse_html_extracts_the_markup_on_success() {
+        let html = parse_html(serde_json::json!({
+            "id": 1,
+            "ok": true,
+            "html": "<html><body>hi</body></html>",
+        }))
+        .unwrap();
+
+        assert_eq!(html, "<html><body>hi</body></html>");
+    }
+
+    #[test]
+    fn parse_html_fails_with_the_reported_error_message() {
+        let err = parse_html(serde_json::json!({
+            "id": 1,
+            "ok": false,
+            "error": "no document"
+        }))
+        .unwrap_err();
+        assert_eq!(err.to_string(), "browser error: no document");
     }
 }

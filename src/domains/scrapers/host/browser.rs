@@ -129,6 +129,9 @@ pub(super) fn table(
         })?,
     )?;
 
+    let submit_browser = browser.clone();
+    let submit_runtime = runtime.clone();
+    let submit_recorder = recorder.clone();
     out.set(
         "submit",
         lua.create_function(
@@ -136,13 +139,13 @@ pub(super) fn table(
                 let timeout = timeout_ms
                     .map(Duration::from_millis)
                     .unwrap_or(DEFAULT_SUBMIT_TIMEOUT);
-                let result = runtime.block_on(browser.submit(&selector, timeout));
+                let result = submit_runtime.block_on(submit_browser.submit(&selector, timeout));
                 match &result {
-                    Ok(response) => recorder.record(
+                    Ok(response) => submit_recorder.record(
                         "browser_submit",
                         json!({ "selector": selector, "status": response.status }),
                     ),
-                    Err(err) => recorder.record(
+                    Err(err) => submit_recorder.record(
                         "error",
                         json!({
                             "action": "browser.submit",
@@ -157,6 +160,21 @@ pub(super) fn table(
                 }
             },
         )?,
+    )?;
+
+    out.set(
+        "html",
+        lua.create_function(move |_, _self: Table| {
+            let result = runtime.block_on(browser.html());
+            match &result {
+                Ok(_) => recorder.record("browser_html", json!({})),
+                Err(err) => recorder.record(
+                    "error",
+                    json!({ "action": "browser.html", "message": err.to_string() }),
+                ),
+            }
+            result.map_err(mlua::Error::external)
+        })?,
     )?;
 
     Ok(out)
@@ -390,6 +408,52 @@ mod tests {
         lua.globals().set("browser", browser_table).unwrap();
 
         let result: LuaResult<Table> = lua.load(r##"return browser:submit("#login-form")"##).eval();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn html_returns_the_pages_markup_and_records_a_report_entry() {
+        let mut browser = MockService::new();
+        browser
+            .expect_html()
+            .returning(|| Ok("<html><body>hi</body></html>".to_string()));
+
+        let runtime = runtime();
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder.clone(),
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        lua.globals().set("browser", browser_table).unwrap();
+
+        let result: String = lua.load(r##"return browser:html()"##).eval().unwrap();
+
+        assert_eq!(result, "<html><body>hi</body></html>");
+        let report = recorder.finish();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].event, "browser_html");
+    }
+
+    #[test]
+    fn html_propagates_a_service_error() {
+        let mut browser = MockService::new();
+        browser
+            .expect_html()
+            .returning(|| Err(crate::Error::Browser("boom".to_string())));
+
+        let runtime = runtime();
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let browser_table =
+            table(&lua, Arc::new(browser), recorder, runtime.handle().clone()).unwrap();
+        lua.globals().set("browser", browser_table).unwrap();
+
+        let result: LuaResult<String> = lua.load(r##"return browser:html()"##).eval();
 
         assert!(result.is_err());
     }
