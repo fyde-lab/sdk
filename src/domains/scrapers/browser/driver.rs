@@ -17,7 +17,6 @@ use crate::{Error, Result};
 
 use super::super::host::is_host_allowed;
 use super::Service;
-use super::models::BrowserResponse;
 
 /// One pending `Eval` call's reply slot, keyed by the id embedded in the JS
 /// it sent — see [`BrowserDriver::call`]. Shared between the calling thread
@@ -51,7 +50,7 @@ struct Running {
 /// The real [`Service`] implementation: a webview embedded in an invisible
 /// `tao` window, running entirely on one dedicated OS thread spawned on
 /// first use (see [`ensure_started`](Self::ensure_started)). Every
-/// `open`/`wait_for`/`fill`/`click`/`submit` call is translated into a [`Command`]
+/// `open`/`wait_for`/`fill`/`click` call is translated into a [`Command`]
 /// sent over an [`EventLoopProxy`] and, for everything but `open`, a JS
 /// snippet carrying a unique id that the webview's own `window.ipc`
 /// eventually echoes back — see [`call`](Self::call).
@@ -128,7 +127,8 @@ impl BrowserDriver {
     /// on the browser thread can never receive a reply for an id nothing is
     /// waiting on yet), builds the script via `build_js`, sends it, and
     /// blocks on the reply (or `timeout`). Used by `wait_for`/`fill`/
-    /// `submit` — `open` has no reply to wait for, so it bypasses this.
+    /// `click`/`html` — `open` has no reply to wait for, so it bypasses
+    /// this.
     fn call(&self, build_js: impl FnOnce(u64) -> String, timeout: Duration) -> Result<Value> {
         let (proxy, pending) = self.ensure_started()?;
         let id = self.next_id();
@@ -210,14 +210,6 @@ impl Service for BrowserDriver {
     async fn click(&self, selector: &str) -> Result<()> {
         let result = self.call(|id| click_script(id, selector), Duration::from_secs(10))?;
         parse_ack(result)
-    }
-
-    async fn submit(&self, selector: &str, timeout: Duration) -> Result<BrowserResponse> {
-        let value = self.call(
-            |id| submit_script(id, selector),
-            timeout + Duration::from_secs(1),
-        )?;
-        parse_response(value)
     }
 
     async fn html(&self) -> Result<String> {
@@ -449,45 +441,6 @@ fn click_script(id: u64, selector: &str) -> String {
     )
 }
 
-/// JS that submits the matched `<form>` via `fetch()` instead of a real
-/// navigation (see [`Service::submit`]'s doc comment for why), then reports
-/// the response's status/url/headers/body — or any error — back over IPC.
-fn submit_script(id: u64, selector: &str) -> String {
-    let selector_json = json_literal(selector);
-    format!(
-        r#"(function(){{
-            var __id = {id};
-            try {{
-                var form = document.querySelector({selector_json});
-                if (!form) {{
-                    window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: "element not found"}}));
-                    return;
-                }}
-                var action = form.action || window.location.href;
-                var method = (form.method || 'POST').toUpperCase();
-                var opts = {{ method: method, credentials: 'include' }};
-                if (method !== 'GET' && method !== 'HEAD') {{
-                    opts.body = new URLSearchParams(new FormData(form));
-                }}
-                fetch(action, opts).then(function(res) {{
-                    return res.text().then(function(body) {{
-                        var headers = {{}};
-                        res.headers.forEach(function(v, k) {{ headers[k] = v; }});
-                        window.ipc.postMessage(JSON.stringify({{
-                            id: __id, ok: true, status: res.status, url: res.url,
-                            headers: headers, body: body
-                        }}));
-                    }});
-                }}).catch(function(err) {{
-                    window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: String(err)}}));
-                }});
-            }} catch (e) {{
-                window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: String(e)}}));
-            }}
-        }})();"#
-    )
-}
-
 /// JS that reports the current page's full `document.documentElement.outerHTML`
 /// back over IPC — see [`Service::html`].
 fn html_script(id: u64) -> String {
@@ -541,45 +494,6 @@ fn parse_ack(value: Value) -> Result<()> {
     } else {
         Err(Error::Browser(error_message(&value)))
     }
-}
-
-fn parse_response(value: Value) -> Result<BrowserResponse> {
-    if value.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err(Error::Browser(error_message(&value)));
-    }
-
-    let status = value.get("status").and_then(Value::as_u64).unwrap_or(0) as u16;
-    let url = value
-        .get("url")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let body = value
-        .get("body")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let headers = value
-        .get("headers")
-        .and_then(Value::as_object)
-        .map(|headers| {
-            headers
-                .iter()
-                .filter_map(|(name, value)| {
-                    value
-                        .as_str()
-                        .map(|value| (name.clone(), value.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(BrowserResponse {
-        status,
-        url,
-        headers,
-        body,
-    })
 }
 
 fn parse_html(value: Value) -> Result<String> {
@@ -640,38 +554,6 @@ mod tests {
         let err = parse_ack(serde_json::json!({"id": 1, "ok": false, "error": "no such element"}))
             .unwrap_err();
         assert_eq!(err.to_string(), "browser error: no such element");
-    }
-
-    #[test]
-    fn parse_response_extracts_every_field_on_success() {
-        let response = parse_response(serde_json::json!({
-            "id": 1,
-            "ok": true,
-            "status": 200,
-            "url": "https://example.com/login",
-            "headers": {"content-type": "application/json"},
-            "body": "{\"ok\":true}",
-        }))
-        .unwrap();
-
-        assert_eq!(response.status, 200);
-        assert_eq!(response.url, "https://example.com/login");
-        assert_eq!(response.body, "{\"ok\":true}");
-        assert_eq!(
-            response.headers,
-            vec![("content-type".to_string(), "application/json".to_string())]
-        );
-    }
-
-    #[test]
-    fn parse_response_fails_with_the_reported_error_message() {
-        let err = parse_response(serde_json::json!({
-            "id": 1,
-            "ok": false,
-            "error": "network error"
-        }))
-        .unwrap_err();
-        assert_eq!(err.to_string(), "browser error: network error");
     }
 
     #[test]

@@ -5,13 +5,12 @@ use mlua::{Lua, Result as LuaResult, Table};
 use serde_json::json;
 use tokio::runtime::Handle;
 
-use super::super::browser::{BrowserResponse, Service as BrowserService};
+use super::super::browser::Service as BrowserService;
 use super::super::reports::Recorder;
 
 const DEFAULT_WAIT_FOR_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `fyde.browser` — `open`/`wait_for`/`fill`/`click`/`submit`, backed by
+/// `fyde.browser` — `open`/`wait_for`/`fill`/`click`, backed by
 /// [`BrowserService`] (a real `wry` webview, see
 /// `browser::driver::BrowserDriver`), so a login flow blocked by a
 /// client-rendered SPA or a JS-driven WAF challenge can drive a real
@@ -28,8 +27,8 @@ const DEFAULT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// `allowed_domains` gates `open` the same way it gates every `fyde.http`
 /// method (see `host::ensure_domain_allowed`) — the webview only ever
 /// navigates where this call tells it to, so checking `open`'s `url` is
-/// enough; `wait_for`/`fill`/`click`/`submit`/`html` act on whatever page
-/// is already loaded and never take a URL of their own.
+/// enough; `wait_for`/`fill`/`click`/`html` act on whatever page is already
+/// loaded and never take a URL of their own.
 pub(super) fn table(
     lua: &Lua,
     browser: Arc<dyn BrowserService>,
@@ -143,39 +142,6 @@ pub(super) fn table(
         })?,
     )?;
 
-    let submit_browser = browser.clone();
-    let submit_runtime = runtime.clone();
-    let submit_recorder = recorder.clone();
-    out.set(
-        "submit",
-        lua.create_function(
-            move |lua, (_self, selector, timeout_ms): (Table, String, Option<u64>)| {
-                let timeout = timeout_ms
-                    .map(Duration::from_millis)
-                    .unwrap_or(DEFAULT_SUBMIT_TIMEOUT);
-                let result = submit_runtime.block_on(submit_browser.submit(&selector, timeout));
-                match &result {
-                    Ok(response) => submit_recorder.record(
-                        "browser_submit",
-                        json!({ "selector": selector, "status": response.status }),
-                    ),
-                    Err(err) => submit_recorder.record(
-                        "error",
-                        json!({
-                            "action": "browser.submit",
-                            "selector": selector,
-                            "message": err.to_string(),
-                        }),
-                    ),
-                }
-                match result {
-                    Ok(response) => response_to_table(lua, &response),
-                    Err(err) => Err(mlua::Error::external(err)),
-                }
-            },
-        )?,
-    )?;
-
     out.set(
         "html",
         lua.create_function(move |_, _self: Table| {
@@ -194,25 +160,12 @@ pub(super) fn table(
     Ok(out)
 }
 
-fn response_to_table(lua: &Lua, response: &BrowserResponse) -> LuaResult<Table> {
-    let out = lua.create_table()?;
-    out.set("status", response.status)?;
-    out.set("url", response.url.as_str())?;
-    let headers = lua.create_table()?;
-    for (name, value) in &response.headers {
-        headers.set(name.as_str(), value.as_str())?;
-    }
-    out.set("headers", headers)?;
-    out.set("body", response.body.as_str())?;
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use mockall::predicate::eq;
 
     use super::*;
-    use crate::domains::scrapers::browser::{FakeBrowserResponse, MockService};
+    use crate::domains::scrapers::browser::MockService;
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Runtime::new().unwrap()
@@ -220,9 +173,9 @@ mod tests {
 
     /// Only `open` ever checks `allowed_domains` (see `ensure_domain_allowed`
     /// gating it above) — every other test in this module exercises
-    /// `wait_for`/`fill`/`click`/`submit`/`html`, none of which take a URL,
-    /// so this fixed list (matching the one URL `open`'s own tests use)
-    /// keeps every other `table(...)` call site here from having to care.
+    /// `wait_for`/`fill`/`click`/`html`, none of which take a URL, so this
+    /// fixed list (matching the one URL `open`'s own tests use) keeps every
+    /// other `table(...)` call site here from having to care.
     fn allowed_domains() -> Arc<Vec<String>> {
         Arc::new(vec!["example.com".to_string()])
     }
@@ -444,63 +397,6 @@ mod tests {
         lua.globals().set("browser", browser_table).unwrap();
 
         let result: LuaResult<()> = lua.load(r##"browser:click("#missing")"##).exec();
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn submit_returns_a_table_with_status_url_headers_and_body() {
-        let mut browser = MockService::new();
-        browser.expect_submit().returning(|_, _| {
-            Ok(FakeBrowserResponse::new()
-                .with_status(200)
-                .with_body("logged in")
-                .build())
-        });
-
-        let runtime = runtime();
-        let lua = Lua::new();
-        let recorder = Arc::new(Recorder::new("didaxis"));
-        let browser_table = table(
-            &lua,
-            Arc::new(browser),
-            recorder,
-            runtime.handle().clone(),
-            allowed_domains(),
-        )
-        .unwrap();
-        lua.globals().set("browser", browser_table).unwrap();
-
-        let result: Table = lua
-            .load(r##"return browser:submit("#login-form")"##)
-            .eval()
-            .unwrap();
-
-        assert_eq!(result.get::<u16>("status").unwrap(), 200);
-        assert_eq!(result.get::<String>("body").unwrap(), "logged in");
-    }
-
-    #[test]
-    fn submit_propagates_a_service_error() {
-        let mut browser = MockService::new();
-        browser
-            .expect_submit()
-            .returning(|_, _| Err(crate::Error::Browser("boom".to_string())));
-
-        let runtime = runtime();
-        let lua = Lua::new();
-        let recorder = Arc::new(Recorder::new("didaxis"));
-        let browser_table = table(
-            &lua,
-            Arc::new(browser),
-            recorder,
-            runtime.handle().clone(),
-            allowed_domains(),
-        )
-        .unwrap();
-        lua.globals().set("browser", browser_table).unwrap();
-
-        let result: LuaResult<Table> = lua.load(r##"return browser:submit("#login-form")"##).eval();
 
         assert!(result.is_err());
     }

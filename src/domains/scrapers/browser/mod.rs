@@ -1,9 +1,4 @@
 mod driver;
-mod models;
-
-pub(super) use models::BrowserResponse;
-#[cfg(test)]
-pub(super) use models::FakeBrowserResponse;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,7 +16,7 @@ use crate::Result;
 /// challenge (Datadome, etc. — see `boursorama`/`edf`) that only passes
 /// when real JS actually runs. Exposed to Lua as `fyde.browser` (see
 /// `host::browser`), with the operations a login flow needs:
-/// `open`/`wait_for`/`fill`/`click`/`submit`.
+/// `open`/`wait_for`/`fill`/`click`.
 ///
 /// Trait methods take `&self` (not `&mut self`) so implementations can be
 /// shared behind `Arc<dyn Service>`, matching every other domain here —
@@ -63,26 +58,19 @@ pub(super) trait Service: Send + Sync {
     /// Sets the value of the first element matched by `selector` and
     /// dispatches `input`/`change` events on it, the way a real keystroke
     /// would — so a framework that only reacts to those events, rather
-    /// than reading `.value` directly on submit, still sees the change.
+    /// than reading `.value` directly, still sees the change.
     async fn fill(&self, selector: &str, value: &str) -> Result<()>;
 
     /// Clicks the first element matched by `selector` via its DOM `.click()`
     /// method — the standard way to simulate a click on a button, link, or
-    /// checkbox without a real pointer/window-system event, and (unlike
-    /// [`Service::submit`]) doesn't assume the target is a `<form>` or wait
-    /// for any resulting navigation/fetch to finish.
+    /// checkbox without a real pointer/window-system event, and doesn't
+    /// assume the target is a `<form>` or wait for any resulting
+    /// navigation/fetch to finish. The only way a script submits a form
+    /// here — there's no separate in-page-`fetch()` submit path (see git
+    /// history for why that was removed: it bypassed the page's own submit
+    /// handling, which breaks any bot-mitigation/fingerprinting script
+    /// hooked onto a real submit event).
     async fn click(&self, selector: &str) -> Result<()>;
-
-    /// Submits the `<form>` matched by `selector` via an in-page `fetch()`
-    /// (not a real navigation), so the script gets the response back as
-    /// data instead of losing it to a page load. Cookies set along the way
-    /// are still picked up by the webview's own cookie store
-    /// (`credentials: 'include'`) — but that store is entirely separate
-    /// from `fyde.http`'s own `wreq` cookie jar; nothing here copies
-    /// cookies between the two, so a script that logs in via `fyde.browser`
-    /// and then wants `fyde.http` to reuse that session has nothing built
-    /// in to do so yet.
-    async fn submit(&self, selector: &str, timeout: Duration) -> Result<BrowserResponse>;
 
     /// Returns the current page's full `document.documentElement.outerHTML`
     /// — the one way a script (or a developer debugging one) can see what
