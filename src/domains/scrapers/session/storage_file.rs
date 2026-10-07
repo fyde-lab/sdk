@@ -32,7 +32,10 @@ impl Storage for FileStorage {
         let path = self.path(scraper_name);
 
         if !tokio::fs::try_exists(&path).await.with_context(|| {
-            format!("failed to check for a saved session file at {}", path.display())
+            format!(
+                "failed to check for a saved session file at {}",
+                path.display()
+            )
         })? {
             return Ok(None);
         }
@@ -52,7 +55,9 @@ impl Storage for FileStorage {
 
         tokio::fs::create_dir_all(&self.dir)
             .await
-            .with_context(|| format!("failed to create sessions directory {}", self.dir.display()))?;
+            .with_context(|| {
+                format!("failed to create sessions directory {}", self.dir.display())
+            })?;
 
         let contents = serde_json::to_string_pretty(&data).with_context(|| {
             format!("failed to serialize session data for scraper {scraper_name:?}")

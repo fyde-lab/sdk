@@ -32,7 +32,10 @@ impl Storage for FileStorage {
         let path = self.path(scraper_name);
 
         if !tokio::fs::try_exists(&path).await.with_context(|| {
-            format!("failed to check for a saved cookie file at {}", path.display())
+            format!(
+                "failed to check for a saved cookie file at {}",
+                path.display()
+            )
         })? {
             return Ok(Vec::new());
         }
@@ -50,11 +53,12 @@ impl Storage for FileStorage {
 
         tokio::fs::create_dir_all(&self.dir)
             .await
-            .with_context(|| format!("failed to create cookies directory {}", self.dir.display()))?;
+            .with_context(|| {
+                format!("failed to create cookies directory {}", self.dir.display())
+            })?;
 
-        let contents = serde_json::to_string_pretty(&cookies).with_context(|| {
-            format!("failed to serialize cookies for scraper {scraper_name:?}")
-        })?;
+        let contents = serde_json::to_string_pretty(&cookies)
+            .with_context(|| format!("failed to serialize cookies for scraper {scraper_name:?}"))?;
 
         tokio::fs::write(&path, contents)
             .await

@@ -15,8 +15,8 @@ use wry::WebViewBuilder;
 
 use crate::{Error, Result};
 
-use super::Service;
 use super::super::host::is_host_allowed;
+use super::Service;
 use super::models::BrowserResponse;
 
 /// One pending `Eval` call's reply slot, keyed by the id embedded in the JS
@@ -301,7 +301,9 @@ fn run_event_loop(
         // `fyde.browser:open` itself is checked against (`host::browser`).
         // Doesn't see subresource loads (`fetch`/images/scripts/etc.),
         // which don't navigate anything; those aren't covered by this.
-        .with_navigation_handler(move |url| is_navigation_allowed(&url, &navigation_allowed_domains))
+        .with_navigation_handler(move |url| {
+            is_navigation_allowed(&url, &navigation_allowed_domains)
+        })
         // Same check for a `window.open(...)`/`target="_blank"` popup,
         // which `with_navigation_handler` doesn't see since it isn't a
         // navigation of the webview that requested it.
@@ -510,7 +512,11 @@ fn html_script(id: u64) -> String {
 fn is_navigation_allowed(url: &str, allowed_domains: &[String]) -> bool {
     url::Url::parse(url)
         .ok()
-        .and_then(|parsed| parsed.host_str().map(|host| is_host_allowed(host, allowed_domains)))
+        .and_then(|parsed| {
+            parsed
+                .host_str()
+                .map(|host| is_host_allowed(host, allowed_domains))
+        })
         .unwrap_or(false)
 }
 
@@ -595,7 +601,10 @@ mod tests {
     fn is_navigation_allowed_accepts_an_allowed_host_and_its_subdomains() {
         let allowed = vec!["example.com".to_string()];
         assert!(is_navigation_allowed("https://example.com/login", &allowed));
-        assert!(is_navigation_allowed("https://sub.example.com/login", &allowed));
+        assert!(is_navigation_allowed(
+            "https://sub.example.com/login",
+            &allowed
+        ));
     }
 
     #[test]
