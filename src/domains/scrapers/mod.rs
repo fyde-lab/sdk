@@ -66,6 +66,18 @@ pub trait Service: Send + Sync {
     /// `settings.json`) can opt a scraper out when it needs to inspect a
     /// redirect response itself instead of being carried straight to its
     /// target.
+    ///
+    /// `allowed_domains` is the only host (or subdomain of a host) this
+    /// run's `fyde.http.get/post_form/post_json/download` and
+    /// `fyde.browser:open` calls may reach — conventionally a per-scraper
+    /// `scripts/<name>/settings.json` `allowed_domains` list. A call whose
+    /// URL isn't covered fails before it ever reaches the network, which
+    /// (since nothing in these scripts wraps `fyde.http`/`fyde.browser`
+    /// calls in `pcall`) stops the script right there and surfaces as this
+    /// `run` call's own `Err`. An empty list means unrestricted — no
+    /// scraper predates this parameter, but a caller that genuinely wants
+    /// no restriction can still pass one.
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
         name: &str,
@@ -74,6 +86,7 @@ pub trait Service: Send + Sync {
         debug_http_dump: bool,
         wreq_emulation: bool,
         follow_redirects: bool,
+        allowed_domains: Vec<String>,
     ) -> Result<()>;
 }
 

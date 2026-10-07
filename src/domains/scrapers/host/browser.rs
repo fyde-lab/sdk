@@ -24,11 +24,18 @@ const DEFAULT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// rather than a bag of unrelated functions. Colon calls pass the table
 /// itself as an implicit first argument, which is why every function below
 /// takes an ignored `Table` as its first parameter.
+///
+/// `allowed_domains` gates `open` the same way it gates every `fyde.http`
+/// method (see `host::ensure_domain_allowed`) — the webview only ever
+/// navigates where this call tells it to, so checking `open`'s `url` is
+/// enough; `wait_for`/`fill`/`click`/`submit`/`html` act on whatever page
+/// is already loaded and never take a URL of their own.
 pub(super) fn table(
     lua: &Lua,
     browser: Arc<dyn BrowserService>,
     recorder: Arc<Recorder>,
     runtime: Handle,
+    allowed_domains: Arc<Vec<String>>,
 ) -> LuaResult<Table> {
     let out = lua.create_table()?;
 
@@ -38,6 +45,13 @@ pub(super) fn table(
     out.set(
         "open",
         lua.create_function(move |_, (_self, url): (Table, String)| {
+            if let Err(message) = super::ensure_domain_allowed(&url, &allowed_domains) {
+                open_recorder.record(
+                    "error",
+                    json!({ "action": "browser.open", "url": url, "message": message.clone() }),
+                );
+                return Err(mlua::Error::RuntimeError(message));
+            }
             let result = open_runtime.block_on(open_browser.open(&url));
             match &result {
                 Ok(()) => open_recorder.record("browser_open", json!({ "url": url })),
@@ -204,6 +218,15 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap()
     }
 
+    /// Only `open` ever checks `allowed_domains` (see `ensure_domain_allowed`
+    /// gating it above) — every other test in this module exercises
+    /// `wait_for`/`fill`/`click`/`submit`/`html`, none of which take a URL,
+    /// so this fixed list (matching the one URL `open`'s own tests use)
+    /// keeps every other `table(...)` call site here from having to care.
+    fn allowed_domains() -> Arc<Vec<String>> {
+        Arc::new(vec!["example.com".to_string()])
+    }
+
     #[test]
     fn open_calls_the_service_and_records_a_report_entry() {
         let mut browser = MockService::new();
@@ -221,6 +244,7 @@ mod tests {
             Arc::new(browser),
             recorder.clone(),
             runtime.handle().clone(),
+            allowed_domains(),
         )
         .unwrap();
         lua.globals().set("browser", browser_table).unwrap();
@@ -232,6 +256,32 @@ mod tests {
         let report = recorder.finish();
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].event, "browser_open");
+    }
+
+    #[test]
+    fn open_blocks_a_url_outside_allowed_domains_without_calling_the_service() {
+        let mut browser = MockService::new();
+        browser.expect_open().times(0);
+
+        let runtime = runtime();
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder.clone(),
+            runtime.handle().clone(),
+            allowed_domains(),
+        )
+        .unwrap();
+        lua.globals().set("browser", browser_table).unwrap();
+
+        let result: LuaResult<()> = lua.load(r#"browser:open("https://evil.com/login")"#).exec();
+
+        assert!(result.is_err());
+        let report = recorder.finish();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].event, "error");
     }
 
     #[test]
@@ -248,8 +298,14 @@ mod tests {
         let runtime = runtime();
         let lua = Lua::new();
         let recorder = Arc::new(Recorder::new("didaxis"));
-        let browser_table =
-            table(&lua, Arc::new(browser), recorder, runtime.handle().clone()).unwrap();
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder,
+            runtime.handle().clone(),
+            allowed_domains(),
+        )
+        .unwrap();
         lua.globals().set("browser", browser_table).unwrap();
 
         lua.load(r##"browser:wait_for("#username")"##)
@@ -271,8 +327,14 @@ mod tests {
         let runtime = runtime();
         let lua = Lua::new();
         let recorder = Arc::new(Recorder::new("didaxis"));
-        let browser_table =
-            table(&lua, Arc::new(browser), recorder, runtime.handle().clone()).unwrap();
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder,
+            runtime.handle().clone(),
+            allowed_domains(),
+        )
+        .unwrap();
         lua.globals().set("browser", browser_table).unwrap();
 
         lua.load(r##"browser:wait_for("#username", 500)"##)
@@ -292,8 +354,14 @@ mod tests {
         let runtime = runtime();
         let lua = Lua::new();
         let recorder = Arc::new(Recorder::new("didaxis"));
-        let browser_table =
-            table(&lua, Arc::new(browser), recorder, runtime.handle().clone()).unwrap();
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder,
+            runtime.handle().clone(),
+            allowed_domains(),
+        )
+        .unwrap();
         lua.globals().set("browser", browser_table).unwrap();
 
         lua.load(r##"browser:fill("#password", "s3cret")"##)
@@ -314,6 +382,7 @@ mod tests {
             Arc::new(browser),
             recorder.clone(),
             runtime.handle().clone(),
+            allowed_domains(),
         )
         .unwrap();
         lua.globals().set("browser", browser_table).unwrap();
@@ -339,8 +408,14 @@ mod tests {
         let runtime = runtime();
         let lua = Lua::new();
         let recorder = Arc::new(Recorder::new("didaxis"));
-        let browser_table =
-            table(&lua, Arc::new(browser), recorder, runtime.handle().clone()).unwrap();
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder,
+            runtime.handle().clone(),
+            allowed_domains(),
+        )
+        .unwrap();
         lua.globals().set("browser", browser_table).unwrap();
 
         lua.load(r##"browser:click("#submit-button")"##)
@@ -358,8 +433,14 @@ mod tests {
         let runtime = runtime();
         let lua = Lua::new();
         let recorder = Arc::new(Recorder::new("didaxis"));
-        let browser_table =
-            table(&lua, Arc::new(browser), recorder, runtime.handle().clone()).unwrap();
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder,
+            runtime.handle().clone(),
+            allowed_domains(),
+        )
+        .unwrap();
         lua.globals().set("browser", browser_table).unwrap();
 
         let result: LuaResult<()> = lua.load(r##"browser:click("#missing")"##).exec();
@@ -380,8 +461,14 @@ mod tests {
         let runtime = runtime();
         let lua = Lua::new();
         let recorder = Arc::new(Recorder::new("didaxis"));
-        let browser_table =
-            table(&lua, Arc::new(browser), recorder, runtime.handle().clone()).unwrap();
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder,
+            runtime.handle().clone(),
+            allowed_domains(),
+        )
+        .unwrap();
         lua.globals().set("browser", browser_table).unwrap();
 
         let result: Table = lua
@@ -403,8 +490,14 @@ mod tests {
         let runtime = runtime();
         let lua = Lua::new();
         let recorder = Arc::new(Recorder::new("didaxis"));
-        let browser_table =
-            table(&lua, Arc::new(browser), recorder, runtime.handle().clone()).unwrap();
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder,
+            runtime.handle().clone(),
+            allowed_domains(),
+        )
+        .unwrap();
         lua.globals().set("browser", browser_table).unwrap();
 
         let result: LuaResult<Table> = lua.load(r##"return browser:submit("#login-form")"##).eval();
@@ -427,6 +520,7 @@ mod tests {
             Arc::new(browser),
             recorder.clone(),
             runtime.handle().clone(),
+            allowed_domains(),
         )
         .unwrap();
         lua.globals().set("browser", browser_table).unwrap();
@@ -449,8 +543,14 @@ mod tests {
         let runtime = runtime();
         let lua = Lua::new();
         let recorder = Arc::new(Recorder::new("didaxis"));
-        let browser_table =
-            table(&lua, Arc::new(browser), recorder, runtime.handle().clone()).unwrap();
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder,
+            runtime.handle().clone(),
+            allowed_domains(),
+        )
+        .unwrap();
         lua.globals().set("browser", browser_table).unwrap();
 
         let result: LuaResult<String> = lua.load(r##"return browser:html()"##).eval();

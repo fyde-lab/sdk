@@ -131,6 +131,27 @@ fn response_to_table(lua: &Lua, runtime: &Handle, resp: wreq::Response) -> LuaRe
 /// final `http_request` entry `get`/`post_form`/`download` also records, so a
 /// report shows every intermediate hop (e.g. an OAuth/OIDC bounce) even
 /// though the script itself only ever sees the start URL and the final one.
+/// Checks `url` against `allowed_domains` (see `host::ensure_domain_allowed`)
+/// before any of `get`/`post_form`/`post_json`/`download` sends a single
+/// byte on the wire. On a violation, records an `error` entry the same way
+/// every other failure in this file does, and returns the `Err` that makes
+/// the Lua call itself fail.
+fn ensure_domain_allowed_or_record(
+    recorder: &Recorder,
+    action: &str,
+    url: &str,
+    allowed_domains: &[String],
+) -> LuaResult<()> {
+    if let Err(message) = super::ensure_domain_allowed(url, allowed_domains) {
+        recorder.record(
+            "error",
+            json!({ "action": action, "url": url, "message": message.clone() }),
+        );
+        return Err(mlua::Error::RuntimeError(message));
+    }
+    Ok(())
+}
+
 fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
     let Some(history) = resp.extensions().get::<wreq::redirect::History>() else {
         return;
@@ -189,6 +210,20 @@ fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
 /// `follow_redirects` field when it needs to inspect a redirect response
 /// itself (e.g. reading a `Location` header) rather than carrying a global
 /// toggle.
+///
+/// `allowed_domains` gates every method here (see
+/// `host::ensure_domain_allowed`): a call whose `url` isn't on one of these
+/// domains (or a subdomain of one) fails before the request is ever sent —
+/// no DNS lookup, no connection, nothing recorded beyond the `error` entry
+/// itself — and that failure propagates as a normal Lua error, stopping the
+/// script unless it's wrapped in `pcall`. It also gates every hop of a
+/// redirect chain, not just the initial URL: when `follow_redirects` is on,
+/// the client's redirect policy itself checks each `Location` target
+/// against `allowed_domains` before following it (delegating to
+/// `redirect::Policy::default()`'s own loop/max-hop handling once a hop
+/// passes that check) — otherwise a page on an allowed domain could redirect
+/// a request straight to a disallowed one and `wreq` would follow it
+/// automatically, bypassing the check above entirely.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn table(
     lua: &Lua,
@@ -199,13 +234,23 @@ pub(super) fn table(
     debug_http_dump: bool,
     wreq_emulation: bool,
     follow_redirects: bool,
+    allowed_domains: Arc<Vec<String>>,
 ) -> LuaResult<Table> {
     let mut builder = Client::builder().cookie_provider(jar);
     if wreq_emulation {
         builder = builder.emulation(Profile::Chrome131);
     }
     let redirect_policy = if follow_redirects {
-        wreq::redirect::Policy::default()
+        let redirect_allowed_domains = allowed_domains.clone();
+        wreq::redirect::Policy::custom(move |attempt| {
+            let target = attempt.uri.to_string();
+            if let Err(message) = super::ensure_domain_allowed(&target, &redirect_allowed_domains) {
+                return attempt.error(message);
+            }
+            // Delegates everything else (loop detection, the 10-hop cap) to
+            // the default policy — `custom` doesn't get that for free.
+            wreq::redirect::Policy::default().redirect(attempt)
+        })
     } else {
         wreq::redirect::Policy::none()
     };
@@ -221,9 +266,11 @@ pub(super) fn table(
     let get_runtime = runtime.clone();
     let get_origins = visited_origins.clone();
     let get_recorder = recorder.clone();
+    let get_allowed_domains = allowed_domains.clone();
     http.set(
         "get",
         lua.create_function(move |lua, (url, headers): (String, Option<Table>)| {
+            ensure_domain_allowed_or_record(&get_recorder, "http.get", &url, &get_allowed_domains)?;
             track_origin(&get_origins, &url);
             let header_map = to_header_map(headers)?;
             let started = Instant::now();
@@ -263,10 +310,17 @@ pub(super) fn table(
     let post_runtime = runtime.clone();
     let post_origins = visited_origins.clone();
     let post_recorder = recorder.clone();
+    let post_allowed_domains = allowed_domains.clone();
     http.set(
         "post_form",
         lua.create_function(
             move |lua, (url, form, headers): (String, Table, Option<Table>)| {
+                ensure_domain_allowed_or_record(
+                    &post_recorder,
+                    "http.post_form",
+                    &url,
+                    &post_allowed_domains,
+                )?;
                 track_origin(&post_origins, &url);
                 let form_map = table_to_string_map(&form)?;
                 let form_fields: Vec<String> = form_map.keys().cloned().collect();
@@ -316,10 +370,17 @@ pub(super) fn table(
     let post_json_runtime = runtime.clone();
     let post_json_origins = visited_origins.clone();
     let post_json_recorder = recorder.clone();
+    let post_json_allowed_domains = allowed_domains.clone();
     http.set(
         "post_json",
         lua.create_function(
             move |lua, (url, body, headers): (String, LuaValue, Option<Table>)| {
+                ensure_domain_allowed_or_record(
+                    &post_json_recorder,
+                    "http.post_json",
+                    &url,
+                    &post_json_allowed_domains,
+                )?;
                 track_origin(&post_json_origins, &url);
                 let body_json: Value = lua.from_value(body)?;
                 let header_map = to_header_map(headers)?;
@@ -367,9 +428,16 @@ pub(super) fn table(
     let download_runtime = runtime.clone();
     let download_origins = visited_origins.clone();
     let download_recorder = recorder;
+    let download_allowed_domains = allowed_domains;
     http.set(
         "download",
         lua.create_function(move |lua, (url, headers): (String, Option<Table>)| {
+            ensure_domain_allowed_or_record(
+                &download_recorder,
+                "http.download",
+                &url,
+                &download_allowed_domains,
+            )?;
             track_origin(&download_origins, &url);
             let header_map = to_header_map(headers)?;
             let started = Instant::now();
@@ -435,6 +503,175 @@ pub(super) fn table(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Runtime::new().unwrap()
+    }
+
+    #[test]
+    fn get_blocks_a_url_outside_allowed_domains_without_reaching_the_network() {
+        let runtime = runtime();
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let http_table = table(
+            &lua,
+            Jar::default().into(),
+            Arc::new(Mutex::new(HashSet::new())),
+            recorder.clone(),
+            runtime.handle().clone(),
+            false,
+            true,
+            true,
+            Arc::new(vec!["allowed.example.com".to_string()]),
+        )
+        .unwrap();
+        lua.globals().set("http", http_table).unwrap();
+
+        let result: LuaResult<Table> = lua
+            .load(r#"return http.get("https://evil.com/steal")"#)
+            .eval();
+
+        assert!(result.is_err());
+        let report = recorder.finish();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].event, "error");
+    }
+
+    /// Spawns a tiny local server that unconditionally 302-redirects every
+    /// connection to `location`, and returns the `http://127.0.0.1:<port>/`
+    /// URL to hit it at. Used to prove the redirect policy itself checks
+    /// `allowed_domains` on each hop, not just the request's starting URL —
+    /// a real request/response round trip is the only way to exercise
+    /// `wreq`'s own redirect-following machinery.
+    fn spawn_redirecting_server(runtime: &tokio::runtime::Runtime, location: &str) -> String {
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let location = location.to_string();
+
+        runtime.spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let location = location.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://127.0.0.1:{}/", addr.port())
+    }
+
+    #[test]
+    fn get_blocks_a_redirect_to_a_domain_outside_allowed_domains() {
+        let runtime = runtime();
+        let url = spawn_redirecting_server(&runtime, "http://evil.example.invalid/");
+
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let http_table = table(
+            &lua,
+            Jar::default().into(),
+            Arc::new(Mutex::new(HashSet::new())),
+            recorder.clone(),
+            runtime.handle().clone(),
+            false,
+            false,
+            true,
+            // Allows the redirecting server's own host, but not the host
+            // it redirects to — proving the block happens on the redirect
+            // hop, not the (allowed) initial request.
+            Arc::new(vec!["127.0.0.1".to_string()]),
+        )
+        .unwrap();
+        lua.globals().set("http", http_table).unwrap();
+
+        let result: LuaResult<Table> = lua.load(format!(r#"return http.get("{url}")"#)).eval();
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("evil.example.invalid"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Spawns a tiny local server that always responds `200 OK` with
+    /// `body`, and returns the `http://127.0.0.1:<port>/` URL to hit it at
+    /// — the final hop a redirect inside `allowed_domains` should actually
+    /// reach.
+    fn spawn_ok_server(runtime: &tokio::runtime::Runtime, body: &str) -> String {
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = body.to_string();
+
+        runtime.spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://127.0.0.1:{}/", addr.port())
+    }
+
+    #[test]
+    fn get_follows_a_redirect_to_a_domain_inside_allowed_domains() {
+        let runtime = runtime();
+        let target_url = spawn_ok_server(&runtime, "hello");
+        let redirect_url = spawn_redirecting_server(&runtime, &target_url);
+
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let http_table = table(
+            &lua,
+            Jar::default().into(),
+            Arc::new(Mutex::new(HashSet::new())),
+            recorder.clone(),
+            runtime.handle().clone(),
+            false,
+            false,
+            true,
+            // Both servers are on 127.0.0.1 (just different ports, which
+            // the domain check ignores) — proving an allowed redirect still
+            // gets followed, not just that a disallowed one gets blocked.
+            Arc::new(vec!["127.0.0.1".to_string()]),
+        )
+        .unwrap();
+        lua.globals().set("http", http_table).unwrap();
+
+        let result: Table = lua
+            .load(format!(r#"return http.get("{redirect_url}")"#))
+            .eval()
+            .unwrap();
+
+        assert_eq!(result.get::<u16>("status").unwrap(), 200);
+        assert_eq!(result.get::<String>("body").unwrap(), "hello");
+    }
 
     #[test]
     fn origin_of_strips_the_path_from_a_url() {

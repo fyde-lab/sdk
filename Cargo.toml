@@ -73,6 +73,10 @@ tonic-prost = "0.14.6"
 tao = "0.37"
 uniffi = { version = "=0.32.0", features = ["tokio"] }
 uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
+# Already pulled in transitively by `wreq`; declared directly here too since
+# `domains/scrapers/host/mod.rs`'s `ensure_domain_allowed` parses URLs with
+# it (host extraction for the `fyde.http`/`fyde.browser` domain allowlist).
+url = "2.5.8"
 # `fyde.http` (`domains/scrapers/host/http.rs`) — `wreq` (not `reqwest`) so
 # scraper requests carry a real Chrome TLS/HTTP2 fingerprint
 # (`wreq_util::Profile`) instead of one trivially flagged by fingerprinting

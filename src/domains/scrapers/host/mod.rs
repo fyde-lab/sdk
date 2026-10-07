@@ -33,6 +33,48 @@ pub(super) struct Installed {
     visited_origins: Arc<Mutex<HashSet<String>>>,
 }
 
+/// Enforced by every `fyde.http.get/post_form/post_json/download` call and
+/// `fyde.browser:open` — the one network entry point each of those has —
+/// before it ever reaches the network: `url`'s host must equal, or be a
+/// subdomain of, one of `allowed_domains` (conventionally a scraper's own
+/// `scripts/<name>/settings.json` `allowed_domains` list), or this returns
+/// `Err` with a message describing the violation. An empty `allowed_domains`
+/// means unrestricted — no scraper predates this parameter, so this keeps a
+/// caller that genuinely wants no restriction from having to enumerate
+/// every host a script might reach. A script that ignores the `Err`
+/// (doesn't wrap the call in `pcall`) has its `run` function's call itself
+/// fail, per Lua's normal error propagation — exactly like any other
+/// `fyde.*` error — which is what actually stops the script.
+fn ensure_domain_allowed(url: &str, allowed_domains: &[String]) -> std::result::Result<(), String> {
+    if allowed_domains.is_empty() {
+        return Ok(());
+    }
+
+    // `Url::host_str` already excludes userinfo/port and, per the WHATWG URL
+    // Standard this crate implements, lowercases a domain host during
+    // parsing — the explicit `to_ascii_lowercase()` below is only needed
+    // for `allowed_domains`' own entries.
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string));
+    let Some(host) = host else {
+        return Err(format!("could not determine the host of url {url:?}"));
+    };
+
+    let allowed = allowed_domains.iter().any(|domain| {
+        let domain = domain.to_ascii_lowercase();
+        host == domain || host.ends_with(&format!(".{domain}"))
+    });
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(format!(
+            "host {host:?} (from url {url:?}) is not in this scraper's allowed_domains list {allowed_domains:?}"
+        ))
+    }
+}
+
 impl Installed {
     /// Reads `fyde.session` back out of the Lua VM as JSON, and every cookie
     /// now sitting in the jar for a host `fyde.http` actually visited this
@@ -77,6 +119,12 @@ impl Installed {
 /// `fyde.http` only — it toggles `wreq`'s Chrome TLS/HTTP2 fingerprint
 /// emulation. `follow_redirects` is also forwarded to `fyde.http` only — it
 /// toggles whether the client automatically follows HTTP redirects.
+/// `allowed_domains` is forwarded to both `fyde.http` and `fyde.browser` —
+/// the only two tables with a network entry point of their own — and
+/// enforced by `ensure_domain_allowed` before any of their methods actually
+/// reaches the network: a scraper (conventionally reading its own
+/// `scripts/<name>/settings.json`'s `allowed_domains` list) can only ever
+/// make requests to hosts it explicitly declared.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn install(
     lua: &Lua,
@@ -92,9 +140,11 @@ pub(super) fn install(
     debug_http_dump: bool,
     wreq_emulation: bool,
     follow_redirects: bool,
+    allowed_domains: Vec<String>,
 ) -> Result<Installed> {
     let cookie_jar = build_jar(&cookies);
     let visited_origins = Arc::new(Mutex::new(HashSet::new()));
+    let allowed_domains = Arc::new(allowed_domains);
 
     let fyde = lua.create_table().context("creating the `fyde` table")?;
 
@@ -111,6 +161,7 @@ pub(super) fn install(
             debug_http_dump,
             wreq_emulation,
             follow_redirects,
+            allowed_domains.clone(),
         )?,
     )
     .context("installing fyde.http")?;
@@ -130,8 +181,11 @@ pub(super) fn install(
         documents::save_document_fn(lua, documents, scraper_name, runtime.clone())?,
     )
     .context("installing fyde.save_document")?;
-    fyde.set("browser", browser::table(lua, browser, recorder, runtime)?)
-        .context("installing fyde.browser")?;
+    fyde.set(
+        "browser",
+        browser::table(lua, browser, recorder, runtime, allowed_domains)?,
+    )
+    .context("installing fyde.browser")?;
 
     let session_value = lua
         .to_value(&session_data)
@@ -151,4 +205,55 @@ pub(super) fn install(
         cookie_jar,
         visited_origins,
     })
+}
+
+#[cfg(test)]
+mod domain_guard_tests {
+    use super::*;
+
+    #[test]
+    fn ensure_domain_allowed_ignores_the_urls_port_and_userinfo() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(ensure_domain_allowed("https://Example.com:8443/a/b?c=1", &allowed).is_ok());
+        assert!(ensure_domain_allowed("https://user:pass@example.com/login", &allowed).is_ok());
+    }
+
+    #[test]
+    fn ensure_domain_allowed_rejects_an_unparseable_url() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(ensure_domain_allowed("not a url", &allowed).is_err());
+    }
+
+    #[test]
+    fn ensure_domain_allowed_allows_everything_when_the_list_is_empty() {
+        assert!(ensure_domain_allowed("https://anything.example/at/all", &[]).is_ok());
+    }
+
+    #[test]
+    fn ensure_domain_allowed_accepts_an_exact_match() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(ensure_domain_allowed("https://example.com/login", &allowed).is_ok());
+    }
+
+    #[test]
+    fn ensure_domain_allowed_accepts_a_subdomain_of_an_allowed_domain() {
+        let allowed = vec!["impots.gouv.fr".to_string()];
+        assert!(ensure_domain_allowed("https://cfspart-idp.impots.gouv.fr/", &allowed).is_ok());
+    }
+
+    #[test]
+    fn ensure_domain_allowed_rejects_an_unrelated_host() {
+        let allowed = vec!["example.com".to_string()];
+        let err = ensure_domain_allowed("https://evil.com/steal", &allowed).unwrap_err();
+        assert!(err.contains("evil.com"));
+    }
+
+    #[test]
+    fn ensure_domain_allowed_rejects_a_superdomain_of_an_allowed_domain() {
+        // Allowing "sub.example.com" must not also allow "example.com" or
+        // some unrelated host that merely ends with the same suffix.
+        let allowed = vec!["sub.example.com".to_string()];
+        assert!(ensure_domain_allowed("https://example.com/", &allowed).is_err());
+        assert!(ensure_domain_allowed("https://notsub.example.com/", &allowed).is_err());
+    }
 }
