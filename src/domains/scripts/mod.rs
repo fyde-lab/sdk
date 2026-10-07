@@ -40,7 +40,7 @@ pub trait Service: Send + Sync {
         script: &str,
         description: &str,
         short_description: &str,
-        logo: Vec<u8>,
+        allowed_domains: Vec<String>,
     ) -> Result<Script>;
 
     /// Fetches the script matching `id`.
@@ -59,7 +59,7 @@ pub trait Service: Send + Sync {
         script: &str,
         description: &str,
         short_description: &str,
-        logo: Vec<u8>,
+        allowed_domains: Vec<String>,
     ) -> Result<Script>;
 
     /// Enables `script_id` for the authenticated user. Enabling an
