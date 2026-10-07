@@ -46,14 +46,10 @@ pub(super) struct Installed {
 /// fail, per Lua's normal error propagation — exactly like any other
 /// `fyde.*` error — which is what actually stops the script.
 fn ensure_domain_allowed(url: &str, allowed_domains: &[String]) -> std::result::Result<(), String> {
-    if allowed_domains.is_empty() {
-        return Ok(());
-    }
-
     // `Url::host_str` already excludes userinfo/port and, per the WHATWG URL
     // Standard this crate implements, lowercases a domain host during
-    // parsing — the explicit `to_ascii_lowercase()` below is only needed
-    // for `allowed_domains`' own entries.
+    // parsing — the explicit `to_ascii_lowercase()` in `is_host_allowed` is
+    // only needed for `allowed_domains`' own entries.
     let host = url::Url::parse(url)
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_string));
@@ -61,18 +57,32 @@ fn ensure_domain_allowed(url: &str, allowed_domains: &[String]) -> std::result::
         return Err(format!("could not determine the host of url {url:?}"));
     };
 
-    let allowed = allowed_domains.iter().any(|domain| {
-        let domain = domain.to_ascii_lowercase();
-        host == domain || host.ends_with(&format!(".{domain}"))
-    });
-
-    if allowed {
+    if is_host_allowed(&host, allowed_domains) {
         Ok(())
     } else {
         Err(format!(
             "host {host:?} (from url {url:?}) is not in this scraper's allowed_domains list {allowed_domains:?}"
         ))
     }
+}
+
+/// The host-only half of [`ensure_domain_allowed`] — `host` must equal, or
+/// be a subdomain of, one of `allowed_domains`, or an empty `allowed_domains`
+/// (unrestricted). Exposed beyond `host` (`pub(super)`, i.e. visible
+/// throughout `scrapers`) for `browser::driver`'s `with_navigation_handler`/
+/// `with_new_window_req_handler` callbacks, which only have a URL to parse
+/// themselves — there's no shared request-building code path to hang
+/// `ensure_domain_allowed`'s `Result`-returning, error-message-formatting
+/// shape off of there.
+pub(super) fn is_host_allowed(host: &str, allowed_domains: &[String]) -> bool {
+    if allowed_domains.is_empty() {
+        return true;
+    }
+
+    allowed_domains.iter().any(|domain| {
+        let domain = domain.to_ascii_lowercase();
+        host == domain || host.ends_with(&format!(".{domain}"))
+    })
 }
 
 impl Installed {

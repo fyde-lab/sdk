@@ -16,6 +16,7 @@ use wry::WebViewBuilder;
 use crate::{Error, Result};
 
 use super::Service;
+use super::super::host::is_host_allowed;
 use super::models::BrowserResponse;
 
 /// One pending `Eval` call's reply slot, keyed by the id embedded in the JS
@@ -57,13 +58,15 @@ struct Running {
 pub(super) struct BrowserDriver {
     running: Mutex<Option<Running>>,
     next_id: AtomicU64,
+    allowed_domains: Arc<Vec<String>>,
 }
 
 impl BrowserDriver {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(allowed_domains: Arc<Vec<String>>) -> Self {
         Self {
             running: Mutex::new(None),
             next_id: AtomicU64::new(1),
+            allowed_domains,
         }
     }
 
@@ -98,9 +101,10 @@ impl BrowserDriver {
         // from other threads) comes back out, over `ready_tx`.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<EventLoopProxy<Command>>>();
 
+        let allowed_domains = self.allowed_domains.clone();
         let thread = std::thread::Builder::new()
             .name("fyde-browser".to_string())
-            .spawn(move || run_event_loop(pending_for_thread, ready_tx))
+            .spawn(move || run_event_loop(pending_for_thread, ready_tx, allowed_domains))
             .map_err(|err| Error::Browser(format!("failed to spawn browser thread: {err}")))?;
 
         // Block until the webview has actually been created (or failed to
@@ -230,7 +234,11 @@ impl Service for BrowserDriver {
 /// `ready_tx` once setup finishes, successfully or not) is designed to
 /// cross threads. Processes [`Command`]s until `Command::Shutdown` (or the
 /// window's own close button) exits the loop.
-fn run_event_loop(pending: PendingReplies, ready_tx: Sender<Result<EventLoopProxy<Command>>>) {
+fn run_event_loop(
+    pending: PendingReplies,
+    ready_tx: Sender<Result<EventLoopProxy<Command>>>,
+    allowed_domains: Arc<Vec<String>>,
+) {
     let mut builder = EventLoopBuilder::<Command>::with_user_event();
     #[cfg(target_os = "linux")]
     {
@@ -282,7 +290,28 @@ fn run_event_loop(pending: PendingReplies, ready_tx: Sender<Result<EventLoopProx
         }
     };
 
-    let builder = WebViewBuilder::new().with_ipc_handler(ipc_handler);
+    let navigation_allowed_domains = allowed_domains.clone();
+    let new_window_allowed_domains = allowed_domains;
+    let builder = WebViewBuilder::new()
+        .with_ipc_handler(ipc_handler)
+        // Gates every top-level (and subframe) navigation the webview makes
+        // on its own after `open`'s initial load — a link click, a form
+        // submit that does a real navigation, a JS `location` change, a
+        // server redirect — against the same `allowed_domains` list
+        // `fyde.browser:open` itself is checked against (`host::browser`).
+        // Doesn't see subresource loads (`fetch`/images/scripts/etc.),
+        // which don't navigate anything; those aren't covered by this.
+        .with_navigation_handler(move |url| is_navigation_allowed(&url, &navigation_allowed_domains))
+        // Same check for a `window.open(...)`/`target="_blank"` popup,
+        // which `with_navigation_handler` doesn't see since it isn't a
+        // navigation of the webview that requested it.
+        .with_new_window_req_handler(move |url, _features| {
+            if is_navigation_allowed(&url, &new_window_allowed_domains) {
+                wry::NewWindowResponse::Allow
+            } else {
+                wry::NewWindowResponse::Deny
+            }
+        });
 
     #[cfg(target_os = "linux")]
     let webview = {
@@ -472,6 +501,19 @@ fn html_script(id: u64) -> String {
     )
 }
 
+/// Checks a navigation/new-window request's target `url` against
+/// `allowed_domains`, the same way (and using the same rule — exact host or
+/// subdomain match, empty list meaning unrestricted) `host::browser`'s
+/// `fyde.browser:open` guard does. An unparseable `url` is rejected rather
+/// than allowed — there's no host to check it against, so there's nothing
+/// to justify letting it through.
+fn is_navigation_allowed(url: &str, allowed_domains: &[String]) -> bool {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(|host| is_host_allowed(host, allowed_domains)))
+        .unwrap_or(false)
+}
+
 /// A JS string literal safely encoding `value` — `serde_json`'s string
 /// encoding happens to produce valid JS too (JSON string syntax is a subset
 /// of JS string syntax).
@@ -548,6 +590,30 @@ fn parse_html(value: Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_navigation_allowed_accepts_an_allowed_host_and_its_subdomains() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(is_navigation_allowed("https://example.com/login", &allowed));
+        assert!(is_navigation_allowed("https://sub.example.com/login", &allowed));
+    }
+
+    #[test]
+    fn is_navigation_allowed_rejects_an_unrelated_host() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(!is_navigation_allowed("https://evil.example/", &allowed));
+    }
+
+    #[test]
+    fn is_navigation_allowed_rejects_an_unparseable_url() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(!is_navigation_allowed("not a url", &allowed));
+    }
+
+    #[test]
+    fn is_navigation_allowed_allows_everything_when_the_list_is_empty() {
+        assert!(is_navigation_allowed("https://anything.example/", &[]));
+    }
 
     #[test]
     fn json_literal_escapes_quotes_and_special_characters() {

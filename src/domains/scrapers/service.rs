@@ -151,7 +151,7 @@ fn run_script(
     // only as long as this run does, closed via its `Drop` impl once every
     // `Arc` clone `host::install` handed to `fyde.browser`'s closures goes
     // out of scope at the end of this function.
-    let browser = super::browser::init();
+    let browser = super::browser::init(Arc::new(allowed_domains.clone()));
     let installed = host::install(
         &lua,
         name,

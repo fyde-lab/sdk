@@ -95,7 +95,12 @@ pub(super) trait Service: Send + Sync {
 /// creating the actual window/webview is deferred to first use (see
 /// `driver::BrowserDriver::ensure_started`), so a scraper run that never
 /// calls into `fyde.browser` never pays the cost, or the risk, of touching
-/// a display at all.
-pub(super) fn init() -> Arc<dyn Service> {
-    Arc::new(driver::BrowserDriver::new())
+/// a display at all. `allowed_domains` is the same list `host::install`
+/// enforces on `fyde.browser:open`'s own URL — here it also bounds every
+/// navigation the webview makes on its own afterwards (a link click, a form
+/// submit that does a real navigation, a JS `location` change, a `target`
+/// attribute or `window.open` popup), via `driver::BrowserDriver`'s
+/// `with_navigation_handler`/`with_new_window_req_handler`.
+pub(super) fn init(allowed_domains: Arc<Vec<String>>) -> Arc<dyn Service> {
+    Arc::new(driver::BrowserDriver::new(allowed_domains))
 }
