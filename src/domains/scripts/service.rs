@@ -45,7 +45,7 @@ impl Service for ScriptsClient {
         script: &str,
         description: &str,
         short_description: &str,
-        logo: Vec<u8>,
+        allowed_domains: Vec<String>,
     ) -> Result<Script> {
         self.grpc
             .create_script(
@@ -55,7 +55,7 @@ impl Service for ScriptsClient {
                 script,
                 description,
                 short_description,
-                logo,
+                allowed_domains,
             )
             .await
     }
@@ -73,7 +73,7 @@ impl Service for ScriptsClient {
         script: &str,
         description: &str,
         short_description: &str,
-        logo: Vec<u8>,
+        allowed_domains: Vec<String>,
     ) -> Result<Script> {
         self.grpc
             .update_script(
@@ -84,7 +84,7 @@ impl Service for ScriptsClient {
                 script,
                 description,
                 short_description,
-                logo,
+                allowed_domains,
             )
             .await
     }
@@ -120,14 +120,14 @@ mod tests {
         mock_grpc
             .expect_create_script()
             .withf(
-                |name, is_public, icon, script, description, short_description, logo| {
+                |name, is_public, icon, script, description, short_description, allowed_domains| {
                     name == "my-script"
                         && *is_public
                         && icon == b"icon-bytes"
                         && script == "return 1"
                         && description == "does something"
                         && short_description == "does a thing"
-                        && logo == b"logo-bytes"
+                        && *allowed_domains == vec!["example.com".to_string()]
                 },
             )
             .times(1)
@@ -143,7 +143,7 @@ mod tests {
                 "return 1",
                 "does something",
                 "does a thing",
-                b"logo-bytes".to_vec(),
+                vec!["example.com".to_string()],
             )
             .await
             .unwrap();
@@ -177,7 +177,14 @@ mod tests {
         mock_grpc
             .expect_update_script()
             .withf(
-                move |requested_id, name, is_public, icon, script, description, short_description, logo| {
+                move |requested_id,
+                      name,
+                      is_public,
+                      icon,
+                      script,
+                      description,
+                      short_description,
+                      allowed_domains| {
                     *requested_id == id
                         && name == "my-script"
                         && *is_public
@@ -185,7 +192,7 @@ mod tests {
                         && script == "return 1"
                         && description == "does something"
                         && short_description == "does a thing"
-                        && logo == b"logo-bytes"
+                        && *allowed_domains == vec!["example.com".to_string()]
                 },
             )
             .times(1)
@@ -202,7 +209,7 @@ mod tests {
                 "return 1",
                 "does something",
                 "does a thing",
-                b"logo-bytes".to_vec(),
+                vec!["example.com".to_string()],
             )
             .await
             .unwrap();

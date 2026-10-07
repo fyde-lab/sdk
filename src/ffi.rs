@@ -306,7 +306,7 @@ pub struct FfiScript {
     pub short_description: String,
     pub is_public: bool,
     pub icon: Vec<u8>,
-    pub logo: Vec<u8>,
+    pub allowed_domains: Vec<String>,
     pub version: u64,
     pub script: String,
     pub last_updated: i64,
@@ -321,7 +321,7 @@ impl From<Script> for FfiScript {
             short_description: script.short_description().to_string(),
             is_public: script.is_public(),
             icon: script.icon().to_vec(),
-            logo: script.logo().to_vec(),
+            allowed_domains: script.allowed_domains().to_vec(),
             version: script.version(),
             script: script.script().to_string(),
             last_updated: script.last_updated(),
@@ -636,7 +636,7 @@ impl FydeClient {
         script: String,
         description: String,
         short_description: String,
-        logo: Vec<u8>,
+        allowed_domains: Vec<String>,
     ) -> Result<FfiScript, FfiError> {
         let script = self
             .inner
@@ -648,7 +648,7 @@ impl FydeClient {
                 &script,
                 &description,
                 &short_description,
-                logo,
+                allowed_domains,
             )
             .await?;
         Ok(script.into())
@@ -674,7 +674,7 @@ impl FydeClient {
         script: String,
         description: String,
         short_description: String,
-        logo: Vec<u8>,
+        allowed_domains: Vec<String>,
     ) -> Result<FfiScript, FfiError> {
         let id = parse_uuid(&id)?;
         let script = self
@@ -688,7 +688,7 @@ impl FydeClient {
                 &script,
                 &description,
                 &short_description,
-                logo,
+                allowed_domains,
             )
             .await?;
         Ok(script.into())
@@ -836,7 +836,7 @@ mod tests {
         assert_eq!(ffi.short_description, script.short_description());
         assert_eq!(ffi.is_public, script.is_public());
         assert_eq!(ffi.icon, script.icon());
-        assert_eq!(ffi.logo, script.logo());
+        assert_eq!(ffi.allowed_domains, script.allowed_domains());
         assert_eq!(ffi.version, script.version());
         assert_eq!(ffi.script, script.script());
         assert_eq!(ffi.last_updated, script.last_updated());

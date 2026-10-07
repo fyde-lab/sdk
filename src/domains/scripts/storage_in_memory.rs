@@ -42,7 +42,7 @@ impl Service for InMemoryScriptStorage {
         script: &str,
         description: &str,
         short_description: &str,
-        logo: Vec<u8>,
+        allowed_domains: Vec<String>,
     ) -> Result<Script> {
         let created = Script {
             id: Uuid::now_v7(),
@@ -51,7 +51,7 @@ impl Service for InMemoryScriptStorage {
             short_description: short_description.to_string(),
             is_public,
             icon,
-            logo,
+            allowed_domains,
             version: 1,
             script: script.to_string(),
             last_updated: now(),
@@ -83,7 +83,7 @@ impl Service for InMemoryScriptStorage {
         script: &str,
         description: &str,
         short_description: &str,
-        logo: Vec<u8>,
+        allowed_domains: Vec<String>,
     ) -> Result<Script> {
         let mut scripts = self.scripts.lock().unwrap();
 
@@ -96,7 +96,7 @@ impl Service for InMemoryScriptStorage {
             short_description: short_description.to_string(),
             is_public,
             icon,
-            logo,
+            allowed_domains,
             version: existing.version + 1,
             script: script.to_string(),
             last_updated: now(),
@@ -148,7 +148,15 @@ mod tests {
         let storage = InMemoryScriptStorage::new();
 
         let created = storage
-            .create_script("example", true, vec![1, 2, 3], "return 1 + 1", "", "", Vec::new())
+            .create_script(
+                "example",
+                true,
+                vec![1, 2, 3],
+                "return 1 + 1",
+                "",
+                "",
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -188,7 +196,16 @@ mod tests {
             .unwrap();
 
         let updated = storage
-            .update_script(created.id, "renamed", true, vec![9], "return 2", "", "", Vec::new())
+            .update_script(
+                created.id,
+                "renamed",
+                true,
+                vec![9],
+                "return 2",
+                "",
+                "",
+                Vec::new(),
+            )
             .await
             .unwrap();
 
@@ -202,7 +219,16 @@ mod tests {
         let storage = InMemoryScriptStorage::new();
 
         let err = storage
-            .update_script(Uuid::now_v7(), "renamed", true, Vec::new(), "return 2", "", "", Vec::new())
+            .update_script(
+                Uuid::now_v7(),
+                "renamed",
+                true,
+                Vec::new(),
+                "return 2",
+                "",
+                "",
+                Vec::new(),
+            )
             .await
             .unwrap_err();
 

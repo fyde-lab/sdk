@@ -13,7 +13,11 @@ pub struct Script {
     pub(super) short_description: String,
     pub(super) is_public: bool,
     pub(super) icon: Vec<u8>,
-    pub(super) logo: Vec<u8>,
+    /// The only hosts (or subdomains of them) this script's `fyde.http`/
+    /// `fyde.browser` calls may reach (see
+    /// `../scrapers/host/mod.rs::is_host_allowed`). Empty means
+    /// unrestricted.
+    pub(super) allowed_domains: Vec<String>,
     pub(super) version: u64,
     pub(super) script: String,
     /// Unix timestamp, in seconds, of the last time this script was
@@ -50,10 +54,8 @@ impl Script {
         &self.icon
     }
 
-    /// The script's marketplace banner/logo image — distinct from
-    /// [`Self::icon`] (its small UI icon).
-    pub fn logo(&self) -> &[u8] {
-        &self.logo
+    pub fn allowed_domains(&self) -> &[String] {
+        &self.allowed_domains
     }
 
     pub fn version(&self) -> u64 {
@@ -87,7 +89,7 @@ impl FakeScript {
                 short_description: crate::testing::random_word().to_string(),
                 is_public: false,
                 icon: crate::testing::random_bytes(16),
-                logo: crate::testing::random_bytes(16),
+                allowed_domains: Vec::new(),
                 version: 1,
                 script: "return 1 + 1".to_string(),
                 last_updated: crate::testing::random_past_timestamp(),

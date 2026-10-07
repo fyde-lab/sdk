@@ -41,7 +41,7 @@ pub(super) trait FydeClient: Send + Sync {
         script: &str,
         description: &str,
         short_description: &str,
-        logo: Vec<u8>,
+        allowed_domains: Vec<String>,
     ) -> Result<Script>;
 
     /// Fetches the script matching `id`.
@@ -59,7 +59,7 @@ pub(super) trait FydeClient: Send + Sync {
         script: &str,
         description: &str,
         short_description: &str,
-        logo: Vec<u8>,
+        allowed_domains: Vec<String>,
     ) -> Result<Script>;
 
     /// Enables `script_id` for the authenticated user.
@@ -116,7 +116,7 @@ fn into_domain(script: proto::Script) -> Result<Script> {
         short_description: script.short_description,
         is_public: script.is_public,
         icon: script.icon,
-        logo: script.logo,
+        allowed_domains: script.allowed_domains,
         version: script.version,
         script: script.script,
         last_updated: script.last_updated,
@@ -133,7 +133,7 @@ impl FydeClient for GrpcClient {
         script: &str,
         description: &str,
         short_description: &str,
-        logo: Vec<u8>,
+        allowed_domains: Vec<String>,
     ) -> Result<Script> {
         let request = self
             .sessions
@@ -144,7 +144,7 @@ impl FydeClient for GrpcClient {
                 script: script.to_string(),
                 description: description.to_string(),
                 short_description: short_description.to_string(),
-                logo,
+                allowed_domains,
             })
             .await?;
 
@@ -187,7 +187,7 @@ impl FydeClient for GrpcClient {
         script: &str,
         description: &str,
         short_description: &str,
-        logo: Vec<u8>,
+        allowed_domains: Vec<String>,
     ) -> Result<Script> {
         let request = self
             .sessions
@@ -199,7 +199,7 @@ impl FydeClient for GrpcClient {
                 script: script.to_string(),
                 description: description.to_string(),
                 short_description: short_description.to_string(),
-                logo,
+                allowed_domains,
             })
             .await?;
 
