@@ -60,7 +60,10 @@ impl Installed {
 /// single `fyde` global table: `fyde.log`, `fyde.http`, `fyde.html`,
 /// `fyde.json`, `fyde.progress`, `fyde.input`, `fyde.save_document`,
 /// `fyde.session`, `fyde.browser`. Scripts never reach outside this table —
-/// no raw `io`/`os`/socket access from script code — see
+/// no raw `io`/`os`/socket access from script code, enforced by the VM
+/// itself: `service.rs`'s `sandboxed_lua` builds the `Lua` instance this is
+/// installed into with those standard libraries never loaded in the first
+/// place, not just unreferenced by convention — see
 /// `demo-rust-fyde`'s own `host/mod.rs`, which this is ported from
 /// (`fyde.browser` is the one exception with no `demo-rust-fyde`
 /// counterpart — see `super::browser`). Unlike that port, `fyde.log`,
