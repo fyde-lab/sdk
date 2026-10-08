@@ -10,6 +10,7 @@ use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::{ErrorContext as _, Result};
 
 use super::Script;
+use super::ScriptType;
 
 /// Generated protobuf/gRPC bindings for the `scripts` service, compiled
 /// from `../api-protos/scripts/v1/scripts.proto` by `build.rs`.
@@ -42,6 +43,7 @@ pub(super) trait FydeClient: Send + Sync {
         description: &str,
         short_description: &str,
         allowed_domains: Vec<String>,
+        script_type: ScriptType,
     ) -> Result<Script>;
 
     /// Fetches the script matching `id`.
@@ -60,6 +62,7 @@ pub(super) trait FydeClient: Send + Sync {
         description: &str,
         short_description: &str,
         allowed_domains: Vec<String>,
+        script_type: ScriptType,
     ) -> Result<Script>;
 
     /// Enables `script_id` for the authenticated user.
@@ -104,7 +107,7 @@ impl GrpcClient {
 }
 
 /// Converts a generated `proto::Script` into the domain [`Script`] type,
-/// parsing its canonical UUIDv7 string id.
+/// parsing its canonical UUIDv7 string id and its `type` string.
 fn into_domain(script: proto::Script) -> Result<Script> {
     Ok(Script {
         id: script
@@ -120,6 +123,10 @@ fn into_domain(script: proto::Script) -> Result<Script> {
         version: script.version,
         script: script.script,
         last_updated: script.last_updated,
+        script_type: script
+            .r#type
+            .parse()
+            .context("failed to parse script type returned by the server")?,
     })
 }
 
@@ -134,6 +141,7 @@ impl FydeClient for GrpcClient {
         description: &str,
         short_description: &str,
         allowed_domains: Vec<String>,
+        script_type: ScriptType,
     ) -> Result<Script> {
         let request = self
             .sessions
@@ -145,6 +153,7 @@ impl FydeClient for GrpcClient {
                 description: description.to_string(),
                 short_description: short_description.to_string(),
                 allowed_domains,
+                r#type: script_type.to_string(),
             })
             .await?;
 
@@ -188,6 +197,7 @@ impl FydeClient for GrpcClient {
         description: &str,
         short_description: &str,
         allowed_domains: Vec<String>,
+        script_type: ScriptType,
     ) -> Result<Script> {
         let request = self
             .sessions
@@ -200,6 +210,7 @@ impl FydeClient for GrpcClient {
                 description: description.to_string(),
                 short_description: short_description.to_string(),
                 allowed_domains,
+                r#type: script_type.to_string(),
             })
             .await?;
 

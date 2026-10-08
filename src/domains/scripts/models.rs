@@ -1,4 +1,47 @@
+use std::fmt;
+use std::str::FromStr;
+
 use uuid::Uuid;
+
+use crate::Error;
+
+/// What kind of script this is, opaque to the server beyond storage and
+/// filtering (see `Script`/`CreateScriptRequest`/`UpdateScriptRequest`'s
+/// `type` field in `../../../../api-protos/scripts/v1/scripts.proto`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptType {
+    /// Every script under `fyde-scripts`' `scrapers/` directory.
+    Scraper,
+    /// Every script under `fyde-scripts`' `parsers/` directory.
+    Parser,
+}
+
+impl ScriptType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Scraper => "scraper",
+            Self::Parser => "parser",
+        }
+    }
+}
+
+impl fmt::Display for ScriptType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ScriptType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "scraper" => Ok(Self::Scraper),
+            "parser" => Ok(Self::Parser),
+            other => Err(Error::InvalidScriptType(other.to_string())),
+        }
+    }
+}
 
 /// A user-authored script, as returned by [`super::Service::fetch_script`]/
 /// [`super::Service::list_user_scripts`]/[`super::Service::create_script`].
@@ -23,6 +66,7 @@ pub struct Script {
     /// Unix timestamp, in seconds, of the last time this script was
     /// updated.
     pub(super) last_updated: i64,
+    pub(super) script_type: ScriptType,
 }
 
 impl Script {
@@ -69,6 +113,10 @@ impl Script {
     pub fn last_updated(&self) -> i64 {
         self.last_updated
     }
+
+    pub fn script_type(&self) -> ScriptType {
+        self.script_type
+    }
 }
 
 /// Builds a [`Script`] filled with random-but-plausible data, for use in
@@ -93,12 +141,18 @@ impl FakeScript {
                 version: 1,
                 script: "return 1 + 1".to_string(),
                 last_updated: crate::testing::random_past_timestamp(),
+                script_type: ScriptType::Scraper,
             },
         }
     }
 
     pub(crate) fn with_script(mut self, script: &str) -> Self {
         self.script.script = script.to_string();
+        self
+    }
+
+    pub(crate) fn with_type(mut self, script_type: ScriptType) -> Self {
+        self.script.script_type = script_type;
         self
     }
 
