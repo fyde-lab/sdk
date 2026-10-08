@@ -19,7 +19,7 @@ pub use domains::documents::{
     ChangelogEvent, Document, Metadata, Service as DocumentsService, UploadRequest,
 };
 pub use domains::scrapers::{ProgressEvent, Service as ScrapersService};
-pub use domains::scripts::{InMemoryScriptStorage, Service as ScriptsService};
+pub use domains::scripts::{InMemoryScriptStorage, Script, ScriptType, Service as ScriptsService};
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
 pub use domains::users::Service as UsersService;
@@ -70,6 +70,8 @@ pub enum Error {
     InvalidSourceSubCategory(String),
     #[error("invalid purpose: {0:?}")]
     InvalidPurpose(String),
+    #[error("invalid script type: {0:?}")]
+    InvalidScriptType(String),
     #[error("invalid server response: {0}")]
     InvalidResponse(String),
     #[error("encryption error: {0}")]

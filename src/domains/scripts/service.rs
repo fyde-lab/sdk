@@ -8,6 +8,7 @@ use crate::Result;
 use crate::domains::sessions::SessionsClient;
 
 use super::Script;
+use super::ScriptType;
 use super::Service;
 use super::grpc_client::{FydeClient, GrpcClient};
 
@@ -46,6 +47,7 @@ impl Service for ScriptsClient {
         description: &str,
         short_description: &str,
         allowed_domains: Vec<String>,
+        script_type: ScriptType,
     ) -> Result<Script> {
         self.grpc
             .create_script(
@@ -56,6 +58,7 @@ impl Service for ScriptsClient {
                 description,
                 short_description,
                 allowed_domains,
+                script_type,
             )
             .await
     }
@@ -74,6 +77,7 @@ impl Service for ScriptsClient {
         description: &str,
         short_description: &str,
         allowed_domains: Vec<String>,
+        script_type: ScriptType,
     ) -> Result<Script> {
         self.grpc
             .update_script(
@@ -85,6 +89,7 @@ impl Service for ScriptsClient {
                 description,
                 short_description,
                 allowed_domains,
+                script_type,
             )
             .await
     }
@@ -120,7 +125,14 @@ mod tests {
         mock_grpc
             .expect_create_script()
             .withf(
-                |name, is_public, icon, script, description, short_description, allowed_domains| {
+                |name,
+                 is_public,
+                 icon,
+                 script,
+                 description,
+                 short_description,
+                 allowed_domains,
+                 script_type| {
                     name == "my-script"
                         && *is_public
                         && icon == b"icon-bytes"
@@ -128,10 +140,11 @@ mod tests {
                         && description == "does something"
                         && short_description == "does a thing"
                         && *allowed_domains == vec!["example.com".to_string()]
+                        && *script_type == ScriptType::Scraper
                 },
             )
             .times(1)
-            .returning(move |_, _, _, _, _, _, _| Ok(returned.clone()));
+            .returning(move |_, _, _, _, _, _, _, _| Ok(returned.clone()));
 
         let client = ScriptsClient::with_grpc(mock_grpc);
 
@@ -144,6 +157,7 @@ mod tests {
                 "does something",
                 "does a thing",
                 vec!["example.com".to_string()],
+                ScriptType::Scraper,
             )
             .await
             .unwrap();
@@ -184,7 +198,8 @@ mod tests {
                       script,
                       description,
                       short_description,
-                      allowed_domains| {
+                      allowed_domains,
+                      script_type| {
                     *requested_id == id
                         && name == "my-script"
                         && *is_public
@@ -193,10 +208,11 @@ mod tests {
                         && description == "does something"
                         && short_description == "does a thing"
                         && *allowed_domains == vec!["example.com".to_string()]
+                        && *script_type == ScriptType::Scraper
                 },
             )
             .times(1)
-            .returning(move |_, _, _, _, _, _, _, _| Ok(returned.clone()));
+            .returning(move |_, _, _, _, _, _, _, _, _| Ok(returned.clone()));
 
         let client = ScriptsClient::with_grpc(mock_grpc);
 
@@ -210,6 +226,7 @@ mod tests {
                 "does something",
                 "does a thing",
                 vec!["example.com".to_string()],
+                ScriptType::Scraper,
             )
             .await
             .unwrap();

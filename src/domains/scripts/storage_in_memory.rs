@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::{Error, Result};
 
 use super::Script;
+use super::ScriptType;
 use super::Service;
 
 /// A [`Service`] implementation holding scripts purely in memory, for
@@ -43,6 +44,7 @@ impl Service for InMemoryScriptStorage {
         description: &str,
         short_description: &str,
         allowed_domains: Vec<String>,
+        script_type: ScriptType,
     ) -> Result<Script> {
         let created = Script {
             id: Uuid::now_v7(),
@@ -55,6 +57,7 @@ impl Service for InMemoryScriptStorage {
             version: 1,
             script: script.to_string(),
             last_updated: now(),
+            script_type,
         };
 
         self.scripts
@@ -84,6 +87,7 @@ impl Service for InMemoryScriptStorage {
         description: &str,
         short_description: &str,
         allowed_domains: Vec<String>,
+        script_type: ScriptType,
     ) -> Result<Script> {
         let mut scripts = self.scripts.lock().unwrap();
 
@@ -100,6 +104,7 @@ impl Service for InMemoryScriptStorage {
             version: existing.version + 1,
             script: script.to_string(),
             last_updated: now(),
+            script_type,
         };
 
         scripts.insert(id, updated.clone());
@@ -156,6 +161,7 @@ mod tests {
                 "",
                 "",
                 Vec::new(),
+                ScriptType::Scraper,
             )
             .await
             .unwrap();
@@ -169,7 +175,16 @@ mod tests {
     async fn fetches_a_previously_created_script() {
         let storage = InMemoryScriptStorage::new();
         let created = storage
-            .create_script("example", true, Vec::new(), "return 1", "", "", Vec::new())
+            .create_script(
+                "example",
+                true,
+                Vec::new(),
+                "return 1",
+                "",
+                "",
+                Vec::new(),
+                ScriptType::Scraper,
+            )
             .await
             .unwrap();
 
@@ -191,7 +206,16 @@ mod tests {
     async fn updating_a_script_increments_its_version() {
         let storage = InMemoryScriptStorage::new();
         let created = storage
-            .create_script("example", false, Vec::new(), "return 1", "", "", Vec::new())
+            .create_script(
+                "example",
+                false,
+                Vec::new(),
+                "return 1",
+                "",
+                "",
+                Vec::new(),
+                ScriptType::Scraper,
+            )
             .await
             .unwrap();
 
@@ -205,6 +229,7 @@ mod tests {
                 "",
                 "",
                 Vec::new(),
+                ScriptType::Scraper,
             )
             .await
             .unwrap();
@@ -228,6 +253,7 @@ mod tests {
                 "",
                 "",
                 Vec::new(),
+                ScriptType::Scraper,
             )
             .await
             .unwrap_err();
@@ -239,11 +265,29 @@ mod tests {
     async fn lists_only_enabled_scripts() {
         let storage = InMemoryScriptStorage::new();
         let enabled = storage
-            .create_script("enabled", true, Vec::new(), "return 1", "", "", Vec::new())
+            .create_script(
+                "enabled",
+                true,
+                Vec::new(),
+                "return 1",
+                "",
+                "",
+                Vec::new(),
+                ScriptType::Scraper,
+            )
             .await
             .unwrap();
         let disabled = storage
-            .create_script("disabled", true, Vec::new(), "return 2", "", "", Vec::new())
+            .create_script(
+                "disabled",
+                true,
+                Vec::new(),
+                "return 2",
+                "",
+                "",
+                Vec::new(),
+                ScriptType::Scraper,
+            )
             .await
             .unwrap();
 
@@ -259,11 +303,29 @@ mod tests {
     async fn lists_only_public_scripts() {
         let storage = InMemoryScriptStorage::new();
         let public = storage
-            .create_script("public", true, Vec::new(), "return 1", "", "", Vec::new())
+            .create_script(
+                "public",
+                true,
+                Vec::new(),
+                "return 1",
+                "",
+                "",
+                Vec::new(),
+                ScriptType::Scraper,
+            )
             .await
             .unwrap();
         let private = storage
-            .create_script("private", false, Vec::new(), "return 2", "", "", Vec::new())
+            .create_script(
+                "private",
+                false,
+                Vec::new(),
+                "return 2",
+                "",
+                "",
+                Vec::new(),
+                ScriptType::Scraper,
+            )
             .await
             .unwrap();
 
@@ -277,7 +339,16 @@ mod tests {
     async fn disabling_a_script_removes_it_from_the_listing() {
         let storage = InMemoryScriptStorage::new();
         let script = storage
-            .create_script("example", true, Vec::new(), "return 1", "", "", Vec::new())
+            .create_script(
+                "example",
+                true,
+                Vec::new(),
+                "return 1",
+                "",
+                "",
+                Vec::new(),
+                ScriptType::Scraper,
+            )
             .await
             .unwrap();
 

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::domains::documents::{
     EventType, Metadata, Purpose, SourceCategory, SourceSubCategory, UploadRequest,
 };
-use crate::domains::scripts::Script;
+use crate::domains::scripts::{Script, ScriptType};
 use crate::domains::sessions::Service as SessionsService;
 use crate::{ChangelogEvent, Client, ClientConfig, Document, Error, LogLevel, Storage};
 
@@ -296,6 +296,31 @@ impl From<Document> for FfiDocument {
     }
 }
 
+/// What kind of script this is, mirroring [`ScriptType`].
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiScriptType {
+    Scraper,
+    Parser,
+}
+
+impl From<ScriptType> for FfiScriptType {
+    fn from(script_type: ScriptType) -> Self {
+        match script_type {
+            ScriptType::Scraper => FfiScriptType::Scraper,
+            ScriptType::Parser => FfiScriptType::Parser,
+        }
+    }
+}
+
+impl From<FfiScriptType> for ScriptType {
+    fn from(script_type: FfiScriptType) -> Self {
+        match script_type {
+            FfiScriptType::Scraper => ScriptType::Scraper,
+            FfiScriptType::Parser => ScriptType::Parser,
+        }
+    }
+}
+
 /// A user-authored script, mirroring [`Script`] across the FFI boundary.
 /// `id` crosses as a string since UniFFI has no native UUID type.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -310,6 +335,7 @@ pub struct FfiScript {
     pub version: u64,
     pub script: String,
     pub last_updated: i64,
+    pub script_type: FfiScriptType,
 }
 
 impl From<Script> for FfiScript {
@@ -325,6 +351,7 @@ impl From<Script> for FfiScript {
             version: script.version(),
             script: script.script().to_string(),
             last_updated: script.last_updated(),
+            script_type: script.script_type().into(),
         }
     }
 }
@@ -637,6 +664,7 @@ impl FydeClient {
         description: String,
         short_description: String,
         allowed_domains: Vec<String>,
+        script_type: FfiScriptType,
     ) -> Result<FfiScript, FfiError> {
         let script = self
             .inner
@@ -649,6 +677,7 @@ impl FydeClient {
                 &description,
                 &short_description,
                 allowed_domains,
+                script_type.into(),
             )
             .await?;
         Ok(script.into())
@@ -675,6 +704,7 @@ impl FydeClient {
         description: String,
         short_description: String,
         allowed_domains: Vec<String>,
+        script_type: FfiScriptType,
     ) -> Result<FfiScript, FfiError> {
         let id = parse_uuid(&id)?;
         let script = self
@@ -689,6 +719,7 @@ impl FydeClient {
                 &description,
                 &short_description,
                 allowed_domains,
+                script_type.into(),
             )
             .await?;
         Ok(script.into())
