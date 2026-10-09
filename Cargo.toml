@@ -121,6 +121,14 @@ android-native-keyring-store = "1.0.0"
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
 dbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `wry`'s own WebKitGTK backend types — `domains/scrapers/browser/driver.rs`
+# calls `WebViewExt::download_uri` on the `webkit2gtk::WebView` wry hands
+# its new-window handler, to turn a popup into a real download (see
+# `run_event_loop`'s `with_new_window_req_handler`). Must stay on the same
+# major version `wry` itself depends on, so the `WebView` types match.
+webkit2gtk = "2.0"
+
 [build-dependencies]
 tonic-prost-build = "0.14.6"
 

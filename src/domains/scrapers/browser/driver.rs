@@ -416,11 +416,38 @@ fn run_event_loop(
         // Same check for a `window.open(...)`/`target="_blank"` popup,
         // which `with_navigation_handler` doesn't see since it isn't a
         // navigation of the webview that requested it.
-        .with_new_window_req_handler(move |url, _features| {
-            if is_navigation_allowed(&url, &new_window_allowed_domains) {
+        //
+        // While a `Service::download` call is waiting, an allowed popup is
+        // denied and its URL downloaded through the opener webview instead:
+        // on Linux, wry's `Allow` builds a separate, always-shown GTK window
+        // (ignoring `visible`) whose webview has none of the download
+        // handlers below, so a page that opens its PDF in a popup (cesu's
+        // `affichagePdf_<id>` buttons) would just display it there and
+        // `download` would time out. `download_uri` goes through the same
+        // `WebContext` (cookies included) the handlers below are registered
+        // on, so it lands in `pending_download` like any other download.
+        .with_new_window_req_handler({
+            let pending_download = pending_download.clone();
+            move |url, features| {
+                if !is_navigation_allowed(&url, &new_window_allowed_domains) {
+                    tracing::warn!(%url, "browser popup blocked by allowed_domains");
+                    return wry::NewWindowResponse::Deny;
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    use webkit2gtk::WebViewExt as _;
+                    let download_waiting = pending_download
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .is_some();
+                    if download_waiting {
+                        features.opener.webview.download_uri(&url);
+                        return wry::NewWindowResponse::Deny;
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = (&pending_download, features);
                 wry::NewWindowResponse::Allow
-            } else {
-                wry::NewWindowResponse::Deny
             }
         })
         // Redirects every download to a fresh, unique path under the OS
