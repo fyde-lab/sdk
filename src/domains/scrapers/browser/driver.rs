@@ -584,7 +584,7 @@ fn html_script(id: u64) -> String {
 
 /// Checks a navigation/new-window request's target `url` against
 /// `allowed_domains`, the same way (and using the same rule — exact host or
-/// subdomain match, empty list meaning unrestricted) `host::browser`'s
+/// subdomain match, empty list allowing nothing) `host::browser`'s
 /// `fyde.browser:open` guard does. An unparseable `url` is rejected rather
 /// than allowed — there's no host to check it against, so there's nothing
 /// to justify letting it through.
@@ -660,8 +660,8 @@ mod tests {
     }
 
     #[test]
-    fn is_navigation_allowed_allows_everything_when_the_list_is_empty() {
-        assert!(is_navigation_allowed("https://anything.example/", &[]));
+    fn is_navigation_allowed_allows_nothing_when_the_list_is_empty() {
+        assert!(!is_navigation_allowed("https://anything.example/", &[]));
     }
 
     #[test]

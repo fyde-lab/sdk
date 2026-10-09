@@ -74,9 +74,9 @@ pub trait Service: Send + Sync {
     /// URL isn't covered fails before it ever reaches the network, which
     /// (since nothing in these scripts wraps `fyde.http`/`fyde.browser`
     /// calls in `pcall`) stops the script right there and surfaces as this
-    /// `run` call's own `Err`. An empty list means unrestricted — no
-    /// scraper predates this parameter, but a caller that genuinely wants
-    /// no restriction can still pass one.
+    /// `run` call's own `Err`. An empty list allows no host at all (fail
+    /// closed), and an IP-literal host is only reachable when that exact
+    /// address is listed.
     ///
     /// `browser_visible` toggles whether this run's `fyde.browser` webview
     /// (see the private `browser` sub-domain) is shown as a real, visible

@@ -38,10 +38,12 @@ pub(super) struct Installed {
 /// before it ever reaches the network: `url`'s host must equal, or be a
 /// subdomain of, one of `allowed_domains` (conventionally a scraper's own
 /// `scripts/<name>/settings.json` `allowed_domains` list), or this returns
-/// `Err` with a message describing the violation. An empty `allowed_domains`
-/// means unrestricted — no scraper predates this parameter, so this keeps a
-/// caller that genuinely wants no restriction from having to enumerate
-/// every host a script might reach. A script that ignores the `Err`
+/// `Err` with a message describing the violation. Fails closed: an empty
+/// `allowed_domains` allows nothing, so a scraper (or a server-supplied
+/// script record) that forgets to declare its hosts can't reach arbitrary
+/// hosts — including `localhost` or LAN addresses — by omission. See
+/// [`is_host_allowed`] for how IP-literal hosts are matched. A script that
+/// ignores the `Err`
 /// (doesn't wrap the call in `pcall`) has its `run` function's call itself
 /// fail, per Lua's normal error propagation — exactly like any other
 /// `fyde.*` error — which is what actually stops the script.
@@ -67,21 +69,27 @@ fn ensure_domain_allowed(url: &str, allowed_domains: &[String]) -> std::result::
 }
 
 /// The host-only half of [`ensure_domain_allowed`] — `host` must equal, or
-/// be a subdomain of, one of `allowed_domains`, or an empty `allowed_domains`
-/// (unrestricted). Exposed beyond `host` (`pub(super)`, i.e. visible
+/// be a subdomain of, one of `allowed_domains`; an empty `allowed_domains`
+/// allows nothing. An IP-literal `host` (e.g. `127.0.0.1`, `[::1]`) only ever
+/// matches an identical entry, never by suffix — otherwise an entry like
+/// `0.1` would let `10.0.0.1` through as a "subdomain" — so loopback/private
+/// addresses are only reachable when a scraper lists that exact address.
+/// Exposed beyond `host` (`pub(super)`, i.e. visible
 /// throughout `scrapers`) for `browser::driver`'s `with_navigation_handler`/
 /// `with_new_window_req_handler` callbacks, which only have a URL to parse
 /// themselves — there's no shared request-building code path to hang
 /// `ensure_domain_allowed`'s `Result`-returning, error-message-formatting
 /// shape off of there.
 pub(super) fn is_host_allowed(host: &str, allowed_domains: &[String]) -> bool {
-    if allowed_domains.is_empty() {
-        return true;
-    }
+    let is_ip_literal = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok();
 
     allowed_domains.iter().any(|domain| {
         let domain = domain.to_ascii_lowercase();
-        host == domain || host.ends_with(&format!(".{domain}"))
+        host == domain || (!is_ip_literal && host.ends_with(&format!(".{domain}")))
     })
 }
 
@@ -244,8 +252,23 @@ mod domain_guard_tests {
     }
 
     #[test]
-    fn ensure_domain_allowed_allows_everything_when_the_list_is_empty() {
-        assert!(ensure_domain_allowed("https://anything.example/at/all", &[]).is_ok());
+    fn ensure_domain_allowed_allows_nothing_when_the_list_is_empty() {
+        assert!(ensure_domain_allowed("https://anything.example/at/all", &[]).is_err());
+        assert!(ensure_domain_allowed("http://127.0.0.1:8080/", &[]).is_err());
+    }
+
+    #[test]
+    fn ensure_domain_allowed_only_matches_an_ip_literal_exactly() {
+        let allowed = vec!["0.1".to_string(), "127.0.0.1".to_string()];
+        assert!(ensure_domain_allowed("http://10.0.0.1/", &allowed).is_err());
+        assert!(ensure_domain_allowed("http://127.0.0.1:8080/", &allowed).is_ok());
+    }
+
+    #[test]
+    fn ensure_domain_allowed_rejects_an_unlisted_ipv6_literal() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(ensure_domain_allowed("http://[::1]/", &allowed).is_err());
+        assert!(ensure_domain_allowed("http://[::1]/", &["[::1]".to_string()]).is_ok());
     }
 
     #[test]
