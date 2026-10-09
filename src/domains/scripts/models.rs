@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -43,6 +44,37 @@ impl FromStr for ScriptType {
     }
 }
 
+/// What kind of value a [`ScriptParameter`] expects, so a client can render
+/// the right form control (text field, number field, toggle) and coerce the
+/// entered value before sending it back to the script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptParameterType {
+    String,
+    Number,
+    Boolean,
+}
+
+/// A single configurable parameter a script declares it needs from the user
+/// (e.g. a login username, an API key) before it can run. A script's full
+/// set of these is carried on [`Script::parameters`], keyed by the
+/// parameter's machine name (e.g. "username", "password") as the script
+/// itself refers to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptParameter {
+    /// Human-readable label for the form control, e.g. "Mot de passe".
+    pub label: String,
+    /// Example value shown in the empty form control, e.g. "••••••••".
+    pub placeholder: String,
+    pub parameter_type: ScriptParameterType,
+    /// Whether the script requires this parameter to be set before it can
+    /// run.
+    pub required: bool,
+    /// Whether the value is sensitive (e.g. a password) and should be
+    /// masked/stored accordingly by the client. Opaque to the server beyond
+    /// storage: it never sees the value either way.
+    pub secret: bool,
+}
+
 /// A user-authored script, as returned by [`super::Service::fetch_script`]/
 /// [`super::Service::list_user_scripts`]/[`super::Service::create_script`].
 /// Unlike [`crate::Document`], script content is not encrypted client-side —
@@ -67,6 +99,9 @@ pub struct Script {
     /// updated.
     pub(super) last_updated: i64,
     pub(super) script_type: ScriptType,
+    /// The parameters this script needs from the user before it can run,
+    /// keyed by the parameter's machine name.
+    pub(super) parameters: HashMap<String, ScriptParameter>,
 }
 
 impl Script {
@@ -117,6 +152,10 @@ impl Script {
     pub fn script_type(&self) -> ScriptType {
         self.script_type
     }
+
+    pub fn parameters(&self) -> &HashMap<String, ScriptParameter> {
+        &self.parameters
+    }
 }
 
 /// Builds a [`Script`] filled with random-but-plausible data, for use in
@@ -142,6 +181,7 @@ impl FakeScript {
                 script: "return 1 + 1".to_string(),
                 last_updated: crate::testing::random_past_timestamp(),
                 script_type: ScriptType::Scraper,
+                parameters: HashMap::new(),
             },
         }
     }

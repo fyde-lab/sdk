@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,6 +9,7 @@ use crate::Result;
 use crate::domains::sessions::SessionsClient;
 
 use super::Script;
+use super::ScriptParameter;
 use super::ScriptType;
 use super::Service;
 use super::grpc_client::{FydeClient, GrpcClient};
@@ -48,6 +50,7 @@ impl Service for ScriptsClient {
         short_description: &str,
         allowed_domains: Vec<String>,
         script_type: ScriptType,
+        parameters: HashMap<String, ScriptParameter>,
     ) -> Result<Script> {
         self.grpc
             .create_script(
@@ -59,6 +62,7 @@ impl Service for ScriptsClient {
                 short_description,
                 allowed_domains,
                 script_type,
+                parameters,
             )
             .await
     }
@@ -78,6 +82,7 @@ impl Service for ScriptsClient {
         short_description: &str,
         allowed_domains: Vec<String>,
         script_type: ScriptType,
+        parameters: HashMap<String, ScriptParameter>,
     ) -> Result<Script> {
         self.grpc
             .update_script(
@@ -90,6 +95,7 @@ impl Service for ScriptsClient {
                 short_description,
                 allowed_domains,
                 script_type,
+                parameters,
             )
             .await
     }
@@ -117,6 +123,10 @@ mod tests {
     use crate::domains::scripts::FakeScript;
     use crate::domains::scripts::grpc_client::MockFydeClient;
 
+    fn no_parameters() -> HashMap<String, ScriptParameter> {
+        HashMap::new()
+    }
+
     #[tokio::test]
     async fn create_script_delegates_to_grpc() {
         let expected = FakeScript::new().build();
@@ -132,7 +142,8 @@ mod tests {
                  description,
                  short_description,
                  allowed_domains,
-                 script_type| {
+                 script_type,
+                 parameters| {
                     name == "my-script"
                         && *is_public
                         && icon == b"icon-bytes"
@@ -141,10 +152,11 @@ mod tests {
                         && short_description == "does a thing"
                         && *allowed_domains == vec!["example.com".to_string()]
                         && *script_type == ScriptType::Scraper
+                        && parameters.is_empty()
                 },
             )
             .times(1)
-            .returning(move |_, _, _, _, _, _, _, _| Ok(returned.clone()));
+            .returning(move |_, _, _, _, _, _, _, _, _| Ok(returned.clone()));
 
         let client = ScriptsClient::with_grpc(mock_grpc);
 
@@ -158,6 +170,7 @@ mod tests {
                 "does a thing",
                 vec!["example.com".to_string()],
                 ScriptType::Scraper,
+                no_parameters(),
             )
             .await
             .unwrap();
@@ -199,7 +212,8 @@ mod tests {
                       description,
                       short_description,
                       allowed_domains,
-                      script_type| {
+                      script_type,
+                      parameters| {
                     *requested_id == id
                         && name == "my-script"
                         && *is_public
@@ -209,10 +223,11 @@ mod tests {
                         && short_description == "does a thing"
                         && *allowed_domains == vec!["example.com".to_string()]
                         && *script_type == ScriptType::Scraper
+                        && parameters.is_empty()
                 },
             )
             .times(1)
-            .returning(move |_, _, _, _, _, _, _, _, _| Ok(returned.clone()));
+            .returning(move |_, _, _, _, _, _, _, _, _, _| Ok(returned.clone()));
 
         let client = ScriptsClient::with_grpc(mock_grpc);
 
@@ -227,6 +242,7 @@ mod tests {
                 "does a thing",
                 vec!["example.com".to_string()],
                 ScriptType::Scraper,
+                no_parameters(),
             )
             .await
             .unwrap();

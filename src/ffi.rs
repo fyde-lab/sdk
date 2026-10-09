@@ -6,6 +6,7 @@
 //! UniFFI has no native `Uuid` type and cannot export the crate's own
 //! [`Document`]/[`ChangelogEvent`] types directly.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -14,7 +15,7 @@ use uuid::Uuid;
 use crate::domains::documents::{
     EventType, Metadata, Purpose, SourceCategory, SourceSubCategory, UploadRequest,
 };
-use crate::domains::scripts::{Script, ScriptType};
+use crate::domains::scripts::{Script, ScriptParameter, ScriptParameterType, ScriptType};
 use crate::domains::sessions::Service as SessionsService;
 use crate::{ChangelogEvent, Client, ClientConfig, Document, Error, LogLevel, Storage};
 
@@ -321,6 +322,70 @@ impl From<FfiScriptType> for ScriptType {
     }
 }
 
+/// What kind of value a [`FfiScriptParameter`] expects, mirroring
+/// [`ScriptParameterType`].
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiScriptParameterType {
+    String,
+    Number,
+    Boolean,
+}
+
+impl From<ScriptParameterType> for FfiScriptParameterType {
+    fn from(parameter_type: ScriptParameterType) -> Self {
+        match parameter_type {
+            ScriptParameterType::String => FfiScriptParameterType::String,
+            ScriptParameterType::Number => FfiScriptParameterType::Number,
+            ScriptParameterType::Boolean => FfiScriptParameterType::Boolean,
+        }
+    }
+}
+
+impl From<FfiScriptParameterType> for ScriptParameterType {
+    fn from(parameter_type: FfiScriptParameterType) -> Self {
+        match parameter_type {
+            FfiScriptParameterType::String => ScriptParameterType::String,
+            FfiScriptParameterType::Number => ScriptParameterType::Number,
+            FfiScriptParameterType::Boolean => ScriptParameterType::Boolean,
+        }
+    }
+}
+
+/// A single configurable parameter a script declares it needs from the
+/// user, mirroring [`ScriptParameter`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiScriptParameter {
+    pub label: String,
+    pub placeholder: String,
+    pub parameter_type: FfiScriptParameterType,
+    pub required: bool,
+    pub secret: bool,
+}
+
+impl From<ScriptParameter> for FfiScriptParameter {
+    fn from(parameter: ScriptParameter) -> Self {
+        Self {
+            label: parameter.label,
+            placeholder: parameter.placeholder,
+            parameter_type: parameter.parameter_type.into(),
+            required: parameter.required,
+            secret: parameter.secret,
+        }
+    }
+}
+
+impl From<FfiScriptParameter> for ScriptParameter {
+    fn from(parameter: FfiScriptParameter) -> Self {
+        Self {
+            label: parameter.label,
+            placeholder: parameter.placeholder,
+            parameter_type: parameter.parameter_type.into(),
+            required: parameter.required,
+            secret: parameter.secret,
+        }
+    }
+}
+
 /// A user-authored script, mirroring [`Script`] across the FFI boundary.
 /// `id` crosses as a string since UniFFI has no native UUID type.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -336,6 +401,7 @@ pub struct FfiScript {
     pub script: String,
     pub last_updated: i64,
     pub script_type: FfiScriptType,
+    pub parameters: HashMap<String, FfiScriptParameter>,
 }
 
 impl From<Script> for FfiScript {
@@ -352,6 +418,11 @@ impl From<Script> for FfiScript {
             script: script.script().to_string(),
             last_updated: script.last_updated(),
             script_type: script.script_type().into(),
+            parameters: script
+                .parameters()
+                .iter()
+                .map(|(key, parameter)| (key.clone(), parameter.clone().into()))
+                .collect(),
         }
     }
 }
@@ -665,6 +736,7 @@ impl FydeClient {
         short_description: String,
         allowed_domains: Vec<String>,
         script_type: FfiScriptType,
+        parameters: HashMap<String, FfiScriptParameter>,
     ) -> Result<FfiScript, FfiError> {
         let script = self
             .inner
@@ -678,6 +750,10 @@ impl FydeClient {
                 &short_description,
                 allowed_domains,
                 script_type.into(),
+                parameters
+                    .into_iter()
+                    .map(|(key, parameter)| (key, parameter.into()))
+                    .collect(),
             )
             .await?;
         Ok(script.into())
@@ -705,6 +781,7 @@ impl FydeClient {
         short_description: String,
         allowed_domains: Vec<String>,
         script_type: FfiScriptType,
+        parameters: HashMap<String, FfiScriptParameter>,
     ) -> Result<FfiScript, FfiError> {
         let id = parse_uuid(&id)?;
         let script = self
@@ -720,6 +797,10 @@ impl FydeClient {
                 &short_description,
                 allowed_domains,
                 script_type.into(),
+                parameters
+                    .into_iter()
+                    .map(|(key, parameter)| (key, parameter.into()))
+                    .collect(),
             )
             .await?;
         Ok(script.into())

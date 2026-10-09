@@ -5,6 +5,7 @@ mod storage_in_memory;
 
 pub use storage_in_memory::InMemoryScriptStorage;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,7 +16,7 @@ use uuid::Uuid;
 
 #[cfg(test)]
 pub(crate) use models::FakeScript;
-pub use models::{Script, ScriptType};
+pub use models::{Script, ScriptParameter, ScriptParameterType, ScriptType};
 
 use crate::Result;
 use crate::domains::sessions::SessionsClient;
@@ -42,6 +43,7 @@ pub trait Service: Send + Sync {
         short_description: &str,
         allowed_domains: Vec<String>,
         script_type: ScriptType,
+        parameters: HashMap<String, ScriptParameter>,
     ) -> Result<Script>;
 
     /// Fetches the script matching `id`.
@@ -62,6 +64,7 @@ pub trait Service: Send + Sync {
         short_description: &str,
         allowed_domains: Vec<String>,
         script_type: ScriptType,
+        parameters: HashMap<String, ScriptParameter>,
     ) -> Result<Script>;
 
     /// Enables `script_id` for the authenticated user. Enabling an

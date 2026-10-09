@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::{Error, Result};
 
 use super::Script;
+use super::ScriptParameter;
 use super::ScriptType;
 use super::Service;
 
@@ -45,6 +46,7 @@ impl Service for InMemoryScriptStorage {
         short_description: &str,
         allowed_domains: Vec<String>,
         script_type: ScriptType,
+        parameters: HashMap<String, ScriptParameter>,
     ) -> Result<Script> {
         let created = Script {
             id: Uuid::now_v7(),
@@ -58,6 +60,7 @@ impl Service for InMemoryScriptStorage {
             script: script.to_string(),
             last_updated: now(),
             script_type,
+            parameters,
         };
 
         self.scripts
@@ -88,6 +91,7 @@ impl Service for InMemoryScriptStorage {
         short_description: &str,
         allowed_domains: Vec<String>,
         script_type: ScriptType,
+        parameters: HashMap<String, ScriptParameter>,
     ) -> Result<Script> {
         let mut scripts = self.scripts.lock().unwrap();
 
@@ -105,6 +109,7 @@ impl Service for InMemoryScriptStorage {
             script: script.to_string(),
             last_updated: now(),
             script_type,
+            parameters,
         };
 
         scripts.insert(id, updated.clone());
@@ -162,6 +167,7 @@ mod tests {
                 "",
                 Vec::new(),
                 ScriptType::Scraper,
+                HashMap::new(),
             )
             .await
             .unwrap();
@@ -184,6 +190,7 @@ mod tests {
                 "",
                 Vec::new(),
                 ScriptType::Scraper,
+                HashMap::new(),
             )
             .await
             .unwrap();
@@ -215,6 +222,7 @@ mod tests {
                 "",
                 Vec::new(),
                 ScriptType::Scraper,
+                HashMap::new(),
             )
             .await
             .unwrap();
@@ -230,6 +238,7 @@ mod tests {
                 "",
                 Vec::new(),
                 ScriptType::Scraper,
+                HashMap::new(),
             )
             .await
             .unwrap();
@@ -254,6 +263,7 @@ mod tests {
                 "",
                 Vec::new(),
                 ScriptType::Scraper,
+                HashMap::new(),
             )
             .await
             .unwrap_err();
@@ -274,6 +284,7 @@ mod tests {
                 "",
                 Vec::new(),
                 ScriptType::Scraper,
+                HashMap::new(),
             )
             .await
             .unwrap();
@@ -287,6 +298,7 @@ mod tests {
                 "",
                 Vec::new(),
                 ScriptType::Scraper,
+                HashMap::new(),
             )
             .await
             .unwrap();
@@ -312,6 +324,7 @@ mod tests {
                 "",
                 Vec::new(),
                 ScriptType::Scraper,
+                HashMap::new(),
             )
             .await
             .unwrap();
@@ -325,6 +338,7 @@ mod tests {
                 "",
                 Vec::new(),
                 ScriptType::Scraper,
+                HashMap::new(),
             )
             .await
             .unwrap();
@@ -348,6 +362,7 @@ mod tests {
                 "",
                 Vec::new(),
                 ScriptType::Scraper,
+                HashMap::new(),
             )
             .await
             .unwrap();
