@@ -17,6 +17,7 @@ use wry::WebViewBuilder;
 
 use crate::{Error, Result};
 
+use super::super::cookies::Cookie;
 use super::super::host::is_host_allowed;
 use super::Service;
 
@@ -52,6 +53,9 @@ enum Command {
     /// `window.ipc.postMessage(JSON.stringify({id, ...}))`, whose `id`
     /// `call` is already waiting on in `PendingReplies`.
     Eval(String),
+    /// Reads back every cookie the webview holds (see [`Service::cookies`]),
+    /// already converted and filtered by [`from_webview_cookie`].
+    Cookies(SyncSender<std::result::Result<Vec<Cookie>, String>>),
     /// Exits the event loop, ending the thread.
     Shutdown,
 }
@@ -75,15 +79,21 @@ pub(super) struct BrowserDriver {
     next_id: AtomicU64,
     allowed_domains: Arc<Vec<String>>,
     visible: bool,
+    initial_cookies: Vec<Cookie>,
 }
 
 impl BrowserDriver {
-    pub(super) fn new(allowed_domains: Arc<Vec<String>>, visible: bool) -> Self {
+    pub(super) fn new(
+        allowed_domains: Arc<Vec<String>>,
+        visible: bool,
+        initial_cookies: Vec<Cookie>,
+    ) -> Self {
         Self {
             running: Mutex::new(None),
             next_id: AtomicU64::new(1),
             allowed_domains,
             visible,
+            initial_cookies,
         }
     }
 
@@ -126,6 +136,7 @@ impl BrowserDriver {
 
         let allowed_domains = self.allowed_domains.clone();
         let visible = self.visible;
+        let initial_cookies = self.initial_cookies.clone();
         let thread = std::thread::Builder::new()
             .name("fyde-browser".to_string())
             .spawn(move || {
@@ -135,6 +146,7 @@ impl BrowserDriver {
                     ready_tx,
                     allowed_domains,
                     visible,
+                    initial_cookies,
                 )
             })
             .map_err(|err| Error::Browser(format!("failed to spawn browser thread: {err}")))?;
@@ -251,6 +263,29 @@ impl Service for BrowserDriver {
         parse_html(value)
     }
 
+    async fn cookies(&self) -> Result<Vec<Cookie>> {
+        // Deliberately not `ensure_started`: a run that never touched
+        // `fyde.browser` has no cookies here, and mustn't open a window
+        // just to find that out.
+        let proxy = match self
+            .running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            Some(running) => running.proxy.clone(),
+            None => return Ok(Vec::new()),
+        };
+
+        let (tx, rx) = sync_channel(1);
+        proxy
+            .send_event(Command::Cookies(tx))
+            .map_err(|_| Error::Browser("browser thread is no longer running".to_string()))?;
+        rx.recv_timeout(Duration::from_secs(10))
+            .map_err(|_| Error::Browser("timed out reading the browser's cookies".to_string()))?
+            .map_err(|err| Error::Browser(format!("reading the browser's cookies: {err}")))
+    }
+
     async fn download(&self, selector: &str, timeout: Duration) -> Result<Vec<u8>> {
         let (_proxy, _pending, pending_download) = self.ensure_started()?;
 
@@ -301,6 +336,7 @@ fn run_event_loop(
     ready_tx: Sender<Result<EventLoopProxy<Command>>>,
     allowed_domains: Arc<Vec<String>>,
     visible: bool,
+    initial_cookies: Vec<Cookie>,
 ) {
     let mut builder = EventLoopBuilder::<Command>::with_user_event();
     #[cfg(target_os = "linux")]
@@ -358,6 +394,7 @@ fn run_event_loop(
         }
     };
 
+    let cookies_allowed_domains = allowed_domains.clone();
     let navigation_allowed_domains = allowed_domains.clone();
     let new_window_allowed_domains = allowed_domains;
     let builder = WebViewBuilder::new()
@@ -370,7 +407,11 @@ fn run_event_loop(
         // Doesn't see subresource loads (`fetch`/images/scripts/etc.),
         // which don't navigate anything; those aren't covered by this.
         .with_navigation_handler(move |url| {
-            is_navigation_allowed(&url, &navigation_allowed_domains)
+            let allowed = is_navigation_allowed(&url, &navigation_allowed_domains);
+            if !allowed {
+                tracing::warn!(%url, "browser navigation blocked by allowed_domains");
+            }
+            allowed
         })
         // Same check for a `window.open(...)`/`target="_blank"` popup,
         // which `with_navigation_handler` doesn't see since it isn't a
@@ -443,6 +484,17 @@ fn run_event_loop(
         }
     };
 
+    // Seeded before `ready_tx` fires, so no `open` can race ahead of them.
+    for saved in &initial_cookies {
+        let Some(cookie) = to_webview_cookie(saved) else {
+            tracing::warn!(origin = %saved.origin, "fyde.browser: skipping an unparseable saved cookie");
+            continue;
+        };
+        if let Err(err) = webview.set_cookie(&cookie) {
+            tracing::warn!(origin = %saved.origin, "fyde.browser: failed to restore a saved cookie: {err}");
+        }
+    }
+
     if ready_tx.send(Ok(proxy)).is_err() {
         return;
     }
@@ -459,6 +511,20 @@ fn run_event_loop(
                 if let Err(err) = webview.evaluate_script(&script) {
                     tracing::error!("fyde.browser: evaluate_script failed: {err}");
                 }
+            }
+            Event::UserEvent(Command::Cookies(reply)) => {
+                let cookies = webview
+                    .cookies()
+                    .map(|cookies| {
+                        cookies
+                            .iter()
+                            .filter_map(|cookie| {
+                                from_webview_cookie(cookie, &cookies_allowed_domains)
+                            })
+                            .collect()
+                    })
+                    .map_err(|err| err.to_string());
+                let _ = reply.send(cookies);
             }
             Event::UserEvent(Command::Shutdown) => {
                 *control_flow = ControlFlow::Exit;
@@ -588,15 +654,66 @@ fn html_script(id: u64) -> String {
 /// `fyde.browser:open` guard does. An unparseable `url` is rejected rather
 /// than allowed — there's no host to check it against, so there's nothing
 /// to justify letting it through.
+///
+/// `about:blank`/`about:srcdoc` are the one hostless exception: pages
+/// routinely create such frames (e.g. Cloudflare Turnstile's widget does
+/// several), they never touch the network, and blocking them silently
+/// breaks whatever the page built them for.
 fn is_navigation_allowed(url: &str, allowed_domains: &[String]) -> bool {
-    url::Url::parse(url)
-        .ok()
-        .and_then(|parsed| {
-            parsed
-                .host_str()
-                .map(|host| is_host_allowed(host, allowed_domains))
-        })
-        .unwrap_or(false)
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() == "about" {
+        return matches!(parsed.path(), "blank" | "srcdoc");
+    }
+    parsed
+        .host_str()
+        .is_some_and(|host| is_host_allowed(host, allowed_domains))
+}
+
+/// Converts a saved [`Cookie`] (whether `fyde.http` or a previous run's
+/// webview captured it) into the form `WebView::set_cookie` takes.
+///
+/// Every cookie crossing `wry`'s cookie API ends up host-only: `wry` hands
+/// libsoup `cookie::Cookie::domain()`, which strips the leading dot that
+/// would mark a domain cookie, so there is no way to express `Domain=` scope
+/// through it. A saved `Domain=example.com` cookie is restored as host-only
+/// on `example.com`; anything else as host-only on its origin's host.
+fn to_webview_cookie(saved: &Cookie) -> Option<cookie::Cookie<'static>> {
+    let host = url::Url::parse(&saved.origin).ok()?.host_str()?.to_string();
+    let mut cookie = cookie::Cookie::parse(saved.set_cookie.clone()).ok()?;
+    let domain = cookie.domain().map(str::to_string).unwrap_or(host);
+    cookie.set_domain(domain);
+    if cookie.path().is_none() {
+        cookie.set_path("/");
+    }
+    Some(cookie)
+}
+
+/// Converts one of the webview's own cookies into a [`Cookie`] ready to be
+/// persisted alongside `fyde.http`'s — host-only on its domain, for the
+/// reason [`to_webview_cookie`] explains. Cookies for a host outside
+/// `allowed_domains` (left behind by some third-party frame) are dropped:
+/// nothing in this run could ever have used them.
+fn from_webview_cookie(cookie: &cookie::Cookie<'_>, allowed_domains: &[String]) -> Option<Cookie> {
+    let domain = cookie.domain()?;
+    if !is_host_allowed(domain, allowed_domains) {
+        return None;
+    }
+    let mut set_cookie = format!("{}={}", cookie.name(), cookie.value());
+    if let Some(path) = cookie.path() {
+        set_cookie.push_str(&format!("; Path={path}"));
+    }
+    if cookie.secure() == Some(true) {
+        set_cookie.push_str("; Secure");
+    }
+    if cookie.http_only() == Some(true) {
+        set_cookie.push_str("; HttpOnly");
+    }
+    Some(Cookie {
+        origin: format!("https://{domain}"),
+        set_cookie,
+    })
 }
 
 /// A JS string literal safely encoding `value` — `serde_json`'s string
@@ -662,6 +779,93 @@ mod tests {
     #[test]
     fn is_navigation_allowed_allows_nothing_when_the_list_is_empty() {
         assert!(!is_navigation_allowed("https://anything.example/", &[]));
+    }
+
+    #[test]
+    fn to_webview_cookie_scopes_a_host_only_cookie_to_its_origin_host() {
+        let saved = Cookie {
+            origin: "https://www.example.com".to_string(),
+            set_cookie: "session=abc".to_string(),
+        };
+
+        let cookie = to_webview_cookie(&saved).unwrap();
+
+        assert_eq!(cookie.name(), "session");
+        assert_eq!(cookie.value(), "abc");
+        assert_eq!(cookie.domain(), Some("www.example.com"));
+        assert_eq!(cookie.path(), Some("/"));
+    }
+
+    #[test]
+    fn to_webview_cookie_keeps_an_explicit_domain_and_path() {
+        let saved = Cookie {
+            origin: "https://www.example.com".to_string(),
+            set_cookie: "session=abc; Domain=example.com; Path=/app; Secure".to_string(),
+        };
+
+        let cookie = to_webview_cookie(&saved).unwrap();
+
+        assert_eq!(cookie.domain(), Some("example.com"));
+        assert_eq!(cookie.path(), Some("/app"));
+        assert_eq!(cookie.secure(), Some(true));
+    }
+
+    #[test]
+    fn to_webview_cookie_rejects_an_unparseable_origin() {
+        let saved = Cookie {
+            origin: "not a url".to_string(),
+            set_cookie: "session=abc".to_string(),
+        };
+
+        assert!(to_webview_cookie(&saved).is_none());
+    }
+
+    #[test]
+    fn from_webview_cookie_formats_an_allowed_cookie_as_host_only() {
+        let cookie = cookie::Cookie::build(("session", "abc"))
+            .domain("www.example.com")
+            .path("/")
+            .secure(true)
+            .http_only(true)
+            .build();
+
+        let saved = from_webview_cookie(&cookie, &["example.com".to_string()]).unwrap();
+
+        assert_eq!(saved.origin, "https://www.example.com");
+        assert_eq!(saved.set_cookie, "session=abc; Path=/; Secure; HttpOnly");
+    }
+
+    #[test]
+    fn from_webview_cookie_drops_a_cookie_for_a_disallowed_host() {
+        let cookie = cookie::Cookie::build(("tracker", "1"))
+            .domain("evil.example")
+            .build();
+
+        assert!(from_webview_cookie(&cookie, &["example.com".to_string()]).is_none());
+    }
+
+    #[test]
+    fn webview_cookie_round_trips_through_a_saved_cookie() {
+        let original = Cookie {
+            origin: "https://example.com".to_string(),
+            set_cookie: "session=abc; Path=/; Secure".to_string(),
+        };
+
+        let restored = from_webview_cookie(
+            &to_webview_cookie(&original).unwrap(),
+            &["example.com".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn is_navigation_allowed_accepts_about_blank_and_srcdoc_frames() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(is_navigation_allowed("about:blank", &allowed));
+        assert!(is_navigation_allowed("about:srcdoc", &allowed));
+        assert!(!is_navigation_allowed("about:config", &allowed));
     }
 
     #[test]

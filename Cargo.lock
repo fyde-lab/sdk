@@ -1987,6 +1987,7 @@ dependencies = [
  "apple-native-keyring-store",
  "argon2",
  "async-trait",
+ "cookie",
  "dbus-secret-service-keyring-store",
  "futures",
  "fyde-server",
