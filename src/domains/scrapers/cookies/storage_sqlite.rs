@@ -68,6 +68,16 @@ impl Storage for SqliteStorage {
 
         Ok(())
     }
+
+    async fn delete_all(&self, scraper_name: &str) -> Result<()> {
+        sqlx::query("DELETE FROM scraper_cookies WHERE scraper_name = ?1")
+            .bind(scraper_name)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("failed to delete cookies for scraper {scraper_name:?}"))?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -167,5 +177,30 @@ mod tests {
 
         assert_eq!(storage.list("didaxis").await.unwrap(), vec![didaxis_cookie]);
         assert_eq!(storage.list("impots").await.unwrap(), vec![impots_cookie]);
+    }
+
+    #[tokio::test]
+    async fn delete_all_removes_only_that_scrapers_cookies() {
+        let storage = setup().await;
+        let kept = FakeCookie::new().build();
+        storage
+            .replace_all("didaxis", vec![FakeCookie::new().build()])
+            .await
+            .unwrap();
+        storage
+            .replace_all("impots", vec![kept.clone()])
+            .await
+            .unwrap();
+
+        storage.delete_all("didaxis").await.unwrap();
+
+        assert!(storage.list("didaxis").await.unwrap().is_empty());
+        assert_eq!(storage.list("impots").await.unwrap(), vec![kept]);
+    }
+
+    #[tokio::test]
+    async fn delete_all_succeeds_when_nothing_was_saved() {
+        let storage = setup().await;
+        storage.delete_all("didaxis").await.unwrap();
     }
 }

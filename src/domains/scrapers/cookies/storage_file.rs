@@ -66,6 +66,18 @@ impl Storage for FileStorage {
 
         Ok(())
     }
+
+    async fn delete_all(&self, scraper_name: &str) -> Result<()> {
+        let path = self.path(scraper_name);
+
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => {
+                Err(err).with_context(|| format!("failed to delete cookie file {}", path.display()))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -171,5 +183,30 @@ mod tests {
             .unwrap();
 
         assert!(dir.join("didaxis.cookies.json").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_all_removes_only_that_scrapers_cookies() {
+        let (_tmp, storage) = setup();
+        let kept = FakeCookie::new().build();
+        storage
+            .replace_all("didaxis", vec![FakeCookie::new().build()])
+            .await
+            .unwrap();
+        storage
+            .replace_all("impots", vec![kept.clone()])
+            .await
+            .unwrap();
+
+        storage.delete_all("didaxis").await.unwrap();
+
+        assert!(storage.list("didaxis").await.unwrap().is_empty());
+        assert_eq!(storage.list("impots").await.unwrap(), vec![kept]);
+    }
+
+    #[tokio::test]
+    async fn delete_all_succeeds_when_nothing_was_saved() {
+        let (_tmp, storage) = setup();
+        storage.delete_all("didaxis").await.unwrap();
     }
 }

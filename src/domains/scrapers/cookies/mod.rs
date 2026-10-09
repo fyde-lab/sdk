@@ -34,6 +34,11 @@ pub(super) trait Service: Send + Sync {
     /// `cookies` — the full set a scraper run's `fyde.http` client picked up
     /// for a host it actually visited.
     async fn save(&self, scraper_name: &str, cookies: Vec<Cookie>) -> Result<()>;
+
+    /// Deletes every cookie previously saved for `scraper_name` — what a
+    /// failed run does instead of [`Service::save`], so the next run starts
+    /// from a clean slate rather than from a session that just failed.
+    async fn delete(&self, scraper_name: &str) -> Result<()>;
 }
 
 /// Selects which [`storage::Storage`] backend [`init`] builds the cookies

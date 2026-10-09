@@ -18,4 +18,8 @@ pub(crate) trait Storage: Send + Sync {
     /// Replaces every cookie previously saved for `scraper_name` with
     /// `cookies`.
     async fn replace_all(&self, scraper_name: &str, cookies: Vec<Cookie>) -> Result<()>;
+
+    /// Deletes every cookie saved for `scraper_name`. Not an error if none
+    /// were saved.
+    async fn delete_all(&self, scraper_name: &str) -> Result<()>;
 }
