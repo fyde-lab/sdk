@@ -2,6 +2,8 @@ mod domains;
 mod ffi;
 #[path = "tools/log/mod.rs"]
 mod log;
+#[path = "tools/sandbox/mod.rs"]
+mod sandbox;
 #[path = "tools/sql/mod.rs"]
 mod sql;
 #[cfg(test)]
