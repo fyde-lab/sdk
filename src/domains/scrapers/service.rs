@@ -108,6 +108,14 @@ impl Service for ScrapersClient {
             .save(name, session_data)
             .await
             .with_context(|| format!("failed to save session for scraper {name:?}"))?;
+        // Cookies (http jar + browser) are loaded at startup and kept only
+        // when the run succeeded; a failed run discards them, since they may
+        // belong to a session the site rejected.
+        let cookies = if run_result.is_ok() {
+            cookies
+        } else {
+            Vec::new()
+        };
         self.cookies
             .save(name, cookies)
             .await
@@ -451,10 +459,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_saves_session_and_cookies_even_when_the_script_fails() {
+    async fn run_saves_session_but_deletes_cookies_when_the_script_fails() {
         let mut cookies = MockCookiesService::new();
-        cookies.expect_load().returning(|_| Ok(Vec::new()));
-        cookies.expect_save().times(1).returning(|_, _| Ok(()));
+        let stale = FakeCookie::new().build();
+        cookies
+            .expect_load()
+            .returning(move |_| Ok(vec![stale.clone()]));
+        cookies
+            .expect_save()
+            .withf(|_, saved| saved.is_empty())
+            .times(1)
+            .returning(|_, _| Ok(()));
         let mut session = MockSessionService::new();
         session.expect_load().returning(|_| Ok(json!({})));
         session

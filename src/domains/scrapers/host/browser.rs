@@ -192,8 +192,7 @@ pub(super) fn table(
                 let timeout = timeout_ms
                     .map(Duration::from_millis)
                     .unwrap_or(DEFAULT_DOWNLOAD_TIMEOUT);
-                let result =
-                    runtime.block_on(browser.download(&selector, timeout));
+                let result = runtime.block_on(browser.download(&selector, timeout));
                 match &result {
                     Ok(bytes) => recorder.record(
                         "browser_download",
@@ -656,9 +655,8 @@ mod tests {
         .unwrap();
         lua.globals().set("browser", browser_table).unwrap();
 
-        let result: LuaResult<mlua::LuaString> = lua
-            .load(r##"return browser:download("#missing")"##)
-            .eval();
+        let result: LuaResult<mlua::LuaString> =
+            lua.load(r##"return browser:download("#missing")"##).eval();
 
         assert!(result.is_err());
     }
