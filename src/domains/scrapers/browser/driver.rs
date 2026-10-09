@@ -685,12 +685,24 @@ fn html_script(id: u64) -> String {
 /// routinely create such frames (e.g. Cloudflare Turnstile's widget does
 /// several), they never touch the network, and blocking them silently
 /// breaks whatever the page built them for.
+///
+/// A `blob:` URL has no host of its own either, but embeds the origin of the
+/// page that created it (`blob:https://www.example.com/<uuid>`), so it's
+/// checked against that origin's host instead — e.g. bouyguestelecom.fr's
+/// invoice links fetch the PDF with a bearer token and `window.open` the
+/// resulting blob.
 fn is_navigation_allowed(url: &str, allowed_domains: &[String]) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
     if parsed.scheme() == "about" {
         return matches!(parsed.path(), "blank" | "srcdoc");
+    }
+    if parsed.scheme() == "blob" {
+        return match parsed.origin() {
+            url::Origin::Tuple(_, host, _) => is_host_allowed(&host.to_string(), allowed_domains),
+            url::Origin::Opaque(_) => false,
+        };
     }
     parsed
         .host_str()
@@ -700,16 +712,25 @@ fn is_navigation_allowed(url: &str, allowed_domains: &[String]) -> bool {
 /// Converts a saved [`Cookie`] (whether `fyde.http` or a previous run's
 /// webview captured it) into the form `WebView::set_cookie` takes.
 ///
-/// Every cookie crossing `wry`'s cookie API ends up host-only: `wry` hands
-/// libsoup `cookie::Cookie::domain()`, which strips the leading dot that
-/// would mark a domain cookie, so there is no way to express `Domain=` scope
-/// through it. A saved `Domain=example.com` cookie is restored as host-only
-/// on `example.com`; anything else as host-only on its origin's host.
+/// Every saved cookie is restored as a *domain* cookie on its saved domain
+/// (its `Domain=` attribute if any, its origin's host otherwise), never as a
+/// host-only one. Reading the webview's cookies back (see
+/// [`from_webview_cookie`]) can't tell the two apart — `cookie::Cookie::domain()`
+/// strips the leading dot libsoup uses to mark a domain cookie — so a site's
+/// `Domain=.example.com` session cookie gets saved as plain `example.com`,
+/// and restoring that host-only would never send it to `www.example.com`,
+/// silently logging the next run out (confirmed on bouyguestelecom.fr, whose
+/// SSO and CAS cookies are all domain cookies). Widening an originally
+/// host-only cookie to its subdomains is the lesser evil: they're all inside
+/// `allowed_domains` anyway.
+///
+/// `wry` hands libsoup `cookie.domain()`, which strips exactly one leading
+/// dot — hence the double dot here, so libsoup receives `.example.com`.
 fn to_webview_cookie(saved: &Cookie) -> Option<cookie::Cookie<'static>> {
     let host = url::Url::parse(&saved.origin).ok()?.host_str()?.to_string();
     let mut cookie = cookie::Cookie::parse(saved.set_cookie.clone()).ok()?;
     let domain = cookie.domain().map(str::to_string).unwrap_or(host);
-    cookie.set_domain(domain);
+    cookie.set_domain(format!("..{}", domain.trim_start_matches('.')));
     if cookie.path().is_none() {
         cookie.set_path("/");
     }
@@ -717,12 +738,13 @@ fn to_webview_cookie(saved: &Cookie) -> Option<cookie::Cookie<'static>> {
 }
 
 /// Converts one of the webview's own cookies into a [`Cookie`] ready to be
-/// persisted alongside `fyde.http`'s — host-only on its domain, for the
-/// reason [`to_webview_cookie`] explains. Cookies for a host outside
+/// persisted alongside `fyde.http`'s, keyed by its domain only: whether it
+/// was a domain or host-only cookie is lost on the way out of `wry` (see
+/// [`to_webview_cookie`], which restores it as a domain cookie). Cookies for a host outside
 /// `allowed_domains` (left behind by some third-party frame) are dropped:
 /// nothing in this run could ever have used them.
 fn from_webview_cookie(cookie: &cookie::Cookie<'_>, allowed_domains: &[String]) -> Option<Cookie> {
-    let domain = cookie.domain()?;
+    let domain = cookie.domain()?.trim_start_matches('.');
     if !is_host_allowed(domain, allowed_domains) {
         return None;
     }
@@ -808,7 +830,7 @@ mod tests {
     }
 
     #[test]
-    fn to_webview_cookie_scopes_a_host_only_cookie_to_its_origin_host() {
+    fn to_webview_cookie_scopes_a_cookie_without_domain_to_its_origin_hosts_domain() {
         let saved = Cookie {
             origin: "https://www.example.com".to_string(),
             set_cookie: "session=abc".to_string(),
@@ -818,7 +840,7 @@ mod tests {
 
         assert_eq!(cookie.name(), "session");
         assert_eq!(cookie.value(), "abc");
-        assert_eq!(cookie.domain(), Some("www.example.com"));
+        assert_eq!(cookie.domain(), Some(".www.example.com"));
         assert_eq!(cookie.path(), Some("/"));
     }
 
@@ -831,7 +853,7 @@ mod tests {
 
         let cookie = to_webview_cookie(&saved).unwrap();
 
-        assert_eq!(cookie.domain(), Some("example.com"));
+        assert_eq!(cookie.domain(), Some(".example.com"));
         assert_eq!(cookie.path(), Some("/app"));
         assert_eq!(cookie.secure(), Some(true));
     }
@@ -884,6 +906,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn is_navigation_allowed_checks_a_blob_url_against_its_embedded_origin() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(is_navigation_allowed(
+            "blob:https://www.example.com/0b1d5a3e-8c1f-4a5e-9a57-2f9c3d1e7b6a",
+            &allowed
+        ));
+        assert!(!is_navigation_allowed(
+            "blob:https://evil.example/0b1d5a3e-8c1f-4a5e-9a57-2f9c3d1e7b6a",
+            &allowed
+        ));
+        assert!(!is_navigation_allowed("blob:null/0b1d5a3e", &allowed));
     }
 
     #[test]

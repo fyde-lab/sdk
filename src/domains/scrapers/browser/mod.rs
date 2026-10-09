@@ -102,7 +102,8 @@ pub(super) trait Service: Send + Sync {
     /// `allowed_domains`, as [`Cookie`]s the `cookies` sub-domain can persist
     /// — the counterpart of the saved cookies [`init`] seeds it with, so a
     /// browser-driven login survives across runs the same way a `fyde.http`
-    /// one does. Every such cookie is host-only (see
+    /// one does. Whether each was a domain or host-only cookie is lost
+    /// (they're restored as domain cookies — see
     /// `driver::to_webview_cookie` for why). Empty, without ever starting
     /// the webview, if this run never used it.
     async fn cookies(&self) -> Result<Vec<Cookie>>;

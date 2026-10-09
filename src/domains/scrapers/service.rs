@@ -108,9 +108,6 @@ impl Service for ScrapersClient {
             .save(name, session_data)
             .await
             .with_context(|| format!("failed to save session for scraper {name:?}"))?;
-        // Cookies (http jar + browser) are loaded at startup and kept only
-        // when the run succeeded; a failed run discards them, since they may
-        // belong to a session the site rejected.
         let cookies = if run_result.is_ok() {
             cookies
         } else {
@@ -133,10 +130,10 @@ impl Service for ScrapersClient {
 /// fresh Lua VM, installs the `fyde` host table (see `host::install`),
 /// evaluates `script` and calls its `run(parameters)` entrypoint, then reads
 /// back `fyde.session`'s final contents and every cookie picked up this run
-/// — regardless of whether the script's `run` succeeded or failed, mirroring
-/// `demo-rust-fyde`'s `main.rs`, which saves the session/cookie file either
-/// way. The caller is responsible for persisting the returned session
-/// data/cookies and for propagating `run_result`.
+/// — regardless of whether the script's `run` succeeded or failed. The
+/// caller is responsible for persisting the returned session data/cookies
+/// (cookies only when `run_result` is `Ok`, see `Service::run`) and for
+/// propagating `run_result`.
 #[allow(clippy::too_many_arguments)]
 fn run_script(
     name: &str,
