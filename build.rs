@@ -20,7 +20,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::compile_protos(proto_dir.join("users/v1/users.proto"))?;
     tonic_prost_build::compile_protos(proto_dir.join("scripts/v1/scripts.proto"))?;
 
-    println!("cargo:rerun-if-changed=build.rs");
+    // Deliberately no `cargo:rerun-if-changed` here: the protos come from the BSR module
+    // above, not from any local file, so there's nothing for Cargo to watch — emitting
+    // `rerun-if-changed=build.rs` made Cargo treat a build with unchanged source as fully
+    // cached and skip re-fetching, silently compiling against a stale schema whenever the
+    // BSR module moved on without this file changing. Emitting no rerun-if directive at all
+    // keeps Cargo's default of always rerunning this build script.
 
     Ok(())
 }
