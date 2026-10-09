@@ -2024,6 +2024,7 @@ dependencies = [
  "uniffi",
  "url",
  "uuid",
+ "webkit2gtk",
  "windows-native-keyring-store",
  "wreq",
  "wreq-util",
