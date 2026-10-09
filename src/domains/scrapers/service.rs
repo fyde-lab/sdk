@@ -148,13 +148,21 @@ fn run_script(
     browser_visible: bool,
 ) -> Result<(Value, Vec<Cookie>, Result<()>)> {
     let lua = sandboxed_lua().context("building sandboxed lua vm")?;
-    // Built fresh per run, same as the Lua VM itself: there's no persisted
-    // state to carry across runs the way `session`/`cookies` have, so the
-    // webview it lazily spawns (see `browser::driver::BrowserDriver`) lives
-    // only as long as this run does, closed via its `Drop` impl once every
-    // `Arc` clone `host::install` handed to `fyde.browser`'s closures goes
-    // out of scope at the end of this function.
-    let browser = super::browser::init(Arc::new(allowed_domains.clone()), browser_visible);
+    // Built fresh per run, same as the Lua VM itself: the webview it lazily
+    // spawns (see `browser::driver::BrowserDriver`) lives only as long as
+    // this run does, closed via its `Drop` impl once every `Arc` clone
+    // (`host::install`'s for `fyde.browser`'s closures, and this function's
+    // own for reading its cookies back below) goes out of scope at the end
+    // of this function. Its only state carried across runs is cookies,
+    // seeded here from the same saved jar `fyde.http` gets.
+    let browser = super::browser::init(
+        Arc::new(allowed_domains.clone()),
+        browser_visible,
+        cookies.clone(),
+    );
+    let browser_for_cookies = browser.clone();
+    let cookies_runtime = runtime.clone();
+    let cookies_recorder = recorder.clone();
     let installed = host::install(
         &lua,
         name,
@@ -175,11 +183,55 @@ fn run_script(
 
     let run_result = evaluate_and_run(&lua, name, script, parameters);
 
-    let (session_data, cookies) = installed
+    let (session_data, http_cookies) = installed
         .drain(&lua)
         .context("reading back session data and cookies after the scraper run")?;
 
-    Ok((session_data, cookies, run_result))
+    // A failure here only costs the next run its browser session, so it's
+    // recorded rather than allowed to fail a run that otherwise succeeded.
+    let browser_cookies = cookies_runtime
+        .block_on(browser_for_cookies.cookies())
+        .unwrap_or_else(|err| {
+            cookies_recorder.record(
+                "error",
+                json!({ "action": "browser.cookies", "message": err.to_string() }),
+            );
+            Vec::new()
+        });
+
+    Ok((
+        session_data,
+        merge_cookies(http_cookies, browser_cookies),
+        run_result,
+    ))
+}
+
+/// Combines the cookies `fyde.http` and `fyde.browser` each ended the run
+/// with into the one jar the `cookies` sub-domain saves. Both started from
+/// the same saved jar, so the same cookie (same origin and name) can come
+/// back from both; the browser's copy wins, since a browser-driven step is
+/// what a script falls back on when plain HTTP isn't enough, making it the
+/// more likely of the two to hold the live session.
+fn merge_cookies(http_cookies: Vec<Cookie>, browser_cookies: Vec<Cookie>) -> Vec<Cookie> {
+    fn key(cookie: &Cookie) -> (&str, &str) {
+        let name = cookie
+            .set_cookie
+            .split(['=', ';'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        (cookie.origin.as_str(), name)
+    }
+
+    let from_browser: std::collections::HashSet<(&str, &str)> =
+        browser_cookies.iter().map(key).collect();
+    let mut merged: Vec<Cookie> = http_cookies
+        .iter()
+        .filter(|cookie| !from_browser.contains(&key(cookie)))
+        .cloned()
+        .collect();
+    merged.extend(browser_cookies.iter().cloned());
+    merged
 }
 
 /// Builds a fully sandboxed Lua VM for running a scraper script: only the
@@ -280,6 +332,44 @@ mod tests {
         )
     }
 
+    #[test]
+    fn merge_cookies_prefers_the_browsers_copy_of_the_same_cookie() {
+        let stale = FakeCookie::new()
+            .with_origin("https://example.com")
+            .with_set_cookie("session=old; Path=/")
+            .build();
+        let fresh = FakeCookie::new()
+            .with_origin("https://example.com")
+            .with_set_cookie("session=new; Path=/; HttpOnly")
+            .build();
+
+        let merged = merge_cookies(vec![stale], vec![fresh.clone()]);
+
+        assert_eq!(merged, vec![fresh]);
+    }
+
+    #[test]
+    fn merge_cookies_keeps_distinct_cookies_from_both_sides() {
+        let from_http = FakeCookie::new()
+            .with_origin("https://example.com")
+            .with_set_cookie("csrf=1")
+            .build();
+        let other_host = FakeCookie::new()
+            .with_origin("https://other.example.com")
+            .with_set_cookie("session=a")
+            .build();
+        let from_browser = FakeCookie::new()
+            .with_origin("https://example.com")
+            .with_set_cookie("session=b")
+            .build();
+
+        let merged = merge_cookies(
+            vec![from_http.clone(), other_host.clone()],
+            vec![from_browser.clone()],
+        );
+
+        assert_eq!(merged, vec![from_http, other_host, from_browser]);
+    }
     #[tokio::test]
     async fn run_loads_session_and_cookies_before_running_and_saves_them_after() {
         let loaded_cookie = FakeCookie::new().build();

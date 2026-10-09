@@ -1928,6 +1928,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "async-trait",
+ "cookie",
  "futures",
  "fyde-server",
  "hkdf 0.12.4",

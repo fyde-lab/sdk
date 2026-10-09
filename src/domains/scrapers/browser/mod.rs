@@ -7,6 +7,7 @@ use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
 
+use super::cookies::Cookie;
 use crate::Result;
 
 /// Drives a real, embedded webview (`wry`, windowed via `tao`) so a scraper
@@ -26,8 +27,10 @@ use crate::Result;
 /// same way `host::documents`'s tests mock `documents::Service` (see the
 /// sdk `CLAUDE.md`'s mockall testing convention).
 ///
-/// Unlike `session`/`cookies`, there's no persisted state here and no
-/// swappable storage backend — a fresh [`driver::BrowserDriver`] is built
+/// Unlike `session`/`cookies`, there's no swappable storage backend, and the
+/// only persisted state is cookies, which go through the `cookies`
+/// sub-domain (see [`init`]/[`Service::cookies`]) rather than any storage of
+/// this module's own — a fresh [`driver::BrowserDriver`] is built
 /// per scraper run (see `service.rs::run_script`), lives only for that
 /// run, and is torn down (its window closed, its dedicated OS thread
 /// joined) once the run's `Arc<dyn Service>` is dropped — see
@@ -95,6 +98,15 @@ pub(super) trait Service: Send + Sync {
     /// in flight at a time per driver (matching every scraper script's own
     /// single-threaded, one-step-at-a-time use of `fyde.browser`).
     async fn download(&self, selector: &str, timeout: Duration) -> Result<Vec<u8>>;
+
+    /// Returns every cookie the webview currently holds for a host in
+    /// `allowed_domains`, as [`Cookie`]s the `cookies` sub-domain can persist
+    /// — the counterpart of the saved cookies [`init`] seeds it with, so a
+    /// browser-driven login survives across runs the same way a `fyde.http`
+    /// one does. Every such cookie is host-only (see
+    /// `driver::to_webview_cookie` for why). Empty, without ever starting
+    /// the webview, if this run never used it.
+    async fn cookies(&self) -> Result<Vec<Cookie>>;
 }
 
 /// Builds the real, `wry`-backed browser service. Never fails on its own —
@@ -112,6 +124,18 @@ pub(super) trait Service: Send + Sync {
 /// is actually shown — off by default (see `driver::run_event_loop`), so a
 /// scraper run only pops up a real window when a caller explicitly asks to
 /// watch (or manually intervene in) its browser-driven flow.
-pub(super) fn init(allowed_domains: Arc<Vec<String>>, visible: bool) -> Arc<dyn Service> {
-    Arc::new(driver::BrowserDriver::new(allowed_domains, visible))
+///
+/// `cookies` (this scraper's saved cookie jar, see the `cookies`
+/// sub-domain) is loaded into the webview as soon as it starts, before
+/// anything navigates — see [`Service::cookies`] for the way back out.
+pub(super) fn init(
+    allowed_domains: Arc<Vec<String>>,
+    visible: bool,
+    cookies: Vec<Cookie>,
+) -> Arc<dyn Service> {
+    Arc::new(driver::BrowserDriver::new(
+        allowed_domains,
+        visible,
+        cookies,
+    ))
 }
