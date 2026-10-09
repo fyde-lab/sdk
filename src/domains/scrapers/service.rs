@@ -59,6 +59,7 @@ impl Service for ScrapersClient {
         wreq_emulation: bool,
         follow_redirects: bool,
         allowed_domains: Vec<String>,
+        browser_visible: bool,
     ) -> Result<()> {
         let cookies = self.cookies.load(name).await?;
         let session_data = self.session.load(name).await?;
@@ -89,6 +90,7 @@ impl Service for ScrapersClient {
                 wreq_emulation,
                 follow_redirects,
                 allowed_domains,
+                browser_visible,
             )
         })
         .await
@@ -143,6 +145,7 @@ fn run_script(
     wreq_emulation: bool,
     follow_redirects: bool,
     allowed_domains: Vec<String>,
+    browser_visible: bool,
 ) -> Result<(Value, Vec<Cookie>, Result<()>)> {
     let lua = sandboxed_lua().context("building sandboxed lua vm")?;
     // Built fresh per run, same as the Lua VM itself: there's no persisted
@@ -151,7 +154,7 @@ fn run_script(
     // only as long as this run does, closed via its `Drop` impl once every
     // `Arc` clone `host::install` handed to `fyde.browser`'s closures goes
     // out of scope at the end of this function.
-    let browser = super::browser::init(Arc::new(allowed_domains.clone()));
+    let browser = super::browser::init(Arc::new(allowed_domains.clone()), browser_visible);
     let installed = host::install(
         &lua,
         name,
@@ -321,6 +324,7 @@ mod tests {
                 true,
                 true,
                 Vec::new(),
+                false,
             )
             .await
             .unwrap();
@@ -354,6 +358,7 @@ mod tests {
                 true,
                 true,
                 Vec::new(),
+                false,
             )
             .await
             .unwrap();
@@ -384,7 +389,16 @@ mod tests {
         "#;
 
         let result = client
-            .run("didaxis", script, json!({}), false, true, true, Vec::new())
+            .run(
+                "didaxis",
+                script,
+                json!({}),
+                false,
+                true,
+                true,
+                Vec::new(),
+                false,
+            )
             .await;
 
         assert!(result.is_err());
@@ -423,7 +437,16 @@ mod tests {
         "#;
 
         client
-            .run("didaxis", script, json!({}), false, true, true, Vec::new())
+            .run(
+                "didaxis",
+                script,
+                json!({}),
+                false,
+                true,
+                true,
+                Vec::new(),
+                false,
+            )
             .await
             .unwrap();
 
@@ -462,6 +485,7 @@ mod tests {
                 true,
                 true,
                 Vec::new(),
+                false,
             )
             .await;
 
@@ -519,7 +543,16 @@ mod tests {
         "#;
 
         let result = client
-            .run("didaxis", script, json!({}), false, true, true, Vec::new())
+            .run(
+                "didaxis",
+                script,
+                json!({}),
+                false,
+                true,
+                true,
+                Vec::new(),
+                false,
+            )
             .await;
 
         assert!(result.is_err());
@@ -553,6 +586,7 @@ mod tests {
                 true,
                 true,
                 vec!["allowed.example.com".to_string()],
+                false,
             )
             .await;
 

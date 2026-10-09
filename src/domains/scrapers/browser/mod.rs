@@ -89,6 +89,11 @@ pub(super) trait Service: Send + Sync {
 /// submit that does a real navigation, a JS `location` change, a `target`
 /// attribute or `window.open` popup), via `driver::BrowserDriver`'s
 /// `with_navigation_handler`/`with_new_window_req_handler`.
-pub(super) fn init(allowed_domains: Arc<Vec<String>>) -> Arc<dyn Service> {
-    Arc::new(driver::BrowserDriver::new(allowed_domains))
+///
+/// `visible` toggles whether the window this run's webview is embedded in
+/// is actually shown — off by default (see `driver::run_event_loop`), so a
+/// scraper run only pops up a real window when a caller explicitly asks to
+/// watch (or manually intervene in) its browser-driven flow.
+pub(super) fn init(allowed_domains: Arc<Vec<String>>, visible: bool) -> Arc<dyn Service> {
+    Arc::new(driver::BrowserDriver::new(allowed_domains, visible))
 }

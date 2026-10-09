@@ -77,6 +77,13 @@ pub trait Service: Send + Sync {
     /// `run` call's own `Err`. An empty list means unrestricted — no
     /// scraper predates this parameter, but a caller that genuinely wants
     /// no restriction can still pass one.
+    ///
+    /// `browser_visible` toggles whether this run's `fyde.browser` webview
+    /// (see the private `browser` sub-domain) is shown as a real, visible
+    /// window instead of the invisible one it uses by default — useful for
+    /// watching, or manually intervening in, a script's browser-driven login
+    /// flow. Has no effect on a script that never calls `fyde.browser`,
+    /// since the window is only ever created lazily on first use.
     #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
@@ -87,6 +94,7 @@ pub trait Service: Send + Sync {
         wreq_emulation: bool,
         follow_redirects: bool,
         allowed_domains: Vec<String>,
+        browser_visible: bool,
     ) -> Result<()>;
 }
 

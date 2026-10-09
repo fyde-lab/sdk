@@ -58,14 +58,16 @@ pub(super) struct BrowserDriver {
     running: Mutex<Option<Running>>,
     next_id: AtomicU64,
     allowed_domains: Arc<Vec<String>>,
+    visible: bool,
 }
 
 impl BrowserDriver {
-    pub(super) fn new(allowed_domains: Arc<Vec<String>>) -> Self {
+    pub(super) fn new(allowed_domains: Arc<Vec<String>>, visible: bool) -> Self {
         Self {
             running: Mutex::new(None),
             next_id: AtomicU64::new(1),
             allowed_domains,
+            visible,
         }
     }
 
@@ -101,9 +103,10 @@ impl BrowserDriver {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<EventLoopProxy<Command>>>();
 
         let allowed_domains = self.allowed_domains.clone();
+        let visible = self.visible;
         let thread = std::thread::Builder::new()
             .name("fyde-browser".to_string())
-            .spawn(move || run_event_loop(pending_for_thread, ready_tx, allowed_domains))
+            .spawn(move || run_event_loop(pending_for_thread, ready_tx, allowed_domains, visible))
             .map_err(|err| Error::Browser(format!("failed to spawn browser thread: {err}")))?;
 
         // Block until the webview has actually been created (or failed to
@@ -230,6 +233,7 @@ fn run_event_loop(
     pending: PendingReplies,
     ready_tx: Sender<Result<EventLoopProxy<Command>>>,
     allowed_domains: Arc<Vec<String>>,
+    visible: bool,
 ) {
     let mut builder = EventLoopBuilder::<Command>::with_user_event();
     #[cfg(target_os = "linux")]
@@ -240,17 +244,22 @@ fn run_event_loop(
     let mut event_loop = builder.build();
     let proxy = event_loop.create_proxy();
 
-    let mut window_builder = WindowBuilder::new().with_visible(false);
+    let mut window_builder = WindowBuilder::new().with_visible(visible);
+    if visible {
+        window_builder = window_builder
+            .with_title("fyde scraper")
+            .with_inner_size(tao::dpi::LogicalSize::new(1200.0, 900.0));
+    }
     // tao packs a `gtk::Box` into the window by default (for its own GTK layout needs), which
     // leaves no room for `build_gtk` below to add the webview directly: `GtkApplicationWindow`
     // is a `GtkBin` subclass and can only ever hold one child, so the two conflict — observed
     // as a `Gtk-WARNING` and a webview that's constructed but never actually attached (so it
-    // never loads/renders anything, and every `wait_for` call just times out). wry's own docs
-    // for exactly this `build_gtk`-on-`window.gtk_window()` pattern note the same conflict and
-    // recommend packing a `gtk::Fixed` into that default box instead of disabling it — not done
-    // here since this window is never shown or sized (`with_visible(false)` above), so there's
-    // nothing for a `gtk::Fixed`'s layout behavior to do for us; disabling the box entirely is
-    // the simpler fix for a window that's just a headless host for the webview.
+    // never loads/renders anything, and every `wait_for` call just times out). This is
+    // structural (`GtkBin` only ever has room for one child), not about visibility, so it's
+    // disabled unconditionally — wry's own docs for exactly this `build_gtk`-on-
+    // `window.gtk_window()` pattern note the same conflict and recommend packing a `gtk::Fixed`
+    // into that default box instead of disabling it, but there's nothing for a `gtk::Fixed`'s
+    // layout behavior to do here since the webview is the window's only content either way.
     #[cfg(target_os = "linux")]
     {
         use tao::platform::unix::WindowBuilderExtUnix as _;
