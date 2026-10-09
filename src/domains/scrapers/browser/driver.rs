@@ -370,7 +370,11 @@ fn run_event_loop(
         // Doesn't see subresource loads (`fetch`/images/scripts/etc.),
         // which don't navigate anything; those aren't covered by this.
         .with_navigation_handler(move |url| {
-            is_navigation_allowed(&url, &navigation_allowed_domains)
+            let allowed = is_navigation_allowed(&url, &navigation_allowed_domains);
+            if !allowed {
+                tracing::warn!(%url, "browser navigation blocked by allowed_domains");
+            }
+            allowed
         })
         // Same check for a `window.open(...)`/`target="_blank"` popup,
         // which `with_navigation_handler` doesn't see since it isn't a
@@ -588,15 +592,21 @@ fn html_script(id: u64) -> String {
 /// `fyde.browser:open` guard does. An unparseable `url` is rejected rather
 /// than allowed — there's no host to check it against, so there's nothing
 /// to justify letting it through.
+///
+/// `about:blank`/`about:srcdoc` are the one hostless exception: pages
+/// routinely create such frames (e.g. Cloudflare Turnstile's widget does
+/// several), they never touch the network, and blocking them silently
+/// breaks whatever the page built them for.
 fn is_navigation_allowed(url: &str, allowed_domains: &[String]) -> bool {
-    url::Url::parse(url)
-        .ok()
-        .and_then(|parsed| {
-            parsed
-                .host_str()
-                .map(|host| is_host_allowed(host, allowed_domains))
-        })
-        .unwrap_or(false)
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() == "about" {
+        return matches!(parsed.path(), "blank" | "srcdoc");
+    }
+    parsed
+        .host_str()
+        .is_some_and(|host| is_host_allowed(host, allowed_domains))
 }
 
 /// A JS string literal safely encoding `value` — `serde_json`'s string
@@ -657,6 +667,14 @@ mod tests {
     fn is_navigation_allowed_rejects_an_unparseable_url() {
         let allowed = vec!["example.com".to_string()];
         assert!(!is_navigation_allowed("not a url", &allowed));
+    }
+
+    #[test]
+    fn is_navigation_allowed_accepts_about_blank_and_srcdoc_frames() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(is_navigation_allowed("about:blank", &allowed));
+        assert!(is_navigation_allowed("about:srcdoc", &allowed));
+        assert!(!is_navigation_allowed("about:config", &allowed));
     }
 
     #[test]
