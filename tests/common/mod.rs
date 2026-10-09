@@ -130,9 +130,11 @@ where
 }
 
 /// A username unique enough to never collide with another scenario's
-/// account, even though every scenario gets its own isolated server.
+/// account, even though every scenario gets its own isolated server. Kept
+/// within the server's `MAX_USERNAME_LEN` (32, see
+/// `../server/src/domains/users/models.rs`) — a full UUID would overflow it.
 pub fn random_username() -> String {
-    format!("e2e-test-user-{}", uuid::Uuid::new_v4())
+    format!("e2e-{}", &uuid::Uuid::new_v4().simple().to_string()[..24])
 }
 
 /// Builds a minimal, single-page PDF containing `text`, for tests that need
