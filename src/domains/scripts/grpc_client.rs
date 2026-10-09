@@ -89,7 +89,7 @@ pub(super) trait FydeClient: Send + Sync {
 /// [`crate::Client::init`]). Cloning a [`Channel`] is cheap — it's just a
 /// handle to the same underlying connection — so a fresh generated client
 /// is created per call. Every call is authenticated by attaching the
-/// session token currently persisted in settings (if any) as a bearer
+/// session token currently persisted in the secrets store (if any) as a bearer
 /// `authorization` header (see
 /// [`crate::domains::sessions::Service::authenticated_request`]).
 pub(super) struct GrpcClient {
@@ -367,12 +367,12 @@ mod tests {
 
     use super::*;
     use crate::Error;
-    use crate::domains::settings::MockService as MockSettingsService;
+    use crate::domains::secrets::MockService as MockSecretsService;
 
     fn sessions() -> Arc<SessionsClient> {
-        let mut settings = MockSettingsService::new();
-        settings.expect_get().returning(|_| Ok(None));
-        Arc::new(SessionsClient::new(Arc::new(settings)))
+        let mut secrets = MockSecretsService::new();
+        secrets.expect_get().returning(|_| Ok(None));
+        Arc::new(SessionsClient::new(Arc::new(secrets)))
     }
 
     #[tokio::test]

@@ -1,11 +1,11 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tonic::transport::Channel;
 
 use crate::domains::documents::Service as DocumentsService;
-#[cfg(test)]
-use crate::domains::sessions::SESSION_TOKEN_SETTING;
+use crate::domains::secrets::{MASTER_KEY_SECRET, Service as SecretsService};
 use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
 use crate::sql::LocalDatabase;
@@ -16,10 +16,13 @@ use super::crypto::{
     wrap_master_key,
 };
 use super::grpc_client::{FydeClient, GrpcClient};
-use super::{
-    LANGUAGE_SETTING, MASTER_KEY_SETTING, ROLE_SETTING, Role, Service, decode_master_key,
-    encode_master_key,
-};
+use super::{LANGUAGE_SETTING, ROLE_SETTING, Role, Service, decode_master_key, encode_master_key};
+
+/// How long `logout` waits for the server to acknowledge closing the
+/// session before giving up on it and clearing local state anyway — an
+/// unreachable server must not leave `logout` (and the account's keys on
+/// this device) hanging on a TCP connect timeout.
+const SERVER_LOGOUT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The device's preferred interface language as a short code (e.g. "en",
 /// "fr"), read from the `LC_ALL`/`LC_MESSAGES`/`LANG` environment variables
@@ -40,9 +43,9 @@ fn system_language() -> String {
 
 /// A client for the fyde server's users service. Persists the session
 /// token opened by the most recent `create`/`login` call via
-/// [`SessionsClient::save_new_session`] under
-/// [`crate::domains::sessions::SESSION_TOKEN_SETTING`],
-/// read back from there by every other service's gRPC transport (via
+/// [`SessionsClient::save_new_session`] (under
+/// [`crate::domains::secrets::SESSION_TOKEN_SECRET`]), read back from there
+/// by every other service's gRPC transport (via
 /// [`crate::domains::sessions::Service::authenticated_request`]) to
 /// authenticate its own calls, so [`Service::logout`] doesn't need a token
 /// passed in.
@@ -50,6 +53,7 @@ pub struct UsersClient {
     grpc: Box<dyn FydeClient>,
     opaque: Box<dyn OpaqueClient>,
     settings: Arc<dyn SettingsService>,
+    secrets: Arc<dyn SecretsService>,
     sessions: Arc<SessionsClient>,
     local_db: Arc<dyn LocalDatabase>,
     documents: Arc<dyn DocumentsService>,
@@ -57,14 +61,15 @@ pub struct UsersClient {
 
 impl UsersClient {
     /// Creates a client for the users service using the shared `channel`
-    /// connection to the fyde server, persisting newly created accounts'
-    /// master keys in `settings`, the session token and authenticating
-    /// outgoing calls via `sessions`, wiping `local_db` on `logout`, and
-    /// starting/stopping changelog consumption on `documents` from
-    /// `create`/`login`/`logout`.
+    /// connection to the fyde server, persisting the account's master key
+    /// in `secrets` and its role in `settings`, the session token and
+    /// authenticating outgoing calls via `sessions`, clearing `secrets` and
+    /// wiping `local_db` on `logout`, and starting/stopping changelog
+    /// consumption on `documents` from `create`/`login`/`logout`.
     pub(super) async fn new(
         channel: Channel,
         settings: Arc<dyn SettingsService>,
+        secrets: Arc<dyn SecretsService>,
         sessions: Arc<SessionsClient>,
         local_db: Arc<dyn LocalDatabase>,
         documents: Arc<dyn DocumentsService>,
@@ -73,6 +78,7 @@ impl UsersClient {
             grpc: Box::new(GrpcClient::new(channel, sessions.clone())),
             opaque: Box::new(DefaultOpaqueClient),
             settings,
+            secrets,
             sessions,
             local_db,
             documents,
@@ -88,7 +94,7 @@ impl UsersClient {
         grpc: impl FydeClient + 'static,
         opaque: impl OpaqueClient + 'static,
         settings: Arc<dyn SettingsService>,
-        sessions: Arc<SessionsClient>,
+        secrets: Arc<dyn SecretsService>,
         local_db: Arc<dyn LocalDatabase>,
         documents: Arc<dyn DocumentsService>,
     ) -> Self {
@@ -96,16 +102,55 @@ impl UsersClient {
             grpc: Box::new(grpc),
             opaque: Box::new(opaque),
             settings,
-            sessions,
+            sessions: Arc::new(SessionsClient::new(secrets.clone())),
+            secrets,
             local_db,
             documents,
         }
+    }
+
+    /// Fails with [`Error::AlreadyLoggedIn`] if a session is already open on
+    /// this device. Checked by `create`/`login` before anything else: the
+    /// local cache isn't partitioned per account, so opening a second
+    /// account's session on top of the first would hand it the first
+    /// account's cached documents, changelog cursor and scraper cookies.
+    async fn ensure_no_open_session(&self) -> Result<()> {
+        if self.sessions.is_connected().await? {
+            return Err(Error::AlreadyLoggedIn);
+        }
+        Ok(())
+    }
+
+    /// Persists everything a freshly opened session needs locally, then
+    /// starts changelog consumption. The session token goes last: it's what
+    /// `is_connected` (and so `Client::init` on the next start) keys off, so
+    /// a failure partway through never leaves a session that looks open but
+    /// has no master key to decrypt anything with.
+    async fn open_session(&self, token: &str, raw_master_key: &[u8], role: Role) -> Result<()> {
+        self.secrets
+            .set(MASTER_KEY_SECRET, &encode_master_key(raw_master_key)?)
+            .await
+            .context("failed to persist master key")?;
+
+        self.settings
+            .set(ROLE_SETTING, &role.to_string())
+            .await
+            .context("failed to persist role")?;
+
+        self.sessions.save_new_session(token).await?;
+
+        self.documents
+            .start_sync()
+            .await
+            .context("failed to start changelog sync")
     }
 }
 
 #[async_trait]
 impl Service for UsersClient {
     async fn create(&self, username: &str, password: &str, device_name: &str) -> Result<String> {
+        self.ensure_no_open_session().await?;
+
         let (state, opaque_request) = self
             .opaque
             .start_registration(password)
@@ -137,27 +182,14 @@ impl Service for UsersClient {
             .await
             .context("failed to finish registration")?;
 
-        self.sessions.save_new_session(&token).await?;
-
-        self.settings
-            .set(MASTER_KEY_SETTING, &encode_master_key(&raw_master_key)?)
-            .await
-            .context("failed to persist master key")?;
-
-        self.settings
-            .set(ROLE_SETTING, &role.to_string())
-            .await
-            .context("failed to persist role")?;
-
-        self.documents
-            .start_sync()
-            .await
-            .context("failed to start changelog sync")?;
+        self.open_session(&token, &raw_master_key, role).await?;
 
         Ok(token)
     }
 
     async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String> {
+        self.ensure_no_open_session().await?;
+
         let (state, opaque_request) = self
             .opaque
             .start_login(password)
@@ -180,28 +212,13 @@ impl Service for UsersClient {
             .await
             .context("failed to log in")?;
 
-        self.sessions.save_new_session(&token).await?;
-
         let wrapped_master_key = String::from_utf8(encrypted_master_key)
             .map_err(|_| Error::Encryption("server returned a non-UTF-8 master key".into()))
             .context("failed to decode master key returned by the server")?;
         let raw_master_key = unwrap_master_key(&export_key, &wrapped_master_key)
             .context("failed to unwrap master key returned by the server")?;
 
-        self.settings
-            .set(MASTER_KEY_SETTING, &encode_master_key(&raw_master_key)?)
-            .await
-            .context("failed to persist master key")?;
-
-        self.settings
-            .set(ROLE_SETTING, &role.to_string())
-            .await
-            .context("failed to persist role")?;
-
-        self.documents
-            .start_sync()
-            .await
-            .context("failed to start changelog sync")?;
+        self.open_session(&token, &raw_master_key, role).await?;
 
         Ok(token)
     }
@@ -213,14 +230,32 @@ impl Service for UsersClient {
 
         self.documents.stop_sync();
 
-        self.grpc.logout().await.context("failed to log out")?;
+        // Needs the session token, so it goes before local state is
+        // cleared — but its outcome must not decide whether local state is
+        // cleared at all.
+        match tokio::time::timeout(SERVER_LOGOUT_TIMEOUT, self.grpc.logout()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!("server-side logout failed, clearing local state anyway: {err}")
+            }
+            Err(_) => tracing::warn!(
+                "server-side logout timed out after {SERVER_LOGOUT_TIMEOUT:?}, clearing local state anyway"
+            ),
+        }
 
-        self.local_db
+        // Both always run, so a failure in one never leaves the other's data
+        // behind.
+        let cleared = self
+            .secrets
+            .clear()
+            .await
+            .context("failed to clear secrets");
+        let wiped = self
+            .local_db
             .wipe()
             .await
-            .context("failed to wipe local database")?;
-
-        Ok(())
+            .context("failed to wipe local database");
+        cleared.and(wiped)
     }
 
     async fn change_password(
@@ -235,8 +270,8 @@ impl Service for UsersClient {
         // envelope, without a round trip to the server's `FinishLogin` —
         // so this never opens a session, unlike a real `login()` call. The
         // resulting export key isn't needed for anything else: the master
-        // key is read back raw from local settings below, not decrypted
-        // from a wrapped form that would need it.
+        // key is read back raw from the credential store below, not
+        // decrypted from a wrapped form that would need it.
         let (login_state, login_request) = self
             .opaque
             .start_login(old_password)
@@ -267,13 +302,13 @@ impl Service for UsersClient {
             .context("failed to finish OPAQUE registration")?;
 
         let raw_master_key = self
-            .settings
-            .get(MASTER_KEY_SETTING)
+            .secrets
+            .get(MASTER_KEY_SECRET)
             .await
             .context("failed to read current master key")?
             .ok_or_else(|| {
                 Error::Encryption(
-                    "no master key found in local settings; log in or create an account first"
+                    "no master key found in the credential store; log in or create an account first"
                         .into(),
                 )
             })
@@ -327,6 +362,7 @@ mod tests {
     use super::super::crypto::{MockOpaqueClient, fake_login_state, fake_registration_state};
     use super::super::grpc_client::MockFydeClient;
     use super::*;
+    use crate::domains::secrets::{MockService as MockSecretsService, SESSION_TOKEN_SECRET};
     use crate::domains::settings::MockService as MockSettingsService;
     use crate::sql::MockLocalDatabase;
 
@@ -334,17 +370,14 @@ mod tests {
         grpc: impl FydeClient + 'static,
         opaque: impl OpaqueClient + 'static,
         settings: MockSettingsService,
+        secrets: MockSecretsService,
     ) -> UsersClient {
-        let settings: Arc<dyn SettingsService> = Arc::new(settings);
-        let sessions = Arc::new(SessionsClient::new(settings.clone()));
-        let mut local_db = MockLocalDatabase::new();
-        local_db.expect_wipe().returning(|| Ok(()));
         UsersClient::with_deps(
             grpc,
             opaque,
-            settings,
-            sessions,
-            Arc::new(local_db),
+            Arc::new(settings),
+            Arc::new(secrets),
+            Arc::new(MockLocalDatabase::new()),
             Arc::new(RecordingDocuments::default()),
         )
     }
@@ -476,14 +509,20 @@ mod tests {
             .returning(|_, _, _, _, _| Ok(("a-token".to_string(), Role::User)));
 
         let mut settings = MockSettingsService::new();
-        settings
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
+        secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .withf(|key, _| key == SESSION_TOKEN_SECRET)
             .times(1)
             .returning(|_, _| Ok(()));
-        settings
+        secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .withf(|key, _| key == MASTER_KEY_SECRET)
             .times(1)
             .returning(|_, _| Ok(()));
         settings
@@ -492,7 +531,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_deps(mock_grpc, opaque, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         let token = client
             .create("alice", "correct horse battery staple", "Pierre's iPhone")
@@ -523,14 +562,20 @@ mod tests {
 
         let persisted_master_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let mut settings = MockSettingsService::new();
-        settings
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
+        secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .withf(|key, _| key == SESSION_TOKEN_SECRET)
             .returning(|_, _| Ok(()));
         let set_master_key = persisted_master_key.clone();
-        settings
+        secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .withf(|key, _| key == MASTER_KEY_SECRET)
             .times(1)
             .returning(move |_, value| {
                 *set_master_key.lock().unwrap() = Some(value.to_string());
@@ -542,7 +587,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_deps(mock_grpc, opaque, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
         client
             .create("alice", "correct horse battery staple", "device")
             .await
@@ -550,7 +595,7 @@ mod tests {
 
         // What's sent to the server is the *wrapped* form (opaque to it);
         // what's persisted locally is the *raw* key underneath — never the
-        // wrapped form itself (see `MASTER_KEY_SETTING`'s doc). Unwrapping
+        // wrapped form itself (see `MASTER_KEY_SECRET`'s doc). Unwrapping
         // the sent bytes under the export key `opaque_for_create` produced
         // must yield exactly what was persisted.
         let sent = sent_master_key.lock().unwrap().clone().unwrap();
@@ -565,7 +610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_persists_an_encrypted_master_key_in_settings() {
+    async fn create_persists_an_encrypted_master_key_in_the_credential_store() {
         let opaque = opaque_for_create(b"the-request", b"the-upload", b"the-export-key");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
@@ -580,15 +625,21 @@ mod tests {
         let persisted_master_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let mut settings = MockSettingsService::new();
-        settings
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
+        secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .withf(|key, _| key == SESSION_TOKEN_SECRET)
             .times(1)
             .returning(|_, _| Ok(()));
         let set_master_key = persisted_master_key.clone();
-        settings
+        secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .withf(|key, _| key == MASTER_KEY_SECRET)
             .times(1)
             .returning(move |_, value| {
                 *set_master_key.lock().unwrap() = Some(value.to_string());
@@ -600,7 +651,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_deps(mock_grpc, opaque, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         client
             .create("alice", "correct horse battery staple", "Pierre's iPhone")
@@ -617,7 +668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_persists_the_session_token_in_settings() {
+    async fn create_persists_the_session_token_in_the_credential_store() {
         let opaque = opaque_for_create(b"the-request", b"the-upload", b"the-export-key");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
@@ -627,23 +678,29 @@ mod tests {
             .expect_finish_registration()
             .returning(|_, _, _, _, _| Ok(("a-token".to_string(), Role::User)));
 
-        // Captures what `create` persists under `SESSION_TOKEN_SETTING` so
+        // Captures what `create` persists under `SESSION_TOKEN_SECRET` so
         // it can be read back and asserted on below.
         let persisted_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let mut settings = MockSettingsService::new();
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
         let set_token = persisted_token.clone();
-        settings
+        secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .withf(|key, _| key == SESSION_TOKEN_SECRET)
             .times(1)
             .returning(move |_, value| {
                 *set_token.lock().unwrap() = Some(value.to_string());
                 Ok(())
             });
-        settings
+        secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .withf(|key, _| key == MASTER_KEY_SECRET)
             .times(1)
             .returning(|_, _| Ok(()));
         settings
@@ -652,7 +709,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_deps(mock_grpc, opaque, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         client
             .create("alice", "correct horse battery staple", "Pierre's iPhone")
@@ -683,14 +740,20 @@ mod tests {
             .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
 
         let mut settings = MockSettingsService::new();
-        settings
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
+        secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .withf(|key, _| key == SESSION_TOKEN_SECRET)
             .times(1)
             .returning(|_, _| Ok(()));
-        settings
+        secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .withf(|key, _| key == MASTER_KEY_SECRET)
             .times(1)
             .returning(|_, _| Ok(()));
         settings
@@ -699,7 +762,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_deps(mock_grpc, opaque, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         let token = client
             .login("alice", "correct horse battery staple", "Pierre's iPhone")
@@ -710,7 +773,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_persists_the_session_token_in_settings() {
+    async fn login_persists_the_session_token_in_the_credential_store() {
         let opaque = opaque_for_login(b"the-request", b"the-upload");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
@@ -723,18 +786,24 @@ mod tests {
         let persisted_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let mut settings = MockSettingsService::new();
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
         let set_token = persisted_token.clone();
-        settings
+        secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .withf(|key, _| key == SESSION_TOKEN_SECRET)
             .times(1)
             .returning(move |_, value| {
                 *set_token.lock().unwrap() = Some(value.to_string());
                 Ok(())
             });
-        settings
+        secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .withf(|key, _| key == MASTER_KEY_SECRET)
             .times(1)
             .returning(|_, _| Ok(()));
         settings
@@ -743,7 +812,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_deps(mock_grpc, opaque, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         client
             .login("alice", "correct horse battery staple", "device")
@@ -776,14 +845,20 @@ mod tests {
         let persisted_master_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let mut settings = MockSettingsService::new();
-        settings
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
+        secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SETTING)
+            .withf(|key, _| key == SESSION_TOKEN_SECRET)
             .returning(|_, _| Ok(()));
         let set_master_key = persisted_master_key.clone();
-        settings
+        secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SETTING)
+            .withf(|key, _| key == MASTER_KEY_SECRET)
             .times(1)
             .returning(move |_, value| {
                 *set_master_key.lock().unwrap() = Some(value.to_string());
@@ -795,7 +870,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_deps(mock_grpc, opaque, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         client
             .login("alice", "correct horse battery staple", "device")
@@ -805,7 +880,7 @@ mod tests {
         // What the server returned is the *wrapped* form; what must be
         // persisted locally is the raw key underneath it, unwrapped under
         // the login's export key — never the wrapped form itself (see
-        // `MASTER_KEY_SETTING`'s doc).
+        // `MASTER_KEY_SECRET`'s doc).
         let expected_raw = super::super::crypto::unwrap_master_key(
             LOGIN_EXPORT_KEY,
             &String::from_utf8(wrapped_master_key).unwrap(),
@@ -815,245 +890,176 @@ mod tests {
         assert_eq!(decode_master_key(&persisted).unwrap(), expected_raw);
     }
 
+    /// A [`MockSecretsService`] reporting a session as already open, the
+    /// state `logout` acts on and `create`/`login` refuse to run in.
+    fn secrets_with_open_session() -> MockSecretsService {
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .returning(|_| Ok(Some("a-token".to_string())));
+        secrets
+    }
+
     #[tokio::test]
-    async fn logout_closes_the_session_opened_by_login() {
+    async fn create_refuses_without_contacting_the_server_while_a_session_is_open() {
+        // No `MockOpaqueClient`/`MockFydeClient` expectations set up: either
+        // panics if called, proving nothing happens before the check.
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            secrets_with_open_session(),
+        );
+
+        let err = client
+            .create("bob", "correct horse battery staple", "device")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::AlreadyLoggedIn));
+    }
+
+    #[tokio::test]
+    async fn login_refuses_without_contacting_the_server_while_a_session_is_open() {
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            secrets_with_open_session(),
+        );
+
+        let err = client
+            .login("bob", "correct horse battery staple", "device")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::AlreadyLoggedIn));
+    }
+
+    #[tokio::test]
+    async fn login_persists_nothing_when_the_returned_master_key_cannot_be_unwrapped() {
         let opaque = opaque_for_login(b"the-request", b"the-upload");
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_start_login()
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
-        mock_grpc
-            .expect_finish_login()
-            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
-        mock_grpc.expect_logout().times(1).returning(|| Ok(()));
+        mock_grpc.expect_finish_login().returning(|_, _, _| {
+            Ok((
+                "a-token".to_string(),
+                b"not a wrapped master key".to_vec(),
+                Role::User,
+            ))
+        });
 
-        let mut settings = MockSettingsService::new();
-        settings
-            .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SETTING)
-            .returning(|_, _| Ok(()));
-        settings
-            .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SETTING)
-            .returning(|_, _| Ok(()));
-        settings
-            .expect_set()
-            .withf(|key, _| key == ROLE_SETTING)
-            .returning(|_, _| Ok(()));
-        settings
+        // No `expect_set()` on either mock: the mock panics if `login`
+        // persists anything — in particular the session token, which would
+        // otherwise leave a session that looks open but can't decrypt.
+        let mut secrets = MockSecretsService::new();
+        secrets
             .expect_get()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
-            .times(1)
-            .returning(|_| Ok(Some("a-token".to_string())));
-
-        let client = client_with_deps(mock_grpc, opaque, settings);
-        client
-            .login("alice", "correct horse battery staple", "device")
-            .await
-            .unwrap();
-
-        client.logout().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn logout_is_a_no_op_without_an_open_session() {
-        // No `expect_logout()` set up: the mock panics if it's called.
-        let mock_grpc = MockFydeClient::new();
-        let opaque = MockOpaqueClient::new();
-
-        let mut settings = MockSettingsService::new();
-        settings
-            .expect_get()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .withf(|key| key == SESSION_TOKEN_SECRET)
             .times(1)
             .returning(|_| Ok(None));
 
-        let client = client_with_deps(mock_grpc, opaque, settings);
+        let client = client_with_deps(mock_grpc, opaque, MockSettingsService::new(), secrets);
 
-        client.logout().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn logout_forgets_the_session_token_once_used() {
-        let opaque = opaque_for_login(b"the-request", b"the-upload");
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc
-            .expect_start_login()
-            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
-        mock_grpc
-            .expect_finish_login()
-            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
-        mock_grpc.expect_logout().times(1).returning(|| Ok(()));
-
-        let mut settings = MockSettingsService::new();
-        settings
-            .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SETTING)
-            .returning(|_, _| Ok(()));
-        settings
-            .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SETTING)
-            .returning(|_, _| Ok(()));
-        settings
-            .expect_set()
-            .withf(|key, _| key == ROLE_SETTING)
-            .returning(|_, _| Ok(()));
-        // Mockall checks the most-recently-defined expectation first, so
-        // this "already gone" expectation (defined first, checked last)
-        // matches the second `logout()` call, once the "still open" one
-        // below has been used up by the first.
-        settings
-            .expect_get()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
-            .times(1)
-            .returning(|_| Ok(None));
-        settings
-            .expect_get()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
-            .times(1)
-            .returning(|_| Ok(Some("a-token".to_string())));
-
-        let client = client_with_deps(mock_grpc, opaque, settings);
         client
             .login("alice", "correct horse battery staple", "device")
             .await
-            .unwrap();
-
-        client.logout().await.unwrap();
-        client.logout().await.unwrap();
+            .unwrap_err();
     }
 
     #[tokio::test]
-    async fn logout_wipes_the_local_database() {
+    async fn logout_closes_the_server_session_and_clears_local_state() {
         let mut mock_grpc = MockFydeClient::new();
-        mock_grpc
-            .expect_start_login()
-            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
-        mock_grpc
-            .expect_finish_login()
-            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
         mock_grpc.expect_logout().times(1).returning(|| Ok(()));
 
-        let mut settings = MockSettingsService::new();
-        settings
-            .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SETTING)
-            .returning(|_, _| Ok(()));
-        settings
-            .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SETTING)
-            .returning(|_, _| Ok(()));
-        settings
-            .expect_set()
-            .withf(|key, _| key == ROLE_SETTING)
-            .returning(|_, _| Ok(()));
-        settings
-            .expect_get()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
-            .returning(|_| Ok(Some("a-token".to_string())));
-        let settings: Arc<dyn SettingsService> = Arc::new(settings);
-        let sessions = Arc::new(SessionsClient::new(settings.clone()));
-
+        let mut secrets = secrets_with_open_session();
+        secrets.expect_clear().times(1).returning(|| Ok(()));
         let mut local_db = MockLocalDatabase::new();
         local_db.expect_wipe().times(1).returning(|| Ok(()));
 
         let client = UsersClient::with_deps(
             mock_grpc,
-            opaque_for_login(b"the-request", b"the-upload"),
-            settings,
-            sessions,
+            MockOpaqueClient::new(),
+            Arc::new(MockSettingsService::new()),
+            Arc::new(secrets),
             Arc::new(local_db),
             Arc::new(RecordingDocuments::default()),
         );
-        client
-            .login("alice", "correct horse battery staple", "device")
-            .await
-            .unwrap();
 
         client.logout().await.unwrap();
     }
 
     #[tokio::test]
-    async fn logout_stops_a_running_sync() {
+    async fn logout_clears_local_state_even_if_the_server_rejects_it() {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
-            .expect_start_login()
-            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
-        mock_grpc
-            .expect_finish_login()
-            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
-        mock_grpc.expect_logout().times(1).returning(|| Ok(()));
+            .expect_logout()
+            .times(1)
+            .returning(|| Err(Error::Grpc(tonic::Status::unavailable("server down"))));
 
-        let mut settings = MockSettingsService::new();
-        settings
-            .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SETTING)
-            .returning(|_, _| Ok(()));
-        settings
-            .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SETTING)
-            .returning(|_, _| Ok(()));
-        settings
-            .expect_set()
-            .withf(|key, _| key == ROLE_SETTING)
-            .returning(|_, _| Ok(()));
-        settings
-            .expect_get()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
-            .returning(|_| Ok(Some("a-token".to_string())));
-        let settings: Arc<dyn SettingsService> = Arc::new(settings);
-        let sessions = Arc::new(SessionsClient::new(settings.clone()));
-
+        let mut secrets = secrets_with_open_session();
+        secrets.expect_clear().times(1).returning(|| Ok(()));
         let mut local_db = MockLocalDatabase::new();
-        local_db.expect_wipe().returning(|| Ok(()));
-
-        let documents = Arc::new(RecordingDocuments::default());
+        local_db.expect_wipe().times(1).returning(|| Ok(()));
 
         let client = UsersClient::with_deps(
             mock_grpc,
-            opaque_for_login(b"the-request", b"the-upload"),
-            settings,
-            sessions,
+            MockOpaqueClient::new(),
+            Arc::new(MockSettingsService::new()),
+            Arc::new(secrets),
             Arc::new(local_db),
-            documents.clone(),
+            Arc::new(RecordingDocuments::default()),
         );
-        client
-            .login("alice", "correct horse battery staple", "device")
-            .await
-            .unwrap();
 
         client.logout().await.unwrap();
-
-        assert!(
-            documents
-                .stop_sync_called
-                .load(std::sync::atomic::Ordering::SeqCst)
-        );
     }
 
     #[tokio::test]
-    async fn logout_does_not_stop_sync_without_an_open_session() {
-        let mock_grpc = MockFydeClient::new();
-        let opaque = MockOpaqueClient::new();
+    async fn logout_still_wipes_the_local_database_if_clearing_secrets_fails() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_logout().returning(|| Ok(()));
 
-        let mut settings = MockSettingsService::new();
-        settings
-            .expect_get()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
+        let mut secrets = secrets_with_open_session();
+        secrets
+            .expect_clear()
             .times(1)
-            .returning(|_| Ok(None));
-        let settings: Arc<dyn SettingsService> = Arc::new(settings);
-        let sessions = Arc::new(SessionsClient::new(settings.clone()));
+            .returning(|| Err(Error::Encryption("keychain locked".into())));
         let mut local_db = MockLocalDatabase::new();
-        local_db.expect_wipe().returning(|| Ok(()));
-        let documents = Arc::new(RecordingDocuments::default());
+        local_db.expect_wipe().times(1).returning(|| Ok(()));
 
         let client = UsersClient::with_deps(
             mock_grpc,
-            opaque,
-            settings,
-            sessions,
+            MockOpaqueClient::new(),
+            Arc::new(MockSettingsService::new()),
+            Arc::new(secrets),
             Arc::new(local_db),
+            Arc::new(RecordingDocuments::default()),
+        );
+
+        assert!(client.logout().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn logout_is_a_no_op_without_an_open_session() {
+        // No `expect_logout()`/`expect_clear()`/`expect_wipe()` set up: each
+        // mock panics if called.
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
+        let documents = Arc::new(RecordingDocuments::default());
+
+        let client = UsersClient::with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            Arc::new(MockSettingsService::new()),
+            Arc::new(secrets),
+            Arc::new(MockLocalDatabase::new()),
             documents.clone(),
         );
 
@@ -1061,6 +1067,35 @@ mod tests {
 
         assert!(
             !documents
+                .stop_sync_called
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_stops_a_running_sync() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_logout().returning(|| Ok(()));
+
+        let mut secrets = secrets_with_open_session();
+        secrets.expect_clear().returning(|| Ok(()));
+        let mut local_db = MockLocalDatabase::new();
+        local_db.expect_wipe().returning(|| Ok(()));
+        let documents = Arc::new(RecordingDocuments::default());
+
+        let client = UsersClient::with_deps(
+            mock_grpc,
+            MockOpaqueClient::new(),
+            Arc::new(MockSettingsService::new()),
+            Arc::new(secrets),
+            Arc::new(local_db),
+            documents.clone(),
+        );
+
+        client.logout().await.unwrap();
+
+        assert!(
+            documents
                 .stop_sync_called
                 .load(std::sync::atomic::Ordering::SeqCst)
         );
@@ -1113,7 +1148,7 @@ mod tests {
 
         // Captures what `change_password` sends the server as the new
         // `encrypted_master_key`, so it can be checked against the raw key
-        // read back from local settings below.
+        // read back from the credential store below.
         let sent_master_key: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
         let capture = sent_master_key.clone();
         mock_grpc
@@ -1128,18 +1163,19 @@ mod tests {
         let raw_master_key = b"the-raw-master-key--------------".to_vec();
         let encoded_master_key = encode_master_key(&raw_master_key).unwrap();
 
-        let mut settings = MockSettingsService::new();
-        settings
+        let settings = MockSettingsService::new();
+        let mut secrets = MockSecretsService::new();
+        secrets
             .expect_get()
-            .withf(|key| key == MASTER_KEY_SETTING)
+            .withf(|key| key == MASTER_KEY_SECRET)
             .times(1)
             .returning(move |_| Ok(Some(encoded_master_key.clone())));
         // No `expect_set()` set up: the mock panics if it's called, proving
-        // `change_password` never touches local settings — the raw key it
+        // `change_password` never rewrites the master key — the raw key it
         // already cached stays untouched, since only what protects it
         // server-side changes.
 
-        let client = client_with_deps(mock_grpc, opaque, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         client
             .change_password("alice", "old password", "new password")
@@ -1177,7 +1213,8 @@ mod tests {
         // set up either: the mock panics if either is called.
 
         let settings = MockSettingsService::new();
-        let client = client_with_deps(mock_grpc, opaque, settings);
+        let secrets = MockSecretsService::new();
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         let err = client
             .change_password("alice", "wrong password", "new password")
@@ -1188,7 +1225,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn change_password_fails_without_a_master_key_in_settings() {
+    async fn change_password_fails_without_a_master_key_in_the_credential_store() {
         let opaque = opaque_for_change_password();
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
@@ -1203,14 +1240,15 @@ mod tests {
         // it's called, proving a missing local master key is caught before
         // ever sending the new registration record to the server.
 
-        let mut settings = MockSettingsService::new();
-        settings
+        let settings = MockSettingsService::new();
+        let mut secrets = MockSecretsService::new();
+        secrets
             .expect_get()
-            .withf(|key| key == MASTER_KEY_SETTING)
+            .withf(|key| key == MASTER_KEY_SECRET)
             .times(1)
             .returning(|_| Ok(None));
 
-        let client = client_with_deps(mock_grpc, opaque, settings);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         let err = client
             .change_password("alice", "old password", "new password")
@@ -1223,13 +1261,19 @@ mod tests {
     #[tokio::test]
     async fn set_language_persists_it_under_language_setting() {
         let mut settings = MockSettingsService::new();
+        let secrets = MockSecretsService::new();
         settings
             .expect_set()
             .withf(|key, value| key == LANGUAGE_SETTING && value == "fr")
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_deps(MockFydeClient::new(), MockOpaqueClient::new(), settings);
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            settings,
+            secrets,
+        );
 
         client.set_language("fr").await.unwrap();
     }
@@ -1237,13 +1281,19 @@ mod tests {
     #[tokio::test]
     async fn get_language_returns_the_persisted_value() {
         let mut settings = MockSettingsService::new();
+        let secrets = MockSecretsService::new();
         settings
             .expect_get()
             .withf(|key| key == LANGUAGE_SETTING)
             .times(1)
             .returning(|_| Ok(Some("fr".to_string())));
 
-        let client = client_with_deps(MockFydeClient::new(), MockOpaqueClient::new(), settings);
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            settings,
+            secrets,
+        );
 
         assert_eq!(client.get_language().await.unwrap(), Some("fr".to_string()));
     }
@@ -1251,13 +1301,19 @@ mod tests {
     #[tokio::test]
     async fn get_language_returns_none_when_never_set() {
         let mut settings = MockSettingsService::new();
+        let secrets = MockSecretsService::new();
         settings
             .expect_get()
             .withf(|key| key == LANGUAGE_SETTING)
             .times(1)
             .returning(|_| Ok(None));
 
-        let client = client_with_deps(MockFydeClient::new(), MockOpaqueClient::new(), settings);
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            settings,
+            secrets,
+        );
 
         assert_eq!(client.get_language().await.unwrap(), None);
     }
@@ -1265,13 +1321,19 @@ mod tests {
     #[tokio::test]
     async fn role_returns_the_cached_value() {
         let mut settings = MockSettingsService::new();
+        let secrets = MockSecretsService::new();
         settings
             .expect_get()
             .withf(|key| key == ROLE_SETTING)
             .times(1)
             .returning(|_| Ok(Some("admin".to_string())));
 
-        let client = client_with_deps(MockFydeClient::new(), MockOpaqueClient::new(), settings);
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            settings,
+            secrets,
+        );
 
         assert_eq!(client.role().await.unwrap(), Some(Role::Admin));
     }
@@ -1279,13 +1341,19 @@ mod tests {
     #[tokio::test]
     async fn role_returns_none_when_never_set() {
         let mut settings = MockSettingsService::new();
+        let secrets = MockSecretsService::new();
         settings
             .expect_get()
             .withf(|key| key == ROLE_SETTING)
             .times(1)
             .returning(|_| Ok(None));
 
-        let client = client_with_deps(MockFydeClient::new(), MockOpaqueClient::new(), settings);
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            settings,
+            secrets,
+        );
 
         assert_eq!(client.role().await.unwrap(), None);
     }

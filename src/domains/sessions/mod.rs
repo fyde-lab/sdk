@@ -7,24 +7,21 @@ use async_trait::async_trait;
 use mockall::automock;
 
 use crate::Result;
-use crate::domains::settings::Service as SettingsService;
+use crate::domains::secrets::Service as SecretsService;
 
 pub(crate) use service::SessionsClient;
-
-/// The settings key under which the session token opened by the most
-/// recent `users::Service::create`/`login` call is persisted.
-pub(crate) const SESSION_TOKEN_SETTING: &str = "session_token";
 
 /// Session-token attachment, shared by every service's gRPC transport so
 /// authenticated calls attach it automatically. The token itself has no
 /// in-memory copy: it is the one persisted by
-/// `users::Service::create`/`login` in the settings store, so a session
-/// survives across process restarts without extra plumbing.
+/// `users::Service::create`/`login` in the secrets store (under
+/// [`crate::domains::secrets::SESSION_TOKEN_SECRET`]), so a session survives
+/// across process restarts without extra plumbing.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(crate) trait Service: Send + Sync {
     /// Builds a tonic request for `message`, attaching the session token
-    /// currently persisted in settings (if any) as a `Bearer`
+    /// currently persisted in the secrets store (if any) as a `Bearer`
     /// `authorization` header. Calls made before any session is opened
     /// (e.g. `CreateUser`/`Login` themselves) go out unauthenticated, since
     /// there is nothing to attach yet.
@@ -40,17 +37,17 @@ pub(crate) trait Service: Send + Sync {
     async fn save_new_session(&self, token: &str) -> Result<()>;
 
     /// Returns whether a session token is currently persisted (i.e. a
-    /// [`Service::save_new_session`] call happened since the local database
-    /// was last wiped by `users::Service::logout`). Called by
-    /// `users::Service::logout`.
+    /// [`Service::save_new_session`] call happened since
+    /// `users::Service::logout` last cleared it). Called by
+    /// `users::Service::create`/`login`/`logout`.
     async fn is_connected(&self) -> Result<bool>;
 }
 
-/// Initializes the sessions service: uses `settings` to read the session
+/// Initializes the sessions service: uses `secrets` to read the session
 /// token attached to outgoing gRPC requests. Returns the concrete
 /// [`SessionsClient`] rather than `Arc<dyn Service>` because
 /// [`Service::authenticated_request`] is generic, which makes the trait
 /// object-unsafe (`dyn Service` cannot exist).
-pub(crate) fn init(settings: Arc<dyn SettingsService>) -> Arc<SessionsClient> {
-    Arc::new(SessionsClient::new(settings))
+pub(crate) fn init(secrets: Arc<dyn SecretsService>) -> Arc<SessionsClient> {
+    Arc::new(SessionsClient::new(secrets))
 }

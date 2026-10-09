@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use mlua::{Lua, LuaOptions, StdLib};
+use mlua::{Lua, StdLib};
 use pdf_oxide::PdfDocument;
 use pdf_oxide::converters::ConversionOptions;
 use uuid::Uuid;
@@ -9,31 +9,34 @@ use uuid::Uuid;
 use crate::domains::documents::{Document, Metadata, Purpose, SourceCategory, SourceSubCategory};
 use crate::{ErrorContext as _, Result};
 
+/// Upper bound on the Lua instructions one classification script may run
+/// against one document (see [`crate::sandbox::Limits`]) — far more than a
+/// script matching on a transcript ever needs, so only a runaway loop hits it.
+const MAX_INSTRUCTIONS: u64 = 200_000_000;
+
+/// Heap a classification script gets on top of what the document it runs
+/// against needs (see [`sandboxed`]).
+const BASE_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Builds a fully sandboxed Lua VM: no `io`, `os`, `package` (so no
 /// `require`), `debug`, or FFI libraries are loaded, only the side-effect
 /// free `table`/`string`/`math` subset — so Lua code run in it has no path
 /// to the filesystem, OS environment, subprocesses, dynamic library loading,
-/// or the network.
-///
-/// `Lua::new_with` always loads the base library (`_G`) regardless of the
-/// requested [`StdLib`] flags — it unconditionally calls `luaopen_base`
-/// internally, with no `StdLib` flag to opt out — so `dofile`/`loadfile`
-/// (direct filesystem access) and `load` (arbitrary/binary chunk loading)
-/// are stripped from the globals table by hand afterwards to close that
-/// gap.
-pub(super) fn sandboxed() -> Result<Lua> {
-    let libs = StdLib::TABLE | StdLib::STRING | StdLib::MATH;
-    let lua =
-        Lua::new_with(libs, LuaOptions::new()).context("failed to create sandboxed lua vm")?;
-
-    let globals = lua.globals();
-    for unsafe_global in ["dofile", "loadfile", "load"] {
-        globals
-            .set(unsafe_global, mlua::Value::Nil)
-            .context("failed to strip an unsafe global from the sandboxed lua vm")?;
-    }
-
-    Ok(lua)
+/// or the network. See [`crate::sandbox::new_vm`] for the globals it strips
+/// on top of that and the limits it enforces: these scripts come from the
+/// server (any user's public script a user enabled), so one that loops
+/// forever or allocates without bound must fail on its own rather than
+/// hang or crash the app. The memory limit scales with `content_len`
+/// (the document's size), since the document's content and its
+/// `pdf_as_markdown`/`pdf_as_html` conversions all live on the VM's heap.
+pub(super) fn sandboxed(content_len: usize) -> Result<Lua> {
+    crate::sandbox::new_vm(
+        StdLib::TABLE | StdLib::STRING | StdLib::MATH,
+        crate::sandbox::Limits {
+            memory_bytes: BASE_MEMORY_BYTES.saturating_add(content_len.saturating_mul(4)),
+            max_instructions: MAX_INSTRUCTIONS,
+        },
+    )
 }
 
 /// Exposes `document` as a global table in `lua`, scoping a script's access
@@ -319,7 +322,7 @@ mod tests {
 
     #[test]
     fn sandboxed_vm_has_no_filesystem_or_process_access() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
 
         for global in [
             "os", "io", "require", "dofile", "loadfile", "load", "package",
@@ -333,7 +336,7 @@ mod tests {
 
     #[test]
     fn sandboxed_vm_can_still_run_safe_lua() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
 
         let sum: i64 = lua.load("return 1 + 41").eval().unwrap();
 
@@ -342,7 +345,7 @@ mod tests {
 
     #[test]
     fn expose_document_sets_content_and_metadata_globals() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let _metadata = expose_document(&lua, &document).unwrap();
@@ -362,7 +365,7 @@ mod tests {
 
     #[test]
     fn read_metadata_matches_the_original_when_a_script_makes_no_changes() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
@@ -374,7 +377,7 @@ mod tests {
 
     #[test]
     fn read_metadata_reflects_a_field_a_script_assigned() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
@@ -390,7 +393,7 @@ mod tests {
 
     #[test]
     fn read_metadata_keeps_the_latest_value_across_multiple_assignments() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
@@ -410,7 +413,7 @@ mod tests {
 
     #[test]
     fn pdf_as_markdown_renders_the_documents_pdf_content_as_markdown() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
         let pdf = crate::domains::documents::parser::transcript::tests::build_pdf("Hello World!");
 
         expose_pdf_conversions(&lua, &pdf).unwrap();
@@ -421,7 +424,7 @@ mod tests {
 
     #[test]
     fn pdf_as_html_renders_the_documents_pdf_content_as_html() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
         let pdf = crate::domains::documents::parser::transcript::tests::build_pdf("Hello World!");
 
         expose_pdf_conversions(&lua, &pdf).unwrap();
@@ -432,7 +435,7 @@ mod tests {
 
     #[test]
     fn set_source_sets_the_category_and_sub_category() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
@@ -456,7 +459,7 @@ mod tests {
 
     #[test]
     fn set_source_accepts_a_nil_sub_category() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
@@ -471,7 +474,7 @@ mod tests {
 
     #[test]
     fn set_source_errors_on_an_unknown_category() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
@@ -484,7 +487,7 @@ mod tests {
 
     #[test]
     fn set_source_errors_on_an_unknown_sub_category() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
@@ -499,7 +502,7 @@ mod tests {
 
     #[test]
     fn set_purpose_sets_the_purpose() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
@@ -515,7 +518,7 @@ mod tests {
 
     #[test]
     fn set_purpose_errors_on_an_unknown_purpose() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
@@ -528,7 +531,7 @@ mod tests {
 
     #[test]
     fn read_metadata_ignores_script_writes_to_immutable_fields() {
-        let lua = sandboxed().unwrap();
+        let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();

@@ -6,8 +6,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::domains::documents::Metadata;
-use crate::domains::settings::Service as SettingsService;
-use crate::domains::users::{MASTER_KEY_SETTING, decode_master_key};
+use crate::domains::secrets::{MASTER_KEY_SECRET, Service as SecretsService};
+use crate::domains::users::decode_master_key;
 use crate::{Error, ErrorContext as _, Result};
 
 use super::models::EventType;
@@ -46,19 +46,20 @@ fn generate_dek() -> [u8; KEY_LEN] {
     dek
 }
 
-/// Returns the raw, still-encoded master key persisted locally under
-/// [`MASTER_KEY_SETTING`], or fails with [`Error::Encryption`] if no master
+/// Returns the raw, still-encoded master key kept in the credential store under
+/// [`MASTER_KEY_SECRET`], or fails with [`Error::Encryption`] if no master
 /// key is on hand yet — i.e. before any account has been created or logged
 /// into on this device. Shared by [`derive_kek`] (which also decodes it)
 /// and [`ensure_master_key`] (which just needs to know one is present).
-async fn encoded_master_key(settings: &dyn SettingsService) -> Result<String> {
-    settings
-        .get(MASTER_KEY_SETTING)
+async fn encoded_master_key(secrets: &dyn SecretsService) -> Result<String> {
+    secrets
+        .get(MASTER_KEY_SECRET)
         .await
-        .context("failed to read master key from local settings")?
+        .context("failed to read master key from the credential store")?
         .ok_or_else(|| {
             Error::Encryption(
-                "no master key found in local settings; log in or create an account first".into(),
+                "no master key found in the credential store; log in or create an account first"
+                    .into(),
             )
         })
 }
@@ -68,24 +69,24 @@ async fn encoded_master_key(settings: &dyn SettingsService) -> Result<String> {
 /// caller that wants to fail fast with this specific error before
 /// attempting unrelated authenticated work (see
 /// `changelog::Service::ensure_master_key`).
-pub(super) async fn ensure_master_key(settings: &dyn SettingsService) -> Result<()> {
-    encoded_master_key(settings).await?;
+pub(super) async fn ensure_master_key(secrets: &dyn SecretsService) -> Result<()> {
+    encoded_master_key(secrets).await?;
     Ok(())
 }
 
 /// Derives the key-encryption-key (KEK) that wraps every changelog event's
-/// DEK from the account's raw master key, persisted locally under
-/// [`MASTER_KEY_SETTING`] by `users::Service::create`/`login` (see that
+/// DEK from the account's raw master key, kept in the credential store under
+/// [`MASTER_KEY_SECRET`] by `users::Service::create`/`login` (see that
 /// constant's doc for why only the raw key is ever cached locally, never
 /// the wrapped/encrypted form the server stores — a `change_password` call
 /// never touches this value, since the raw key it derives from never
 /// changes, only what protects it server-side). Fails with
 /// [`Error::Encryption`] if no master key is on hand yet — i.e. before any
 /// account has been created or logged into on this device.
-async fn derive_kek(settings: &dyn SettingsService) -> Result<[u8; KEY_LEN]> {
-    let encoded_master_key = encoded_master_key(settings).await?;
+async fn derive_kek(secrets: &dyn SecretsService) -> Result<[u8; KEY_LEN]> {
+    let encoded_master_key = encoded_master_key(secrets).await?;
     let master_key = decode_master_key(&encoded_master_key)
-        .context("failed to decode master key from local settings")?;
+        .context("failed to decode master key from the credential store")?;
 
     let mut hasher = Sha256::new();
     hasher.update(&master_key);
@@ -142,7 +143,7 @@ fn aead_decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>> {
 /// Returns `wrapped_dek || ciphertext` — a single opaque blob, since the
 /// server's `changelog` table has no separate column for the DEK.
 pub(super) async fn encrypt_event(
-    settings: &dyn SettingsService,
+    secrets: &dyn SecretsService,
     event_type: EventType,
     document_id: Uuid,
     content: Option<&[u8]>,
@@ -160,7 +161,7 @@ pub(super) async fn encrypt_event(
     let encrypted_payload =
         aead_encrypt(&dek, &bytes).context("failed to encrypt changelog event")?;
 
-    let kek = derive_kek(settings).await?;
+    let kek = derive_kek(secrets).await?;
     let wrapped_dek = aead_encrypt(&kek, &dek).context("failed to wrap changelog event DEK")?;
 
     let mut encrypted_content = Vec::with_capacity(wrapped_dek.len() + encrypted_payload.len());
@@ -175,7 +176,7 @@ pub(super) type DecryptedEvent = (EventType, Uuid, Option<Vec<u8>>, Option<Metad
 
 /// Decrypts an `encrypted_content` blob produced by [`encrypt_event`].
 pub(super) async fn decrypt_event(
-    settings: &dyn SettingsService,
+    secrets: &dyn SecretsService,
     encrypted_content: &[u8],
 ) -> Result<DecryptedEvent> {
     if encrypted_content.len() < WRAPPED_KEY_LEN {
@@ -183,7 +184,7 @@ pub(super) async fn decrypt_event(
     }
     let (wrapped_dek, encrypted_payload) = encrypted_content.split_at(WRAPPED_KEY_LEN);
 
-    let kek = derive_kek(settings).await?;
+    let kek = derive_kek(secrets).await?;
     let dek = aead_decrypt(&kek, wrapped_dek).context("failed to unwrap changelog event DEK")?;
     let dek: [u8; KEY_LEN] = dek
         .try_into()
@@ -206,30 +207,30 @@ pub(super) async fn decrypt_event(
 mod tests {
     use super::*;
     use crate::domains::documents::FakeMetadata;
-    use crate::domains::settings::MockService as MockSettingsService;
+    use crate::domains::secrets::MockService as MockSecretsService;
     use crate::domains::users::encode_master_key;
 
-    /// A [`SettingsService`] fixture with a fixed raw master key set under
-    /// [`MASTER_KEY_SETTING`], for exercising real KEK derivation
+    /// A [`SecretsService`] fixture with a fixed raw master key set under
+    /// [`MASTER_KEY_SECRET`], for exercising real KEK derivation
     /// without depending on `users::Service::create`/`login`.
-    fn settings_with_master_key() -> MockSettingsService {
-        let mut settings = MockSettingsService::new();
+    fn secrets_with_master_key() -> MockSecretsService {
+        let mut secrets = MockSecretsService::new();
         let encoded = encode_master_key(b"the-account-master-key").unwrap();
-        settings
+        secrets
             .expect_get()
-            .withf(|key| key == MASTER_KEY_SETTING)
+            .withf(|key| key == MASTER_KEY_SECRET)
             .returning(move |_| Ok(Some(encoded.clone())));
-        settings
+        secrets
     }
 
     #[tokio::test]
     async fn encrypt_event_roundtrips_a_created_event() {
-        let settings = settings_with_master_key();
+        let secrets = secrets_with_master_key();
         let document_id = Uuid::now_v7();
         let metadata = FakeMetadata::new().build();
 
         let encrypted = encrypt_event(
-            &settings,
+            &secrets,
             EventType::Created,
             document_id,
             Some(b"body"),
@@ -239,7 +240,7 @@ mod tests {
         .unwrap();
 
         let (event_type, decrypted_id, content, decrypted_metadata) =
-            decrypt_event(&settings, &encrypted).await.unwrap();
+            decrypt_event(&secrets, &encrypted).await.unwrap();
 
         assert_eq!(event_type, EventType::Created);
         assert_eq!(decrypted_id, document_id);
@@ -249,15 +250,15 @@ mod tests {
 
     #[tokio::test]
     async fn encrypt_event_roundtrips_a_deleted_event_with_no_content_or_metadata() {
-        let settings = settings_with_master_key();
+        let secrets = secrets_with_master_key();
         let document_id = Uuid::now_v7();
 
-        let encrypted = encrypt_event(&settings, EventType::Deleted, document_id, None, None)
+        let encrypted = encrypt_event(&secrets, EventType::Deleted, document_id, None, None)
             .await
             .unwrap();
 
         let (event_type, decrypted_id, content, metadata) =
-            decrypt_event(&settings, &encrypted).await.unwrap();
+            decrypt_event(&secrets, &encrypted).await.unwrap();
 
         assert_eq!(event_type, EventType::Deleted);
         assert_eq!(decrypted_id, document_id);
@@ -267,10 +268,10 @@ mod tests {
 
     #[tokio::test]
     async fn decrypt_event_rejects_content_tampered_with_after_encryption() {
-        let settings = settings_with_master_key();
+        let secrets = secrets_with_master_key();
         let document_id = Uuid::now_v7();
         let mut encrypted = encrypt_event(
-            &settings,
+            &secrets,
             EventType::Created,
             document_id,
             Some(b"body"),
@@ -281,27 +282,27 @@ mod tests {
         let last = encrypted.len() - 1;
         encrypted[last] ^= 0xff;
 
-        assert!(decrypt_event(&settings, &encrypted).await.is_err());
+        assert!(decrypt_event(&secrets, &encrypted).await.is_err());
     }
 
     #[tokio::test]
     async fn decrypt_event_rejects_a_blob_shorter_than_a_wrapped_key() {
-        let settings = settings_with_master_key();
+        let secrets = secrets_with_master_key();
 
-        assert!(decrypt_event(&settings, b"too short").await.is_err());
+        assert!(decrypt_event(&secrets, b"too short").await.is_err());
     }
 
     #[tokio::test]
-    async fn encrypt_event_fails_without_a_master_key_in_settings() {
-        let mut settings = MockSettingsService::new();
-        settings
+    async fn encrypt_event_fails_without_a_master_key_in_the_credential_store() {
+        let mut secrets = MockSecretsService::new();
+        secrets
             .expect_get()
-            .withf(|key| key == MASTER_KEY_SETTING)
+            .withf(|key| key == MASTER_KEY_SECRET)
             .returning(|_| Ok(None));
         let document_id = Uuid::now_v7();
 
         let err = encrypt_event(
-            &settings,
+            &secrets,
             EventType::Created,
             document_id,
             Some(b"body"),

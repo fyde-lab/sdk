@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::domains::scripts::Service as ScriptsService;
+use crate::domains::scripts::{Script, Service as ScriptsService};
 use crate::{ErrorContext as _, Result};
 
 use super::{Document, Metadata, PDF_CONTENT_TYPE, Service, transcript, vm};
@@ -77,25 +77,37 @@ impl Service for ParserClient {
             .await
             .context("failed to list the scripts enabled for the authenticated user")?;
 
-        let mut metadata = document.metadata().clone();
-        for script in &scripts {
-            let lua = vm::sandboxed()?;
-            let working_document =
-                Document::new(document.id(), document.content().to_vec(), metadata);
-            let source_metadata = vm::expose_document(&lua, &working_document)?;
-            vm::expose_pdf_conversions(&lua, document.content())?;
-            vm::expose_set_source(&lua, source_metadata.clone())?;
-            vm::expose_set_purpose(&lua, source_metadata.clone())?;
-            lua.load(script.script())
-                .exec()
-                .context("failed to run script")?;
-
-            metadata =
-                vm::read_metadata(&lua, working_document.metadata(), &source_metadata.borrow())?;
-        }
-
-        Ok(metadata)
+        // Lua runs synchronously and `mlua::Lua` isn't `Send`, so the whole
+        // loop — every VM built and dropped inside it — runs on a blocking
+        // thread rather than tying up an async worker for as long as the
+        // scripts take (bounded by `vm::sandboxed`'s instruction budget).
+        let document = document.clone();
+        tokio::task::spawn_blocking(move || run_scripts_blocking(&scripts, &document))
+            .await
+            .context("script runner thread panicked")?
     }
+}
+
+/// [`Service::run_scripts`]' synchronous half: runs each of `scripts` in
+/// turn against `document`, each in its own fresh [`vm::sandboxed`] VM,
+/// threading the metadata one script produced into the next.
+fn run_scripts_blocking(scripts: &[Script], document: &Document) -> Result<Metadata> {
+    let mut metadata = document.metadata().clone();
+    for script in scripts {
+        let lua = vm::sandboxed(document.content().len())?;
+        let working_document = Document::new(document.id(), document.content().to_vec(), metadata);
+        let source_metadata = vm::expose_document(&lua, &working_document)?;
+        vm::expose_pdf_conversions(&lua, document.content())?;
+        vm::expose_set_source(&lua, source_metadata.clone())?;
+        vm::expose_set_purpose(&lua, source_metadata.clone())?;
+        crate::sandbox::load_source(&lua, script.script())
+            .exec()
+            .context("failed to run script")?;
+
+        metadata = vm::read_metadata(&lua, working_document.metadata(), &source_metadata.borrow())?;
+    }
+
+    Ok(metadata)
 }
 
 #[cfg(test)]
@@ -154,6 +166,21 @@ mod tests {
                 .with_script("this is not valid lua")
                 .build(),
         ];
+        let mut mock_scripts = MockScriptsService::new();
+        mock_scripts
+            .expect_list_user_scripts()
+            .times(1)
+            .returning(move || Ok(scripts.clone()));
+
+        let client = ParserClient::new(Arc::new(mock_scripts));
+        let document = FakeDocument::new().build();
+
+        client.run_scripts(&document).await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn run_scripts_fails_instead_of_hanging_on_a_script_that_never_terminates() {
+        let scripts = vec![FakeScript::new().with_script("while true do end").build()];
         let mut mock_scripts = MockScriptsService::new();
         mock_scripts
             .expect_list_user_scripts()

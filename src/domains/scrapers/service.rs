@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use mlua::{Function, Lua, LuaOptions, LuaSerdeExt as _, StdLib, Table};
+use mlua::{Function, Lua, LuaSerdeExt as _, StdLib, Table};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
 
@@ -245,25 +245,21 @@ fn merge_cookies(http_cookies: Vec<Cookie>, browser_cookies: Vec<Cookie>) -> Vec
 /// `documents::parser::vm::sandboxed`, which doesn't need it) is kept because
 /// `didaxis.lua` calls `utf8.len`.
 ///
-/// `Lua::new_with` always loads the base library (`_G`) regardless of the
-/// requested `StdLib` flags — it unconditionally calls `luaopen_base`
-/// internally, with no `StdLib` flag to opt out — so `dofile`/`loadfile`
-/// (direct filesystem access) and `load` (arbitrary/binary chunk loading)
-/// are stripped from the globals table by hand afterwards to close that gap,
-/// same approach as `documents::parser::vm::sandboxed`.
+/// See [`crate::sandbox::new_vm`] for the globals it strips on top of that
+/// and the limits it enforces, so a script that loops forever or allocates
+/// without bound fails on its own instead of hanging or crashing the host.
+/// The memory limit leaves room for the documents a script downloads, which
+/// live on the VM's heap as Lua strings until `fyde.save_document` takes
+/// them; the instruction budget only counts Lua code actually executing, not
+/// time spent blocked in host functions (network calls, `fyde.input.ask`).
 fn sandboxed_lua() -> Result<Lua> {
-    let libs = StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8;
-    let lua = Lua::new_with(libs, LuaOptions::new())
-        .context("failed to create sandboxed scraper lua vm")?;
-
-    let globals = lua.globals();
-    for unsafe_global in ["dofile", "loadfile", "load"] {
-        globals
-            .set(unsafe_global, mlua::Value::Nil)
-            .context("failed to strip an unsafe global from the sandboxed scraper lua vm")?;
-    }
-
-    Ok(lua)
+    crate::sandbox::new_vm(
+        StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
+        crate::sandbox::Limits {
+            memory_bytes: 512 * 1024 * 1024,
+            max_instructions: 5_000_000_000,
+        },
+    )
 }
 
 /// Loads `script` as a module (expecting it to return a table with a single
@@ -271,7 +267,7 @@ fn sandboxed_lua() -> Result<Lua> {
 /// and a Lua scraper script, same as `demo-rust-fyde`'s `main.rs`) and calls
 /// it with `parameters`.
 fn evaluate_and_run(lua: &Lua, name: &str, script: &str, parameters: Value) -> Result<()> {
-    let chunk = lua.load(script).set_name(name);
+    let chunk = crate::sandbox::load_source(lua, script).set_name(name);
     let scraper: Table = chunk.eval().context("evaluating Lua scraper script")?;
 
     let run: Function = scraper

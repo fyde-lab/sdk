@@ -56,20 +56,23 @@ async fn session_lifecycle() {
         .await;
 
     scenario
-        .step("registering the same username again fails", || async {
-            let err = scenario
-                .client
-                .users()
-                .create(&username, TEST_PASSWORD, "another-device")
-                .await
-                .err()
-                .context("re-registering the same username should fail")?;
-            ensure!(
-                err.to_string().contains("already"),
-                "unexpected error re-registering an existing username: {err}"
-            );
-            Ok(())
-        })
+        .step(
+            "creating another account while a session is open fails",
+            || async {
+                let err = scenario
+                    .client
+                    .users()
+                    .create(&random_username(), TEST_PASSWORD, "another-device")
+                    .await
+                    .err()
+                    .context("creating an account while logged in should fail")?;
+                ensure!(
+                    err.to_string().contains("log out first"),
+                    "unexpected error creating an account while logged in: {err}"
+                );
+                Ok(())
+            },
+        )
         .await;
 
     scenario
@@ -110,6 +113,23 @@ async fn session_lifecycle() {
             ensure!(
                 err.to_string().contains("no master key found"),
                 "unexpected error after logout: {err}"
+            );
+            Ok(())
+        })
+        .await;
+
+    scenario
+        .step("registering the same username again fails", || async {
+            let err = scenario
+                .client
+                .users()
+                .create(&username, TEST_PASSWORD, "another-device")
+                .await
+                .err()
+                .context("re-registering the same username should fail")?;
+            ensure!(
+                err.to_string().contains("already"),
+                "unexpected error re-registering an existing username: {err}"
             );
             Ok(())
         })

@@ -272,11 +272,12 @@ fn derive_wrapping_key(export_key: &[u8]) -> Result<[u8; KEY_LEN]> {
 /// (AES-256-GCM, random nonce), returning the result JSON-serialized and
 /// ready to send to the server as `encrypted_master_key`. The server is the
 /// only place this wrapped form is ever persisted — see
-/// [`crate::domains::users::MASTER_KEY_SETTING`] for why the SDK itself
+/// [`crate::domains::secrets::MASTER_KEY_SECRET`] for why the SDK itself
 /// caches only the raw key locally, never this wrapped form. Used both by
 /// [`generate_and_wrap_master_key`] and directly by `change_password`,
-/// which already has the raw key on hand (read back from local settings)
-/// and only needs to wrap it fresh under the new password's export key.
+/// which already has the raw key on hand (read back from the credential
+/// store) and only needs to wrap it fresh under the new password's export
+/// key.
 pub(super) fn wrap_master_key(master_key: &[u8], export_key: &[u8]) -> Result<String> {
     let master_key: &[u8; KEY_LEN] = master_key
         .try_into()
@@ -305,7 +306,7 @@ pub(super) fn wrap_master_key(master_key: &[u8], export_key: &[u8]) -> Result<St
 /// Generates a fresh random master key and wraps it under a key derived
 /// from `export_key` (see [`wrap_master_key`]), returning both the raw key
 /// — the only form the SDK persists locally, under
-/// [`crate::domains::users::MASTER_KEY_SETTING`] — and the wrapped form
+/// [`crate::domains::secrets::MASTER_KEY_SECRET`] — and the wrapped form
 /// sent to the server, which is the only place it's ever stored.
 pub(super) fn generate_and_wrap_master_key(export_key: &[u8]) -> Result<(Vec<u8>, String)> {
     let master_key = generate_master_key();

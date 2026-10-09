@@ -29,6 +29,7 @@ use tonic::transport::Channel;
 use uuid::Uuid;
 
 use crate::domains::scripts::Service as ScriptsService;
+use crate::domains::secrets::Service as SecretsService;
 use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
@@ -123,17 +124,19 @@ pub trait Service: Send + Sync {
 /// a newly uploaded document's metadata and fill in its classification
 /// fields, and calls `on_document_change` (see [`crate::ClientConfig`]) for
 /// every event [`Service::start_sync`] consumes.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn init(
     channel: Channel,
     pool: SqlitePool,
     settings: Arc<dyn SettingsService>,
+    secrets: Arc<dyn SecretsService>,
     sessions: Arc<SessionsClient>,
     server_state: Arc<dyn ServerStateService>,
     scripts: Arc<dyn ScriptsService>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Result<Arc<dyn Service>> {
     let storage = storage_sqlite::SqliteStorage::new(pool.clone());
-    let changelog = changelog::init(channel, pool, settings, sessions, server_state)
+    let changelog = changelog::init(channel, pool, settings, secrets, sessions, server_state)
         .await
         .context("failed to initialize changelog service")?;
     let parser = parser::init(scripts);

@@ -32,6 +32,8 @@ impl SqliteClient {
     }
 
     pub(crate) async fn connect_at(path: PathBuf) -> Result<Self> {
+        create_owner_only(&path)?;
+
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true);
@@ -52,6 +54,12 @@ impl SqliteClient {
         // connection (and thus the same in-memory database) alive for the
         // lifetime of the pool, since each new connection would otherwise
         // get its own private, empty database.
+        // `secure_delete` makes SQLite overwrite deleted content with zeros
+        // instead of just marking its pages free, so a cached document or a
+        // scraper's cookies deleted on `wipe` can't be carved back out of the
+        // file afterwards.
+        let options = options.pragma("secure_delete", "ON");
+
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
@@ -98,8 +106,40 @@ impl SqliteClient {
                 .with_context(|| format!("failed to wipe local database table {table}"))?;
         }
 
+        // Rebuilds the file from what's left, so no page that ever held the
+        // wiped rows survives in it, `secure_delete` notwithstanding (e.g.
+        // pages freed before it was turned on).
+        sqlx::query("VACUUM")
+            .execute(&self.pool)
+            .await
+            .context("failed to compact local database after wiping it")?;
+
         Ok(())
     }
+}
+
+/// Creates the database file at `path` (if it doesn't exist yet) readable
+/// and writable by its owner only, before SQLite opens it: it holds every
+/// cached document in plaintext, so it must not inherit a umask-derived,
+/// typically world-readable mode. SQLite's own journal files copy the main
+/// file's permissions. A no-op off Unix, where the OS's per-user profile
+/// directories (Windows) or per-app sandboxes (mobile) already scope access.
+fn create_owner_only(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to create local database {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -155,5 +195,54 @@ mod tests {
             .execute(client.pool())
             .await
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn creates_the_database_file_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = temp_db_path();
+
+        let client = SqliteClient::connect_at(path.clone()).await.unwrap();
+        drop(client);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn turns_secure_delete_on() {
+        let client = SqliteClient::connect_with(IN_MEMORY_DB).await.unwrap();
+
+        let (secure_delete,): (i64,) = sqlx::query_as("PRAGMA secure_delete")
+            .fetch_one(client.pool())
+            .await
+            .unwrap();
+
+        assert_eq!(secure_delete, 1);
+    }
+
+    #[tokio::test]
+    async fn wipe_leaves_no_trace_of_the_wiped_rows_in_the_database_file() {
+        let path = temp_db_path();
+        let client = SqliteClient::connect_at(path.clone()).await.unwrap();
+        let marker = "wiped-marker-0123456789";
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('k', ?)")
+            .bind(marker)
+            .execute(client.pool())
+            .await
+            .unwrap();
+
+        client.wipe().await.unwrap();
+        drop(client);
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !bytes
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes())
+        );
+        std::fs::remove_file(&path).unwrap();
     }
 }
