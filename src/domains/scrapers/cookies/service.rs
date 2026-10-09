@@ -27,6 +27,10 @@ impl<S: Storage> Service for CookiesClient<S> {
     async fn save(&self, scraper_name: &str, cookies: Vec<Cookie>) -> Result<()> {
         self.storage.replace_all(scraper_name, cookies).await
     }
+
+    async fn delete(&self, scraper_name: &str) -> Result<()> {
+        self.storage.delete_all(scraper_name).await
+    }
 }
 
 #[cfg(test)]
@@ -67,5 +71,18 @@ mod tests {
         let client = CookiesClient::new(storage);
 
         client.save("didaxis", cookies).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_scrapers_cookies_from_storage() {
+        let mut storage = MockStorage::new();
+        storage
+            .expect_delete_all()
+            .with(eq("didaxis"))
+            .times(1)
+            .returning(|_| Ok(()));
+        let client = CookiesClient::new(storage);
+
+        client.delete("didaxis").await.unwrap();
     }
 }

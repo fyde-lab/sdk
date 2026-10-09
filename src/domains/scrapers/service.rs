@@ -108,10 +108,21 @@ impl Service for ScrapersClient {
             .save(name, session_data)
             .await
             .with_context(|| format!("failed to save session for scraper {name:?}"))?;
-        self.cookies
-            .save(name, cookies)
-            .await
-            .with_context(|| format!("failed to save cookies for scraper {name:?}"))?;
+        // A failed run's cookies (`fyde.http`'s and `fyde.browser`'s alike)
+        // are discarded rather than saved: a script that died partway may
+        // have been working from an expired or rejected session, and
+        // keeping it would make the next run start from the same bad state.
+        if run_result.is_ok() {
+            self.cookies
+                .save(name, cookies)
+                .await
+                .with_context(|| format!("failed to save cookies for scraper {name:?}"))?;
+        } else {
+            self.cookies
+                .delete(name)
+                .await
+                .with_context(|| format!("failed to delete cookies for scraper {name:?}"))?;
+        }
         self.reports
             .save(recorder.finish())
             .await
@@ -125,10 +136,10 @@ impl Service for ScrapersClient {
 /// fresh Lua VM, installs the `fyde` host table (see `host::install`),
 /// evaluates `script` and calls its `run(parameters)` entrypoint, then reads
 /// back `fyde.session`'s final contents and every cookie picked up this run
-/// — regardless of whether the script's `run` succeeded or failed, mirroring
-/// `demo-rust-fyde`'s `main.rs`, which saves the session/cookie file either
-/// way. The caller is responsible for persisting the returned session
-/// data/cookies and for propagating `run_result`.
+/// — regardless of whether the script's `run` succeeded or failed. The
+/// caller is responsible for persisting the returned session data, for
+/// saving the cookies on success (or deleting them on failure), and for
+/// propagating `run_result`.
 #[allow(clippy::too_many_arguments)]
 fn run_script(
     name: &str,
@@ -451,10 +462,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_saves_session_and_cookies_even_when_the_script_fails() {
+    async fn run_saves_the_session_but_deletes_the_cookies_when_the_script_fails() {
         let mut cookies = MockCookiesService::new();
         cookies.expect_load().returning(|_| Ok(Vec::new()));
-        cookies.expect_save().times(1).returning(|_, _| Ok(()));
+        cookies
+            .expect_delete()
+            .with(eq("didaxis"))
+            .times(1)
+            .returning(|_| Ok(()));
         let mut session = MockSessionService::new();
         session.expect_load().returning(|_| Ok(json!({})));
         session
@@ -555,7 +570,7 @@ mod tests {
     async fn run_fails_when_the_script_has_no_run_function() {
         let mut cookies = MockCookiesService::new();
         cookies.expect_load().returning(|_| Ok(Vec::new()));
-        cookies.expect_save().returning(|_, _| Ok(()));
+        cookies.expect_delete().returning(|_| Ok(()));
         let mut session = MockSessionService::new();
         session.expect_load().returning(|_| Ok(json!({})));
         session.expect_save().returning(|_, _| Ok(()));
@@ -613,7 +628,7 @@ mod tests {
     async fn run_rejects_a_script_that_tries_to_reach_the_os_or_filesystem() {
         let mut cookies = MockCookiesService::new();
         cookies.expect_load().returning(|_| Ok(Vec::new()));
-        cookies.expect_save().returning(|_, _| Ok(()));
+        cookies.expect_delete().returning(|_| Ok(()));
         let mut session = MockSessionService::new();
         session.expect_load().returning(|_| Ok(json!({})));
         session.expect_save().returning(|_, _| Ok(()));
@@ -648,7 +663,7 @@ mod tests {
     async fn run_blocks_an_http_call_to_a_domain_outside_allowed_domains() {
         let mut cookies = MockCookiesService::new();
         cookies.expect_load().returning(|_| Ok(Vec::new()));
-        cookies.expect_save().returning(|_, _| Ok(()));
+        cookies.expect_delete().returning(|_| Ok(()));
         let mut session = MockSessionService::new();
         session.expect_load().returning(|_| Ok(json!({})));
         session.expect_save().returning(|_, _| Ok(()));
