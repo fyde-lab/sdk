@@ -117,7 +117,7 @@ pub(super) trait FydeClient: Send + Sync {
 /// just a handle to the same underlying connection — so a fresh generated
 /// client is created per call. Every call, including `logout` itself, is
 /// authenticated by attaching the session token currently persisted in
-/// settings (if any) as a bearer `authorization` header (see
+/// the secrets store (if any) as a bearer `authorization` header (see
 /// [`crate::domains::sessions::Service::authenticated_request`]) — harmless
 /// for the four registration/login steps, which the server doesn't require
 /// one for.
@@ -302,16 +302,16 @@ mod tests {
 
     use super::*;
     use crate::Error;
-    use crate::domains::settings::MockService as MockSettingsService;
+    use crate::domains::secrets::MockService as MockSecretsService;
 
     #[tokio::test]
     async fn new_does_not_connect_to_the_server() {
         // A syntactically valid but unreachable address, connected lazily:
         // if `client()` dialed eagerly at construction, this would fail
         // here rather than on first use below.
-        let mut settings = MockSettingsService::new();
-        settings.expect_get().returning(|_| Ok(None));
-        let sessions = Arc::new(SessionsClient::new(Arc::new(settings)));
+        let mut secrets = MockSecretsService::new();
+        secrets.expect_get().returning(|_| Ok(None));
+        let sessions = Arc::new(SessionsClient::new(Arc::new(secrets)));
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         let grpc = GrpcClient::new(channel, sessions);
 

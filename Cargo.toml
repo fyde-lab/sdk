@@ -12,6 +12,14 @@ argon2 = "0.5.3"
 async-trait = "0.1.92"
 futures = "0.3.34"
 hkdf = "0.12.4"
+# The `secrets` domain (`domains/secrets`) keeps the account master key and
+# the session token in the OS's native credential store rather than in the
+# local SQLite database. `keyring-core` is the store-agnostic API; each
+# platform pulls in only its own native store below (the all-in-one `keyring`
+# crate's own docs advise apps that pick their stores per platform to depend
+# on these directly instead). See `storage_keystore.rs` for which store each
+# platform uses.
+keyring-core = "1.0.0"
 # `vendored` builds Lua from source rather than requiring a system install —
 # needed since this crate cross-compiles to Android/iOS (see `../CLAUDE.md`'s
 # `application/` entry) where no system Lua exists.
@@ -89,6 +97,26 @@ wreq-util = "0.2.0"
 # `fyde.browser` (see the `tao` entry above) — the actual webview.
 wry = "0.57"
 xdg = "2.5.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", features = ["protected"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { version = "1.1.0", default-features = false }
+
+# Exports the `Java_io_crates_keyring_Keyring_00024Companion_initializeNdkContext`
+# JNI entry point the Android app must call once at startup — see the sdk
+# CLAUDE.md's `secrets` section.
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "1.0.0"
+
+# Freedesktop Secret Service (GNOME Keyring, KWallet, ...) over `libdbus`,
+# which `wry`/`tao` already need on Linux (see `shell.nix`).
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
+dbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

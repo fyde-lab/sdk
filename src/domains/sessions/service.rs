@@ -2,20 +2,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::domains::settings::Service as SettingsService;
+use crate::domains::secrets::{SESSION_TOKEN_SECRET, Service as SecretsService};
 use crate::{Error, ErrorContext as _, Result};
 
-use super::{SESSION_TOKEN_SETTING, Service};
+use super::Service;
 
 /// The default [`Service`] implementation, reading the session token from
-/// an injected [`SettingsService`].
+/// an injected [`SecretsService`].
 pub(crate) struct SessionsClient {
-    settings: Arc<dyn SettingsService>,
+    secrets: Arc<dyn SecretsService>,
 }
 
 impl SessionsClient {
-    pub(crate) fn new(settings: Arc<dyn SettingsService>) -> Self {
-        Self { settings }
+    pub(crate) fn new(secrets: Arc<dyn SecretsService>) -> Self {
+        Self { secrets }
     }
 }
 
@@ -28,8 +28,8 @@ impl Service for SessionsClient {
         let mut request = tonic::Request::new(message);
 
         if let Some(token) = self
-            .settings
-            .get(SESSION_TOKEN_SETTING)
+            .secrets
+            .get(SESSION_TOKEN_SECRET)
             .await
             .context("failed to read session token")?
         {
@@ -43,16 +43,16 @@ impl Service for SessionsClient {
     }
 
     async fn save_new_session(&self, token: &str) -> Result<()> {
-        self.settings
-            .set(SESSION_TOKEN_SETTING, token)
+        self.secrets
+            .set(SESSION_TOKEN_SECRET, token)
             .await
             .context("failed to persist session token")
     }
 
     async fn is_connected(&self) -> Result<bool> {
         Ok(self
-            .settings
-            .get(SESSION_TOKEN_SETTING)
+            .secrets
+            .get(SESSION_TOKEN_SECRET)
             .await
             .context("failed to read session token")?
             .is_some())
@@ -62,16 +62,16 @@ impl Service for SessionsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domains::settings::MockService as MockSettingsService;
+    use crate::domains::secrets::MockService as MockSecretsService;
 
     #[tokio::test]
     async fn leaves_the_request_unauthenticated_without_a_stored_token() {
-        let mut settings = MockSettingsService::new();
-        settings
+        let mut secrets = MockSecretsService::new();
+        secrets
             .expect_get()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .withf(|key| key == SESSION_TOKEN_SECRET)
             .returning(|_| Ok(None));
-        let client = SessionsClient::new(Arc::new(settings));
+        let client = SessionsClient::new(Arc::new(secrets));
 
         let request = client.authenticated_request(()).await.unwrap();
 
@@ -80,12 +80,12 @@ mod tests {
 
     #[tokio::test]
     async fn attaches_the_stored_token_as_a_bearer_header() {
-        let mut settings = MockSettingsService::new();
-        settings
+        let mut secrets = MockSecretsService::new();
+        secrets
             .expect_get()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .withf(|key| key == SESSION_TOKEN_SECRET)
             .returning(|_| Ok(Some("a-token".to_string())));
-        let client = SessionsClient::new(Arc::new(settings));
+        let client = SessionsClient::new(Arc::new(secrets));
 
         let request = client.authenticated_request(()).await.unwrap();
 
@@ -97,37 +97,37 @@ mod tests {
 
     #[tokio::test]
     async fn save_new_session_persists_the_token_under_the_session_key() {
-        let mut settings = MockSettingsService::new();
-        settings
+        let mut secrets = MockSecretsService::new();
+        secrets
             .expect_set()
-            .withf(|key, value| key == SESSION_TOKEN_SETTING && value == "a-token")
+            .withf(|key, value| key == SESSION_TOKEN_SECRET && value == "a-token")
             .times(1)
             .returning(|_, _| Ok(()));
-        let client = SessionsClient::new(Arc::new(settings));
+        let client = SessionsClient::new(Arc::new(secrets));
 
         client.save_new_session("a-token").await.unwrap();
     }
 
     #[tokio::test]
     async fn is_connected_returns_true_with_a_stored_token() {
-        let mut settings = MockSettingsService::new();
-        settings
+        let mut secrets = MockSecretsService::new();
+        secrets
             .expect_get()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .withf(|key| key == SESSION_TOKEN_SECRET)
             .returning(|_| Ok(Some("a-token".to_string())));
-        let client = SessionsClient::new(Arc::new(settings));
+        let client = SessionsClient::new(Arc::new(secrets));
 
         assert!(client.is_connected().await.unwrap());
     }
 
     #[tokio::test]
     async fn is_connected_returns_false_without_a_stored_token() {
-        let mut settings = MockSettingsService::new();
-        settings
+        let mut secrets = MockSecretsService::new();
+        secrets
             .expect_get()
-            .withf(|key| key == SESSION_TOKEN_SETTING)
+            .withf(|key| key == SESSION_TOKEN_SECRET)
             .returning(|_| Ok(None));
-        let client = SessionsClient::new(Arc::new(settings));
+        let client = SessionsClient::new(Arc::new(secrets));
 
         assert!(!client.is_connected().await.unwrap());
     }

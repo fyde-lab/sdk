@@ -43,6 +43,10 @@ fn config(url: &str, db_path: &std::path::Path) -> ClientConfig {
 #[tokio::test]
 #[serial(e2e)]
 async fn reconnecting_with_a_persisted_session_resumes_sync_without_logging_in_again() {
+    // `Storage::Disk` keeps secrets in the OS credential store; keep this
+    // test off the machine's real keychain (a headless runner may not even
+    // have one) while still letting them outlive the first `Client`.
+    fyde_sdk::use_in_process_keystore_for_tests().expect("failed to swap in a test keystore");
     let server = TestServer::start();
     let db_path = temp_db_path();
     let username = random_username();
@@ -77,7 +81,7 @@ async fn reconnecting_with_a_persisted_session_resumes_sync_without_logging_in_a
 
     // No `login`/`create` call on this second client: `Client::init` must
     // have started sync on its own, since a session was already persisted
-    // in the local database from the first client.
+    // by the first client.
     let document = wait_for(Duration::from_secs(1), || async {
         client.documents().get(document_id).await.ok()?
     })

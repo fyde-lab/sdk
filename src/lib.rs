@@ -80,6 +80,10 @@ pub enum Error {
     Encryption(String),
     #[error("invalid credentials")]
     InvalidCredentials,
+    #[error("a session is already open on this device; log out first")]
+    AlreadyLoggedIn,
+    #[error("credential store error: {0}")]
+    Keystore(#[from] keyring_core::Error),
     #[error("messagepack encode error: {0}")]
     MessagePackEncode(#[from] rmp_serde::encode::Error),
     #[error("messagepack decode error: {0}")]
@@ -206,12 +210,23 @@ impl Client {
             .try_init();
 
         let sqlite: Arc<SqliteClient> = Arc::new(
-            match config.storage {
-                Storage::Disk(path) => SqliteClient::connect_at(path).await,
+            match &config.storage {
+                Storage::Disk(path) => SqliteClient::connect_at(path.clone()).await,
                 Storage::Memory => SqliteClient::connect_with(sql::IN_MEMORY_DB).await,
             }
             .context("failed to open local database")?,
         );
+
+        // Secrets (master key, session token) live in the OS credential
+        // store next to an on-disk database, never in the database itself;
+        // an in-memory client keeps them in memory, like everything else.
+        let secrets = domains::secrets::init(match &config.storage {
+            Storage::Disk(path) => domains::secrets::StorageConfig::Keystore {
+                database_path: path,
+            },
+            Storage::Memory => domains::secrets::StorageConfig::Memory,
+        })
+        .context("failed to initialize secrets store")?;
 
         // Opened lazily: `connect_lazy` doesn't dial the server here, only
         // once some call actually needs it (see each domain's
@@ -223,13 +238,17 @@ impl Client {
             .connect_lazy();
 
         let settings = domains::settings::init(sqlite.pool().clone());
-        let sessions = domains::sessions::init(settings.clone());
+        domains::secrets::migrate_from_settings(secrets.as_ref(), settings.as_ref())
+            .await
+            .context("failed to migrate secrets out of the local database")?;
+        let sessions = domains::sessions::init(secrets.clone());
         let server_state = domains::server_state::init(channel.clone());
         let scripts = domains::scripts::init(channel.clone(), sessions.clone());
         let documents = domains::documents::init(
             channel.clone(),
             sqlite.pool().clone(),
             settings.clone(),
+            secrets.clone(),
             sessions.clone(),
             server_state.clone(),
             scripts.clone(),
@@ -240,6 +259,7 @@ impl Client {
         let users = domains::users::init(
             channel.clone(),
             settings.clone(),
+            secrets,
             sessions.clone(),
             sqlite.clone(),
             documents.clone(),
@@ -254,7 +274,7 @@ impl Client {
         );
 
         // A session may already be open from a previous run (the token is
-        // persisted in `settings`, not just held in memory — see
+        // persisted in `secrets`, not just held in memory — see
         // `users::mod`'s doc comment) — in that case `create`/`login` won't
         // run again to start it, so start it here instead.
         if sessions.is_connected().await? {
@@ -313,6 +333,18 @@ impl Client {
     pub(crate) fn sessions(&self) -> &SessionsClient {
         self.sessions.as_ref()
     }
+}
+
+/// Testing hook, not part of the supported API: makes every [`Client`]
+/// created afterwards in this process with [`Storage::Disk`] keep its
+/// secrets (master key, session token) in an in-process store instead of
+/// the OS credential store — they survive dropping and re-`init`ing a
+/// `Client`, but not the process, and the machine's real keychain is never
+/// touched. For end-to-end tests that must not depend on (or leave entries
+/// behind in) a desktop keychain, which a headless runner may not even have.
+#[doc(hidden)]
+pub fn use_in_process_keystore_for_tests() -> Result<()> {
+    domains::secrets::use_in_process_store()
 }
 
 /// Builds a standalone [`ScrapersService`] for local/dev use — no
