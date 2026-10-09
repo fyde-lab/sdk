@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mlua::{Lua, Result as LuaResult, Table};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::runtime::Handle;
 
 use super::super::browser::Service as BrowserService;
@@ -29,11 +29,18 @@ const DEFAULT_WAIT_FOR_TIMEOUT: Duration = Duration::from_secs(10);
 /// navigates where this call tells it to, so checking `open`'s `url` is
 /// enough; `wait_for`/`fill`/`click`/`html` act on whatever page is already
 /// loaded and never take a URL of their own.
+///
+/// `debug_http_dump` (forwarded from `Service::run`'s own parameter, the
+/// same one that opts `fyde.http` into dumping response bodies — see
+/// `host::http::table`'s doc comment) additionally records the page's HTML
+/// right after a successful `open`, under the `browser_open` report entry's
+/// `html` field — enable it only for a trusted, local debugging run.
 pub(super) fn table(
     lua: &Lua,
     browser: Arc<dyn BrowserService>,
     recorder: Arc<Recorder>,
     runtime: Handle,
+    debug_http_dump: bool,
     allowed_domains: Arc<Vec<String>>,
 ) -> LuaResult<Table> {
     let out = lua.create_table()?;
@@ -53,7 +60,22 @@ pub(super) fn table(
             }
             let result = open_runtime.block_on(open_browser.open(&url));
             match &result {
-                Ok(()) => open_recorder.record("browser_open", json!({ "url": url })),
+                Ok(()) => {
+                    let mut entry = json!({ "url": url });
+                    // Mirrors `fyde.http`'s own `debug_http_dump` dump (see
+                    // `host::http::table`'s doc comment): opt-in only,
+                    // for a trusted local debugging run, since a page's
+                    // HTML can carry session-bound content.
+                    if debug_http_dump {
+                        let html = open_runtime.block_on(open_browser.html());
+                        if let Ok(html) = html
+                            && let Value::Object(fields) = &mut entry
+                        {
+                            fields.insert("html".into(), Value::String(html));
+                        }
+                    }
+                    open_recorder.record("browser_open", entry);
+                }
                 Err(err) => open_recorder.record(
                     "error",
                     json!({ "action": "browser.open", "url": url, "message": err.to_string() }),
@@ -197,6 +219,7 @@ mod tests {
             Arc::new(browser),
             recorder.clone(),
             runtime.handle().clone(),
+            false,
             allowed_domains(),
         )
         .unwrap();
@@ -209,6 +232,47 @@ mod tests {
         let report = recorder.finish();
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].event, "browser_open");
+        assert!(report.entries[0].value.get("html").is_none());
+    }
+
+    #[test]
+    fn open_dumps_the_pages_html_when_debug_http_dump_is_set() {
+        let mut browser = MockService::new();
+        browser
+            .expect_open()
+            .with(eq("https://example.com/login"))
+            .times(1)
+            .returning(|_| Ok(()));
+        browser
+            .expect_html()
+            .times(1)
+            .returning(|| Ok("<html><body>login page</body></html>".to_string()));
+
+        let runtime = runtime();
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder.clone(),
+            runtime.handle().clone(),
+            true,
+            allowed_domains(),
+        )
+        .unwrap();
+        lua.globals().set("browser", browser_table).unwrap();
+
+        lua.load(r#"browser:open("https://example.com/login")"#)
+            .exec()
+            .unwrap();
+
+        let report = recorder.finish();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].event, "browser_open");
+        assert_eq!(
+            report.entries[0].value.get("html").and_then(Value::as_str),
+            Some("<html><body>login page</body></html>")
+        );
     }
 
     #[test]
@@ -224,6 +288,7 @@ mod tests {
             Arc::new(browser),
             recorder.clone(),
             runtime.handle().clone(),
+            false,
             allowed_domains(),
         )
         .unwrap();
@@ -256,6 +321,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            false,
             allowed_domains(),
         )
         .unwrap();
@@ -285,6 +351,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            false,
             allowed_domains(),
         )
         .unwrap();
@@ -312,6 +379,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            false,
             allowed_domains(),
         )
         .unwrap();
@@ -335,6 +403,7 @@ mod tests {
             Arc::new(browser),
             recorder.clone(),
             runtime.handle().clone(),
+            false,
             allowed_domains(),
         )
         .unwrap();
@@ -366,6 +435,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            false,
             allowed_domains(),
         )
         .unwrap();
@@ -391,6 +461,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            false,
             allowed_domains(),
         )
         .unwrap();
@@ -416,6 +487,7 @@ mod tests {
             Arc::new(browser),
             recorder.clone(),
             runtime.handle().clone(),
+            false,
             allowed_domains(),
         )
         .unwrap();
@@ -444,6 +516,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            false,
             allowed_domains(),
         )
         .unwrap();

@@ -123,9 +123,11 @@ impl Installed {
 /// write an entry to `recorder` — the `reports` sub-domain's per-run debug
 /// report, `demo-rust-fyde`'s `Report` brought back (`service.rs` saves it
 /// once the script's `run` function returns). `debug_http_dump` is
-/// forwarded to `fyde.http` only (see `host::http::table`) — it opts this
-/// run into recording full request/response headers/bodies instead of just
-/// method/url/status/timing. `wreq_emulation` is also forwarded to
+/// forwarded to `fyde.http` and `fyde.browser` (see `host::http::table` and
+/// `host::browser::table`) — it opts this run into recording full
+/// request/response headers/bodies for `fyde.http`, and the opened page's
+/// HTML for `fyde.browser:open`, instead of just method/url/status/timing.
+/// `wreq_emulation` is also forwarded to
 /// `fyde.http` only — it toggles `wreq`'s Chrome TLS/HTTP2 fingerprint
 /// emulation. `follow_redirects` is also forwarded to `fyde.http` only — it
 /// toggles whether the client automatically follows HTTP redirects.
@@ -193,7 +195,14 @@ pub(super) fn install(
     .context("installing fyde.save_document")?;
     fyde.set(
         "browser",
-        browser::table(lua, browser, recorder, runtime, allowed_domains)?,
+        browser::table(
+            lua,
+            browser,
+            recorder,
+            runtime,
+            debug_http_dump,
+            allowed_domains,
+        )?,
     )
     .context("installing fyde.browser")?;
 
