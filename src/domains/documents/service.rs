@@ -57,6 +57,18 @@ impl<S: Storage> Service for DocumentsClient<S> {
     /// being sent alongside the ciphertext. Only the wrapped DEK and
     /// ciphertext ever leave this process.
     async fn upload(&self, request: UploadRequest) -> Result<Uuid> {
+        // Checked before anything else — parsing below also lists and runs
+        // the user's enabled scripts against the document (see
+        // `Self::run_scripts`), which needs a session just as much as
+        // actually publishing the event does. Failing fast here means a
+        // caller who never logged in gets this specific, recognizable
+        // error instead of whatever that unrelated, also-authenticated
+        // work happens to fail with first.
+        self.changelog
+            .ensure_master_key()
+            .await
+            .context("cannot upload a document before logging in")?;
+
         let (content, original_name) = match request.source {
             UploadSource::Path(path) => {
                 check_extension(&path)?;
@@ -177,6 +189,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_fails_fast_with_no_master_key_before_ever_parsing_the_document() {
+        let file = write_temp_file("pdf", b"hello world");
+
+        let changelog = Arc::new(RecordingChangelog {
+            no_master_key: true,
+            ..Default::default()
+        });
+        // `no_op_parser` panics on any call, proving `upload` never reaches
+        // parsing (and so never lists/runs scripts) once this check fails.
+        let client = DocumentsClient::new(MockStorage::new(), changelog, no_op_parser(), None);
+
+        let err = client
+            .upload(UploadRequest::from_path(file.path()))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("no master key found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn run_scripts_delegates_to_the_parser_service() {
         let document = super::super::FakeDocument::new().build();
         let expected = super::super::FakeMetadata::new().build();
@@ -216,10 +251,24 @@ mod tests {
         sent: Mutex<Vec<SentEvent>>,
         to_consume: Mutex<Vec<ChangelogEvent>>,
         stopped: std::sync::atomic::AtomicBool,
+        /// When set, `ensure_master_key` fails the same way the real
+        /// `ChangelogClient` does before any account has ever logged in —
+        /// for tests exercising `Service::upload`'s fail-fast check.
+        no_master_key: bool,
     }
 
     #[async_trait]
     impl ChangelogService for RecordingChangelog {
+        async fn ensure_master_key(&self) -> Result<()> {
+            if self.no_master_key {
+                return Err(Error::Encryption(
+                    "no master key found in local settings; log in or create an account first"
+                        .into(),
+                ));
+            }
+            Ok(())
+        }
+
         async fn send(
             &self,
             event_type: EventType,

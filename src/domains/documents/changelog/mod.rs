@@ -31,6 +31,16 @@ use crate::{ErrorContext as _, Result};
 /// `start_consume_job`), so tests use hand-written fakes instead.
 #[async_trait]
 pub(super) trait Service: Send + Sync {
+    /// Fails with the same error [`Service::send`] would eventually hit
+    /// while encrypting, if no master key is on hand yet — i.e. before any
+    /// account has been created or logged into on this device — without
+    /// actually encrypting anything. Exposed so a caller doing unrelated
+    /// authenticated work before it ever reaches `send` (e.g.
+    /// `documents::Service::upload` listing a user's enabled scripts) can
+    /// fail fast with this specific, recognizable error instead of
+    /// whatever that other work happens to fail with first.
+    async fn ensure_master_key(&self) -> Result<()>;
+
     /// Encrypts and publishes a new event. `content`/`metadata` are `None`
     /// for event types that don't carry them (e.g. a future `Deleted`
     /// event only carries `document_id`).

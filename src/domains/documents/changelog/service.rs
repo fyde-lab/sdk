@@ -327,6 +327,10 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
 
 #[async_trait]
 impl<D: DocumentStorage + 'static, O: CursorStorage + 'static> Service for ChangelogClient<D, O> {
+    async fn ensure_master_key(&self) -> Result<()> {
+        crypto::ensure_master_key(&*self.settings).await
+    }
+
     async fn send(
         &self,
         event_type: EventType,

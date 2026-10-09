@@ -46,6 +46,33 @@ fn generate_dek() -> [u8; KEY_LEN] {
     dek
 }
 
+/// Returns the raw, still-encoded master key persisted locally under
+/// [`MASTER_KEY_SETTING`], or fails with [`Error::Encryption`] if no master
+/// key is on hand yet — i.e. before any account has been created or logged
+/// into on this device. Shared by [`derive_kek`] (which also decodes it)
+/// and [`ensure_master_key`] (which just needs to know one is present).
+async fn encoded_master_key(settings: &dyn SettingsService) -> Result<String> {
+    settings
+        .get(MASTER_KEY_SETTING)
+        .await
+        .context("failed to read master key from local settings")?
+        .ok_or_else(|| {
+            Error::Encryption(
+                "no master key found in local settings; log in or create an account first".into(),
+            )
+        })
+}
+
+/// Fails with the same error [`derive_kek`] would hit while encrypting, if
+/// no master key is on hand yet, without actually deriving the KEK — for a
+/// caller that wants to fail fast with this specific error before
+/// attempting unrelated authenticated work (see
+/// `changelog::Service::ensure_master_key`).
+pub(super) async fn ensure_master_key(settings: &dyn SettingsService) -> Result<()> {
+    encoded_master_key(settings).await?;
+    Ok(())
+}
+
 /// Derives the key-encryption-key (KEK) that wraps every changelog event's
 /// DEK from the account's raw master key, persisted locally under
 /// [`MASTER_KEY_SETTING`] by `users::Service::create`/`login` (see that
@@ -56,15 +83,7 @@ fn generate_dek() -> [u8; KEY_LEN] {
 /// [`Error::Encryption`] if no master key is on hand yet — i.e. before any
 /// account has been created or logged into on this device.
 async fn derive_kek(settings: &dyn SettingsService) -> Result<[u8; KEY_LEN]> {
-    let encoded_master_key = settings
-        .get(MASTER_KEY_SETTING)
-        .await
-        .context("failed to read master key from local settings")?
-        .ok_or_else(|| {
-            Error::Encryption(
-                "no master key found in local settings; log in or create an account first".into(),
-            )
-        })?;
+    let encoded_master_key = encoded_master_key(settings).await?;
     let master_key = decode_master_key(&encoded_master_key)
         .context("failed to decode master key from local settings")?;
 
