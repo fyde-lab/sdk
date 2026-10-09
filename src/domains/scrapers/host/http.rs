@@ -236,7 +236,7 @@ pub(super) fn table(
     follow_redirects: bool,
     allowed_domains: Arc<Vec<String>>,
 ) -> LuaResult<Table> {
-    let mut builder = Client::builder().cookie_provider(jar);
+    let mut builder = Client::builder().cookie_provider(jar.clone());
     if wreq_emulation {
         builder = builder.emulation(Profile::Chrome131);
     }
@@ -422,6 +422,32 @@ pub(super) fn table(
                 }
             },
         )?,
+    )?;
+
+    // `set_cookie(url, set_cookie)` adds a cookie to this run's jar exactly as
+    // if `url` had answered with a `Set-Cookie: <set_cookie>` header, for
+    // sites that set a cookie from inline JS (e.g. a `document.cookie = ...`
+    // anti-bot challenge) that a plain HTTP client never runs. A manual
+    // `Cookie` request header can't stand in for this: `wreq` skips the jar
+    // entirely for a request that already carries one. Records nothing (the
+    // value may be a session secret); gated by `allowed_domains` like every
+    // other method here so a script can't plant cookies for other hosts.
+    let set_cookie_origins = visited_origins.clone();
+    let set_cookie_recorder = recorder.clone();
+    let set_cookie_allowed_domains = allowed_domains.clone();
+    http.set(
+        "set_cookie",
+        lua.create_function(move |_, (url, set_cookie): (String, String)| {
+            ensure_domain_allowed_or_record(
+                &set_cookie_recorder,
+                "http.set_cookie",
+                &url,
+                &set_cookie_allowed_domains,
+            )?;
+            track_origin(&set_cookie_origins, &url);
+            jar.add(set_cookie.as_str(), url.as_str());
+            Ok(())
+        })?,
     )?;
 
     let download_client = client.clone();
@@ -684,6 +710,39 @@ mod tests {
             Some("https://example.com".to_string())
         );
         assert_eq!(origin_of("not a url"), None);
+    }
+
+    #[test]
+    fn set_cookie_adds_to_the_jar_and_respects_allowed_domains() {
+        let runtime = runtime();
+        let lua = Lua::new();
+        let jar: Arc<Jar> = Jar::default().into();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let http_table = table(
+            &lua,
+            jar.clone(),
+            Arc::new(Mutex::new(HashSet::new())),
+            recorder,
+            runtime.handle().clone(),
+            false,
+            true,
+            true,
+            Arc::new(vec!["allowed.example.com".to_string()]),
+        )
+        .unwrap();
+        lua.globals().set("http", http_table).unwrap();
+
+        lua.load(r#"http.set_cookie("https://allowed.example.com/", "mit=abc; Path=/")"#)
+            .exec()
+            .unwrap();
+        let matches: Vec<_> = jar.matches("https://allowed.example.com").collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].value(), "abc");
+
+        let result = lua
+            .load(r#"http.set_cookie("https://evil.example.net/", "mit=abc")"#)
+            .exec();
+        assert!(result.is_err());
     }
 
     #[test]
