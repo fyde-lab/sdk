@@ -238,9 +238,6 @@ impl Client {
             .connect_lazy();
 
         let settings = domains::settings::init(sqlite.pool().clone());
-        domains::secrets::migrate_from_settings(secrets.as_ref(), settings.as_ref())
-            .await
-            .context("failed to migrate secrets out of the local database")?;
         let sessions = domains::sessions::init(secrets.clone());
         let server_state = domains::server_state::init(channel.clone());
         let scripts = domains::scripts::init(channel.clone(), sessions.clone());

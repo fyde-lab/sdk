@@ -121,14 +121,13 @@ impl SqliteClient {
 /// Creates the database file at `path` (if it doesn't exist yet) readable
 /// and writable by its owner only, before SQLite opens it: it holds every
 /// cached document in plaintext, so it must not inherit a umask-derived,
-/// typically world-readable mode. Also tightens an existing file created by
-/// an earlier version of this SDK. SQLite's own journal files copy the main
+/// typically world-readable mode. SQLite's own journal files copy the main
 /// file's permissions. A no-op off Unix, where the OS's per-user profile
 /// directories (Windows) or per-app sandboxes (mobile) already scope access.
 fn create_owner_only(path: &std::path::Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        use std::os::unix::fs::OpenOptionsExt as _;
 
         std::fs::OpenOptions::new()
             .create(true)
@@ -136,8 +135,6 @@ fn create_owner_only(path: &std::path::Path) -> Result<()> {
             .mode(0o600)
             .open(path)
             .with_context(|| format!("failed to create local database {}", path.display()))?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to restrict permissions on {}", path.display()))?;
     }
     #[cfg(not(unix))]
     let _ = path;
@@ -205,22 +202,6 @@ mod tests {
     async fn creates_the_database_file_readable_by_its_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
         let path = temp_db_path();
-
-        let client = SqliteClient::connect_at(path.clone()).await.unwrap();
-        drop(client);
-
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn tightens_the_permissions_of_an_existing_database_file() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let path = temp_db_path();
-        std::fs::write(&path, b"").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         let client = SqliteClient::connect_at(path.clone()).await.unwrap();
         drop(client);

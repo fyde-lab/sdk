@@ -55,7 +55,6 @@ Keeps the values that would compromise the account if read off the device — th
 - `service.rs` — `SecretsClient` over an injected `Storage`.
 - `storage_keystore.rs` — the real adapter, on `keyring-core` plus each platform's own store crate (target-specific dependencies in `Cargo.toml`): the login Keychain on macOS, the data-protection Keychain on iOS, the Credential Manager on Windows, an Android Keystore-backed vault on Android, and the freedesktop Secret Service over D-Bus on Linux/other desktop Unixes (a headless Linux box with no Secret Service fails rather than silently falling back to plaintext). Entries are namespaced per local database (`fyde-sdk.<sha256 of its canonical path>`), so two `Client`s on two databases never share secrets. **Android apps must hand the library their JNI context once at startup**, before the first `Client::init`: declare a Kotlin class `io.crates.keyring.Keyring` with a companion `external fun initializeNdkContext(context: Context)` and call it from the main activity's `onCreate` — the symbol (`Java_io_crates_keyring_Keyring_00024Companion_initializeNdkContext`) is exported from this crate's own shared library by `android-native-keyring-store`, so no separate `.so` needs loading. Only the Linux path has been exercised while writing this; the other platforms follow each store crate's own documented usage.
 - `storage_memory.rs` — process memory only, used for `Storage::Memory` clients so they never touch the OS store.
-- `migration.rs` — `migrate_from_settings`, run on every `Client::init`: moves any secret an older SDK left in the `settings` table into the credential store, then deletes it there. A no-op once nothing is left.
 - `crate::use_in_process_keystore_for_tests` (`#[doc(hidden)]`) swaps the process-wide store for `keyring-core`'s in-memory mock, for `tests/` suites that use `Storage::Disk` (e.g. `reconnect_lifecycle_test.rs`) and must not depend on, or leave entries in, the machine's real keychain.
 
 ### Scrapers service (`src/domains/scrapers/`)
@@ -90,7 +89,7 @@ The enforced solution: every `tests/*_test.rs` top-level test function is annota
 
 ### SQLite client (`src/tools/sql/sqlite.rs`)
 
-`SqliteClient` manages a local on-disk database independent of the gRPC services, at `$XDG_DATA_HOME/fyde/fyde.db` (falling back to `~/.local/share/fyde/fyde.db`), created on first connect. Uses a single-connection pool deliberately, since SQLite only supports one writer at a time. Since it holds every cached document in plaintext, the file is created (or tightened to) mode `0600` on Unix, every connection runs with `PRAGMA secure_delete = ON`, and `wipe` finishes with a `VACUUM`, so nothing deleted on logout can be carved back out of the file.
+`SqliteClient` manages a local on-disk database independent of the gRPC services, at `$XDG_DATA_HOME/fyde/fyde.db` (falling back to `~/.local/share/fyde/fyde.db`), created on first connect. Uses a single-connection pool deliberately, since SQLite only supports one writer at a time. Since it holds every cached document in plaintext, the file is created with mode `0600` on Unix, every connection runs with `PRAGMA secure_delete = ON`, and `wipe` finishes with a `VACUUM`, so nothing deleted on logout can be carved back out of the file.
 
 ### Lua sandbox (`src/tools/sandbox/`)
 

@@ -1,10 +1,8 @@
-mod migration;
 mod service;
 mod storage;
 mod storage_keystore;
 mod storage_memory;
 
-pub(crate) use migration::migrate_from_settings;
 pub(crate) use storage_keystore::use_in_process_store;
 
 use std::path::Path;
