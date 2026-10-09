@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,7 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::run_return::EventLoopExtRunReturn as _;
 use tao::window::WindowBuilder;
+use uuid::Uuid;
 use wry::WebViewBuilder;
 
 use crate::{Error, Result};
@@ -24,6 +26,19 @@ use super::Service;
 /// thread's IPC handler (which looks the id up and fills it in once the
 /// page posts a matching message back).
 type PendingReplies = Arc<Mutex<HashMap<u64, SyncSender<Value>>>>;
+
+/// The single in-flight download's reply slot, if any — set by
+/// [`BrowserDriver::download`] right before it triggers the click that
+/// starts the download, and filled in by the `download_completed_handler`
+/// installed in [`run_event_loop`] once the webview engine reports the
+/// download finished (or failed). `None` here (checked by the handler) means
+/// no script-level `download` call is currently waiting, which can happen if
+/// a page starts a download on its own outside of `download`'s control —
+/// that outcome is logged and the file cleaned up rather than delivered
+/// nowhere. Only one slot, not a map keyed by id like [`PendingReplies`],
+/// since nothing here runs more than one download at a time (see
+/// [`Service::download`]'s own doc comment).
+type PendingDownload = Arc<Mutex<Option<SyncSender<Option<PathBuf>>>>>;
 
 /// Sent from a [`BrowserDriver`] method to the dedicated OS thread actually
 /// holding the `tao` event loop and `wry` webview — neither type is `Send`,
@@ -44,6 +59,7 @@ enum Command {
 struct Running {
     proxy: EventLoopProxy<Command>,
     pending: PendingReplies,
+    pending_download: PendingDownload,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -84,14 +100,20 @@ impl BrowserDriver {
     /// connection (X11/Wayland on Linux) that a headless server or CI
     /// runner may simply not have, and this way that's only ever a problem
     /// for a run that actually touches `fyde.browser`.
-    fn ensure_started(&self) -> Result<(EventLoopProxy<Command>, PendingReplies)> {
+    fn ensure_started(&self) -> Result<(EventLoopProxy<Command>, PendingReplies, PendingDownload)> {
         let mut guard = self.running.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(running) = guard.as_ref() {
-            return Ok((running.proxy.clone(), running.pending.clone()));
+            return Ok((
+                running.proxy.clone(),
+                running.pending.clone(),
+                running.pending_download.clone(),
+            ));
         }
 
         let pending: PendingReplies = Arc::new(Mutex::new(HashMap::new()));
         let pending_for_thread = pending.clone();
+        let pending_download: PendingDownload = Arc::new(Mutex::new(None));
+        let pending_download_for_thread = pending_download.clone();
 
         // The `tao`/`wry` types involved (`EventLoop`, `WebView`, the GTK
         // objects underneath them on Linux) are all `!Send`, so none of
@@ -106,7 +128,15 @@ impl BrowserDriver {
         let visible = self.visible;
         let thread = std::thread::Builder::new()
             .name("fyde-browser".to_string())
-            .spawn(move || run_event_loop(pending_for_thread, ready_tx, allowed_domains, visible))
+            .spawn(move || {
+                run_event_loop(
+                    pending_for_thread,
+                    pending_download_for_thread,
+                    ready_tx,
+                    allowed_domains,
+                    visible,
+                )
+            })
             .map_err(|err| Error::Browser(format!("failed to spawn browser thread: {err}")))?;
 
         // Block until the webview has actually been created (or failed to
@@ -119,10 +149,11 @@ impl BrowserDriver {
         *guard = Some(Running {
             proxy: proxy.clone(),
             pending: pending.clone(),
+            pending_download: pending_download.clone(),
             thread: Some(thread),
         });
 
-        Ok((proxy, pending))
+        Ok((proxy, pending, pending_download))
     }
 
     /// Runs one `Eval` round-trip: allocates an id, registers its reply slot
@@ -133,7 +164,7 @@ impl BrowserDriver {
     /// `click`/`html` — `open` has no reply to wait for, so it bypasses
     /// this.
     fn call(&self, build_js: impl FnOnce(u64) -> String, timeout: Duration) -> Result<Value> {
-        let (proxy, pending) = self.ensure_started()?;
+        let (proxy, pending, _pending_download) = self.ensure_started()?;
         let id = self.next_id();
 
         let (tx, rx) = sync_channel(1);
@@ -187,7 +218,7 @@ impl Drop for BrowserDriver {
 #[async_trait]
 impl Service for BrowserDriver {
     async fn open(&self, url: &str) -> Result<()> {
-        let (proxy, _pending) = self.ensure_started()?;
+        let (proxy, _pending, _pending_download) = self.ensure_started()?;
         proxy
             .send_event(Command::Open(url.to_string()))
             .map_err(|_| Error::Browser("browser thread is no longer running".to_string()))
@@ -219,6 +250,41 @@ impl Service for BrowserDriver {
         let value = self.call(html_script, Duration::from_secs(10))?;
         parse_html(value)
     }
+
+    async fn download(&self, selector: &str, timeout: Duration) -> Result<Vec<u8>> {
+        let (_proxy, _pending, pending_download) = self.ensure_started()?;
+
+        let (tx, rx) = sync_channel(1);
+        *pending_download.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+
+        // Reuses the same click path `Service::click` does — the download
+        // is a side effect of this click, not a separate webview command.
+        if let Err(err) = self.click(selector).await {
+            *pending_download.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            return Err(err);
+        }
+
+        let path = match rx.recv_timeout(timeout) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                return Err(Error::Browser(
+                    "download failed or was cancelled by the browser engine".to_string(),
+                ));
+            }
+            Err(_) => {
+                *pending_download.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                return Err(Error::Browser(format!(
+                    "timed out after {timeout:?} waiting for a download to complete"
+                )));
+            }
+        };
+
+        let bytes = std::fs::read(&path).map_err(|err| {
+            Error::Browser(format!("failed to read downloaded file {path:?}: {err}"))
+        })?;
+        let _ = std::fs::remove_file(&path);
+        Ok(bytes)
+    }
 }
 
 /// Builds the `tao` event loop and `wry` webview and owns them for as long
@@ -231,6 +297,7 @@ impl Service for BrowserDriver {
 /// window's own close button) exits the loop.
 fn run_event_loop(
     pending: PendingReplies,
+    pending_download: PendingDownload,
     ready_tx: Sender<Result<EventLoopProxy<Command>>>,
     allowed_domains: Arc<Vec<String>>,
     visible: bool,
@@ -313,6 +380,47 @@ fn run_event_loop(
                 wry::NewWindowResponse::Allow
             } else {
                 wry::NewWindowResponse::Deny
+            }
+        })
+        // Redirects every download to a fresh, unique path under the OS
+        // temp dir instead of the engine's default (a real downloads
+        // directory, which would also prompt/collide across concurrent
+        // runs) — `Service::download` reads this path back once the
+        // completed handler below reports it finished, then deletes it.
+        // Always allows the download (`true`): the resource it downloads
+        // from was already reached through a page this webview navigated
+        // to, which `with_navigation_handler`/`with_new_window_req_handler`
+        // above already gated against `allowed_domains`.
+        .with_download_started_handler(move |_url, path| {
+            *path = std::env::temp_dir().join(format!("fyde-browser-download-{}", Uuid::new_v4()));
+            true
+        })
+        // Delivers the finished (or failed) download to whichever
+        // `Service::download` call is currently waiting, via
+        // `pending_download` — see that type's own doc comment for why a
+        // single slot, not a map, is enough here. A download that
+        // completes with nobody waiting (nothing in this host triggers one
+        // outside of `Service::download` itself, but a page could still do
+        // it unprompted) is logged and its file cleaned up rather than
+        // silently leaked on disk.
+        .with_download_completed_handler(move |_url, path, success| {
+            let waiting = pending_download
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take();
+            match waiting {
+                Some(sender) => {
+                    let _ = sender.send(if success { path } else { None });
+                }
+                None => {
+                    tracing::warn!(
+                        "fyde.browser: a download completed (success={success}) with no \
+                         pending `download` call waiting for it"
+                    );
+                    if let Some(path) = path {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
             }
         });
 
@@ -416,7 +524,16 @@ fn fill_script(id: u64, selector: &str, value: &str) -> String {
                     window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: "element not found"}}));
                     return;
                 }}
-                el.value = {value_json};
+                // Go through the prototype's native setter rather than
+                // `el.value = ...`: React (and libraries built on it, like
+                // react-hook-form) tracks an input's last-known value via an
+                // instance-level setter, so a plain assignment updates that
+                // tracker too and React then ignores the `input` event below
+                // as a no-op, leaving its own state empty.
+                var proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype
+                    : el instanceof HTMLSelectElement ? HTMLSelectElement.prototype
+                    : HTMLInputElement.prototype;
+                Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, {value_json});
                 el.dispatchEvent(new Event('input', {{bubbles: true}}));
                 el.dispatchEvent(new Event('change', {{bubbles: true}}));
                 window.ipc.postMessage(JSON.stringify({{id: __id, ok: true}}));

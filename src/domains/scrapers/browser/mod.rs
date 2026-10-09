@@ -16,7 +16,7 @@ use crate::Result;
 /// challenge (Datadome, etc. — see `boursorama`/`edf`) that only passes
 /// when real JS actually runs. Exposed to Lua as `fyde.browser` (see
 /// `host::browser`), with the operations a login flow needs:
-/// `open`/`wait_for`/`fill`/`click`.
+/// `open`/`wait_for`/`fill`/`click`/`download`.
 ///
 /// Trait methods take `&self` (not `&mut self`) so implementations can be
 /// shared behind `Arc<dyn Service>`, matching every other domain here —
@@ -77,6 +77,24 @@ pub(super) trait Service: Send + Sync {
     /// the webview actually rendered, since every other method here only
     /// reports a selector match/mismatch, never the markup itself.
     async fn html(&self) -> Result<String>;
+
+    /// Clicks the first element matched by `selector`, the same way
+    /// [`Service::click`] does, but for a button/link whose handler doesn't
+    /// change the page at all — instead it triggers the webview engine's own
+    /// native file-download machinery (a `window.open()`/popup whose
+    /// response carries `Content-Disposition: attachment`, or an anchor with
+    /// a `download` attribute), which neither [`Service::wait_for`] nor
+    /// [`Service::html`] can ever observe since nothing in the DOM changes
+    /// (confirmed live against `cesu.urssaf.fr`'s "Bulletin de salaire"
+    /// buttons — see `../../../scripts/scrapers/cesu/script.lua`'s header
+    /// comment). Blocks until the download finishes (or `timeout` elapses)
+    /// and returns the downloaded file's raw bytes, read back from wherever
+    /// the webview engine saved it — see `driver::BrowserDriver`'s
+    /// `download_started_handler`/`download_completed_handler` for how that
+    /// destination is chosen and captured. Only one `download` call may be
+    /// in flight at a time per driver (matching every scraper script's own
+    /// single-threaded, one-step-at-a-time use of `fyde.browser`).
+    async fn download(&self, selector: &str, timeout: Duration) -> Result<Vec<u8>>;
 }
 
 /// Builds the real, `wry`-backed browser service. Never fails on its own —

@@ -9,8 +9,11 @@ use super::super::browser::Service as BrowserService;
 use super::super::reports::Recorder;
 
 const DEFAULT_WAIT_FOR_TIMEOUT: Duration = Duration::from_secs(10);
+// A real file download (even a small PDF) routinely takes longer than a DOM
+// change to settle, so `download` gets a longer default than `wait_for`'s.
+const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `fyde.browser` — `open`/`wait_for`/`fill`/`click`, backed by
+/// `fyde.browser` — `open`/`wait_for`/`fill`/`click`/`download`, backed by
 /// [`BrowserService`] (a real `wry` webview, see
 /// `browser::driver::BrowserDriver`), so a login flow blocked by a
 /// client-rendered SPA or a JS-driven WAF challenge can drive a real
@@ -164,19 +167,51 @@ pub(super) fn table(
         })?,
     )?;
 
+    let html_browser = browser.clone();
+    let html_runtime = runtime.clone();
+    let html_recorder = recorder.clone();
     out.set(
         "html",
         lua.create_function(move |_, _self: Table| {
-            let result = runtime.block_on(browser.html());
+            let result = html_runtime.block_on(html_browser.html());
             match &result {
-                Ok(_) => recorder.record("browser_html", json!({})),
-                Err(err) => recorder.record(
+                Ok(_) => html_recorder.record("browser_html", json!({})),
+                Err(err) => html_recorder.record(
                     "error",
                     json!({ "action": "browser.html", "message": err.to_string() }),
                 ),
             }
             result.map_err(mlua::Error::external)
         })?,
+    )?;
+
+    out.set(
+        "download",
+        lua.create_function(
+            move |lua, (_self, selector, timeout_ms): (Table, String, Option<u64>)| {
+                let timeout = timeout_ms
+                    .map(Duration::from_millis)
+                    .unwrap_or(DEFAULT_DOWNLOAD_TIMEOUT);
+                let result =
+                    runtime.block_on(browser.download(&selector, timeout));
+                match &result {
+                    Ok(bytes) => recorder.record(
+                        "browser_download",
+                        json!({ "selector": selector, "bytes": bytes.len() }),
+                    ),
+                    Err(err) => recorder.record(
+                        "error",
+                        json!({
+                            "action": "browser.download",
+                            "selector": selector,
+                            "message": err.to_string(),
+                        }),
+                    ),
+                }
+                let bytes = result.map_err(mlua::Error::external)?;
+                lua.create_string(&bytes)
+            },
+        )?,
     )?;
 
     Ok(out)
@@ -523,6 +558,107 @@ mod tests {
         lua.globals().set("browser", browser_table).unwrap();
 
         let result: LuaResult<String> = lua.load(r##"return browser:html()"##).eval();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn download_returns_the_bytes_and_records_their_size_not_their_content() {
+        let mut browser = MockService::new();
+        browser
+            .expect_download()
+            .withf(|selector, timeout| {
+                selector == "#affichagePdf_123" && *timeout == DEFAULT_DOWNLOAD_TIMEOUT
+            })
+            .times(1)
+            .returning(|_, _| Ok(b"%PDF-1.4 fake bytes".to_vec()));
+
+        let runtime = runtime();
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder.clone(),
+            runtime.handle().clone(),
+            false,
+            allowed_domains(),
+        )
+        .unwrap();
+        lua.globals().set("browser", browser_table).unwrap();
+
+        let result: mlua::LuaString = lua
+            .load(r##"return browser:download("#affichagePdf_123")"##)
+            .eval()
+            .unwrap();
+
+        assert_eq!(result.as_bytes().as_ref(), b"%PDF-1.4 fake bytes");
+        let report = recorder.finish();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].event, "browser_download");
+        assert_eq!(
+            report.entries[0].value.get("bytes").and_then(Value::as_u64),
+            Some(19)
+        );
+        assert!(
+            !serde_json::to_string(&report.entries)
+                .unwrap()
+                .contains("PDF-1.4")
+        );
+    }
+
+    #[test]
+    fn download_passes_a_caller_given_timeout_in_milliseconds() {
+        let mut browser = MockService::new();
+        browser
+            .expect_download()
+            .withf(|_, timeout| *timeout == Duration::from_millis(5000))
+            .times(1)
+            .returning(|_, _| Ok(vec![]));
+
+        let runtime = runtime();
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder,
+            runtime.handle().clone(),
+            false,
+            allowed_domains(),
+        )
+        .unwrap();
+        lua.globals().set("browser", browser_table).unwrap();
+
+        lua.load(r##"browser:download("#affichagePdf_123", 5000)"##)
+            .exec()
+            .unwrap();
+    }
+
+    #[test]
+    fn download_propagates_a_service_error() {
+        let mut browser = MockService::new();
+        browser
+            .expect_download()
+            .returning(|_, _| Err(crate::Error::Browser("timed out".to_string())));
+
+        let runtime = runtime();
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let browser_table = table(
+            &lua,
+            Arc::new(browser),
+            recorder,
+            runtime.handle().clone(),
+            false,
+            allowed_domains(),
+        )
+        .unwrap();
+        lua.globals().set("browser", browser_table).unwrap();
+
+        let result: LuaResult<mlua::LuaString> = lua
+            .load(r##"return browser:download("#missing")"##)
+            .eval();
 
         assert!(result.is_err());
     }
