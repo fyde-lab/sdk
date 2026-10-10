@@ -124,13 +124,6 @@ fn response_to_table(lua: &Lua, runtime: &Handle, resp: wreq::Response) -> LuaRe
     Ok(out)
 }
 
-/// Records one `http_redirect` entry per hop in `resp`'s redirect chain —
-/// `wreq` stashes it as a [`wreq::redirect::History`] response extension
-/// whenever its (non-`none`) [`wreq::redirect::Policy`] actually follows a
-/// redirect (see `table`'s client builder). Each entry is independent of the
-/// final `http_request` entry `get`/`post_form`/`download` also records, so a
-/// report shows every intermediate hop (e.g. an OAuth/OIDC bounce) even
-/// though the script itself only ever sees the start URL and the final one.
 /// Checks `url` against `allowed_domains` (see `host::ensure_domain_allowed`)
 /// before any of `get`/`post_form`/`post_json`/`download` sends a single
 /// byte on the wire. On a violation, records an `error` entry the same way
@@ -152,6 +145,14 @@ fn ensure_domain_allowed_or_record(
     Ok(())
 }
 
+/// Records one `http_redirect` entry per hop in `resp`'s redirect chain —
+/// `wreq` stashes it as a [`wreq::redirect::History`] response extension
+/// whenever its (non-`none`) [`wreq::redirect::Policy`] actually follows a
+/// redirect (see `table`'s client builder). Each entry is independent of the
+/// final `http_request` entry `get`/`post_form`/`post_json`/`download` also
+/// record, so a report shows every intermediate hop (e.g. an OAuth/OIDC
+/// bounce) even though the script itself only ever sees the start URL and
+/// the final one.
 fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
     let Some(history) = resp.extensions().get::<wreq::redirect::History>() else {
         return;
@@ -196,9 +197,9 @@ fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
 /// `wreq_emulation` controls whether the client applies `wreq_util`'s
 /// Chrome TLS/HTTP2 fingerprint emulation (`Profile::Chrome131`) — some
 /// sites' WAFs block `wreq`'s TLS fingerprint outright regardless of
-/// whether emulation is on, so a scraper can opt out per `scripts/<name>/
-/// settings.json`'s `wreq_emulation` field rather than carrying a global
-/// toggle.
+/// whether emulation is on, so a scraper can opt out per its
+/// `scrapers/<name>/settings.json`'s `wreq_emulation` field (in the
+/// `scripts` repo) rather than carrying a global toggle.
 ///
 /// `follow_redirects` controls whether the client follows HTTP redirects at
 /// all. Unlike `reqwest`, `wreq`'s builder defaults to not following
@@ -206,7 +207,7 @@ fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
 /// real-browser-like client that follows them (e.g. to pick up cookies set
 /// along an OAuth/OIDC redirect chain before a login POST), so this matches
 /// `reqwest`'s own default (`redirect::Policy::default()`) when `true`. A
-/// scraper can opt out per `scripts/<name>/settings.json`'s
+/// scraper can opt out per its `scrapers/<name>/settings.json`'s
 /// `follow_redirects` field when it needs to inspect a redirect response
 /// itself (e.g. reading a `Location` header) rather than carrying a global
 /// toggle.

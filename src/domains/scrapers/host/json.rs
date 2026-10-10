@@ -15,11 +15,11 @@ pub(super) fn table(lua: &Lua) -> LuaResult<Table> {
             // mlua defaults to representing a JSON `null` as a special null
             // "userdata" sentinel distinct from Lua `nil` (so an encode
             // round-trip can tell an explicit null apart from a missing
-            // key). Scripts here only ever decode, and expect the ordinary
-            // Lua idiom of testing a field with `if value then`, which that
-            // sentinel breaks: it's truthy, since only `nil`/`false` are
-            // falsy in Lua. Decode `null` as real `nil` instead so those
-            // checks see an absent field, matching Lua convention.
+            // key). Scripts test decoded fields with the ordinary Lua idiom
+            // `if value then`, which that sentinel breaks: it's truthy, since
+            // only `nil`/`false` are falsy in Lua. Decode `null` as real
+            // `nil` instead so those checks see an absent field, matching
+            // Lua convention.
             let options = SerializeOptions::new()
                 .serialize_none_to_null(false)
                 .serialize_unit_to_null(false);

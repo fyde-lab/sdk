@@ -61,11 +61,12 @@ pub struct UsersClient {
 
 impl UsersClient {
     /// Creates a client for the users service using the shared `channel`
-    /// connection to the fyde server, persisting the account's master key
-    /// in `secrets` and its role in `settings`, the session token and
-    /// authenticating outgoing calls via `sessions`, clearing `secrets` and
-    /// wiping `local_db` on `logout`, and starting/stopping changelog
-    /// consumption on `documents` from `create`/`login`/`logout`.
+    /// connection to the fyde server. The account's master key is persisted
+    /// in `secrets` and its role in `settings`; the session token is
+    /// persisted, and outgoing calls authenticated, via `sessions`;
+    /// `secrets` is cleared and `local_db` wiped on `logout`; and changelog
+    /// consumption on `documents` is started by `create`/`login` and stopped
+    /// by `logout`.
     pub(super) async fn new(
         channel: Channel,
         settings: Arc<dyn SettingsService>,

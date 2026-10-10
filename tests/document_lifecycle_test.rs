@@ -15,9 +15,9 @@ use uuid::Uuid;
 
 use common::{Scenario, TEST_PASSWORD, build_pdf, random_username, wait_for};
 
-// `#[serial(e2e)]`: this suite must not run concurrently with
-// `session_lifecycle_test.rs` — see the sdk CLAUDE.md's "must run
-// serially" note under Testing.
+// `#[serial(e2e)]`: this suite must not run concurrently with any other
+// `tests/` suite — see the sdk CLAUDE.md's "must run serially" note under
+// Testing.
 #[tokio::test]
 #[serial(e2e)]
 async fn document_lifecycle() {

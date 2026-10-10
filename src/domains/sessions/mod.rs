@@ -23,8 +23,8 @@ pub(crate) trait Service: Send + Sync {
     /// Builds a tonic request for `message`, attaching the session token
     /// currently persisted in the secrets store (if any) as a `Bearer`
     /// `authorization` header. Calls made before any session is opened
-    /// (e.g. `CreateUser`/`Login` themselves) go out unauthenticated, since
-    /// there is nothing to attach yet.
+    /// (e.g. the registration/login RPCs themselves) go out
+    /// unauthenticated, since there is nothing to attach yet.
     async fn authenticated_request<T: Send + 'static>(
         &self,
         message: T,

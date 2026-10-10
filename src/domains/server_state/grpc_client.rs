@@ -25,7 +25,7 @@ pub(super) trait FydeClient: Send + Sync {
 
 /// The production [`FydeClient`] implementation, backed by a tonic
 /// [`Channel`] shared with every other domain's gRPC client (see
-/// [`crate::Client::connect`]). Cloning a [`Channel`] is cheap — it's just
+/// [`crate::Client::init`]). Cloning a [`Channel`] is cheap — it's just
 /// a handle to the same underlying connection — so a fresh generated
 /// client is created per call.
 pub(super) struct GrpcClient {

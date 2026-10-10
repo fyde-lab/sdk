@@ -7,13 +7,15 @@ use super::models::{Report, ReportEntry};
 
 /// Accumulates one scraper run's debug report in memory as it happens —
 /// ported from `demo-rust-fyde`'s `Report` (`report.rs`): every `fyde.log`,
-/// `fyde.http`, `fyde.progress` and `fyde.input` call records a
-/// `(event_type, value)` entry via [`record`]. Unlike `demo-rust-fyde`,
-/// which rewrote a file to disk on every entry so a crash mid-run never
-/// lost debug output, this just keeps entries in memory — [`finish`] hands
-/// the finished [`Report`] to `super::Service::save` once the run is over,
-/// whether it succeeded or failed. `host::install` builds one per run and
-/// threads it (behind an `Arc`) into `host::log`/`http`/`progress`/`input`.
+/// `fyde.http`, `fyde.progress`, `fyde.input` and `fyde.browser` call
+/// records a `(event_type, value)` entry via [`Recorder::record`]. Unlike
+/// `demo-rust-fyde`, which rewrote a file to disk on every entry so a crash
+/// mid-run never lost debug output, this just keeps entries in memory —
+/// [`Recorder::finish`] hands the finished [`Report`] to
+/// `super::Service::save` once the run is over, whether it succeeded or
+/// failed. `scrapers::service`
+/// builds one per run and `host::install` threads it (behind an `Arc`) into
+/// `host::log`/`http`/`progress`/`input`/`browser`.
 pub(crate) struct Recorder {
     scraper_name: String,
     started_at_ms: i64,

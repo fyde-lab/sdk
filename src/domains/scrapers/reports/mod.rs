@@ -18,8 +18,8 @@ use sqlx::SqlitePool;
 
 use crate::Result;
 
-/// Persists a scraper run's debug report — the logs, HTTP requests/
-/// responses, progress updates and input prompts recorded by
+/// Persists a scraper run's debug report — the logs, HTTP requests,
+/// browser steps, progress updates, input prompts and errors recorded by
 /// [`Recorder`] while the run was in progress — ported from
 /// `demo-rust-fyde`'s `report.rs`. Trait methods take `&self` (not `&mut
 /// self`) so implementations can be shared behind `Arc<dyn Service>`.

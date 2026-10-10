@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// One `(event_type, value)` entry recorded during a scraper run — a log
-/// call, an HTTP request/response, a progress update or an input prompt.
+/// One `(event_type, value)` entry recorded during a scraper run — e.g. a
+/// log call, an HTTP request, a browser step, a progress update, an input
+/// prompt or an error.
 /// Ported from `demo-rust-fyde`'s `report.rs`, whose `Report::record` built
 /// exactly this shape before writing it straight to disk; here it's just
 /// data, collected by `super::Recorder` and handed to [`Report`] once a run

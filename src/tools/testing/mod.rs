@@ -1,8 +1,9 @@
 //! Test-only primitives for building random-but-plausible fixture data,
 //! used by the `Fake*` builders in each domain's `models.rs`. Draws
 //! randomness from repeated [`Uuid::new_v4`] (backed by the OS's CSPRNG)
-//! rather than pulling in a dedicated `rand`-style crate just for test
-//! fixtures.
+//! rather than `rand` (even though it's already a regular dependency), to
+//! keep every `Fake*` builder's randomness source consistent with
+//! `../server`'s.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

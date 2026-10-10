@@ -236,9 +236,9 @@ pub(super) fn fake_login_state() -> LoginState {
 }
 
 /// A random master key wrapped under a key derived from the OPAQUE export
-/// key (see [`finish_registration`]), JSON-serialized for storage as a
-/// single settings value under `master_key`. `nonce` isn't secret — it's
-/// required to decrypt, so it travels alongside the ciphertext.
+/// key (see [`finish_registration`]), JSON-serialized into the single
+/// `encrypted_master_key` value the server stores. `nonce` isn't secret —
+/// it's required to decrypt, so it travels alongside the ciphertext.
 #[derive(Serialize, Deserialize)]
 struct WrappedMasterKey {
     nonce: Vec<u8>,
@@ -254,12 +254,10 @@ fn generate_master_key() -> [u8; KEY_LEN] {
 }
 
 /// Derives a 256-bit key-wrapping key from an OPAQUE export key via
-/// HKDF-SHA256. Unlike the master key wrapping this crate used before
-/// OPAQUE (which derived straight from the plaintext password via Argon2),
-/// no further stretching happens here: the export key is already the
-/// output of OPAQUE's own key-stretched, oblivious-PRF-hardened exchange
-/// (see [`high_effort_ksf`]) — running another slow hash over it would add
-/// cost without adding security.
+/// HKDF-SHA256. No further stretching happens here: the export key is
+/// already the output of OPAQUE's own key-stretched, oblivious-PRF-hardened
+/// exchange (see [`high_effort_ksf`]) — running another slow hash over it
+/// would add cost without adding security.
 fn derive_wrapping_key(export_key: &[u8]) -> Result<[u8; KEY_LEN]> {
     let mut key = [0u8; KEY_LEN];
     Hkdf::<sha2_opaque::Sha256>::new(None, export_key)

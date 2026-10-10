@@ -37,16 +37,15 @@ pub(super) struct Installed {
 /// `fyde.browser:open` — the one network entry point each of those has —
 /// before it ever reaches the network: `url`'s host must equal, or be a
 /// subdomain of, one of `allowed_domains` (conventionally a scraper's own
-/// `scripts/<name>/settings.json` `allowed_domains` list), or this returns
+/// `scrapers/<name>/settings.json` `allowed_domains` list), or this returns
 /// `Err` with a message describing the violation. Fails closed: an empty
 /// `allowed_domains` allows nothing, so a scraper (or a server-supplied
 /// script record) that forgets to declare its hosts can't reach arbitrary
 /// hosts — including `localhost` or LAN addresses — by omission. See
 /// [`is_host_allowed`] for how IP-literal hosts are matched. A script that
-/// ignores the `Err`
-/// (doesn't wrap the call in `pcall`) has its `run` function's call itself
-/// fail, per Lua's normal error propagation — exactly like any other
-/// `fyde.*` error — which is what actually stops the script.
+/// ignores the `Err` (doesn't wrap the call in `pcall`) has its `run`
+/// function's call itself fail, per Lua's normal error propagation — exactly
+/// like any other `fyde.*` error — which is what actually stops the script.
 fn ensure_domain_allowed(url: &str, allowed_domains: &[String]) -> std::result::Result<(), String> {
     // `Url::host_str` already excludes userinfo/port and, per the WHATWG URL
     // Standard this crate implements, lowercases a domain host during
@@ -132,18 +131,17 @@ impl Installed {
 /// report, `demo-rust-fyde`'s `Report` brought back (`service.rs` saves it
 /// once the script's `run` function returns). `debug_http_dump` is
 /// forwarded to `fyde.http` and `fyde.browser` (see `host::http::table` and
-/// `host::browser::table`) — it opts this run into recording full
-/// request/response headers/bodies for `fyde.http`, and the opened page's
-/// HTML for `fyde.browser:open`, instead of just method/url/status/timing.
-/// `wreq_emulation` is also forwarded to
-/// `fyde.http` only — it toggles `wreq`'s Chrome TLS/HTTP2 fingerprint
-/// emulation. `follow_redirects` is also forwarded to `fyde.http` only — it
+/// `host::browser::table`) — it opts this run into also recording response
+/// bodies for `fyde.http`, and the opened page's HTML for
+/// `fyde.browser:open`, on top of the method/url/status/timing always
+/// recorded. `wreq_emulation` is also forwarded to `fyde.http` only — it
+/// toggles `wreq`'s Chrome TLS/HTTP2 fingerprint emulation. `follow_redirects` is also forwarded to `fyde.http` only — it
 /// toggles whether the client automatically follows HTTP redirects.
 /// `allowed_domains` is forwarded to both `fyde.http` and `fyde.browser` —
 /// the only two tables with a network entry point of their own — and
 /// enforced by `ensure_domain_allowed` before any of their methods actually
 /// reaches the network: a scraper (conventionally reading its own
-/// `scripts/<name>/settings.json`'s `allowed_domains` list) can only ever
+/// `scrapers/<name>/settings.json`'s `allowed_domains` list) can only ever
 /// make requests to hosts it explicitly declared.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn install(

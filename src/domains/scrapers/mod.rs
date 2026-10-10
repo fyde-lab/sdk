@@ -35,24 +35,26 @@ pub trait Service: Send + Sync {
     /// this scraper's persisted session data and cookie jar (see the
     /// private `session`/`cookies` sub-domains) — two different scripts
     /// sharing a `name` share session/cookie state, so callers should use a
-    /// stable, unique name per script (e.g. its file stem, as
-    /// `demo-rust-fyde` does). `parameters` is handed to the script's
+    /// stable, unique name per script (e.g. its directory name under the
+    /// `scripts` repo's `scrapers/`). `parameters` is handed to the script's
     /// `run(parameters)` entrypoint as-is (as a Lua table) — this service
     /// never looks inside it, so a script is free to read whatever fields it
     /// needs (conventionally `username`/`password`) back out of it.
     ///
     /// Loads this scraper's previously saved session data and cookies before
-    /// running, and persists their final state back — including
-    /// `fyde.session`'s contents and every cookie `fyde.http` picked up for
-    /// a host it visited — once the script's `run` function returns, whether
-    /// it succeeded or failed, so state from a partial run isn't lost.
+    /// running, and persists their final state back once the script's `run`
+    /// function returns. `fyde.session`'s contents are saved whether it
+    /// succeeded or failed, so state from a partial run isn't lost; cookies
+    /// (`fyde.http`'s and the webview's, merged) are saved only on success —
+    /// a failed run clears them, so the next run starts logged out instead
+    /// of replaying a half-finished login or a revoked session.
     ///
-    /// `debug_http_dump` opts this run's `fyde.http` calls into recording
-    /// full request/response headers and bodies (and form values) into the
-    /// per-run debug report, instead of just method/url/status/timing — see
-    /// `host::http::table`'s doc comment for why this defaults to off
-    /// (header values, form values and body content routinely carry
-    /// credentials/session cookies).
+    /// `debug_http_dump` opts this run's `fyde.http.get/post_form/post_json`
+    /// calls into also recording the *response* body in the per-run debug
+    /// report, on top of the method/url/status/timing always recorded.
+    /// Request headers, form/JSON values and download bodies are never
+    /// recorded, since they routinely carry credentials/session cookies —
+    /// see `host::http::table`'s doc comment.
     ///
     /// `wreq_emulation` toggles `fyde.http`'s Chrome TLS/HTTP2 fingerprint
     /// emulation (`wreq_util::Profile::Chrome131`) on or off for this run —
@@ -67,10 +69,10 @@ pub trait Service: Send + Sync {
     /// redirect response itself instead of being carried straight to its
     /// target.
     ///
-    /// `allowed_domains` is the only host (or subdomain of a host) this
+    /// `allowed_domains` lists the only hosts (or subdomains of them) this
     /// run's `fyde.http.get/post_form/post_json/download` and
     /// `fyde.browser:open` calls may reach — conventionally a per-scraper
-    /// `scripts/<name>/settings.json` `allowed_domains` list. A call whose
+    /// `scrapers/<name>/settings.json` `allowed_domains` list. A call whose
     /// URL isn't covered fails before it ever reaches the network, which
     /// (since nothing in these scripts wraps `fyde.http`/`fyde.browser`
     /// calls in `pcall`) stops the script right there and surfaces as this
@@ -130,12 +132,9 @@ pub(crate) fn init(
     on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
 ) -> Arc<dyn Service> {
     let (cookies_storage, session_storage, reports_storage) = match storage {
-        // Separate subdirectories so a cookie file, a session file and a
-        // report file for the same scraper name never collide, even though
-        // their own sub-domains already give them distinct naming
-        // (`<name>.cookies.json`, `<name>.json`,
-        // `<name>_<started_at_ms>.json`) — this keeps the three
-        // sub-domains' files visibly separated on disk too.
+        // Each sub-domain already names its files distinctly
+        // (`<name>.cookies.json`, `<name>.json`, `<name>_<started_at_ms>.json`);
+        // separate subdirectories just keep them visibly apart on disk.
         StorageConfig::File(dir) => (
             cookies::StorageConfig::File(dir.join("cookies")),
             session::StorageConfig::File(dir.join("session")),

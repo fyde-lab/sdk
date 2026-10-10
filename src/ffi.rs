@@ -1,10 +1,10 @@
 //! Foreign-function interface exposing the SDK to non-Rust callers (currently
 //! the Kotlin Multiplatform `application`) via UniFFI-generated bindings.
 //!
-//! [`FydeClient`] mirrors [`Client`] plus its documents and changelog
-//! operations; domain types are mirrored as `Ffi*` records/enums since
-//! UniFFI has no native `Uuid` type and cannot export the crate's own
-//! [`Document`]/[`ChangelogEvent`] types directly.
+//! [`FydeClient`] mirrors [`Client`] plus its users, sessions, server
+//! state, documents and scripts operations; domain types are mirrored as
+//! `Ffi*` records/enums since UniFFI has no native `Uuid` type and cannot
+//! export the crate's own [`Document`]/[`ChangelogEvent`] types directly.
 
 use std::collections::HashMap;
 use std::path::Path;

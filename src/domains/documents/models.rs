@@ -393,8 +393,8 @@ pub enum UploadSource {
 /// Parameters for [`super::Service::upload`]: where to read the document's
 /// content from, plus any of the modifiable [`Metadata`] fields to set
 /// up front. Every field besides `source` is optional — left `None`, it's
-/// derived the same way it always was (from the document itself and
-/// whatever scripts run against it); set, it overrides that derived value.
+/// derived from the document itself and whatever scripts run against it;
+/// set, it overrides that derived value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadRequest {
     pub source: UploadSource,
@@ -408,8 +408,7 @@ pub struct UploadRequest {
 
 impl UploadRequest {
     /// Builds a request to upload the file at `path`, with no metadata
-    /// overrides — equivalent to how [`super::Service::upload`] used to be
-    /// called before it took this struct.
+    /// overrides.
     pub fn from_path(path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             source: UploadSource::Path(path.into()),

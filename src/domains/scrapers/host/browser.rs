@@ -13,8 +13,8 @@ const DEFAULT_WAIT_FOR_TIMEOUT: Duration = Duration::from_secs(10);
 // change to settle, so `download` gets a longer default than `wait_for`'s.
 const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `fyde.browser` — `open`/`wait_for`/`fill`/`click`/`download`, backed by
-/// [`BrowserService`] (a real `wry` webview, see
+/// `fyde.browser` — `open`/`wait_for`/`fill`/`click`/`html`/`download`,
+/// backed by [`BrowserService`] (a real `wry` webview, see
 /// `browser::driver::BrowserDriver`), so a login flow blocked by a
 /// client-rendered SPA or a JS-driven WAF challenge can drive a real
 /// browser engine instead of `fyde.http`'s plain HTTP client.
@@ -28,10 +28,10 @@ const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// takes an ignored `Table` as its first parameter.
 ///
 /// `allowed_domains` gates `open` the same way it gates every `fyde.http`
-/// method (see `host::ensure_domain_allowed`) — the webview only ever
-/// navigates where this call tells it to, so checking `open`'s `url` is
-/// enough; `wait_for`/`fill`/`click`/`html` act on whatever page is already
-/// loaded and never take a URL of their own.
+/// method (see `host::ensure_domain_allowed`); the other methods act on
+/// whatever page is already loaded and never take a URL of their own. Any
+/// navigation the page makes on its own afterwards (link clicks, redirects,
+/// popups) is gated separately by `browser::driver`'s navigation handlers.
 ///
 /// `debug_http_dump` (forwarded from `Service::run`'s own parameter, the
 /// same one that opts `fyde.http` into dumping response bodies — see

@@ -10,8 +10,9 @@ use crate::{ErrorContext as _, Result};
 
 use super::Role;
 
-/// Generated protobuf/gRPC bindings for the `users` service, compiled from
-/// `../api-protos/users/v1/users.proto` by `build.rs`.
+/// Generated protobuf/gRPC bindings for the `users` service, compiled by
+/// `build.rs` from `users/v1/users.proto` in the `buf.build/fyde-lab/api`
+/// BSR module (sourced from `../api-protos`).
 mod proto {
     tonic::include_proto!("users.v1");
 }
@@ -108,7 +109,7 @@ pub(super) trait FydeClient: Send + Sync {
 
 /// The production [`FydeClient`] implementation, backed by a tonic
 /// [`Channel`] shared with every other domain's gRPC client (see
-/// [`crate::Client::connect`]), so they all reuse the same underlying
+/// [`crate::Client::init`]), so they all reuse the same underlying
 /// connection instead of each opening one of their own. The channel is
 /// typically opened lazily (via `Endpoint::connect_lazy`), so the SDK can be
 /// used offline for anything that doesn't reach this client; a call that

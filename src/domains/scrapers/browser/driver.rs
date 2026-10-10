@@ -67,13 +67,13 @@ struct Running {
     thread: Option<JoinHandle<()>>,
 }
 
-/// The real [`Service`] implementation: a webview embedded in an invisible
-/// `tao` window, running entirely on one dedicated OS thread spawned on
-/// first use (see [`ensure_started`](Self::ensure_started)). Every
-/// `open`/`wait_for`/`fill`/`click` call is translated into a [`Command`]
-/// sent over an [`EventLoopProxy`] and, for everything but `open`, a JS
-/// snippet carrying a unique id that the webview's own `window.ipc`
-/// eventually echoes back — see [`call`](Self::call).
+/// The real [`Service`] implementation: a webview embedded in a `tao`
+/// window (hidden unless `visible`), running entirely on one dedicated OS
+/// thread spawned on first use (see [`ensure_started`](Self::ensure_started)).
+/// Every call is translated into a [`Command`] sent over an
+/// [`EventLoopProxy`]; `wait_for`/`fill`/`click`/`html` send a JS snippet
+/// carrying a unique id that the webview's own `window.ipc` eventually
+/// echoes back — see [`call`](Self::call).
 pub(super) struct BrowserDriver {
     running: Mutex<Option<Running>>,
     next_id: AtomicU64,
@@ -104,8 +104,7 @@ impl BrowserDriver {
     /// Spawns the dedicated OS thread owning this run's `tao` event loop and
     /// `wry` webview, the first time any [`Service`] method is actually
     /// called — never at construction. A scraper script that only ever
-    /// calls `fyde.http`/`fyde.html` (every scraper so far, except whatever
-    /// newly adopts `fyde.browser`) never pays the cost, or the risk, of
+    /// calls `fyde.http`/`fyde.html` never pays the cost, or the risk, of
     /// creating a real window: `wry`'s `WebView` needs a live window-system
     /// connection (X11/Wayland on Linux) that a headless server or CI
     /// runner may simply not have, and this way that's only ever a problem

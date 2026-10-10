@@ -31,8 +31,9 @@ pub(super) trait Service: Send + Sync {
     async fn load(&self, scraper_name: &str) -> Result<Vec<Cookie>>;
 
     /// Replaces every cookie previously saved for `scraper_name` with
-    /// `cookies` — the full set a scraper run's `fyde.http` client picked up
-    /// for a host it actually visited.
+    /// `cookies` — the full set a scraper run ended with: what its
+    /// `fyde.http` client picked up for a host it actually visited, merged
+    /// with the webview's own if it used `fyde.browser`.
     async fn save(&self, scraper_name: &str, cookies: Vec<Cookie>) -> Result<()>;
 }
 

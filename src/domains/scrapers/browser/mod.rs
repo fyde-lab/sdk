@@ -13,11 +13,11 @@ use crate::Result;
 /// Drives a real, embedded webview (`wry`, windowed via `tao`) so a scraper
 /// script can get past a site a plain `fyde.http` request can't: a
 /// client-rendered SPA with no plain-HTML fallback (e.g. `scaleway`'s
-/// invoices table — see `../../CLAUDE.md`), or a WAF/bot-detection
-/// challenge (Datadome, etc. — see `boursorama`/`edf`) that only passes
-/// when real JS actually runs. Exposed to Lua as `fyde.browser` (see
-/// `host::browser`), with the operations a login flow needs:
-/// `open`/`wait_for`/`fill`/`click`/`download`.
+/// invoices table — see the `scripts` repo's `CLAUDE.md`), or a
+/// WAF/bot-detection challenge (Datadome, etc. — see `boursorama`/`edf`)
+/// that only passes when real JS actually runs. Exposed to Lua as
+/// `fyde.browser` (see `host::browser`), with the operations a login flow
+/// needs: `open`/`wait_for`/`fill`/`click`/`html`/`download`.
 ///
 /// Trait methods take `&self` (not `&mut self`) so implementations can be
 /// shared behind `Arc<dyn Service>`, matching every other domain here —
@@ -69,10 +69,9 @@ pub(super) trait Service: Send + Sync {
     /// checkbox without a real pointer/window-system event, and doesn't
     /// assume the target is a `<form>` or wait for any resulting
     /// navigation/fetch to finish. The only way a script submits a form
-    /// here — there's no separate in-page-`fetch()` submit path (see git
-    /// history for why that was removed: it bypassed the page's own submit
-    /// handling, which breaks any bot-mitigation/fingerprinting script
-    /// hooked onto a real submit event).
+    /// here — there's deliberately no in-page-`fetch()` submit path, since
+    /// that would bypass the page's own submit handling and break any
+    /// bot-mitigation/fingerprinting script hooked onto a real submit event.
     async fn click(&self, selector: &str) -> Result<()>;
 
     /// Returns the current page's full `document.documentElement.outerHTML`
@@ -89,7 +88,7 @@ pub(super) trait Service: Send + Sync {
     /// a `download` attribute), which neither [`Service::wait_for`] nor
     /// [`Service::html`] can ever observe since nothing in the DOM changes
     /// (confirmed live against `cesu.urssaf.fr`'s "Bulletin de salaire"
-    /// buttons — see `../../../scripts/scrapers/cesu/script.lua`'s header
+    /// buttons — see the `scripts` repo's `scrapers/cesu/script.lua` header
     /// comment). Blocks until the download finishes (or `timeout` elapses)
     /// and returns the downloaded file's raw bytes, read back from wherever
     /// the webview engine saved it — see `driver::BrowserDriver`'s
@@ -121,9 +120,9 @@ pub(super) trait Service: Send + Sync {
 /// `with_navigation_handler`/`with_new_window_req_handler`.
 ///
 /// `visible` toggles whether the window this run's webview is embedded in
-/// is actually shown — off by default (see `driver::run_event_loop`), so a
-/// scraper run only pops up a real window when a caller explicitly asks to
-/// watch (or manually intervene in) its browser-driven flow.
+/// is actually shown, so a scraper run only pops up a real window when a
+/// caller explicitly asks to watch (or manually intervene in) its
+/// browser-driven flow.
 ///
 /// `cookies` (this scraper's saved cookie jar, see the `cookies`
 /// sub-domain) is loaded into the webview as soon as it starts, before

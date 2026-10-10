@@ -144,7 +144,7 @@ pub enum Storage {
 /// Configuration for [`Client::init`].
 pub struct ClientConfig {
     /// The `http://` or `https://` base URL of the fyde server to connect
-    /// to (e.g. `http://127.0.0.1:8080`).
+    /// to (e.g. `http://127.0.0.1:40051`).
     pub url: String,
     /// Which SQLite backend to persist local state to.
     pub storage: Storage,
@@ -194,8 +194,8 @@ impl Client {
     /// Connects to a fyde server per `config`.
     pub async fn init(config: ClientConfig) -> Result<Self> {
         // Ignore the result: a subscriber may already be installed by the
-        // consuming binary (e.g. `cli` sets one up via `RUST_LOG`), or by a
-        // previous `Client::init` call, and a library must not panic over it.
+        // consuming binary or by a previous `Client::init` call, and a
+        // library must not panic over it.
         use tracing_subscriber::prelude::*;
         let callback_layer = config
             .on_log
@@ -349,9 +349,9 @@ pub fn use_in_process_keystore_for_tests() -> Result<()> {
 /// sync. Meant for a CLI runner (ported from `demo-rust-fyde`) that just
 /// runs Lua scraper scripts and keeps their output on disk.
 ///
-/// Cookies and session data persist as JSON files under `storage_dir` (one
-/// file per scraper per sub-domain, created if missing — see
-/// [`domains::scrapers::StorageConfig::File`]) rather than in a SQLite
+/// Cookies, session data and per-run debug reports persist as JSON files
+/// under `storage_dir` (one subdirectory per sub-domain, created if missing
+/// — see [`domains::scrapers::StorageConfig::File`]) rather than in a SQLite
 /// database: a standalone CLI runner has no reason to pull in a local
 /// database just for this, unlike [`Client`], which already has one for
 /// everything else it persists. Documents a script saves via
