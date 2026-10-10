@@ -228,11 +228,6 @@ impl FakeScript {
         self
     }
 
-    pub(crate) fn with_type(mut self, script_type: ScriptType) -> Self {
-        self.script.script_type = script_type;
-        self
-    }
-
     pub(crate) fn with_parameter(mut self, name: &str, parameter: ScriptParameter) -> Self {
         self.script.parameters.insert(name.to_string(), parameter);
         self

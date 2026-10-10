@@ -8,8 +8,8 @@ use tonic::transport::Channel;
 use uuid::Uuid;
 
 use crate::domains::documents::{Document, Metadata, Storage as DocumentStorage};
-use crate::domains::secrets::Service as SecretsService;
 use crate::domains::scripts::{InstalledScript, Storage as ScriptStorage};
+use crate::domains::secrets::Service as SecretsService;
 use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
 use crate::{Error, ErrorContext as _, Result};
@@ -425,8 +425,8 @@ mod tests {
     use super::super::storage::MockCursorStorage;
     use super::*;
     use crate::domains::documents::{FakeMetadata, MockStorage};
-    use crate::domains::secrets::MockService as MockSecretsService;
     use crate::domains::scripts::{FakeInstalledScript, MockStorage as MockScriptStorage};
+    use crate::domains::secrets::MockService as MockSecretsService;
     use crate::domains::server_state::MockService as MockServerState;
 
     /// A [`ServerStateService`] mock reporting the server as always
