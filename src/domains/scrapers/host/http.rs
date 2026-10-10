@@ -198,7 +198,7 @@ fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
 /// Chrome TLS/HTTP2 fingerprint emulation (`Profile::Chrome131`) — some
 /// sites' WAFs block `wreq`'s TLS fingerprint outright regardless of
 /// whether emulation is on, so a scraper can opt out per its
-/// `scrapers/<name>/settings.json`'s `wreq_emulation` field (in the
+/// `scrapers/<name>/manifest.json`'s `wreq_emulation` field (in the
 /// `scripts` repo) rather than carrying a global toggle.
 ///
 /// `follow_redirects` controls whether the client follows HTTP redirects at
@@ -207,7 +207,7 @@ fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
 /// real-browser-like client that follows them (e.g. to pick up cookies set
 /// along an OAuth/OIDC redirect chain before a login POST), so this matches
 /// `reqwest`'s own default (`redirect::Policy::default()`) when `true`. A
-/// scraper can opt out per its `scrapers/<name>/settings.json`'s
+/// scraper can opt out per its `scrapers/<name>/manifest.json`'s
 /// `follow_redirects` field when it needs to inspect a redirect response
 /// itself (e.g. reading a `Location` header) rather than carrying a global
 /// toggle.

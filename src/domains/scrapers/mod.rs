@@ -60,19 +60,19 @@ pub trait Service: Send + Sync {
     /// emulation (`wreq_util::Profile::Chrome131`) on or off for this run —
     /// some sites' WAFs block `wreq`'s TLS fingerprint outright regardless
     /// of emulation, so a caller (conventionally reading a per-scraper
-    /// `settings.json`) can opt a scraper out.
+    /// `manifest.json`) can opt a scraper out.
     ///
     /// `follow_redirects` toggles whether `fyde.http` automatically follows
     /// HTTP redirects for this run — on by default for a real-browser-like
     /// client, but a caller (conventionally reading the same per-scraper
-    /// `settings.json`) can opt a scraper out when it needs to inspect a
+    /// `manifest.json`) can opt a scraper out when it needs to inspect a
     /// redirect response itself instead of being carried straight to its
     /// target.
     ///
     /// `allowed_domains` lists the only hosts (or subdomains of them) this
     /// run's `fyde.http.get/post_form/post_json/download` and
     /// `fyde.browser:open` calls may reach — conventionally a per-scraper
-    /// `scrapers/<name>/settings.json` `allowed_domains` list. A call whose
+    /// `scrapers/<name>/manifest.json` `allowed_domains` list. A call whose
     /// URL isn't covered fails before it ever reaches the network, which
     /// (since nothing in these scripts wraps `fyde.http`/`fyde.browser`
     /// calls in `pcall`) stops the script right there and surfaces as this

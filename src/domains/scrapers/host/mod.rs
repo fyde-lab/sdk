@@ -37,7 +37,7 @@ pub(super) struct Installed {
 /// `fyde.browser:open` — the one network entry point each of those has —
 /// before it ever reaches the network: `url`'s host must equal, or be a
 /// subdomain of, one of `allowed_domains` (conventionally a scraper's own
-/// `scrapers/<name>/settings.json` `allowed_domains` list), or this returns
+/// `scrapers/<name>/manifest.json` `allowed_domains` list), or this returns
 /// `Err` with a message describing the violation. Fails closed: an empty
 /// `allowed_domains` allows nothing, so a scraper (or a server-supplied
 /// script record) that forgets to declare its hosts can't reach arbitrary
@@ -141,7 +141,7 @@ impl Installed {
 /// the only two tables with a network entry point of their own — and
 /// enforced by `ensure_domain_allowed` before any of their methods actually
 /// reaches the network: a scraper (conventionally reading its own
-/// `scrapers/<name>/settings.json`'s `allowed_domains` list) can only ever
+/// `scrapers/<name>/manifest.json`'s `allowed_domains` list) can only ever
 /// make requests to hosts it explicitly declared.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn install(
