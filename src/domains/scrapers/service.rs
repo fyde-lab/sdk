@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use tokio::runtime::Handle;
 
 use crate::domains::documents::Service as DocumentsService;
+use crate::domains::scripts::InstalledScript;
 use crate::{ErrorContext as _, Result};
 
 use super::cookies::{Cookie, Service as CookiesService};
@@ -13,6 +14,15 @@ use super::host;
 use super::reports::{Recorder, Service as ReportsService};
 use super::session::Service as SessionService;
 use super::{ProgressEvent, Service};
+
+/// The `wreq_emulation`/`follow_redirects` an installed script runs with.
+/// Each scraper's `manifest.json` (in `../scripts`) chooses these for a dev
+/// run, but a published script doesn't carry them, so an installed one gets
+/// what 110 of the 112 manifests choose — a real Chrome fingerprint, and
+/// redirects followed. (`ameli` and `cesu` opt out of emulation, so they
+/// won't behave as in a dev run until scripts publish these flags too.)
+const INSTALLED_WREQ_EMULATION: bool = true;
+const INSTALLED_FOLLOW_REDIRECTS: bool = true;
 
 /// The default [`Service`] implementation, running scripts in a fresh
 /// `mlua::Lua` VM per call, delegating session/cookie persistence to
@@ -50,6 +60,23 @@ impl ScrapersClient {
 
 #[async_trait]
 impl Service for ScrapersClient {
+    async fn run_installed(&self, installed: &InstalledScript) -> Result<()> {
+        let script = installed.script();
+        let parameters = serde_json::to_value(installed.parameters())
+            .with_context(|| format!("failed to encode parameters of script {}", script.id()))?;
+        self.run(
+            &script.id().to_string(),
+            script.script(),
+            parameters,
+            false,
+            INSTALLED_WREQ_EMULATION,
+            INSTALLED_FOLLOW_REDIRECTS,
+            script.allowed_domains().to_vec(),
+            false,
+        )
+        .await
+    }
+
     async fn run(
         &self,
         name: &str,
@@ -300,6 +327,8 @@ mod tests {
     use super::super::session::MockService as MockSessionService;
     use super::*;
     use crate::domains::documents::MockService as MockDocumentsService;
+    use crate::domains::scripts::{FakeInstalledScript, FakeScript};
+    use std::collections::HashMap;
 
     const TRIVIAL_SCRIPT: &str = r#"
         local M = {}
@@ -453,6 +482,45 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_installed_runs_the_script_with_its_installed_parameters_under_its_id() {
+        let script = FakeScript::new()
+            .with_script(
+                r#"
+                local M = {}
+                function M.run(parameters)
+                    assert(parameters.username == "alice", "unexpected username")
+                end
+                return M
+            "#,
+            )
+            .build();
+        let name = script.id().to_string();
+        let installed = FakeInstalledScript::new()
+            .with_script(script)
+            .with_parameters(HashMap::from([("username".to_string(), json!("alice"))]));
+
+        let mut cookies = MockCookiesService::new();
+        let loaded_name = name.clone();
+        cookies
+            .expect_load()
+            .withf(move |requested| requested == loaded_name)
+            .times(1)
+            .returning(|_| Ok(Vec::new()));
+        cookies.expect_save().returning(|_, _| Ok(()));
+        let mut session = MockSessionService::new();
+        session
+            .expect_load()
+            .withf(move |requested| requested == name)
+            .times(1)
+            .returning(|_| Ok(json!({})));
+        session.expect_save().returning(|_, _| Ok(()));
+
+        let client = client(cookies, session, MockDocumentsService::new());
+
+        client.run_installed(&installed.build()).await.unwrap();
     }
 
     #[tokio::test]

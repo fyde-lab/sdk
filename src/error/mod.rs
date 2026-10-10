@@ -109,6 +109,8 @@ macro_rules! for_each_error_code {
             ScriptFailed = 5004,
             /// The embedded browser a scraper script drives failed.
             BrowserFailed = 5005,
+            /// No installation of this script has synced to this device.
+            ScriptNotInstalled = 5006,
         }
     };
 }
@@ -197,6 +199,8 @@ pub(crate) enum ErrorKind {
     DocumentNotFound(uuid::Uuid),
     #[error("script {0} not found")]
     ScriptNotFound(uuid::Uuid),
+    #[error("script {0} is not installed on this device")]
+    ScriptNotInstalled(uuid::Uuid),
     #[error("missing value for required parameter {parameter:?} of script {script_id}")]
     MissingScriptParameter {
         script_id: uuid::Uuid,
@@ -250,6 +254,7 @@ impl ErrorKind {
             ErrorKind::UnsupportedDocumentExtension(_) => ErrorCode::UnsupportedDocumentExtension,
             ErrorKind::DocumentNotFound(_) => ErrorCode::DocumentNotFound,
             ErrorKind::ScriptNotFound(_) => ErrorCode::ScriptNotFound,
+            ErrorKind::ScriptNotInstalled(_) => ErrorCode::ScriptNotInstalled,
             ErrorKind::MissingScriptParameter { .. } => ErrorCode::MissingScriptParameter,
             ErrorKind::InvalidChangelogEvent(_) => ErrorCode::InvalidChangelogEvent,
             ErrorKind::InvalidSourceCategory(_) => ErrorCode::InvalidSourceCategory,

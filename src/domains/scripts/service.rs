@@ -170,6 +170,18 @@ impl<S: Storage> Service for ScriptsClient<S> {
             .await
             .context("failed to list installed scripts")
     }
+
+    async fn fetch_installed_script(&self, script_id: Uuid) -> Result<InstalledScript> {
+        let installed = self
+            .storage
+            .list_installed_scripts()
+            .await
+            .with_context(|| format!("failed to look up installation of script {script_id}"))?;
+        installed
+            .into_iter()
+            .find(|installed| installed.script().id() == script_id)
+            .ok_or_else(|| ErrorKind::ScriptNotInstalled(script_id).into())
+    }
 }
 
 #[cfg(test)]
@@ -394,6 +406,39 @@ mod tests {
         let client = ScriptsClient::with_grpc(MockFydeClient::new(), storage, unused_changelog());
 
         assert_eq!(client.list_installed_scripts().await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn fetch_installed_script_returns_the_matching_installation() {
+        let wanted = FakeInstalledScript::new().build();
+        let id = wanted.script().id();
+        let installed = vec![FakeInstalledScript::new().build(), wanted.clone()];
+        let mut storage = MockStorage::new();
+        storage
+            .expect_list_installed_scripts()
+            .times(1)
+            .returning(move || Ok(installed.clone()));
+
+        let client = ScriptsClient::with_grpc(MockFydeClient::new(), storage, unused_changelog());
+
+        assert_eq!(client.fetch_installed_script(id).await.unwrap(), wanted);
+    }
+
+    #[tokio::test]
+    async fn fetch_installed_script_fails_when_it_hasnt_synced_here() {
+        let mut storage = MockStorage::new();
+        storage
+            .expect_list_installed_scripts()
+            .times(1)
+            .returning(|| Ok(vec![FakeInstalledScript::new().build()]));
+
+        let client = ScriptsClient::with_grpc(MockFydeClient::new(), storage, unused_changelog());
+
+        let err = client
+            .fetch_installed_script(Uuid::new_v4())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::ScriptNotInstalled);
     }
 
     #[tokio::test]

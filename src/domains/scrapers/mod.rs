@@ -17,6 +17,7 @@ use sqlx::SqlitePool;
 
 use crate::Result;
 use crate::domains::documents::Service as DocumentsService;
+use crate::domains::scripts::InstalledScript;
 
 /// Runs Lua scraper scripts: a sandboxed Lua 5.4 VM with host capabilities
 /// exposed under a single `fyde` global table (`fyde.http`, `fyde.html`,
@@ -98,6 +99,12 @@ pub trait Service: Send + Sync {
         allowed_domains: Vec<String>,
         browser_visible: bool,
     ) -> Result<()>;
+
+    /// Runs an installed script (see `scripts::Service::fetch_installed_
+    /// script`) with the parameter values it was installed with, its own
+    /// allowed domains, and its id as the name its session/cookies are
+    /// kept under. The browser stays hidden and no HTTP bodies are dumped.
+    async fn run_installed(&self, installed: &InstalledScript) -> Result<()>;
 }
 
 /// Selects which storage backend [`init`] builds the `session`/`cookies`/

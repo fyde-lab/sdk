@@ -22,7 +22,7 @@ use crate::domains::sessions::Service as SessionsService;
 use crate::domains::users::system_language;
 use crate::{
     ChangelogEvent, Client, ClientConfig, Document, Error, ErrorCode, ErrorContext as _, ErrorKind,
-    LogLevel, Storage,
+    LogLevel, ProgressEvent, Storage,
 };
 
 macro_rules! define_ffi_error {
@@ -610,8 +610,7 @@ impl From<FfiClientConfig> for ClientConfig {
             log_level: config.log_level.into(),
             on_log: None,
             on_document_change: None,
-            // Not yet exposed over FFI — see `domains::scrapers`, which has
-            // no uniffi bindings yet.
+            // Set by `FydeClient::init` from its `scraper_listener`.
             on_scraper_progress: None,
             on_scraper_question: None,
         }
@@ -625,6 +624,49 @@ impl From<FfiClientConfig> for ClientConfig {
 #[uniffi::export(callback_interface)]
 pub trait DocumentChangeListener: Send + Sync {
     fn on_event(&self, event: FfiChangelogEvent);
+}
+
+/// A scraper run's progress, mirroring [`ProgressEvent`]: a named step
+/// starting, or how far the current step has got.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiProgressEvent {
+    Step {
+        name: String,
+    },
+    Update {
+        current: i64,
+        total: i64,
+        message: String,
+    },
+}
+
+impl From<ProgressEvent> for FfiProgressEvent {
+    fn from(event: ProgressEvent) -> Self {
+        match event {
+            ProgressEvent::Step { name } => Self::Step { name },
+            ProgressEvent::Update {
+                current,
+                total,
+                message,
+            } => Self::Update {
+                current,
+                total,
+                message,
+            },
+        }
+    }
+}
+
+/// Callback interface for [`FydeClient::init`]'s `scraper_listener`,
+/// implemented by foreign (Kotlin/Swift) callers so a scraper run started by
+/// [`FydeClient::run_installed_script`] can show its progress and ask the
+/// user questions (a one-time code, ...) on screen. Both are invoked from
+/// the run's own blocking thread, never the caller's: `on_question` may
+/// block until the user answers, and returns their answer to the script.
+#[uniffi::export(callback_interface)]
+pub trait ScraperListener: Send + Sync {
+    fn on_progress(&self, event: FfiProgressEvent);
+    fn on_question(&self, question: String) -> String;
 }
 
 /// A connection to a fyde server, exposed to Kotlin as `FydeClient`.
@@ -666,6 +708,7 @@ impl FydeClient {
         config: FfiClientConfig,
         on_log: Option<Box<dyn LogListener>>,
         on_document_change: Option<Box<dyn DocumentChangeListener>>,
+        scraper_listener: Option<Box<dyn ScraperListener>>,
     ) -> Result<Arc<Self>, FfiError> {
         let mut config: ClientConfig = config.into();
         config.on_log = on_log.map(|listener| -> Arc<dyn Fn(LogLevel, String) + Send + Sync> {
@@ -677,6 +720,16 @@ impl FydeClient {
                 let listener: Arc<dyn DocumentChangeListener> = Arc::from(listener);
                 Arc::new(move |event| listener.on_event(event.into()))
             });
+        if let Some(listener) = scraper_listener {
+            let listener: Arc<dyn ScraperListener> = Arc::from(listener);
+            let for_progress = listener.clone();
+            config.on_scraper_progress = Some(Arc::new(move |event: ProgressEvent| {
+                for_progress.on_progress(event.into())
+            }));
+            config.on_scraper_question = Some(Arc::new(move |question: String| {
+                listener.on_question(question)
+            }));
+        }
 
         match Client::init(config).await {
             Ok(inner) => Ok(Arc::new(Self { inner })),
@@ -986,6 +1039,26 @@ impl FydeClient {
                 .into_iter()
                 .map(FfiInstalledScript::try_from)
                 .collect()
+        })
+        .await
+    }
+
+    /// Runs the installed script `script_id` — with the parameter values it
+    /// was installed with — until it finishes, reporting progress and
+    /// questions through `init`'s `scraper_listener`; the documents it
+    /// saves are uploaded like any other. Fails if the installation hasn't
+    /// synced to this device yet. Mirrors
+    /// [`crate::ScriptsService::fetch_installed_script`] then
+    /// [`crate::ScrapersService::run_installed`].
+    pub async fn run_installed_script(&self, script_id: String) -> Result<(), FfiError> {
+        self.localized(async {
+            let script_id = parse_uuid(&script_id)?;
+            let installed = self
+                .inner
+                .scripts()
+                .fetch_installed_script(script_id)
+                .await?;
+            self.inner.scrapers().run_installed(&installed).await
         })
         .await
     }

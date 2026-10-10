@@ -189,6 +189,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "The add-on's built-in browser ran into a problem.",
             "Le navigateur intégré de l'extension a rencontré un problème.",
         ),
+        ErrorCode::ScriptNotInstalled => (
+            "This add-on isn't installed on this device yet.",
+            "Cette extension n'est pas encore installée sur cet appareil.",
+        ),
     };
 
     match language {

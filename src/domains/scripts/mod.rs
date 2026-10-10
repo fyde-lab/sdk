@@ -111,6 +111,11 @@ pub trait Service: Send + Sync {
     /// synced to this device so far, oldest installation first. Never talks
     /// to the server: reads straight from local storage.
     async fn list_installed_scripts(&self) -> Result<Vec<InstalledScript>>;
+
+    /// The installation of `script_id` synced to this device — the script
+    /// plus the parameter values to run it with. Fails with
+    /// `ErrorCode::ScriptNotInstalled` if there's none (yet).
+    async fn fetch_installed_script(&self, script_id: Uuid) -> Result<InstalledScript>;
 }
 
 /// Initializes the scripts service: talks to the fyde server's scripts

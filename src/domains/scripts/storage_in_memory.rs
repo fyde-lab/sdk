@@ -169,6 +169,16 @@ impl Service for InMemoryScriptStorage {
     async fn list_installed_scripts(&self) -> Result<Vec<InstalledScript>> {
         Ok(self.installed.lock().unwrap().clone())
     }
+
+    async fn fetch_installed_script(&self, script_id: Uuid) -> Result<InstalledScript> {
+        self.installed
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|installed| installed.script.id == script_id)
+            .cloned()
+            .ok_or_else(|| ErrorKind::ScriptNotInstalled(script_id).into())
+    }
 }
 
 #[cfg(test)]
