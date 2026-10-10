@@ -48,16 +48,6 @@ impl ChangelogEvent {
     }
 }
 
-/// Returns the smallest id strictly greater than `id`, used to advance the
-/// consumption cursor past an already-processed entry: ids are unique and
-/// compared byte-for-byte, so the 128-bit successor of `id` is guaranteed
-/// to be strictly greater than it and to skip no real id in between — it
-/// doesn't need to be a valid UUIDv7 itself, it's only ever used as a query
-/// bound (mirrors `DefaultService::consume_since` on the server).
-fn successor(id: Uuid) -> Uuid {
-    Uuid::from_u128(id.as_u128().wrapping_add(1))
-}
-
 /// Path to the advisory lock file arbitrating write access to the local
 /// document cache across processes consuming the same changelog: only the
 /// process holding this lock is allowed to persist documents/metadata via
@@ -322,11 +312,10 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
                 }
             }
 
-            let next_cursor = successor(event.id);
             self.cursor_storage
-                .save_cursor(next_cursor)
+                .save_cursor(event.id)
                 .await
-                .with_context(|| format!("failed to persist changelog cursor {next_cursor}"))?;
+                .with_context(|| format!("failed to persist changelog cursor {}", event.id))?;
 
             callback(event);
         }
@@ -499,7 +488,7 @@ mod tests {
             .returning(|| Ok(Uuid::nil()));
         cursor_storage
             .expect_save_cursor()
-            .withf(move |id| *id == successor(event_id))
+            .withf(move |id| *id == event_id)
             .times(1)
             .returning(|_| Ok(()));
 
@@ -546,7 +535,7 @@ mod tests {
             .returning(|| Ok(Uuid::nil()));
         cursor_storage
             .expect_save_cursor()
-            .withf(move |id| *id == successor(event_id))
+            .withf(move |id| *id == event_id)
             .times(1)
             .returning(|_| Ok(()));
 
@@ -737,7 +726,7 @@ mod tests {
             .returning(|| Ok(Uuid::nil()));
         cursor_storage
             .expect_save_cursor()
-            .withf(move |id| *id == successor(event_id))
+            .withf(move |id| *id == event_id)
             .times(1)
             .returning(|_| Ok(()));
         cursor_storage
@@ -883,7 +872,7 @@ mod tests {
             .returning(|| Ok(Uuid::nil()));
         cursor_storage
             .expect_save_cursor()
-            .withf(move |id| *id == successor(event_id))
+            .withf(move |id| *id == event_id)
             .times(1)
             .returning(|_| Ok(()));
 
@@ -927,7 +916,7 @@ mod tests {
             .returning(|| Ok(Uuid::nil()));
         cursor_storage
             .expect_save_cursor()
-            .withf(move |id| *id == successor(event_id))
+            .withf(move |id| *id == event_id)
             .times(1)
             .returning(|_| Ok(()));
 
@@ -995,7 +984,7 @@ mod tests {
     async fn consume_resumes_from_the_persisted_cursor() {
         let document_id = Uuid::now_v7();
         let cursor = Uuid::now_v7();
-        let event_id = successor(cursor);
+        let event_id = Uuid::now_v7();
 
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
@@ -1016,7 +1005,7 @@ mod tests {
             .returning(move || Ok(cursor));
         cursor_storage
             .expect_save_cursor()
-            .withf(move |id| *id == successor(event_id))
+            .withf(move |id| *id == event_id)
             .times(1)
             .returning(|_| Ok(()));
 

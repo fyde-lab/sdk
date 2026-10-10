@@ -37,7 +37,7 @@ pub(super) trait FydeClient: Send + Sync {
     /// Submits a new, already-encrypted event, returning its assigned id.
     async fn record_event(&self, encrypted_content: Vec<u8>) -> Result<Uuid>;
 
-    /// Streams every entry with an id greater than or equal to `id`,
+    /// Streams every entry with an id strictly greater than `id`,
     /// oldest first: replays persisted history, then continues with the
     /// live tail. `None` means "from the beginning of the changelog".
     async fn consume_since(&self, id: Option<Uuid>) -> Result<EventStream>;
