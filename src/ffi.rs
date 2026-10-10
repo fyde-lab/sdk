@@ -15,9 +15,13 @@ use uuid::Uuid;
 use crate::domains::documents::{
     EventType, Metadata, Purpose, SourceCategory, SourceSubCategory, UploadRequest,
 };
-use crate::domains::scripts::{Script, ScriptParameter, ScriptParameterType, ScriptType};
+use crate::domains::scripts::{
+    InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptParameterType, ScriptType,
+};
 use crate::domains::sessions::Service as SessionsService;
-use crate::{ChangelogEvent, Client, ClientConfig, Document, Error, LogLevel, Storage};
+use crate::{
+    ChangelogEvent, Client, ClientConfig, Document, Error, ErrorContext as _, LogLevel, Storage,
+};
 
 /// Error type surfaced to FFI callers. UniFFI requires exported errors to be
 /// their own type rather than the crate's own [`Error`], so every failure is
@@ -427,6 +431,34 @@ impl From<Script> for FfiScript {
     }
 }
 
+/// A script installed for the authenticated user, mirroring
+/// [`InstalledScript`] across the FFI boundary. `parameters_json` is the
+/// JSON object of values the script was installed with (e.g.
+/// `{"username": "alice"}`), since UniFFI has no native JSON value type.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiInstalledScript {
+    pub script: FfiScript,
+    pub parameters_json: String,
+}
+
+impl TryFrom<InstalledScript> for FfiInstalledScript {
+    type Error = Error;
+
+    fn try_from(installed: InstalledScript) -> Result<Self, Self::Error> {
+        let parameters_json = serde_json::to_string(installed.parameters()).with_context(|| {
+            format!(
+                "failed to serialize parameters of installed script {}",
+                installed.script().id()
+            )
+        })?;
+
+        Ok(Self {
+            script: installed.script().clone().into(),
+            parameters_json,
+        })
+    }
+}
+
 /// The kind of write recorded by an [`FfiChangelogEvent`], mirroring
 /// [`EventType`].
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
@@ -434,6 +466,7 @@ pub enum FfiEventType {
     Created,
     UpdateMetadata,
     Deleted,
+    ScriptInstalled,
 }
 
 impl From<EventType> for FfiEventType {
@@ -442,19 +475,21 @@ impl From<EventType> for FfiEventType {
             EventType::Created => FfiEventType::Created,
             EventType::UpdateMetadata => FfiEventType::UpdateMetadata,
             EventType::Deleted => FfiEventType::Deleted,
+            EventType::ScriptInstalled => FfiEventType::ScriptInstalled,
         }
     }
 }
 
-/// A single recorded write against a document, mirroring [`ChangelogEvent`]
-/// across the FFI boundary. `id`/`document_id` cross as strings since
+/// A single recorded write, mirroring [`ChangelogEvent`] across the FFI
+/// boundary. `subject_id` is a document or script id depending on
+/// `event_type` (see [`ChangelogEvent`]). `id`/`subject_id` cross as strings since
 /// UniFFI has no native UUID type. `content`/`metadata` are `None` for
 /// event types that don't carry them.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiChangelogEvent {
     pub id: String,
     pub event_type: FfiEventType,
-    pub document_id: String,
+    pub subject_id: String,
     pub content: Option<Vec<u8>>,
     pub metadata: Option<FfiMetadata>,
 }
@@ -464,7 +499,7 @@ impl From<ChangelogEvent> for FfiChangelogEvent {
         Self {
             id: event.id().to_string(),
             event_type: event.event_type().into(),
-            document_id: event.document_id().to_string(),
+            subject_id: event.subject_id().to_string(),
             content: event.content().map(<[u8]>::to_vec),
             metadata: event.metadata().cloned().map(FfiMetadata::from),
         }
@@ -837,6 +872,43 @@ impl FydeClient {
         Ok(scripts.into_iter().map(FfiScript::from).collect())
     }
 
+    /// Installs `script_id` for the authenticated user, to be run with
+    /// `parameters_json` — a JSON object keyed by the script's parameter
+    /// names (e.g. `{"username": "alice"}`). Mirrors
+    /// [`crate::ScriptsService::install_script`]: the installation only
+    /// shows up in [`Self::list_installed_scripts`] once the background
+    /// sync job has consumed it back.
+    pub async fn install_script(
+        &self,
+        script_id: String,
+        parameters_json: String,
+    ) -> Result<(), FfiError> {
+        let script_id = parse_uuid(&script_id)?;
+        let parameters = serde_json::from_str(&parameters_json).with_context(|| {
+            format!("invalid parameters json for script {script_id}: expected a JSON object")
+        })?;
+
+        self.inner
+            .scripts()
+            .install_script(InstallScriptRequest {
+                script_id,
+                parameters,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Lists every script installed for the authenticated user that's been
+    /// synced to this device so far. Mirrors
+    /// [`crate::ScriptsService::list_installed_scripts`].
+    pub async fn list_installed_scripts(&self) -> Result<Vec<FfiInstalledScript>, FfiError> {
+        let installed = self.inner.scripts().list_installed_scripts().await?;
+        Ok(installed
+            .into_iter()
+            .map(FfiInstalledScript::try_from)
+            .collect::<Result<_, _>>()?)
+    }
+
     /// Runs every script currently enabled for the authenticated user
     /// against the document matching `document_id`, then publishes the
     /// resulting metadata if any script changed it. Mirrors
@@ -971,13 +1043,13 @@ mod tests {
     }
 
     #[test]
-    fn changelog_event_conversion_stringifies_the_document_id_and_preserves_payload() {
+    fn changelog_event_conversion_stringifies_the_subject_id_and_preserves_payload() {
         let id = Uuid::now_v7();
         let document_id = Uuid::now_v7();
         let event = FakeChangelogEvent::new()
             .with_id(id)
             .with_event_type(EventType::Created)
-            .with_document_id(document_id)
+            .with_subject_id(document_id)
             .with_content(b"body".to_vec())
             .with_metadata(FakeMetadata::new().build())
             .build();
@@ -986,7 +1058,7 @@ mod tests {
 
         assert_eq!(ffi.id, id.to_string());
         assert!(matches!(ffi.event_type, FfiEventType::Created));
-        assert_eq!(ffi.document_id, document_id.to_string());
+        assert_eq!(ffi.subject_id, document_id.to_string());
         assert_eq!(ffi.content, Some(b"body".to_vec()));
         assert!(ffi.metadata.is_some());
     }
@@ -995,7 +1067,7 @@ mod tests {
     fn changelog_event_conversion_handles_events_with_no_content_or_metadata() {
         let event = FakeChangelogEvent::new()
             .with_event_type(EventType::Deleted)
-            .with_document_id(Uuid::now_v7())
+            .with_subject_id(Uuid::now_v7())
             .without_content()
             .without_metadata()
             .build();

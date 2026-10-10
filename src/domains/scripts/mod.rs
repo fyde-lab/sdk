@@ -1,9 +1,15 @@
 mod grpc_client;
 mod models;
 mod service;
+mod storage;
 mod storage_in_memory;
+mod storage_sqlite;
 
+#[cfg(test)]
+pub(crate) use storage::MockStorage;
+pub(crate) use storage::Storage;
 pub use storage_in_memory::InMemoryScriptStorage;
+pub(crate) use storage_sqlite::SqliteStorage;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,14 +17,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
+use sqlx::SqlitePool;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
 #[cfg(test)]
-pub(crate) use models::FakeScript;
-pub use models::{Script, ScriptParameter, ScriptParameterType, ScriptType};
+pub(crate) use models::{FakeInstalledScript, FakeScript};
+pub use models::{
+    InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptParameterType, ScriptType,
+};
 
 use crate::Result;
+use crate::domains::changelog::Service as ChangelogService;
 use crate::domains::sessions::SessionsClient;
 
 /// Manages user-authored scripts against the fyde server's scripts service
@@ -81,11 +91,43 @@ pub trait Service: Send + Sync {
     /// Lists every script marked public, regardless of who owns it or
     /// whether the authenticated user has it enabled.
     async fn list_public_scripts(&self) -> Result<Vec<Script>>;
+
+    /// Installs the script `request.script_id` for the authenticated user,
+    /// to be run with `request.parameters`: fetches the script (see
+    /// [`Self::fetch_script`]), then serializes it together with those
+    /// parameters as an [`InstalledScript`] JSON document and publishes it,
+    /// encrypted, as a `ScriptInstalled` changelog event. Fails with
+    /// [`crate::Error::MissingScriptParameter`] if a parameter the script
+    /// marks `required` has no value.
+    ///
+    /// Returns once the event is published, not once it's saved locally:
+    /// like every other changelog event, it's only materialized into local
+    /// storage (and so only shows up in [`Self::list_installed_scripts`])
+    /// once the background sync job consumes it back — on every device
+    /// logged into the same account, not just this one.
+    async fn install_script(&self, request: InstallScriptRequest) -> Result<()>;
+
+    /// Lists every script installed for the authenticated user that's been
+    /// synced to this device so far, oldest installation first. Never talks
+    /// to the server: reads straight from local storage.
+    async fn list_installed_scripts(&self) -> Result<Vec<InstalledScript>>;
 }
 
 /// Initializes the scripts service: talks to the fyde server's scripts
 /// service over the shared `channel` connection, authenticating every call
-/// via `sessions`.
-pub(crate) fn init(channel: Channel, sessions: Arc<SessionsClient>) -> Arc<dyn Service> {
-    Arc::new(service::ScriptsClient::new(channel, sessions))
+/// via `sessions`, publishes script installations through `changelog`, and
+/// reads installed scripts back from the local SQLite database (`pool`)
+/// the changelog materializes them into.
+pub(crate) fn init(
+    channel: Channel,
+    sessions: Arc<SessionsClient>,
+    pool: SqlitePool,
+    changelog: Arc<dyn ChangelogService>,
+) -> Arc<dyn Service> {
+    Arc::new(service::ScriptsClient::new(
+        channel,
+        sessions,
+        SqliteStorage::new(pool),
+        changelog,
+    ))
 }

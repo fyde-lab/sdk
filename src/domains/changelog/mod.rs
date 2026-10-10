@@ -17,13 +17,15 @@ use tonic::transport::Channel;
 
 use crate::domains::documents::{self, Metadata};
 use crate::domains::secrets::Service as SecretsService;
+use crate::domains::scripts;
 use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
 use crate::{ErrorContext as _, Result};
 
 /// Publishes and consumes the fyde server's changelog: a blind relay for
-/// opaque, client-encrypted document write events. `send`/`stop_consume_job`
+/// opaque, client-encrypted write events — document writes, plus script
+/// installations (see [`EventType::ScriptInstalled`]). `send`/`stop_consume_job`
 /// take `&self` so implementations can be shared behind `Arc<dyn Service>`;
 /// `start_consume_job` takes `self: Arc<Self>` since it spawns the consume
 /// loop onto its own background task, which needs an owned, `'static`
@@ -31,7 +33,7 @@ use crate::{ErrorContext as _, Result};
 /// (mockall doesn't support `Fn` trait-object parameters — see
 /// `start_consume_job`), so tests use hand-written fakes instead.
 #[async_trait]
-pub(super) trait Service: Send + Sync {
+pub(crate) trait Service: Send + Sync {
     /// Fails with the same error [`Service::send`] would eventually hit
     /// while encrypting, if no master key is on hand yet — i.e. before any
     /// account has been created or logged into on this device — without
@@ -42,13 +44,14 @@ pub(super) trait Service: Send + Sync {
     /// whatever that other work happens to fail with first.
     async fn ensure_master_key(&self) -> Result<()>;
 
-    /// Encrypts and publishes a new event. `content`/`metadata` are `None`
-    /// for event types that don't carry them (e.g. a future `Deleted`
-    /// event only carries `document_id`).
+    /// Encrypts and publishes a new event about `subject_id` — a document
+    /// or script id depending on `event_type` (see [`ChangelogEvent`]).
+    /// `content`/`metadata` are `None` for event types that don't carry
+    /// them (e.g. a future `Deleted` event only carries `subject_id`).
     async fn send(
         &self,
         event_type: EventType,
-        document_id: uuid::Uuid,
+        subject_id: uuid::Uuid,
         content: Option<&[u8]>,
         metadata: Option<&Metadata>,
     ) -> Result<()>;
@@ -59,7 +62,9 @@ pub(super) trait Service: Send + Sync {
     /// `changelog.proto`), resuming from the cursor persisted locally in
     /// the settings store (from the very beginning of the changelog if it's
     /// never been consumed before). For each `Created` event, caches the
-    /// resulting document in local storage before invoking `callback`; the
+    /// resulting document in local storage before invoking `callback` (and
+    /// likewise saves the installed script for a `ScriptInstalled` event,
+    /// via the `scripts` domain's local storage); the
     /// cursor is persisted as each event is processed, so a later call
     /// resumes right after the last event seen.
     ///
@@ -67,7 +72,8 @@ pub(super) trait Service: Send + Sync {
     /// The spawned task never exits on its own. If a pass over the stream
     /// fails — including with [`crate::Error::InvalidChangelogEvent`] if a
     /// `Created` event is missing its `content` or `metadata`, since a
-    /// `Created` event must carry both — the error is logged and
+    /// `Created` event must carry both, or if a `ScriptInstalled` event's
+    /// `content` is missing or isn't a valid installed script — the error is logged and
     /// consumption is retried immediately from the persisted cursor: the
     /// next pass's wait for
     /// [`crate::domains::server_state::Service::is_server_reachable`]
@@ -102,14 +108,15 @@ pub(super) trait Service: Send + Sync {
 
 /// Initializes the changelog service: connects to the fyde server over the
 /// shared `channel`, and uses `pool` to cache documents materialized from
-/// consumed events directly into the local `documents` table, `settings`
+/// consumed events directly into the local `documents` table (and installed
+/// scripts into the `scripts` domain's `installed_scripts` table), `settings`
 /// to persist the changelog cursor consumed so far (see
 /// [`storage_settings::SettingsCursorStorage`]), `secrets` to read the
 /// account master key `crypto` derives every event's KEK from, and `sessions` to
 /// attach the session token as a bearer `authorization` header on every
 /// outgoing call once a session is opened (see
 /// [`crate::domains::sessions::Service::authenticated_request`]).
-pub(super) async fn init(
+pub(crate) async fn init(
     channel: Channel,
     pool: SqlitePool,
     settings: Arc<dyn SettingsService>,
@@ -117,11 +124,13 @@ pub(super) async fn init(
     sessions: Arc<SessionsClient>,
     server_state: Arc<dyn ServerStateService>,
 ) -> Result<Arc<dyn Service>> {
-    let document_storage = documents::SqliteStorage::new(pool);
+    let document_storage = documents::SqliteStorage::new(pool.clone());
+    let script_storage = scripts::SqliteStorage::new(pool);
     let cursor_storage = storage_settings::SettingsCursorStorage::new(settings);
     let client = service::ChangelogClient::new(
         channel,
         document_storage,
+        script_storage,
         cursor_storage,
         sessions,
         server_state,

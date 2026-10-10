@@ -1,3 +1,4 @@
+pub(crate) mod changelog;
 pub(crate) mod documents;
 pub(crate) mod scrapers;
 pub(crate) mod scripts;

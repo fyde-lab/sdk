@@ -11,14 +11,19 @@ use super::Script;
 use super::ScriptParameter;
 use super::ScriptType;
 use super::Service;
+use super::{InstallScriptRequest, InstalledScript};
 
 /// A [`Service`] implementation holding scripts purely in memory, for
 /// running scripts (e.g. via `documents::Service`'s `run_scripts`) without a
 /// live scripts server. State doesn't survive past the process's lifetime.
+/// With no changelog to publish through, [`Service::install_script`] saves
+/// the installation directly, so it shows up in
+/// [`Service::list_installed_scripts`] immediately.
 #[derive(Default)]
 pub struct InMemoryScriptStorage {
     scripts: Mutex<HashMap<Uuid, Script>>,
     enabled: Mutex<HashSet<Uuid>>,
+    installed: Mutex<Vec<InstalledScript>>,
 }
 
 impl InMemoryScriptStorage {
@@ -146,6 +151,23 @@ impl Service for InMemoryScriptStorage {
             .filter(|script| script.is_public)
             .cloned()
             .collect())
+    }
+
+    async fn install_script(&self, request: InstallScriptRequest) -> Result<()> {
+        let script = self.fetch_script(request.script_id).await?;
+        let mut installed = self.installed.lock().unwrap();
+
+        installed.retain(|existing| existing.script.id != script.id);
+        installed.push(InstalledScript {
+            script,
+            parameters: request.parameters,
+        });
+
+        Ok(())
+    }
+
+    async fn list_installed_scripts(&self) -> Result<Vec<InstalledScript>> {
+        Ok(self.installed.lock().unwrap().clone())
     }
 }
 
@@ -347,6 +369,47 @@ mod tests {
 
         assert_eq!(listed, vec![public]);
         assert!(!listed.contains(&private));
+    }
+
+    #[tokio::test]
+    async fn installing_a_script_lists_it_immediately_replacing_a_previous_install() {
+        let storage = InMemoryScriptStorage::new();
+        let script = storage
+            .create_script(
+                "example",
+                false,
+                Vec::new(),
+                "return 1",
+                "",
+                "",
+                Vec::new(),
+                ScriptType::Scraper,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        for username in ["alice", "bob"] {
+            storage
+                .install_script(InstallScriptRequest {
+                    script_id: script.id,
+                    parameters: HashMap::from([(
+                        "username".to_string(),
+                        serde_json::json!(username),
+                    )]),
+                })
+                .await
+                .unwrap();
+        }
+
+        let installed = storage.list_installed_scripts().await.unwrap();
+
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].script, script);
+        assert_eq!(
+            installed[0].parameters["username"],
+            serde_json::json!("bob")
+        );
     }
 
     #[tokio::test]

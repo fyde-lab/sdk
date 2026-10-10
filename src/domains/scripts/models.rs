@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::Error;
@@ -9,7 +11,8 @@ use crate::Error;
 /// What kind of script this is, opaque to the server beyond storage and
 /// filtering (see `Script`/`CreateScriptRequest`/`UpdateScriptRequest`'s
 /// `type` field in `../../../../api-protos/scripts/v1/scripts.proto`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ScriptType {
     /// Every script under `fyde-scripts`' `scrapers/` directory.
     Scraper,
@@ -47,7 +50,8 @@ impl FromStr for ScriptType {
 /// What kind of value a [`ScriptParameter`] expects, so a client can render
 /// the right form control (text field, number field, toggle) and coerce the
 /// entered value before sending it back to the script.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ScriptParameterType {
     String,
     Number,
@@ -59,7 +63,7 @@ pub enum ScriptParameterType {
 /// set of these is carried on [`Script::parameters`], keyed by the
 /// parameter's machine name (e.g. "username", "password") as the script
 /// itself refers to it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptParameter {
     /// Human-readable label for the form control, e.g. "Mot de passe".
     pub label: String,
@@ -80,7 +84,7 @@ pub struct ScriptParameter {
 /// Unlike [`crate::Document`], script content is not encrypted client-side —
 /// the server stores and can serve it in the clear, since scripts can be
 /// marked public and shared between users.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Script {
     pub(super) id: Uuid,
     pub(super) name: String,
@@ -158,6 +162,39 @@ impl Script {
     }
 }
 
+/// What [`super::Service::install_script`] takes: the id of the script to
+/// install, plus the values to run it with, keyed by the same machine names
+/// as [`Script::parameters`] (e.g. `{"username": "alice"}`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstallScriptRequest {
+    pub script_id: Uuid,
+    pub parameters: HashMap<String, Value>,
+}
+
+/// A script installed for the authenticated user, as persisted locally once
+/// its `ScriptInstalled` changelog event has been consumed (see
+/// [`super::Service::list_installed_scripts`]): the full script, plus the
+/// parameter values it was installed with, so it can be run without asking
+/// for them again. Also the exact JSON payload carried, encrypted, by that
+/// changelog event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstalledScript {
+    pub(super) script: Script,
+    pub(super) parameters: HashMap<String, Value>,
+}
+
+impl InstalledScript {
+    pub fn script(&self) -> &Script {
+        &self.script
+    }
+
+    /// The values to run [`Self::script`] with, keyed by the parameter's
+    /// machine name.
+    pub fn parameters(&self) -> &HashMap<String, Value> {
+        &self.parameters
+    }
+}
+
 /// Builds a [`Script`] filled with random-but-plausible data, for use in
 /// tests.
 #[cfg(test)]
@@ -196,7 +233,80 @@ impl FakeScript {
         self
     }
 
+    pub(crate) fn with_parameter(mut self, name: &str, parameter: ScriptParameter) -> Self {
+        self.script.parameters.insert(name.to_string(), parameter);
+        self
+    }
+
     pub(crate) fn build(self) -> Script {
         self.script
+    }
+}
+
+/// Builds an [`InstalledScript`] filled with random-but-plausible data, for
+/// use in tests.
+#[cfg(test)]
+pub(crate) struct FakeInstalledScript {
+    installed: InstalledScript,
+}
+
+#[cfg(test)]
+impl FakeInstalledScript {
+    pub(crate) fn new() -> Self {
+        Self {
+            installed: InstalledScript {
+                script: FakeScript::new().build(),
+                parameters: HashMap::from([(
+                    "username".to_string(),
+                    Value::String(crate::testing::random_word().to_string()),
+                )]),
+            },
+        }
+    }
+
+    pub(crate) fn with_script(mut self, script: Script) -> Self {
+        self.installed.script = script;
+        self
+    }
+
+    pub(crate) fn with_parameters(mut self, parameters: HashMap<String, Value>) -> Self {
+        self.installed.parameters = parameters;
+        self
+    }
+
+    pub(crate) fn build(self) -> InstalledScript {
+        self.installed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installed_script_roundtrips_through_json() {
+        let installed = FakeInstalledScript::new()
+            .with_script(
+                FakeScript::new()
+                    .with_parameter(
+                        "password",
+                        ScriptParameter {
+                            label: "Mot de passe".to_string(),
+                            placeholder: "••••••••".to_string(),
+                            parameter_type: ScriptParameterType::String,
+                            required: true,
+                            secret: true,
+                        },
+                    )
+                    .build(),
+            )
+            .build();
+
+        let json = serde_json::to_vec(&installed).unwrap();
+
+        assert_eq!(
+            serde_json::from_slice::<InstalledScript>(&json).unwrap(),
+            installed
+        );
     }
 }

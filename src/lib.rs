@@ -21,7 +21,10 @@ pub use domains::documents::{
     ChangelogEvent, Document, Metadata, Service as DocumentsService, UploadRequest,
 };
 pub use domains::scrapers::{ProgressEvent, Service as ScrapersService};
-pub use domains::scripts::{InMemoryScriptStorage, Script, ScriptType, Service as ScriptsService};
+pub use domains::scripts::{
+    InMemoryScriptStorage, InstallScriptRequest, InstalledScript, Script, ScriptType,
+    Service as ScriptsService,
+};
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
 pub use domains::users::Service as UsersService;
@@ -64,6 +67,11 @@ pub enum Error {
     DocumentNotFound(uuid::Uuid),
     #[error("script {0} not found")]
     ScriptNotFound(uuid::Uuid),
+    #[error("missing value for required parameter {parameter:?} of script {script_id}")]
+    MissingScriptParameter {
+        script_id: uuid::Uuid,
+        parameter: String,
+    },
     #[error("invalid changelog event: {0}")]
     InvalidChangelogEvent(String),
     #[error("invalid source category: {0:?}")]
@@ -240,19 +248,31 @@ impl Client {
         let settings = domains::settings::init(sqlite.pool().clone());
         let sessions = domains::sessions::init(secrets.clone());
         let server_state = domains::server_state::init(channel.clone());
-        let scripts = domains::scripts::init(channel.clone(), sessions.clone());
-        let documents = domains::documents::init(
+        // Shared by `scripts` (to publish script installations) and
+        // `documents` (to publish documents and drive the sync job that
+        // consumes every event, scripts' included).
+        let changelog = domains::changelog::init(
             channel.clone(),
             sqlite.pool().clone(),
             settings.clone(),
             secrets.clone(),
             sessions.clone(),
             server_state.clone(),
-            scripts.clone(),
-            config.on_document_change,
         )
         .await
-        .context("failed to initialize documents service")?;
+        .context("failed to initialize changelog service")?;
+        let scripts = domains::scripts::init(
+            channel.clone(),
+            sessions.clone(),
+            sqlite.pool().clone(),
+            changelog.clone(),
+        );
+        let documents = domains::documents::init(
+            sqlite.pool().clone(),
+            changelog,
+            scripts.clone(),
+            config.on_document_change,
+        );
         let users = domains::users::init(
             channel.clone(),
             settings.clone(),

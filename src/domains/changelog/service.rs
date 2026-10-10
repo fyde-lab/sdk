@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::domains::documents::{Document, Metadata, Storage as DocumentStorage};
 use crate::domains::secrets::Service as SecretsService;
+use crate::domains::scripts::{InstalledScript, Storage as ScriptStorage};
 use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
 use crate::{Error, ErrorContext as _, Result};
@@ -32,7 +33,7 @@ impl ChangelogEvent {
             )
         })?;
 
-        let (event_type, document_id, content, metadata) =
+        let (event_type, subject_id, content, metadata) =
             crypto::decrypt_event(secrets, &proto.encrypted_content)
                 .await
                 .with_context(|| format!("failed to decrypt changelog event {id}"))?;
@@ -40,7 +41,7 @@ impl ChangelogEvent {
         Ok(Self {
             id,
             event_type,
-            document_id,
+            subject_id,
             content,
             metadata,
         })
@@ -71,11 +72,13 @@ fn write_lock_path() -> std::path::PathBuf {
 
 /// A client for the fyde server's changelog service. Generic over the
 /// [`DocumentStorage`] implementation used by [`Service::consume`] to cache
-/// documents materialized from consumed events, and the [`CursorStorage`]
+/// documents materialized from consumed events, the [`ScriptStorage`]
+/// implementation it saves installed scripts to, and the [`CursorStorage`]
 /// implementation used to track how far the changelog has been consumed.
-pub(super) struct ChangelogClient<D: DocumentStorage, O: CursorStorage> {
+pub(super) struct ChangelogClient<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> {
     grpc: Box<dyn FydeClient>,
     document_storage: D,
+    script_storage: S,
     cursor_storage: O,
     server_state: Arc<dyn ServerStateService>,
     secrets: Arc<dyn SecretsService>,
@@ -110,10 +113,11 @@ pub(super) struct ChangelogClient<D: DocumentStorage, O: CursorStorage> {
 const SERVER_REACHABILITY_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(200);
 
-impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
+impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, S, O> {
     /// Creates a client for the changelog service using the shared
     /// `channel` connection to the fyde server, using `document_storage` to
     /// cache documents materialized by [`Service::consume`],
+    /// `script_storage` to save the scripts it materializes,
     /// `cursor_storage` to track its progress through the changelog,
     /// `server_state` to wait for the server to be reachable before opening
     /// a changelog stream, and `secrets` to read the account master key
@@ -121,6 +125,7 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
     pub(super) async fn new(
         channel: Channel,
         document_storage: D,
+        script_storage: S,
         cursor_storage: O,
         sessions: Arc<SessionsClient>,
         server_state: Arc<dyn ServerStateService>,
@@ -129,6 +134,7 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(channel, sessions)),
             document_storage,
+            script_storage,
             cursor_storage,
             server_state,
             secrets,
@@ -145,6 +151,7 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
     fn with_grpc(
         grpc: impl FydeClient + 'static,
         document_storage: D,
+        script_storage: S,
         cursor_storage: O,
         server_state: Arc<dyn ServerStateService>,
         secrets: Arc<dyn SecretsService>,
@@ -152,6 +159,7 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
         Self {
             grpc: Box::new(grpc),
             document_storage,
+            script_storage,
             cursor_storage,
             server_state,
             secrets,
@@ -248,18 +256,18 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
                     let (Some(content), Some(metadata)) = (&event.content, &event.metadata) else {
                         return Err(Error::InvalidChangelogEvent(format!(
                             "created event {} for document {} is missing content or metadata",
-                            event.id, event.document_id
+                            event.id, event.subject_id
                         )));
                     };
 
                     if self.has_write_permission() {
                         let document =
-                            Document::new(event.document_id, content.clone(), metadata.clone());
+                            Document::new(event.subject_id, content.clone(), metadata.clone());
                         self.document_storage
                             .save_document(&document)
                             .await
                             .with_context(|| {
-                                format!("failed to cache document {} locally", event.document_id)
+                                format!("failed to cache document {} locally", event.subject_id)
                             })?;
                     }
                 }
@@ -267,23 +275,51 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
                     let Some(metadata) = &event.metadata else {
                         return Err(Error::InvalidChangelogEvent(format!(
                             "update metadata event {} for document {} is missing metadata",
-                            event.id, event.document_id
+                            event.id, event.subject_id
                         )));
                     };
 
                     if self.has_write_permission() {
                         self.document_storage
-                            .update_metadata(event.document_id, metadata)
+                            .update_metadata(event.subject_id, metadata)
                             .await
                             .with_context(|| {
                                 format!(
                                     "failed to update cached document {} locally",
-                                    event.document_id
+                                    event.subject_id
                                 )
                             })?;
                     }
                 }
                 EventType::Deleted => {}
+                EventType::ScriptInstalled => {
+                    let Some(content) = &event.content else {
+                        return Err(Error::InvalidChangelogEvent(format!(
+                            "script installed event {} for script {} is missing content",
+                            event.id, event.subject_id
+                        )));
+                    };
+                    let installed: InstalledScript =
+                        serde_json::from_slice(content).map_err(|err| {
+                            Error::InvalidChangelogEvent(format!(
+                                "script installed event {} for script {} carries an invalid \
+                                 installed script: {err}",
+                                event.id, event.subject_id
+                            ))
+                        })?;
+
+                    if self.has_write_permission() {
+                        self.script_storage
+                            .save_installed_script(&installed)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "failed to save installed script {} locally",
+                                    event.subject_id
+                                )
+                            })?;
+                    }
+                }
             }
 
             let next_cursor = successor(event.id);
@@ -323,7 +359,9 @@ impl<D: DocumentStorage, O: CursorStorage> ChangelogClient<D, O> {
 }
 
 #[async_trait]
-impl<D: DocumentStorage + 'static, O: CursorStorage + 'static> Service for ChangelogClient<D, O> {
+impl<D: DocumentStorage + 'static, S: ScriptStorage + 'static, O: CursorStorage + 'static> Service
+    for ChangelogClient<D, S, O>
+{
     async fn ensure_master_key(&self) -> Result<()> {
         crypto::ensure_master_key(&*self.secrets).await
     }
@@ -331,12 +369,12 @@ impl<D: DocumentStorage + 'static, O: CursorStorage + 'static> Service for Chang
     async fn send(
         &self,
         event_type: EventType,
-        document_id: Uuid,
+        subject_id: Uuid,
         content: Option<&[u8]>,
         metadata: Option<&Metadata>,
     ) -> Result<()> {
         let encrypted_content =
-            crypto::encrypt_event(&*self.secrets, event_type, document_id, content, metadata)
+            crypto::encrypt_event(&*self.secrets, event_type, subject_id, content, metadata)
                 .await
                 .context("failed to encrypt changelog event")?;
 
@@ -388,6 +426,7 @@ mod tests {
     use super::*;
     use crate::domains::documents::{FakeMetadata, MockStorage};
     use crate::domains::secrets::MockService as MockSecretsService;
+    use crate::domains::scripts::{FakeInstalledScript, MockStorage as MockScriptStorage};
     use crate::domains::server_state::MockService as MockServerState;
 
     /// A [`ServerStateService`] mock reporting the server as always
@@ -467,6 +506,7 @@ mod tests {
         let client = ChangelogClient::with_grpc(
             mock_grpc,
             document_storage,
+            MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -481,7 +521,7 @@ mod tests {
         let received = received.lock().unwrap();
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].id, event_id);
-        assert_eq!(received[0].document_id, document_id);
+        assert_eq!(received[0].subject_id, document_id);
         assert_eq!(received[0].event_type, EventType::Created);
     }
 
@@ -513,6 +553,7 @@ mod tests {
         let client = ChangelogClient::with_grpc(
             mock_grpc,
             document_storage,
+            MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -526,7 +567,7 @@ mod tests {
 
         let received = received.lock().unwrap();
         assert_eq!(received.len(), 1);
-        assert_eq!(received[0].document_id, document_id);
+        assert_eq!(received[0].subject_id, document_id);
     }
 
     #[tokio::test]
@@ -538,6 +579,7 @@ mod tests {
         let first = ChangelogClient::with_grpc(
             mock_grpc,
             document_storage,
+            MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -550,6 +592,7 @@ mod tests {
         let mut second = ChangelogClient::with_grpc(
             MockFydeClient::new(),
             MockStorage::new(),
+            MockScriptStorage::new(),
             MockCursorStorage::new(),
             reachable_server_state(),
             fake_secrets(),
@@ -581,6 +624,7 @@ mod tests {
         let client = Arc::new(ChangelogClient::with_grpc(
             mock_grpc,
             document_storage,
+            MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -633,6 +677,7 @@ mod tests {
         let client = ChangelogClient::with_grpc(
             mock_grpc,
             document_storage,
+            MockScriptStorage::new(),
             cursor_storage,
             Arc::new(server_state),
             fake_secrets(),
@@ -659,6 +704,157 @@ mod tests {
         tokio::time::advance(SERVER_REACHABILITY_POLL_INTERVAL).await;
         consume_once_fut.await.unwrap();
         assert_eq!(reachability_checks.load(Ordering::SeqCst), 3);
+    }
+
+    /// A `ScriptInstalled` proto event for `script_id` carrying `content`
+    /// as its (encrypted) payload.
+    fn script_installed_proto_event(
+        id: Uuid,
+        script_id: Uuid,
+        content: &[u8],
+    ) -> ProtoChangelogEvent {
+        let encrypted_content = futures::executor::block_on(crypto::encrypt_event(
+            &*fake_secrets(),
+            EventType::ScriptInstalled,
+            script_id,
+            Some(content),
+            None,
+        ))
+        .unwrap();
+        ProtoChangelogEvent {
+            id: id.to_string(),
+            encrypted_content,
+            previous_id: String::new(),
+        }
+    }
+
+    /// A cursor storage expecting a single pass from the very beginning of
+    /// the changelog that consumes exactly `event_id`.
+    fn cursor_storage_consuming(event_id: Uuid) -> MockCursorStorage {
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+        cursor_storage
+            .expect_save_cursor()
+            .withf(move |id| *id == successor(event_id))
+            .times(1)
+            .returning(|_| Ok(()));
+        cursor_storage
+    }
+
+    #[tokio::test]
+    async fn consume_saves_the_installed_script_for_a_script_installed_event() {
+        let installed = FakeInstalledScript::new().build();
+        let script_id = installed.script().id();
+        let event_id = Uuid::now_v7();
+        let content = serde_json::to_vec(&installed).unwrap();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(vec![Ok(script_installed_proto_event(
+                event_id, script_id, &content,
+            ))])
+            .boxed())
+        });
+
+        let mut script_storage = MockScriptStorage::new();
+        let expected = installed.clone();
+        script_storage
+            .expect_save_installed_script()
+            .withf(move |saved| *saved == expected)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        // No `MockStorage` expectations: a script event must never touch
+        // the documents cache.
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            MockStorage::new(),
+            script_storage,
+            cursor_storage_consuming(event_id),
+            reachable_server_state(),
+            fake_secrets(),
+        );
+        client.acquire_write_lock();
+
+        let received = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let received_in_callback = received.clone();
+        let mut callback = move |event| received_in_callback.lock().unwrap().push(event);
+        client.consume_once(&mut callback).await.unwrap();
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].event_type, EventType::ScriptInstalled);
+        assert_eq!(received[0].subject_id, script_id);
+    }
+
+    #[tokio::test]
+    async fn consume_skips_saving_the_installed_script_without_the_write_lock() {
+        let installed = FakeInstalledScript::new().build();
+        let script_id = installed.script().id();
+        let event_id = Uuid::now_v7();
+        let content = serde_json::to_vec(&installed).unwrap();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(vec![Ok(script_installed_proto_event(
+                event_id, script_id, &content,
+            ))])
+            .boxed())
+        });
+
+        // No `expect_save_installed_script()`: the mock panics if it's
+        // called, proving nothing is persisted without the write lock.
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            MockStorage::new(),
+            MockScriptStorage::new(),
+            cursor_storage_consuming(event_id),
+            reachable_server_state(),
+            fake_secrets(),
+        );
+
+        client.consume_once(&mut |_| {}).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn consume_rejects_a_script_installed_event_with_an_invalid_payload() {
+        let script_id = Uuid::now_v7();
+        let event_id = Uuid::now_v7();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(vec![Ok(script_installed_proto_event(
+                event_id,
+                script_id,
+                b"not json",
+            ))])
+            .boxed())
+        });
+
+        // The cursor must not advance past an event that failed to apply.
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            MockStorage::new(),
+            MockScriptStorage::new(),
+            cursor_storage,
+            reachable_server_state(),
+            fake_secrets(),
+        );
+        client.acquire_write_lock();
+
+        let err = client.consume_once(&mut |_| {}).await.unwrap_err();
+
+        assert!(
+            matches!(err, Error::InvalidChangelogEvent(_)),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -694,6 +890,7 @@ mod tests {
         let client = ChangelogClient::with_grpc(
             mock_grpc,
             document_storage,
+            MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -737,6 +934,7 @@ mod tests {
         let client = ChangelogClient::with_grpc(
             mock_grpc,
             document_storage,
+            MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -782,6 +980,7 @@ mod tests {
         let client = ChangelogClient::with_grpc(
             mock_grpc,
             document_storage,
+            MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -824,6 +1023,7 @@ mod tests {
         let client = ChangelogClient::with_grpc(
             mock_grpc,
             document_storage,
+            MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -862,6 +1062,7 @@ mod tests {
         let client = ChangelogClient::with_grpc(
             mock_grpc,
             document_storage,
+            MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -897,6 +1098,7 @@ mod tests {
         let client = Arc::new(ChangelogClient::with_grpc(
             mock_grpc,
             document_storage,
+            MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -930,6 +1132,7 @@ mod tests {
         let client = ChangelogClient::with_grpc(
             mock_grpc,
             document_storage,
+            MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -965,6 +1168,7 @@ mod tests {
         let client = Arc::new(ChangelogClient::with_grpc(
             mock_grpc,
             document_storage,
+            MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1007,6 +1211,7 @@ mod tests {
         let client = ChangelogClient::with_grpc(
             mock_grpc,
             MockStorage::new(),
+            MockScriptStorage::new(),
             MockCursorStorage::new(),
             reachable_server_state(),
             fake_secrets(),

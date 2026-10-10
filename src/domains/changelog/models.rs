@@ -11,19 +11,26 @@ pub enum EventType {
     Created,
     UpdateMetadata,
     Deleted,
+    /// A script was installed for the account (see
+    /// `scripts::Service::install_script`). The event's `subject_id` is the
+    /// installed script's id, and its `content` the JSON-serialized
+    /// `scripts::InstalledScript` (no `metadata`).
+    ScriptInstalled,
 }
 
-/// A single recorded write against a document, decrypted from the server's
-/// changelog. Inlines the document's fields rather than wrapping a
-/// [`crate::domains::documents::Document`], since not every event type
-/// carries all of them: `content` is `None` for a metadata-only update, and
-/// both `content` and `metadata` are `None` for a deletion (only
-/// `document_id` is meaningful then).
+/// A single recorded write, decrypted from the server's changelog.
+/// `subject_id` is the id of whatever the write is about, which depends on
+/// [`EventType`]: a document for `Created`/`UpdateMetadata`/`Deleted`, a
+/// script for `ScriptInstalled`. Inlines a document's fields rather than
+/// wrapping a [`crate::domains::documents::Document`], since not every
+/// event type carries all of them: `content` is `None` for a metadata-only
+/// update, and both `content` and `metadata` are `None` for a deletion
+/// (only `subject_id` is meaningful then).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangelogEvent {
     pub(super) id: Uuid,
     pub(super) event_type: EventType,
-    pub(super) document_id: Uuid,
+    pub(super) subject_id: Uuid,
     pub(super) content: Option<Vec<u8>>,
     pub(super) metadata: Option<Metadata>,
 }
@@ -37,8 +44,8 @@ impl ChangelogEvent {
         self.event_type
     }
 
-    pub fn document_id(&self) -> Uuid {
-        self.document_id
+    pub fn subject_id(&self) -> Uuid {
+        self.subject_id
     }
 
     pub fn content(&self) -> Option<&[u8]> {
@@ -64,7 +71,7 @@ impl FakeChangelogEvent {
             event: ChangelogEvent {
                 id: Uuid::now_v7(),
                 event_type: EventType::Created,
-                document_id: Uuid::now_v7(),
+                subject_id: Uuid::now_v7(),
                 content: Some(crate::testing::random_bytes(64)),
                 metadata: Some(crate::domains::documents::FakeMetadata::new().build()),
             },
@@ -81,15 +88,15 @@ impl FakeChangelogEvent {
         self
     }
 
-    /// Sets `document_id` to `document`'s id, so the event refers to a
+    /// Sets `subject_id` to `document`'s id, so the event refers to a
     /// document that actually exists in the test's fixtures.
     pub(crate) fn for_document(mut self, document: &crate::domains::documents::Document) -> Self {
-        self.event.document_id = document.id();
+        self.event.subject_id = document.id();
         self
     }
 
-    pub(crate) fn with_document_id(mut self, document_id: Uuid) -> Self {
-        self.event.document_id = document_id;
+    pub(crate) fn with_subject_id(mut self, subject_id: Uuid) -> Self {
+        self.event.subject_id = subject_id;
         self
     }
 
@@ -133,12 +140,12 @@ mod tests {
     }
 
     #[test]
-    fn for_document_sets_the_document_id() {
+    fn for_document_sets_the_subject_id() {
         let document = FakeDocument::new().build();
 
         let event = FakeChangelogEvent::new().for_document(&document).build();
 
-        assert_eq!(event.document_id, document.id());
+        assert_eq!(event.subject_id, document.id());
     }
 
     #[test]
@@ -153,19 +160,19 @@ mod tests {
     #[test]
     fn with_methods_override_every_other_field() {
         let id = Uuid::now_v7();
-        let document_id = Uuid::now_v7();
+        let subject_id = Uuid::now_v7();
         let metadata = crate::domains::documents::FakeMetadata::new().build();
 
         let event = FakeChangelogEvent::new()
             .with_id(id)
             .with_event_type(EventType::Deleted)
-            .with_document_id(document_id)
+            .with_subject_id(subject_id)
             .with_metadata(metadata.clone())
             .build();
 
         assert_eq!(event.id, id);
         assert_eq!(event.event_type, EventType::Deleted);
-        assert_eq!(event.document_id, document_id);
+        assert_eq!(event.subject_id, subject_id);
         assert_eq!(event.metadata, Some(metadata));
     }
 

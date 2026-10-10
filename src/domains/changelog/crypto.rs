@@ -32,7 +32,7 @@ const WRAPPED_KEY_LEN: usize = NONCE_LEN + KEY_LEN + TAG_LEN;
 #[derive(Serialize, Deserialize)]
 struct EventPayload {
     event_type: EventType,
-    document_id: Uuid,
+    subject_id: Uuid,
     #[serde(with = "serde_bytes")]
     content: Option<Vec<u8>>,
     metadata: Option<Metadata>,
@@ -134,7 +134,7 @@ fn aead_decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>> {
 /// used for document uploads before the documents service was folded into
 /// the changelog:
 ///
-/// 1. MessagePack-serializes `{event_type, document_id, content, metadata}`.
+/// 1. MessagePack-serializes `{event_type, subject_id, content, metadata}`.
 /// 2. Generates a fresh, random DEK and encrypts the serialized bytes under
 ///    it (AES-256-GCM, random nonce).
 /// 3. Wraps the DEK itself under a KEK (AES-256-GCM), so only the wrapped
@@ -145,13 +145,13 @@ fn aead_decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>> {
 pub(super) async fn encrypt_event(
     secrets: &dyn SecretsService,
     event_type: EventType,
-    document_id: Uuid,
+    subject_id: Uuid,
     content: Option<&[u8]>,
     metadata: Option<&Metadata>,
 ) -> Result<Vec<u8>> {
     let payload = EventPayload {
         event_type,
-        document_id,
+        subject_id,
         content: content.map(<[u8]>::to_vec),
         metadata: metadata.cloned(),
     };
@@ -171,7 +171,7 @@ pub(super) async fn encrypt_event(
 }
 
 /// The plaintext fields of a decrypted changelog event: `event_type`,
-/// `document_id`, `content`, `metadata`.
+/// `subject_id`, `content`, `metadata`.
 pub(super) type DecryptedEvent = (EventType, Uuid, Option<Vec<u8>>, Option<Metadata>);
 
 /// Decrypts an `encrypted_content` blob produced by [`encrypt_event`].
@@ -197,7 +197,7 @@ pub(super) async fn decrypt_event(
 
     Ok((
         payload.event_type,
-        payload.document_id,
+        payload.subject_id,
         payload.content,
         payload.metadata,
     ))
@@ -226,13 +226,13 @@ mod tests {
     #[tokio::test]
     async fn encrypt_event_roundtrips_a_created_event() {
         let secrets = secrets_with_master_key();
-        let document_id = Uuid::now_v7();
+        let subject_id = Uuid::now_v7();
         let metadata = FakeMetadata::new().build();
 
         let encrypted = encrypt_event(
             &secrets,
             EventType::Created,
-            document_id,
+            subject_id,
             Some(b"body"),
             Some(&metadata),
         )
@@ -243,7 +243,7 @@ mod tests {
             decrypt_event(&secrets, &encrypted).await.unwrap();
 
         assert_eq!(event_type, EventType::Created);
-        assert_eq!(decrypted_id, document_id);
+        assert_eq!(decrypted_id, subject_id);
         assert_eq!(content, Some(b"body".to_vec()));
         assert_eq!(decrypted_metadata, Some(metadata));
     }
@@ -251,9 +251,9 @@ mod tests {
     #[tokio::test]
     async fn encrypt_event_roundtrips_a_deleted_event_with_no_content_or_metadata() {
         let secrets = secrets_with_master_key();
-        let document_id = Uuid::now_v7();
+        let subject_id = Uuid::now_v7();
 
-        let encrypted = encrypt_event(&secrets, EventType::Deleted, document_id, None, None)
+        let encrypted = encrypt_event(&secrets, EventType::Deleted, subject_id, None, None)
             .await
             .unwrap();
 
@@ -261,7 +261,7 @@ mod tests {
             decrypt_event(&secrets, &encrypted).await.unwrap();
 
         assert_eq!(event_type, EventType::Deleted);
-        assert_eq!(decrypted_id, document_id);
+        assert_eq!(decrypted_id, subject_id);
         assert_eq!(content, None);
         assert_eq!(metadata, None);
     }
@@ -269,11 +269,11 @@ mod tests {
     #[tokio::test]
     async fn decrypt_event_rejects_content_tampered_with_after_encryption() {
         let secrets = secrets_with_master_key();
-        let document_id = Uuid::now_v7();
+        let subject_id = Uuid::now_v7();
         let mut encrypted = encrypt_event(
             &secrets,
             EventType::Created,
-            document_id,
+            subject_id,
             Some(b"body"),
             None,
         )
@@ -299,12 +299,12 @@ mod tests {
             .expect_get()
             .withf(|key| key == MASTER_KEY_SECRET)
             .returning(|_| Ok(None));
-        let document_id = Uuid::now_v7();
+        let subject_id = Uuid::now_v7();
 
         let err = encrypt_event(
             &secrets,
             EventType::Created,
-            document_id,
+            subject_id,
             Some(b"body"),
             None,
         )

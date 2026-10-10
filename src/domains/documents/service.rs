@@ -5,7 +5,8 @@ use uuid::Uuid;
 
 use crate::{Error, ErrorContext as _, Result};
 
-use super::changelog::{ChangelogEvent, EventType, Service as ChangelogService};
+use crate::domains::changelog::{ChangelogEvent, EventType, Service as ChangelogService};
+
 use super::parser::Service as ParserService;
 use super::storage::Storage;
 use super::{Document, Metadata, Service, UploadRequest, UploadSource};
@@ -272,13 +273,13 @@ mod tests {
         async fn send(
             &self,
             event_type: EventType,
-            document_id: Uuid,
+            subject_id: Uuid,
             content: Option<&[u8]>,
             metadata: Option<&Metadata>,
         ) -> Result<()> {
             self.sent.lock().unwrap().push((
                 event_type,
-                document_id,
+                subject_id,
                 content.map(<[u8]>::to_vec),
                 metadata.cloned(),
             ));

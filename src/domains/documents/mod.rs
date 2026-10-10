@@ -1,4 +1,3 @@
-mod changelog;
 mod dev;
 mod models;
 pub(crate) mod parser;
@@ -7,8 +6,8 @@ mod storage;
 mod storage_sqlite;
 
 #[cfg(test)]
-pub(crate) use changelog::FakeChangelogEvent;
-pub use changelog::{ChangelogEvent, EventType};
+pub(crate) use crate::domains::changelog::FakeChangelogEvent;
+pub use crate::domains::changelog::{ChangelogEvent, EventType};
 pub use models::{
     Document, Metadata, Purpose, SourceCategory, SourceSubCategory, UploadRequest, UploadSource,
 };
@@ -25,15 +24,11 @@ use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
 use sqlx::SqlitePool;
-use tonic::transport::Channel;
 use uuid::Uuid;
 
+use crate::Result;
+use crate::domains::changelog;
 use crate::domains::scripts::Service as ScriptsService;
-use crate::domains::secrets::Service as SecretsService;
-use crate::domains::server_state::Service as ServerStateService;
-use crate::domains::sessions::SessionsClient;
-use crate::domains::settings::Service as SettingsService;
-use crate::{ErrorContext as _, Result};
 
 /// Uploads documents by publishing them as encrypted changelog events, and
 /// reads back documents materialized locally from consumed events (see
@@ -95,9 +90,9 @@ pub trait Service: Send + Sync {
     /// automatically once a session is open; most callers never need to
     /// call it directly.
     ///
-    /// Delegates entirely to the internal changelog service's
-    /// `start_consume_job` — the changelog itself is private to this
-    /// domain, this is the only way to reach it from outside.
+    /// Delegates entirely to the [`crate::domains::changelog`] service's
+    /// `start_consume_job` — this is the only way to reach it from outside
+    /// the `sdk` crate, since that service's own API is `pub(crate)`.
     ///
     /// Returns as soon as the background job is spawned, not when it stops.
     /// The job itself runs until the server closes the stream or an error
@@ -110,43 +105,36 @@ pub trait Service: Send + Sync {
     /// started its job (in which case that job returns immediately) or
     /// after it has already returned (a no-op).
     /// [`crate::domains::users::Service::logout`] calls this automatically.
-    /// Delegates to the internal changelog service's `stop_consume_job` —
-    /// see [`Self::start_sync`]'s own doc comment for why that's the only
-    /// way to reach it.
+    /// Delegates to the [`crate::domains::changelog`] service's
+    /// `stop_consume_job` — see [`Self::start_sync`]'s own doc comment for
+    /// why that's the only way to reach it.
     fn stop_sync(&self);
 }
 
-/// Initializes the documents service: connects the internal changelog
-/// service to the fyde server over `channel` (see `changelog::init`), wires
-/// up local SQLite-backed caching (via `pool`) of documents materialized
-/// from its consumed events, publishes new documents through it, initializes
-/// the internal parser service (see `parser::init`) with `scripts` to derive
-/// a newly uploaded document's metadata and fill in its classification
-/// fields, and calls `on_document_change` (see [`crate::ClientConfig`]) for
-/// every event [`Service::start_sync`] consumes.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn init(
-    channel: Channel,
+/// Initializes the documents service: publishes new documents through the
+/// shared `changelog` service (which also materializes consumed events
+/// into the local `documents` table — see `changelog::init`), wires up
+/// local SQLite-backed reads (via `pool`) of the documents it cached,
+/// initializes the internal parser service (see `parser::init`) with
+/// `scripts` to derive a newly uploaded document's metadata and fill in its
+/// classification fields, and calls `on_document_change` (see
+/// [`crate::ClientConfig`]) for every event [`Service::start_sync`]
+/// consumes.
+pub(crate) fn init(
     pool: SqlitePool,
-    settings: Arc<dyn SettingsService>,
-    secrets: Arc<dyn SecretsService>,
-    sessions: Arc<SessionsClient>,
-    server_state: Arc<dyn ServerStateService>,
+    changelog: Arc<dyn changelog::Service>,
     scripts: Arc<dyn ScriptsService>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
-) -> Result<Arc<dyn Service>> {
-    let storage = storage_sqlite::SqliteStorage::new(pool.clone());
-    let changelog = changelog::init(channel, pool, settings, secrets, sessions, server_state)
-        .await
-        .context("failed to initialize changelog service")?;
+) -> Arc<dyn Service> {
+    let storage = storage_sqlite::SqliteStorage::new(pool);
     let parser = parser::init(scripts);
 
-    Ok(Arc::new(service::DocumentsClient::new(
+    Arc::new(service::DocumentsClient::new(
         storage,
         changelog,
         parser,
         on_document_change,
-    )))
+    ))
 }
 
 /// Initializes a dev [`Service`] for standalone use without a fyde server
