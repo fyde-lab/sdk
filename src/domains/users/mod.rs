@@ -3,6 +3,7 @@ mod grpc_client;
 mod service;
 
 pub use service::UsersClient;
+pub(crate) use service::system_language;
 
 use std::sync::Arc;
 

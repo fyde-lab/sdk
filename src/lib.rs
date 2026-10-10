@@ -243,6 +243,19 @@ impl Client {
         self.scrapers.as_ref()
     }
 
+    /// Returns `err`'s user-facing wording (see [`Error::user_message`]) in
+    /// the language the user picked via [`UsersService::set_language`],
+    /// falling back to the device's system language if they never picked
+    /// one — or if reading their preference fails, since this is meant to
+    /// be called while already reporting a failure.
+    pub async fn user_message(&self, err: &Error) -> &'static str {
+        let language = match self.users.get_language().await {
+            Ok(Some(language)) => language,
+            Ok(None) | Err(_) => domains::users::system_language(),
+        };
+        err.user_message(&language)
+    }
+
     /// Returns a reference to the client's sessions service. Returns the
     /// concrete `SessionsClient` rather than a trait object, like
     /// [`domains::sessions::init`], since `sessions::Service` is not

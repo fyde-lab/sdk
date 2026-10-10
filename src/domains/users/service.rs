@@ -29,8 +29,9 @@ const SERVER_LOGOUT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (checked in that order, matching POSIX locale precedence) and falling
 /// back to `"en"` if none is set or parses to something unexpected (e.g.
 /// the POSIX default `"C"`/`"POSIX"`). Sent to the server by `create` so it
-/// doesn't need to be asked for.
-fn system_language() -> String {
+/// doesn't need to be asked for, and used as the fallback language for
+/// [`crate::Client::user_message`] when the user hasn't picked one.
+pub(crate) fn system_language() -> String {
     ["LC_ALL", "LC_MESSAGES", "LANG"]
         .into_iter()
         .find_map(|var| std::env::var(var).ok())

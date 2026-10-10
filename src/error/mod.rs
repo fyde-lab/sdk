@@ -112,6 +112,7 @@ macro_rules! for_each_error_code {
         }
     };
 }
+pub(crate) use for_each_error_code;
 
 macro_rules! define_error_code {
     ($($(#[$meta:meta])* $name:ident = $value:literal,)*) => {
@@ -315,7 +316,9 @@ impl Error {
     }
 
     /// A short, non-technical wording of this failure, fit to show an end
-    /// user, in `language` (see [`ErrorCode::user_message`]).
+    /// user, in `language` (see [`ErrorCode::user_message`]). To use the
+    /// language the user picked via `UsersService::set_language`, see
+    /// [`crate::Client::user_message`].
     pub fn user_message(&self, language: &str) -> &'static str {
         self.code().user_message(language)
     }

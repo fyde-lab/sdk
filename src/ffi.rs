@@ -19,34 +19,59 @@ use crate::domains::scripts::{
     InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptParameterType, ScriptType,
 };
 use crate::domains::sessions::Service as SessionsService;
+use crate::domains::users::system_language;
 use crate::{
-    ChangelogEvent, Client, ClientConfig, Document, Error, ErrorContext as _, ErrorKind, LogLevel,
-    Storage,
+    ChangelogEvent, Client, ClientConfig, Document, Error, ErrorCode, ErrorContext as _, ErrorKind,
+    LogLevel, Storage,
 };
 
-/// Error type surfaced to FFI callers. UniFFI requires exported errors to be
-/// their own type rather than the crate's own [`Error`], so every failure is
-/// flattened to its display message here.
-#[derive(Debug, thiserror::Error, uniffi::Error)]
-pub enum FfiError {
-    #[error("{0}")]
-    Failed(String),
-}
+macro_rules! define_ffi_error {
+    ($($(#[$meta:meta])* $name:ident = $value:literal,)*) => {
+        /// Error type surfaced to FFI callers, mirroring [`Error`]: one
+        /// variant per [`ErrorCode`] (so Kotlin can catch e.g.
+        /// `FfiException.InvalidCredentials` specifically), each carrying
+        /// the failure's user-facing wording in the user's selected
+        /// language (see [`Client::user_message`]) as its message. A flat
+        /// error, so Kotlin's `Exception.message` is exactly that wording —
+        /// a record-style error would instead get a generated
+        /// `"field=value, ..."` message. The technical description never
+        /// crosses the boundary; it's logged (and so reaches
+        /// [`FfiClientConfig`]'s log listener) instead.
+        #[derive(Debug, thiserror::Error, uniffi::Error)]
+        #[uniffi(flat_error)]
+        pub enum FfiError {
+            $($(#[$meta])* #[error("{0}")] $name(String),)*
+        }
 
-impl From<Error> for FfiError {
-    fn from(err: Error) -> Self {
-        FfiError::Failed(err.to_string())
+        impl FfiError {
+            fn new(code: ErrorCode, user_message: &str) -> Self {
+                match code {
+                    $(ErrorCode::$name => FfiError::$name(user_message.to_string()),)*
+                }
+            }
+
+            #[cfg(test)]
+            fn code(&self) -> ErrorCode {
+                match self {
+                    $(FfiError::$name(_) => ErrorCode::$name,)*
+                }
+            }
+        }
+    };
+}
+crate::error::for_each_error_code!(define_ffi_error);
+
+impl FfiError {
+    /// Converts `err` for an FFI caller, worded in `language`, logging its
+    /// technical description first since that's otherwise lost here.
+    fn from_error(err: &Error, language: &str) -> Self {
+        tracing::warn!(code = %err.code(), "{err}");
+        Self::new(err.code(), err.user_message(language))
     }
 }
 
-impl From<uuid::Error> for FfiError {
-    fn from(err: uuid::Error) -> Self {
-        Error::from(err).into()
-    }
-}
-
-fn parse_uuid(id: &str) -> Result<Uuid, FfiError> {
-    Ok(Uuid::parse_str(id)?)
+fn parse_uuid(id: &str) -> crate::Result<Uuid> {
+    Uuid::parse_str(id).with_context(|| format!("invalid id {id:?}"))
 }
 
 /// The business domain a document's issuer belongs to, mirroring
@@ -262,7 +287,7 @@ impl From<Metadata> for FfiMetadata {
 }
 
 impl TryFrom<FfiMetadata> for Metadata {
-    type Error = FfiError;
+    type Error = Error;
 
     fn try_from(metadata: FfiMetadata) -> Result<Self, Self::Error> {
         Ok(Self {
@@ -608,9 +633,30 @@ pub struct FydeClient {
     inner: Client,
 }
 
+impl FydeClient {
+    /// Awaits `operation`, converting its error (if any) to an [`FfiError`]
+    /// worded in the user's selected language. Every exported method's body
+    /// runs through this, so none can surface an error untranslated.
+    async fn localized<T>(
+        &self,
+        operation: impl Future<Output = crate::Result<T>>,
+    ) -> Result<T, FfiError> {
+        match operation.await {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                let message = self.inner.user_message(&err).await;
+                tracing::warn!(code = %err.code(), "{err}");
+                Err(FfiError::new(err.code(), message))
+            }
+        }
+    }
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl FydeClient {
     /// Connects to a fyde server per `config`. Mirrors [`Client::init`].
+    /// Fails worded in the device's system language, since the user's own
+    /// preference lives in the local database this is what opens.
     ///
     /// Needs `async_runtime = "tokio"`: `Client::init` goes through sqlx's
     /// connection pool, which requires an active Tokio context to spawn its
@@ -632,8 +678,10 @@ impl FydeClient {
                 Arc::new(move |event| listener.on_event(event.into()))
             });
 
-        let inner = Client::init(config).await?;
-        Ok(Arc::new(Self { inner }))
+        match Client::init(config).await {
+            Ok(inner) => Ok(Arc::new(Self { inner })),
+            Err(err) => Err(FfiError::from_error(&err, &system_language())),
+        }
     }
 
     /// Creates a new account and opens a session for the device named
@@ -645,12 +693,12 @@ impl FydeClient {
         password: String,
         device_name: String,
     ) -> Result<String, FfiError> {
-        let token = self
-            .inner
-            .users()
-            .create(&username, &password, &device_name)
-            .await?;
-        Ok(token)
+        self.localized(
+            self.inner
+                .users()
+                .create(&username, &password, &device_name),
+        )
+        .await
     }
 
     /// Verifies `username`/`password` and opens a session for the device
@@ -662,19 +710,14 @@ impl FydeClient {
         password: String,
         device_name: String,
     ) -> Result<String, FfiError> {
-        let token = self
-            .inner
-            .users()
-            .login(&username, &password, &device_name)
-            .await?;
-        Ok(token)
+        self.localized(self.inner.users().login(&username, &password, &device_name))
+            .await
     }
 
     /// Closes the session opened by the most recent `create_user`/`login`
     /// call. Mirrors [`crate::UsersService::logout`].
     pub async fn logout(&self) -> Result<(), FfiError> {
-        self.inner.users().logout().await?;
-        Ok(())
+        self.localized(self.inner.users().logout()).await
     }
 
     /// Persists `token` as the session token attached to every subsequent
@@ -684,44 +727,49 @@ impl FydeClient {
     /// kept in secure storage across app restarts) without a network round
     /// trip. Mirrors `sessions::Service::save_new_session`.
     pub async fn save_new_session(&self, token: String) -> Result<(), FfiError> {
-        self.inner.sessions().save_new_session(&token).await?;
-        Ok(())
+        self.localized(self.inner.sessions().save_new_session(&token))
+            .await
     }
 
     /// Returns whether a session token is currently persisted, i.e. a
     /// `create_user`/`login`/`save_new_session` call succeeded and `logout`
     /// hasn't been called since. Mirrors `sessions::Service::is_connected`.
     pub async fn is_connected(&self) -> Result<bool, FfiError> {
-        let connected = self.inner.sessions().is_connected().await?;
-        Ok(connected)
+        self.localized(self.inner.sessions().is_connected()).await
     }
 
     /// Returns whether the fyde server currently responds as reachable.
     /// Mirrors [`crate::ServerStateService::is_server_reachable`].
     pub async fn is_server_reachable(&self) -> Result<bool, FfiError> {
-        let reachable = self.inner.server_state().is_server_reachable().await?;
-        Ok(reachable)
+        self.localized(self.inner.server_state().is_server_reachable())
+            .await
     }
 
     /// Reads the local file at `path`, encrypts it and its metadata, then
     /// publishes it as a "created" changelog event, returning its generated
     /// id. Mirrors [`crate::DocumentsService::upload`].
     pub async fn upload_document(&self, path: String) -> Result<String, FfiError> {
-        let id = self
-            .inner
-            .documents()
-            .upload(UploadRequest::from_path(Path::new(&path)))
-            .await?;
-        Ok(id.to_string())
+        self.localized(async {
+            let id = self
+                .inner
+                .documents()
+                .upload(UploadRequest::from_path(Path::new(&path)))
+                .await?;
+            Ok(id.to_string())
+        })
+        .await
     }
 
     /// Fetches a document previously cached locally by the SDK's automatic
     /// changelog sync (see [`FydeClient::init`]'s `on_document_change`), or
     /// `None` if it doesn't exist. Mirrors [`crate::DocumentsService::get`].
     pub async fn get_document(&self, id: String) -> Result<Option<FfiDocument>, FfiError> {
-        let id = parse_uuid(&id)?;
-        let document = self.inner.documents().get(id).await?;
-        Ok(document.map(FfiDocument::from))
+        self.localized(async {
+            let id = parse_uuid(&id)?;
+            let document = self.inner.documents().get(id).await?;
+            Ok(document.map(FfiDocument::from))
+        })
+        .await
     }
 
     /// Lists documents previously cached locally, oldest first, one page at
@@ -731,8 +779,11 @@ impl FydeClient {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<FfiDocument>, FfiError> {
-        let documents = self.inner.documents().list(offset, limit).await?;
-        Ok(documents.into_iter().map(FfiDocument::from).collect())
+        self.localized(async {
+            let documents = self.inner.documents().list(offset, limit).await?;
+            Ok(documents.into_iter().map(FfiDocument::from).collect())
+        })
+        .await
     }
 
     /// Encrypts `metadata` as given and publishes it as an "update metadata"
@@ -740,23 +791,25 @@ impl FydeClient {
     /// associated with `metadata.id`. Mirrors
     /// [`crate::DocumentsService::update_metadata`].
     pub async fn update_document_metadata(&self, metadata: FfiMetadata) -> Result<(), FfiError> {
-        let metadata = Metadata::try_from(metadata)?;
-        self.inner.documents().update_metadata(metadata).await?;
-        Ok(())
+        self.localized(async {
+            let metadata = Metadata::try_from(metadata)?;
+            self.inner.documents().update_metadata(metadata).await
+        })
+        .await
     }
 
-    /// Persists `language` as this device's UI language preference. Mirrors
+    /// Persists `language` as this device's UI language preference — also
+    /// the language every later [`FfiError`] is worded in. Mirrors
     /// [`crate::UsersService::set_language`].
     pub async fn set_language(&self, language: String) -> Result<(), FfiError> {
-        self.inner.users().set_language(&language).await?;
-        Ok(())
+        self.localized(self.inner.users().set_language(&language))
+            .await
     }
 
     /// Returns this device's UI language preference, or `None` if never
     /// set. Mirrors [`crate::UsersService::get_language`].
     pub async fn get_language(&self) -> Result<Option<String>, FfiError> {
-        let language = self.inner.users().get_language().await?;
-        Ok(language)
+        self.localized(self.inner.users().get_language()).await
     }
 
     /// Creates a new script owned by the authenticated user, at version 1.
@@ -774,33 +827,39 @@ impl FydeClient {
         script_type: FfiScriptType,
         parameters: HashMap<String, FfiScriptParameter>,
     ) -> Result<FfiScript, FfiError> {
-        let script = self
-            .inner
-            .scripts()
-            .create_script(
-                &name,
-                is_public,
-                icon,
-                &script,
-                &description,
-                &short_description,
-                allowed_domains,
-                script_type.into(),
-                parameters
-                    .into_iter()
-                    .map(|(key, parameter)| (key, parameter.into()))
-                    .collect(),
-            )
-            .await?;
-        Ok(script.into())
+        self.localized(async {
+            let script = self
+                .inner
+                .scripts()
+                .create_script(
+                    &name,
+                    is_public,
+                    icon,
+                    &script,
+                    &description,
+                    &short_description,
+                    allowed_domains,
+                    script_type.into(),
+                    parameters
+                        .into_iter()
+                        .map(|(key, parameter)| (key, parameter.into()))
+                        .collect(),
+                )
+                .await?;
+            Ok(script.into())
+        })
+        .await
     }
 
     /// Fetches the script matching `id`. Mirrors
     /// [`crate::ScriptsService::fetch_script`].
     pub async fn fetch_script(&self, id: String) -> Result<FfiScript, FfiError> {
-        let id = parse_uuid(&id)?;
-        let script = self.inner.scripts().fetch_script(id).await?;
-        Ok(script.into())
+        self.localized(async {
+            let id = parse_uuid(&id)?;
+            let script = self.inner.scripts().fetch_script(id).await?;
+            Ok(script.into())
+        })
+        .await
     }
 
     /// Updates a script owned by the authenticated user, incrementing its
@@ -819,58 +878,73 @@ impl FydeClient {
         script_type: FfiScriptType,
         parameters: HashMap<String, FfiScriptParameter>,
     ) -> Result<FfiScript, FfiError> {
-        let id = parse_uuid(&id)?;
-        let script = self
-            .inner
-            .scripts()
-            .update_script(
-                id,
-                &name,
-                is_public,
-                icon,
-                &script,
-                &description,
-                &short_description,
-                allowed_domains,
-                script_type.into(),
-                parameters
-                    .into_iter()
-                    .map(|(key, parameter)| (key, parameter.into()))
-                    .collect(),
-            )
-            .await?;
-        Ok(script.into())
+        self.localized(async {
+            let id = parse_uuid(&id)?;
+            let script = self
+                .inner
+                .scripts()
+                .update_script(
+                    id,
+                    &name,
+                    is_public,
+                    icon,
+                    &script,
+                    &description,
+                    &short_description,
+                    allowed_domains,
+                    script_type.into(),
+                    parameters
+                        .into_iter()
+                        .map(|(key, parameter)| (key, parameter.into()))
+                        .collect(),
+                )
+                .await?;
+            Ok(script.into())
+        })
+        .await
     }
 
     /// Enables `script_id` for the authenticated user. Mirrors
     /// [`crate::ScriptsService::enable_script`].
     pub async fn enable_script(&self, script_id: String) -> Result<(), FfiError> {
-        let script_id = parse_uuid(&script_id)?;
-        self.inner.scripts().enable_script(script_id).await?;
-        Ok(())
+        self.localized(async {
+            let script_id = parse_uuid(&script_id)?;
+            self.inner.scripts().enable_script(script_id).await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Disables `script_id` for the authenticated user. Mirrors
     /// [`crate::ScriptsService::disable_script`].
     pub async fn disable_script(&self, script_id: String) -> Result<(), FfiError> {
-        let script_id = parse_uuid(&script_id)?;
-        self.inner.scripts().disable_script(script_id).await?;
-        Ok(())
+        self.localized(async {
+            let script_id = parse_uuid(&script_id)?;
+            self.inner.scripts().disable_script(script_id).await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Lists the scripts currently enabled for the authenticated user.
     /// Mirrors [`crate::ScriptsService::list_user_scripts`].
     pub async fn list_user_scripts(&self) -> Result<Vec<FfiScript>, FfiError> {
-        let scripts = self.inner.scripts().list_user_scripts().await?;
-        Ok(scripts.into_iter().map(FfiScript::from).collect())
+        self.localized(async {
+            let scripts = self.inner.scripts().list_user_scripts().await?;
+            Ok(scripts.into_iter().map(FfiScript::from).collect())
+        })
+        .await
     }
 
     /// Lists every script marked public, regardless of who owns it or
     /// whether the authenticated user has it enabled. Mirrors
     /// [`crate::ScriptsService::list_public_scripts`].
     pub async fn list_public_scripts(&self) -> Result<Vec<FfiScript>, FfiError> {
-        let scripts = self.inner.scripts().list_public_scripts().await?;
-        Ok(scripts.into_iter().map(FfiScript::from).collect())
+        self.localized(async {
+            let scripts = self.inner.scripts().list_public_scripts().await?;
+            Ok(scripts.into_iter().map(FfiScript::from).collect())
+        })
+        .await
     }
 
     /// Installs `script_id` for the authenticated user, to be run with
@@ -884,30 +958,36 @@ impl FydeClient {
         script_id: String,
         parameters_json: String,
     ) -> Result<(), FfiError> {
-        let script_id = parse_uuid(&script_id)?;
-        let parameters = serde_json::from_str(&parameters_json).with_context(|| {
-            format!("invalid parameters json for script {script_id}: expected a JSON object")
-        })?;
+        self.localized(async {
+            let script_id = parse_uuid(&script_id)?;
+            let parameters = serde_json::from_str(&parameters_json).with_context(|| {
+                format!("invalid parameters json for script {script_id}: expected a JSON object")
+            })?;
 
-        self.inner
-            .scripts()
-            .install_script(InstallScriptRequest {
-                script_id,
-                parameters,
-            })
-            .await?;
-        Ok(())
+            self.inner
+                .scripts()
+                .install_script(InstallScriptRequest {
+                    script_id,
+                    parameters,
+                })
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Lists every script installed for the authenticated user that's been
     /// synced to this device so far. Mirrors
     /// [`crate::ScriptsService::list_installed_scripts`].
     pub async fn list_installed_scripts(&self) -> Result<Vec<FfiInstalledScript>, FfiError> {
-        let installed = self.inner.scripts().list_installed_scripts().await?;
-        Ok(installed
-            .into_iter()
-            .map(FfiInstalledScript::try_from)
-            .collect::<Result<_, _>>()?)
+        self.localized(async {
+            let installed = self.inner.scripts().list_installed_scripts().await?;
+            installed
+                .into_iter()
+                .map(FfiInstalledScript::try_from)
+                .collect()
+        })
+        .await
     }
 
     /// Runs every script currently enabled for the authenticated user
@@ -916,18 +996,21 @@ impl FydeClient {
     /// [`crate::DocumentsService::run_scripts`], which only computes the
     /// updated metadata and never persists it itself.
     pub async fn run_scripts_for_document(&self, document_id: String) -> Result<(), FfiError> {
-        let id = parse_uuid(&document_id)?;
-        let document = self
-            .inner
-            .documents()
-            .get(id)
-            .await?
-            .ok_or(Error::from(ErrorKind::DocumentNotFound(id)))?;
-        let metadata = self.inner.documents().run_scripts(&document).await?;
-        if metadata != *document.metadata() {
-            self.inner.documents().update_metadata(metadata).await?;
-        }
-        Ok(())
+        self.localized(async {
+            let id = parse_uuid(&document_id)?;
+            let document = self
+                .inner
+                .documents()
+                .get(id)
+                .await?
+                .ok_or(ErrorKind::DocumentNotFound(id))?;
+            let metadata = self.inner.documents().run_scripts(&document).await?;
+            if metadata != *document.metadata() {
+                self.inner.documents().update_metadata(metadata).await?;
+            }
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -1080,21 +1163,28 @@ mod tests {
     }
 
     #[test]
-    fn ffi_error_flattens_the_source_error_to_its_display_message() {
-        let err = Error::from(ErrorKind::UnsupportedDocumentExtension("txt".to_string()));
-        let message = err.to_string();
+    fn ffi_error_carries_the_code_and_the_localized_wording() {
+        let err: Error = ErrorKind::InvalidCredentials.into();
 
-        let ffi_err: FfiError = err.into();
+        let ffi_err = FfiError::from_error(&err, "fr");
 
-        assert_eq!(ffi_err.to_string(), message);
+        assert_eq!(ffi_err.code(), ErrorCode::InvalidCredentials);
+        assert_eq!(ffi_err.to_string(), err.user_message("fr"));
     }
 
     #[test]
-    fn ffi_error_from_uuid_error_carries_a_message() {
-        let uuid_err = Uuid::parse_str("not-a-uuid").unwrap_err();
+    fn ffi_error_never_carries_the_technical_description() {
+        let err: Error = ErrorKind::UnsupportedDocumentExtension("txt".to_string()).into();
 
-        let ffi_err: FfiError = uuid_err.into();
+        let ffi_err = FfiError::from_error(&err, "en");
 
-        assert!(!ffi_err.to_string().is_empty());
+        assert!(!ffi_err.to_string().contains("txt"));
+    }
+
+    #[test]
+    fn parse_uuid_failure_maps_to_invalid_uuid() {
+        let err = parse_uuid("not-a-uuid").unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::InvalidUuid);
     }
 }
