@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::{Error, ErrorContext as _, Result};
+use crate::{ErrorContext as _, ErrorKind, Result};
 
 use crate::domains::changelog::{ChangelogEvent, EventType, Service as ChangelogService};
 
@@ -167,7 +167,7 @@ fn check_extension(name: &std::path::Path) -> Result<()> {
         .unwrap_or_default()
         .to_ascii_lowercase();
     if extension != "pdf" {
-        return Err(Error::UnsupportedDocumentExtension(extension));
+        return Err(ErrorKind::UnsupportedDocumentExtension(extension).into());
     }
     Ok(())
 }
@@ -262,10 +262,11 @@ mod tests {
     impl ChangelogService for RecordingChangelog {
         async fn ensure_master_key(&self) -> Result<()> {
             if self.no_master_key {
-                return Err(Error::Encryption(
+                return Err(ErrorKind::Encryption(
                     "no master key found in local settings; log in or create an account first"
                         .into(),
-                ));
+                )
+                .into());
             }
             Ok(())
         }

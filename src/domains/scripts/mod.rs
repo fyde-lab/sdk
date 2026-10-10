@@ -97,7 +97,7 @@ pub trait Service: Send + Sync {
     /// [`Self::fetch_script`]), then serializes it together with those
     /// parameters as an [`InstalledScript`] JSON document and publishes it,
     /// encrypted, as a `ScriptInstalled` changelog event. Fails with
-    /// [`crate::Error::MissingScriptParameter`] if a parameter the script
+    /// [`crate::ErrorCode::MissingScriptParameter`] if a parameter the script
     /// marks `required` has no value.
     ///
     /// Returns once the event is published, not once it's saved locally:

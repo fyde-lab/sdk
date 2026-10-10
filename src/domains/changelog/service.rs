@@ -12,7 +12,7 @@ use crate::domains::scripts::{InstalledScript, Storage as ScriptStorage};
 use crate::domains::secrets::Service as SecretsService;
 use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
-use crate::{Error, ErrorContext as _, Result};
+use crate::{ErrorContext as _, ErrorKind, Result};
 
 use super::Service;
 use super::crypto;
@@ -244,10 +244,11 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
             match event.event_type {
                 EventType::Created => {
                     let (Some(content), Some(metadata)) = (&event.content, &event.metadata) else {
-                        return Err(Error::InvalidChangelogEvent(format!(
+                        return Err(ErrorKind::InvalidChangelogEvent(format!(
                             "created event {} for document {} is missing content or metadata",
                             event.id, event.subject_id
-                        )));
+                        ))
+                        .into());
                     };
 
                     if self.has_write_permission() {
@@ -263,10 +264,11 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
                 }
                 EventType::UpdateMetadata => {
                     let Some(metadata) = &event.metadata else {
-                        return Err(Error::InvalidChangelogEvent(format!(
+                        return Err(ErrorKind::InvalidChangelogEvent(format!(
                             "update metadata event {} for document {} is missing metadata",
                             event.id, event.subject_id
-                        )));
+                        ))
+                        .into());
                     };
 
                     if self.has_write_permission() {
@@ -284,14 +286,15 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
                 EventType::Deleted => {}
                 EventType::ScriptInstalled => {
                     let Some(content) = &event.content else {
-                        return Err(Error::InvalidChangelogEvent(format!(
+                        return Err(ErrorKind::InvalidChangelogEvent(format!(
                             "script installed event {} for script {} is missing content",
                             event.id, event.subject_id
-                        )));
+                        ))
+                        .into());
                     };
                     let installed: InstalledScript =
                         serde_json::from_slice(content).map_err(|err| {
-                            Error::InvalidChangelogEvent(format!(
+                            ErrorKind::InvalidChangelogEvent(format!(
                                 "script installed event {} for script {} carries an invalid \
                                  installed script: {err}",
                                 event.id, event.subject_id
@@ -841,7 +844,7 @@ mod tests {
         let err = client.consume_once(&mut |_| {}).await.unwrap_err();
 
         assert!(
-            matches!(err, Error::InvalidChangelogEvent(_)),
+            matches!(err.kind(), ErrorKind::InvalidChangelogEvent(_)),
             "unexpected error: {err}"
         );
     }
@@ -977,7 +980,10 @@ mod tests {
 
         let result = client.consume_once(&mut |_| {}).await;
 
-        assert!(matches!(result, Err(Error::InvalidChangelogEvent(_))));
+        assert!(matches!(
+            result.unwrap_err().kind(),
+            ErrorKind::InvalidChangelogEvent(_)
+        ));
     }
 
     #[tokio::test]
@@ -1030,7 +1036,7 @@ mod tests {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc.expect_consume_since().returning(move |_| {
             if attempts_in_mock.fetch_add(1, Ordering::SeqCst) == 0 {
-                Err(Error::InvalidChangelogEvent("boom".to_string()))
+                Err(ErrorKind::InvalidChangelogEvent("boom".to_string()).into())
             } else {
                 // A never-ending stream, mirroring the real `WatchEvents`
                 // RPC staying open: this keeps the retried attempt parked

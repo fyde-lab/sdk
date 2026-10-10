@@ -15,7 +15,7 @@ use tao::window::WindowBuilder;
 use uuid::Uuid;
 use wry::WebViewBuilder;
 
-use crate::{Error, Result};
+use crate::{ErrorKind, Result};
 
 use super::super::cookies::Cookie;
 use super::super::host::is_host_allowed;
@@ -148,13 +148,13 @@ impl BrowserDriver {
                     initial_cookies,
                 )
             })
-            .map_err(|err| Error::Browser(format!("failed to spawn browser thread: {err}")))?;
+            .map_err(|err| ErrorKind::Browser(format!("failed to spawn browser thread: {err}")))?;
 
         // Block until the webview has actually been created (or failed to
         // be) before handing the proxy back, so a command sent right after
         // `ensure_started` returns can never race the webview's own setup.
         let proxy = ready_rx.recv().map_err(|_| {
-            Error::Browser("browser thread exited before it finished starting up".to_string())
+            ErrorKind::Browser("browser thread exited before it finished starting up".to_string())
         })??;
 
         *guard = Some(Running {
@@ -190,9 +190,9 @@ impl BrowserDriver {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&id);
-            return Err(Error::Browser(
-                "browser thread is no longer running".to_string(),
-            ));
+            return Err(
+                ErrorKind::Browser("browser thread is no longer running".to_string()).into(),
+            );
         }
 
         match rx.recv_timeout(timeout) {
@@ -202,9 +202,10 @@ impl BrowserDriver {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .remove(&id);
-                Err(Error::Browser(format!(
+                Err(ErrorKind::Browser(format!(
                     "timed out after {timeout:?} waiting for the browser"
-                )))
+                ))
+                .into())
             }
         }
     }
@@ -232,7 +233,9 @@ impl Service for BrowserDriver {
         let (proxy, _pending, _pending_download) = self.ensure_started()?;
         proxy
             .send_event(Command::Open(url.to_string()))
-            .map_err(|_| Error::Browser("browser thread is no longer running".to_string()))
+            .map_err(|_| {
+                ErrorKind::Browser("browser thread is no longer running".to_string()).into()
+            })
     }
 
     async fn wait_for(&self, selector: &str, timeout: Duration) -> Result<()> {
@@ -279,10 +282,12 @@ impl Service for BrowserDriver {
         let (tx, rx) = sync_channel(1);
         proxy
             .send_event(Command::Cookies(tx))
-            .map_err(|_| Error::Browser("browser thread is no longer running".to_string()))?;
+            .map_err(|_| ErrorKind::Browser("browser thread is no longer running".to_string()))?;
         rx.recv_timeout(Duration::from_secs(10))
-            .map_err(|_| Error::Browser("timed out reading the browser's cookies".to_string()))?
-            .map_err(|err| Error::Browser(format!("reading the browser's cookies: {err}")))
+            .map_err(|_| ErrorKind::Browser("timed out reading the browser's cookies".to_string()))?
+            .map_err(|err| {
+                ErrorKind::Browser(format!("reading the browser's cookies: {err}")).into()
+            })
     }
 
     async fn download(&self, selector: &str, timeout: Duration) -> Result<Vec<u8>> {
@@ -301,20 +306,22 @@ impl Service for BrowserDriver {
         let path = match rx.recv_timeout(timeout) {
             Ok(Some(path)) => path,
             Ok(None) => {
-                return Err(Error::Browser(
+                return Err(ErrorKind::Browser(
                     "download failed or was cancelled by the browser engine".to_string(),
-                ));
+                )
+                .into());
             }
             Err(_) => {
                 *pending_download.lock().unwrap_or_else(|p| p.into_inner()) = None;
-                return Err(Error::Browser(format!(
+                return Err(ErrorKind::Browser(format!(
                     "timed out after {timeout:?} waiting for a download to complete"
-                )));
+                ))
+                .into());
             }
         };
 
         let bytes = std::fs::read(&path).map_err(|err| {
-            Error::Browser(format!("failed to read downloaded file {path:?}: {err}"))
+            ErrorKind::Browser(format!("failed to read downloaded file {path:?}: {err}"))
         })?;
         let _ = std::fs::remove_file(&path);
         Ok(bytes)
@@ -370,9 +377,10 @@ fn run_event_loop(
     let window = match window_builder.build(&event_loop) {
         Ok(window) => window,
         Err(err) => {
-            let _ = ready_tx.send(Err(Error::Browser(format!(
+            let _ = ready_tx.send(Err(ErrorKind::Browser(format!(
                 "failed to create browser window: {err}"
-            ))));
+            ))
+            .into()));
             return;
         }
     };
@@ -503,9 +511,10 @@ fn run_event_loop(
     let webview = match webview {
         Ok(webview) => webview,
         Err(err) => {
-            let _ = ready_tx.send(Err(Error::Browser(format!(
+            let _ = ready_tx.send(Err(ErrorKind::Browser(format!(
                 "failed to create webview: {err}"
-            ))));
+            ))
+            .into()));
             return;
         }
     };
@@ -783,13 +792,13 @@ fn parse_ack(value: Value) -> Result<()> {
     if value.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(())
     } else {
-        Err(Error::Browser(error_message(&value)))
+        Err(ErrorKind::Browser(error_message(&value)).into())
     }
 }
 
 fn parse_html(value: Value) -> Result<String> {
     if value.get("ok").and_then(Value::as_bool) != Some(true) {
-        return Err(Error::Browser(error_message(&value)));
+        return Err(ErrorKind::Browser(error_message(&value)).into());
     }
     Ok(value
         .get("html")

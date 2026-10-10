@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::{Error, Result};
+use crate::{ErrorKind, Result};
 
 use super::Script;
 use super::ScriptParameter;
@@ -82,7 +82,7 @@ impl Service for InMemoryScriptStorage {
             .unwrap()
             .get(&id)
             .cloned()
-            .ok_or(Error::ScriptNotFound(id))
+            .ok_or(ErrorKind::ScriptNotFound(id).into())
     }
 
     async fn update_script(
@@ -100,7 +100,7 @@ impl Service for InMemoryScriptStorage {
     ) -> Result<Script> {
         let mut scripts = self.scripts.lock().unwrap();
 
-        let existing = scripts.get(&id).ok_or(Error::ScriptNotFound(id))?;
+        let existing = scripts.get(&id).ok_or(ErrorKind::ScriptNotFound(id))?;
 
         let updated = Script {
             id,
@@ -228,7 +228,7 @@ mod tests {
 
         let err = storage.fetch_script(Uuid::now_v7()).await.unwrap_err();
 
-        assert!(matches!(err, Error::ScriptNotFound(_)));
+        assert!(matches!(err.kind(), ErrorKind::ScriptNotFound(_)));
     }
 
     #[tokio::test]
@@ -290,7 +290,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, Error::ScriptNotFound(_)));
+        assert!(matches!(err.kind(), ErrorKind::ScriptNotFound(_)));
     }
 
     #[tokio::test]

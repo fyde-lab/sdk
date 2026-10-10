@@ -50,7 +50,7 @@ pub(super) trait FydeClient: Send + Sync {
 /// typically opened lazily (via `Endpoint::connect_lazy`), so the SDK can be
 /// used offline for anything that doesn't reach this client; a call that
 /// does need the server surfaces a connection failure as
-/// [`crate::Error::GrpcTransport`]. Cloning a [`Channel`] is cheap — it's
+/// [`crate::ErrorCode::ServerUnreachable`]. Cloning a [`Channel`] is cheap — it's
 /// just a handle to the same underlying connection — so a fresh generated
 /// client is created per call. Every call is authenticated by attaching the
 /// session token currently persisted in the secrets store (if any) as a bearer
@@ -120,7 +120,6 @@ mod tests {
     use tonic::transport::Endpoint;
 
     use super::*;
-    use crate::Error;
     use crate::domains::secrets::MockService as MockSecretsService;
 
     #[tokio::test]
@@ -136,6 +135,6 @@ mod tests {
 
         let err = grpc.record_event(vec![1, 2, 3]).await.unwrap_err();
 
-        assert!(matches!(err, Error::Context { .. }));
+        assert!(err.has_context());
     }
 }

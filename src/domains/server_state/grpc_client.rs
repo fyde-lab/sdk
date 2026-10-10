@@ -66,7 +66,6 @@ mod tests {
     use tonic::transport::Endpoint;
 
     use super::*;
-    use crate::Error;
 
     #[tokio::test]
     async fn new_does_not_connect_to_the_server() {
@@ -78,6 +77,6 @@ mod tests {
 
         let err = grpc.check().await.unwrap_err();
 
-        assert!(matches!(err, Error::Context { .. }));
+        assert!(err.has_context());
     }
 }

@@ -4,7 +4,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::Error;
+use crate::{Error, ErrorKind};
 
 /// The business domain a document's issuer belongs to (e.g. a bank, an
 /// insurer, a retailer), as filled in by a user's classification script.
@@ -111,7 +111,7 @@ impl FromStr for SourceCategory {
             "web" => Ok(Self::Web),
             "individual" => Ok(Self::Individual),
             "shopping" => Ok(Self::Shopping),
-            other => Err(Error::InvalidSourceCategory(other.to_string())),
+            other => Err(ErrorKind::InvalidSourceCategory(other.to_string()).into()),
         }
     }
 }
@@ -189,7 +189,7 @@ impl FromStr for SourceSubCategory {
             "internet" => Ok(Self::Internet),
             "citizen" => Ok(Self::Citizen),
             "sport" => Ok(Self::Sport),
-            other => Err(Error::InvalidSourceSubCategory(other.to_string())),
+            other => Err(ErrorKind::InvalidSourceSubCategory(other.to_string()).into()),
         }
     }
 }
@@ -251,7 +251,7 @@ impl FromStr for Purpose {
             "description" => Ok(Self::Description),
             "evaluation" => Ok(Self::Evaluation),
             "employment" => Ok(Self::Employment),
-            other => Err(Error::InvalidPurpose(other.to_string())),
+            other => Err(ErrorKind::InvalidPurpose(other.to_string()).into()),
         }
     }
 }

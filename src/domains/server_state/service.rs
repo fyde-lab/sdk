@@ -47,7 +47,7 @@ impl Service for ServerStateClient {
 mod tests {
     use super::super::grpc_client::MockFydeClient;
     use super::*;
-    use crate::Error;
+    use crate::ErrorKind;
 
     #[tokio::test]
     async fn is_server_reachable_returns_true_when_the_server_reports_serving() {
@@ -81,7 +81,7 @@ mod tests {
         mock_grpc
             .expect_check()
             .times(1)
-            .returning(|| Err(Error::InvalidResponse("connection refused".to_string())));
+            .returning(|| Err(ErrorKind::InvalidResponse("connection refused".to_string()).into()));
 
         let client = ServerStateClient::with_grpc(mock_grpc);
 

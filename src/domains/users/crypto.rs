@@ -13,7 +13,7 @@ use opaque_ke::{
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, ErrorContext as _, Result};
+use crate::{ErrorContext as _, ErrorKind, Result};
 
 /// Length in bytes of an AES-256 key: the master key, and the key derived
 /// from the OPAQUE export key to wrap it.
@@ -109,7 +109,7 @@ pub(super) trait OpaqueClient: Send + Sync {
     /// here, without a round trip to the server: OPAQUE's envelope can't be
     /// opened with the wrong password-derived key, so there's no
     /// finalization message to produce. Fails with
-    /// [`crate::Error::InvalidCredentials`] in that case — the same error a
+    /// [`crate::ErrorCode::InvalidCredentials`] in that case — the same error a
     /// wrong password produces if it isn't caught until the server rejects
     /// `FinishLogin`.
     fn finish_login(
@@ -129,7 +129,7 @@ impl OpaqueClient for DefaultOpaqueClient {
         let mut rng = OsRng;
         let result = ClientRegistration::<FydeCipherSuite>::start(&mut rng, password.as_bytes())
             .map_err(|err| {
-                Error::Encryption(format!("failed to start OPAQUE registration: {err}"))
+                ErrorKind::Encryption(format!("failed to start OPAQUE registration: {err}"))
             })?;
 
         Ok((
@@ -145,7 +145,7 @@ impl OpaqueClient for DefaultOpaqueClient {
         response: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let response = RegistrationResponse::deserialize(response).map_err(|err| {
-            Error::Encryption(format!(
+            ErrorKind::Encryption(format!(
                 "failed to parse OPAQUE registration response: {err}"
             ))
         })?;
@@ -161,7 +161,7 @@ impl OpaqueClient for DefaultOpaqueClient {
                 ClientRegistrationFinishParameters::new(Default::default(), Some(&ksf)),
             )
             .map_err(|err| {
-                Error::Encryption(format!("failed to finish OPAQUE registration: {err}"))
+                ErrorKind::Encryption(format!("failed to finish OPAQUE registration: {err}"))
             })?;
 
         Ok((
@@ -173,7 +173,7 @@ impl OpaqueClient for DefaultOpaqueClient {
     fn start_login(&self, password: &str) -> Result<(LoginState, Vec<u8>)> {
         let mut rng = OsRng;
         let result = ClientLogin::<FydeCipherSuite>::start(&mut rng, password.as_bytes())
-            .map_err(|err| Error::Encryption(format!("failed to start OPAQUE login: {err}")))?;
+            .map_err(|err| ErrorKind::Encryption(format!("failed to start OPAQUE login: {err}")))?;
 
         Ok((
             LoginState(result.state),
@@ -188,7 +188,7 @@ impl OpaqueClient for DefaultOpaqueClient {
         response: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let response = CredentialResponse::deserialize(response).map_err(|err| {
-            Error::Encryption(format!("failed to parse OPAQUE login response: {err}"))
+            ErrorKind::Encryption(format!("failed to parse OPAQUE login response: {err}"))
         })?;
 
         let mut rng = OsRng;
@@ -201,7 +201,7 @@ impl OpaqueClient for DefaultOpaqueClient {
                 response,
                 ClientLoginFinishParameters::new(None, Default::default(), Some(&ksf)),
             )
-            .map_err(|_| Error::InvalidCredentials)?;
+            .map_err(|_| ErrorKind::InvalidCredentials)?;
 
         Ok((
             result.message.serialize().to_vec(),
@@ -262,7 +262,9 @@ fn derive_wrapping_key(export_key: &[u8]) -> Result<[u8; KEY_LEN]> {
     let mut key = [0u8; KEY_LEN];
     Hkdf::<sha2_opaque::Sha256>::new(None, export_key)
         .expand(b"fyde/master-key-wrap-key-v1", &mut key)
-        .map_err(|err| Error::Encryption(format!("failed to derive key from export key: {err}")))?;
+        .map_err(|err| {
+            ErrorKind::Encryption(format!("failed to derive key from export key: {err}"))
+        })?;
     Ok(key)
 }
 
@@ -279,7 +281,7 @@ fn derive_wrapping_key(export_key: &[u8]) -> Result<[u8; KEY_LEN]> {
 pub(super) fn wrap_master_key(master_key: &[u8], export_key: &[u8]) -> Result<String> {
     let master_key: &[u8; KEY_LEN] = master_key
         .try_into()
-        .map_err(|_| Error::Encryption("master key has an invalid length".into()))?;
+        .map_err(|_| ErrorKind::Encryption("master key has an invalid length".into()))?;
 
     let wrapping_key =
         derive_wrapping_key(export_key).context("failed to derive master key wrapping key")?;
@@ -291,7 +293,7 @@ pub(super) fn wrap_master_key(master_key: &[u8], export_key: &[u8]) -> Result<St
     let cipher = Aes256Gcm::new(&wrapping_key.into());
     let ciphertext = cipher
         .encrypt(&nonce, master_key.as_slice())
-        .map_err(|_| Error::Encryption("failed to encrypt master key".into()))?;
+        .map_err(|_| ErrorKind::Encryption("failed to encrypt master key".into()))?;
 
     let wrapped = WrappedMasterKey {
         nonce: nonce_bytes.to_vec(),
@@ -325,15 +327,14 @@ pub(super) fn unwrap_master_key(export_key: &[u8], wrapped_json: &str) -> Result
     let wrapping_key =
         derive_wrapping_key(export_key).context("failed to derive master key wrapping key")?;
 
-    let nonce_bytes: [u8; NONCE_LEN] = wrapped
-        .nonce
-        .try_into()
-        .map_err(|_| Error::Encryption("wrapped master key nonce has the wrong length".into()))?;
+    let nonce_bytes: [u8; NONCE_LEN] = wrapped.nonce.try_into().map_err(|_| {
+        ErrorKind::Encryption("wrapped master key nonce has the wrong length".into())
+    })?;
 
     let cipher = Aes256Gcm::new(&wrapping_key.into());
     cipher
         .decrypt(&Nonce::from(nonce_bytes), wrapped.ciphertext.as_slice())
-        .map_err(|_| Error::Encryption("failed to decrypt master key".into()))
+        .map_err(|_| ErrorKind::Encryption("failed to decrypt master key".into()).into())
 }
 
 #[cfg(test)]
@@ -453,7 +454,7 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(matches!(err, Error::InvalidCredentials));
+        assert!(matches!(err.kind(), ErrorKind::InvalidCredentials));
     }
 
     #[test]
@@ -489,7 +490,7 @@ mod tests {
 
         let err = unwrap_master_key(b"a-different-export-key", &wrapped).unwrap_err();
 
-        assert!(matches!(err, Error::Encryption(_)));
+        assert!(matches!(err.kind(), ErrorKind::Encryption(_)));
     }
 
     #[test]
@@ -511,6 +512,6 @@ mod tests {
 
         let err = wrap_master_key(b"too-short", export_key).unwrap_err();
 
-        assert!(matches!(err, Error::Encryption(_)));
+        assert!(matches!(err.kind(), ErrorKind::Encryption(_)));
     }
 }

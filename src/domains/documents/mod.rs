@@ -47,7 +47,7 @@ pub trait Service: Send + Sync {
     ///
     /// The file type is determined from the source's name's extension;
     /// only `.pdf` is currently accepted, anything else is rejected with
-    /// [`crate::Error::UnsupportedDocumentExtension`].
+    /// [`crate::ErrorCode::UnsupportedDocumentExtension`].
     async fn upload(&self, request: UploadRequest) -> Result<Uuid>;
 
     /// Fetches a document previously cached in local storage by

@@ -234,7 +234,7 @@ impl FydeClient for GrpcClient {
             .into_inner();
 
         into_domain(response.script.ok_or_else(|| {
-            crate::Error::InvalidResponse("create script response had no script".to_string())
+            crate::ErrorKind::InvalidResponse("create script response had no script".to_string())
         })?)
     }
 
@@ -252,7 +252,7 @@ impl FydeClient for GrpcClient {
             .into_inner();
 
         into_domain(response.script.ok_or_else(|| {
-            crate::Error::InvalidResponse("fetch script response had no script".to_string())
+            crate::ErrorKind::InvalidResponse("fetch script response had no script".to_string())
         })?)
     }
 
@@ -293,7 +293,7 @@ impl FydeClient for GrpcClient {
             .into_inner();
 
         into_domain(response.script.ok_or_else(|| {
-            crate::Error::InvalidResponse("update script response had no script".to_string())
+            crate::ErrorKind::InvalidResponse("update script response had no script".to_string())
         })?)
     }
 
@@ -367,7 +367,6 @@ mod tests {
     use tonic::transport::Endpoint;
 
     use super::*;
-    use crate::Error;
     use crate::domains::secrets::MockService as MockSecretsService;
 
     fn sessions() -> Arc<SessionsClient> {
@@ -386,6 +385,6 @@ mod tests {
 
         let err = grpc.list_user_scripts().await.unwrap_err();
 
-        assert!(matches!(err, Error::Context { .. }));
+        assert!(err.has_context());
     }
 }

@@ -485,7 +485,7 @@ mod tests {
         let mut browser = MockService::new();
         browser
             .expect_click()
-            .returning(|_| Err(crate::Error::Browser("element not found".to_string())));
+            .returning(|_| Err(crate::ErrorKind::Browser("element not found".to_string()).into()));
 
         let runtime = runtime();
         let lua = Lua::new();
@@ -540,7 +540,7 @@ mod tests {
         let mut browser = MockService::new();
         browser
             .expect_html()
-            .returning(|| Err(crate::Error::Browser("boom".to_string())));
+            .returning(|| Err(crate::ErrorKind::Browser("boom".to_string()).into()));
 
         let runtime = runtime();
         let lua = Lua::new();
@@ -639,7 +639,7 @@ mod tests {
         let mut browser = MockService::new();
         browser
             .expect_download()
-            .returning(|_, _| Err(crate::Error::Browser("timed out".to_string())));
+            .returning(|_, _| Err(crate::ErrorKind::Browser("timed out".to_string()).into()));
 
         let runtime = runtime();
         let lua = Lua::new();

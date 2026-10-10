@@ -70,7 +70,7 @@ pub(crate) trait Service: Send + Sync {
     ///
     /// Returns as soon as the task is spawned, not when consumption stops.
     /// The spawned task never exits on its own. If a pass over the stream
-    /// fails — including with [`crate::Error::InvalidChangelogEvent`] if a
+    /// fails — including with [`crate::ErrorCode::InvalidChangelogEvent`] if a
     /// `Created` event is missing its `content` or `metadata`, since a
     /// `Created` event must carry both, or if a `ScriptInstalled` event's
     /// `content` is missing or isn't a valid installed script — the error is logged and

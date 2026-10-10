@@ -9,7 +9,7 @@ use crate::domains::secrets::{MASTER_KEY_SECRET, Service as SecretsService};
 use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
 use crate::sql::LocalDatabase;
-use crate::{Error, ErrorContext as _, Result};
+use crate::{ErrorContext as _, ErrorKind, Result};
 
 use super::crypto::{
     DefaultOpaqueClient, OpaqueClient, generate_and_wrap_master_key, unwrap_master_key,
@@ -110,14 +110,14 @@ impl UsersClient {
         }
     }
 
-    /// Fails with [`Error::AlreadyLoggedIn`] if a session is already open on
+    /// Fails with [`crate::ErrorCode::AlreadyLoggedIn`] if a session is already open on
     /// this device. Checked by `create`/`login` before anything else: the
     /// local cache isn't partitioned per account, so opening a second
     /// account's session on top of the first would hand it the first
     /// account's cached documents, changelog cursor and scraper cookies.
     async fn ensure_no_open_session(&self) -> Result<()> {
         if self.sessions.is_connected().await? {
-            return Err(Error::AlreadyLoggedIn);
+            return Err(ErrorKind::AlreadyLoggedIn.into());
         }
         Ok(())
     }
@@ -214,7 +214,7 @@ impl Service for UsersClient {
             .context("failed to log in")?;
 
         let wrapped_master_key = String::from_utf8(encrypted_master_key)
-            .map_err(|_| Error::Encryption("server returned a non-UTF-8 master key".into()))
+            .map_err(|_| ErrorKind::Encryption("server returned a non-UTF-8 master key".into()))
             .context("failed to decode master key returned by the server")?;
         let raw_master_key = unwrap_master_key(&export_key, &wrapped_master_key)
             .context("failed to unwrap master key returned by the server")?;
@@ -267,7 +267,7 @@ impl Service for UsersClient {
     ) -> Result<()> {
         // Verifying `old_password` only needs the local half of an OPAQUE
         // login exchange: `finish_login` fails with
-        // `Error::InvalidCredentials` if it can't open the account's
+        // `ErrorKind::InvalidCredentials` if it can't open the account's
         // envelope, without a round trip to the server's `FinishLogin` —
         // so this never opens a session, unlike a real `login()` call. The
         // resulting export key isn't needed for anything else: the master
@@ -308,10 +308,10 @@ impl Service for UsersClient {
             .await
             .context("failed to read current master key")?
             .ok_or_else(|| {
-                Error::Encryption(
+                ErrorKind::Encryption(
                     "no master key found in the credential store; log in or create an account first"
                         .into(),
-                )
+                ).into()
             })
             .and_then(|encoded| decode_master_key(&encoded))?;
 
@@ -352,7 +352,7 @@ impl Service for UsersClient {
 
         role.parse()
             .map(Some)
-            .map_err(|err| Error::InvalidResponse(format!("invalid cached role: {err}")))
+            .map_err(|err| ErrorKind::InvalidResponse(format!("invalid cached role: {err}")).into())
     }
 }
 
@@ -918,7 +918,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, Error::AlreadyLoggedIn));
+        assert!(matches!(err.kind(), ErrorKind::AlreadyLoggedIn));
     }
 
     #[tokio::test]
@@ -935,7 +935,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, Error::AlreadyLoggedIn));
+        assert!(matches!(err.kind(), ErrorKind::AlreadyLoggedIn));
     }
 
     #[tokio::test]
@@ -999,7 +999,7 @@ mod tests {
         mock_grpc
             .expect_logout()
             .times(1)
-            .returning(|| Err(Error::Grpc(tonic::Status::unavailable("server down"))));
+            .returning(|| Err(ErrorKind::Grpc(tonic::Status::unavailable("server down")).into()));
 
         let mut secrets = secrets_with_open_session();
         secrets.expect_clear().times(1).returning(|| Ok(()));
@@ -1027,7 +1027,7 @@ mod tests {
         secrets
             .expect_clear()
             .times(1)
-            .returning(|| Err(Error::Encryption("keychain locked".into())));
+            .returning(|| Err(ErrorKind::Encryption("keychain locked".into()).into()));
         let mut local_db = MockLocalDatabase::new();
         local_db.expect_wipe().times(1).returning(|| Ok(()));
 
@@ -1200,7 +1200,7 @@ mod tests {
         opaque
             .expect_finish_login()
             .times(1)
-            .returning(|_, _, _| Err(Error::InvalidCredentials));
+            .returning(|_, _, _| Err(ErrorKind::InvalidCredentials.into()));
         // No `expect_start_registration()`/`expect_finish_registration()`
         // set up: the mock panics if either is called, proving a wrong old
         // password never reaches the new-password registration exchange.
@@ -1222,7 +1222,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, Error::Context { .. }));
+        assert!(err.has_context());
     }
 
     #[tokio::test]
@@ -1256,7 +1256,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, Error::Encryption(_)));
+        assert!(matches!(err.kind(), ErrorKind::Encryption(_)));
     }
 
     #[tokio::test]

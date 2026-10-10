@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::domains::changelog::{EventType, Service as ChangelogService};
 use crate::domains::sessions::SessionsClient;
-use crate::{Error, ErrorContext as _, Result};
+use crate::{ErrorContext as _, ErrorKind, Result};
 
 use super::grpc_client::{FydeClient, GrpcClient};
 use super::storage::Storage;
@@ -148,10 +148,11 @@ impl<S: Storage> Service for ScriptsClient<S> {
             .iter()
             .find(|(name, parameter)| parameter.required && !parameters.contains_key(*name))
         {
-            return Err(Error::MissingScriptParameter {
+            return Err(ErrorKind::MissingScriptParameter {
                 script_id,
                 parameter: name.clone(),
-            });
+            }
+            .into());
         }
 
         let content = serde_json::to_vec(&InstalledScript { script, parameters })
@@ -316,7 +317,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(&err, Error::MissingScriptParameter { parameter, .. } if parameter == "username"),
+            matches!(err.kind(), ErrorKind::MissingScriptParameter { parameter, .. } if parameter == "username"),
             "unexpected error: {err}"
         );
         assert!(changelog.sent.lock().unwrap().is_empty());
@@ -358,7 +359,7 @@ mod tests {
         mock_grpc
             .expect_fetch_script()
             .times(1)
-            .returning(|id| Err(Error::ScriptNotFound(id)));
+            .returning(|id| Err(ErrorKind::ScriptNotFound(id).into()));
         let changelog = Arc::new(RecordingChangelog::default());
         let client = ScriptsClient::with_grpc(mock_grpc, MockStorage::new(), changelog.clone());
 

@@ -1,4 +1,5 @@
 mod domains;
+mod error;
 mod ffi;
 #[path = "tools/log/mod.rs"]
 mod log;
@@ -12,7 +13,10 @@ mod testing;
 
 uniffi::setup_scaffolding!();
 
+pub use error::{Error, ErrorCode, Result};
 pub use ffi::{FfiError, FydeClient};
+
+pub(crate) use error::{ErrorContext, ErrorKind};
 
 use std::sync::Arc;
 
@@ -34,109 +38,6 @@ use domains::sessions::{Service as SessionsService, SessionsClient};
 use log::CallbackLayer;
 use sql::SqliteClient;
 use tonic::transport::Endpoint;
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("grpc transport error: {0}")]
-    GrpcTransport(#[from] tonic::transport::Error),
-    #[error("grpc error: {0}")]
-    Grpc(#[from] tonic::Status),
-    #[error("invalid grpc endpoint: {0}")]
-    InvalidEndpoint(String),
-    #[error("invalid uuid: {0}")]
-    InvalidUuid(#[from] uuid::Error),
-    #[error("invalid integer: {0}")]
-    InvalidInteger(#[from] std::num::ParseIntError),
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("database error: {0}")]
-    Database(#[from] sqlx::Error),
-    #[error("database migration error: {0}")]
-    Migrate(#[from] sqlx::migrate::MigrateError),
-    #[error("xdg base directories error: {0}")]
-    Xdg(#[from] xdg::BaseDirectoriesError),
-    #[error("json error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("pdf error: {0}")]
-    Pdf(#[from] pdf_oxide::Error),
-    #[error("lua error: {0}")]
-    Lua(#[from] mlua::Error),
-    #[error("unsupported document extension {0:?}: only .pdf is supported")]
-    UnsupportedDocumentExtension(String),
-    #[error("document {0} not found in local cache")]
-    DocumentNotFound(uuid::Uuid),
-    #[error("script {0} not found")]
-    ScriptNotFound(uuid::Uuid),
-    #[error("missing value for required parameter {parameter:?} of script {script_id}")]
-    MissingScriptParameter {
-        script_id: uuid::Uuid,
-        parameter: String,
-    },
-    #[error("invalid changelog event: {0}")]
-    InvalidChangelogEvent(String),
-    #[error("invalid source category: {0:?}")]
-    InvalidSourceCategory(String),
-    #[error("invalid source sub-category: {0:?}")]
-    InvalidSourceSubCategory(String),
-    #[error("invalid purpose: {0:?}")]
-    InvalidPurpose(String),
-    #[error("invalid script type: {0:?}")]
-    InvalidScriptType(String),
-    #[error("invalid server response: {0}")]
-    InvalidResponse(String),
-    #[error("encryption error: {0}")]
-    Encryption(String),
-    #[error("invalid credentials")]
-    InvalidCredentials,
-    #[error("a session is already open on this device; log out first")]
-    AlreadyLoggedIn,
-    #[error("credential store error: {0}")]
-    Keystore(#[from] keyring_core::Error),
-    #[error("messagepack encode error: {0}")]
-    MessagePackEncode(#[from] rmp_serde::encode::Error),
-    #[error("messagepack decode error: {0}")]
-    MessagePackDecode(#[from] rmp_serde::decode::Error),
-    #[error("scraper task failed: {0}")]
-    TaskJoin(#[from] tokio::task::JoinError),
-    #[error("browser error: {0}")]
-    Browser(String),
-    #[error("{message}: {source}")]
-    Context {
-        message: String,
-        #[source]
-        source: Box<Error>,
-    },
-}
-
-pub type Result<T> = std::result::Result<T, Error>;
-
-/// Attaches a human-readable message to a fallible operation's error,
-/// preserving the original error as its source. Used throughout the crate
-/// so every `?` site reports what it was trying to do, not just the bare
-/// underlying error.
-pub(crate) trait ErrorContext<T> {
-    fn context(self, message: &str) -> Result<T>;
-    fn with_context<F: FnOnce() -> String>(self, f: F) -> Result<T>;
-}
-
-impl<T, E> ErrorContext<T> for std::result::Result<T, E>
-where
-    E: Into<Error>,
-{
-    fn context(self, message: &str) -> Result<T> {
-        self.map_err(|err| Error::Context {
-            message: message.to_string(),
-            source: Box::new(err.into()),
-        })
-    }
-
-    fn with_context<F: FnOnce() -> String>(self, f: F) -> Result<T> {
-        self.map_err(|err| Error::Context {
-            message: f(),
-            source: Box::new(err.into()),
-        })
-    }
-}
 
 /// Selects which SQLite backend a [`Client`] persists local state to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,7 +143,7 @@ impl Client {
         // shared by every domain's gRPC client, so they all reuse the same
         // underlying HTTP/2 connection instead of opening one each.
         let channel = Endpoint::from_shared(config.url)
-            .map_err(|err| Error::InvalidEndpoint(err.to_string()))?
+            .map_err(|err| ErrorKind::InvalidEndpoint(err.to_string()))?
             .connect_lazy();
 
         let settings = domains::settings::init(sqlite.pool().clone());
@@ -402,44 +303,6 @@ pub async fn init_dev_scrapers(
 mod tests {
     use super::*;
 
-    fn io_error() -> std::io::Result<()> {
-        Err(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"))
-    }
-
-    #[test]
-    fn context_wraps_the_error_with_a_message() {
-        let err = io_error().context("failed to do the thing").unwrap_err();
-
-        assert!(matches!(err, Error::Context { .. }));
-        assert_eq!(err.to_string(), "failed to do the thing: io error: missing");
-    }
-
-    #[test]
-    fn with_context_lazily_builds_the_message() {
-        let err = io_error()
-            .with_context(|| format!("failed at offset {}", 42))
-            .unwrap_err();
-
-        assert_eq!(err.to_string(), "failed at offset 42: io error: missing");
-    }
-
-    #[test]
-    fn context_preserves_the_original_error_as_the_source() {
-        use std::error::Error as _;
-
-        let err = io_error().context("failed to do the thing").unwrap_err();
-
-        let source = err.source().expect("context error must carry a source");
-        assert_eq!(source.to_string(), "io error: missing");
-    }
-
-    #[test]
-    fn context_is_a_no_op_on_success() {
-        let ok: std::io::Result<u32> = Ok(42);
-
-        assert_eq!(ok.context("unused").unwrap(), 42);
-    }
-
     #[tokio::test]
     async fn init_rejects_a_malformed_url() {
         let config = ClientConfig {
@@ -457,6 +320,6 @@ mod tests {
             Err(err) => err,
         };
 
-        assert!(matches!(err, Error::InvalidEndpoint(_)));
+        assert_eq!(err.code(), ErrorCode::InvalidServerUrl);
     }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::domains::secrets::{SESSION_TOKEN_SECRET, Service as SecretsService};
-use crate::{Error, ErrorContext as _, Result};
+use crate::{ErrorContext as _, ErrorKind, Result};
 
 use super::Service;
 
@@ -34,7 +34,7 @@ impl Service for SessionsClient {
             .context("failed to read session token")?
         {
             let value = format!("Bearer {token}").parse().map_err(|_| {
-                Error::InvalidResponse("session token is not a valid header value".to_string())
+                ErrorKind::InvalidResponse("session token is not a valid header value".to_string())
             })?;
             request.metadata_mut().insert("authorization", value);
         }

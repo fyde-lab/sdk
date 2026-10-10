@@ -108,9 +108,9 @@ pub trait Service: Send + Sync {
     /// `password` directly), and persists the raw key in the OS credential
     /// store (see [`crate::domains::secrets::MASTER_KEY_SECRET`]). The server's response carries only the new session's
     /// token (see `../api-protos/users.proto`), so there is no user payload
-    /// to return here. Fails with [`crate::Error::Grpc`] (`ALREADY_EXISTS`)
+    /// to return here. Fails with [`crate::ErrorCode::AlreadyExists`]
     /// if the username is already taken, and with
-    /// [`crate::Error::AlreadyLoggedIn`] — before contacting the server — if a
+    /// [`crate::ErrorCode::AlreadyLoggedIn`] — before contacting the server — if a
     /// session is already open on this device. Once the session and master
     /// key are persisted, starts changelog consumption via
     /// [`DocumentsService::start_sync`].
@@ -120,10 +120,10 @@ pub trait Service: Send + Sync {
     /// named `device_name`, returning its session token, via a two-step
     /// OPAQUE login exchange (`StartLogin`/`FinishLogin`). An incorrect
     /// password is often detected locally, without a round trip to the
-    /// server, and fails with [`crate::Error::InvalidCredentials`] in that
+    /// server, and fails with [`crate::ErrorCode::InvalidCredentials`] in that
     /// case; failure detected by the server instead surfaces the usual way,
-    /// as [`crate::Error::Grpc`] (`UNAUTHENTICATED`). Fails with
-    /// [`crate::Error::AlreadyLoggedIn`] — before contacting the server — if a
+    /// as [`crate::ErrorCode::Unauthenticated`]. Fails with
+    /// [`crate::ErrorCode::AlreadyLoggedIn`] — before contacting the server — if a
     /// session is already open on this device. Once the session and master
     /// key are persisted, starts changelog consumption via
     /// [`DocumentsService::start_sync`].
@@ -146,7 +146,7 @@ pub trait Service: Send + Sync {
     /// session itself is what authenticates the change server-side — see
     /// below). Verifies `old_password` the same way `login` verifies a
     /// password: the local half of an OPAQUE login exchange, which fails
-    /// with [`crate::Error::InvalidCredentials`] on a mismatch without ever
+    /// with [`crate::ErrorCode::InvalidCredentials`] on a mismatch without ever
     /// calling the server's `FinishLogin` (so, unlike a real `login()`
     /// call, this never opens an extra session). Then drives a two-step
     /// OPAQUE registration exchange for `new_password`

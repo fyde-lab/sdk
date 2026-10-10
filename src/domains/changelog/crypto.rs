@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::domains::documents::Metadata;
 use crate::domains::secrets::{MASTER_KEY_SECRET, Service as SecretsService};
 use crate::domains::users::decode_master_key;
-use crate::{Error, ErrorContext as _, Result};
+use crate::{ErrorContext as _, ErrorKind, Result};
 
 use super::models::EventType;
 
@@ -47,7 +47,7 @@ fn generate_dek() -> [u8; KEY_LEN] {
 }
 
 /// Returns the raw, still-encoded master key kept in the credential store under
-/// [`MASTER_KEY_SECRET`], or fails with [`Error::Encryption`] if no master
+/// [`MASTER_KEY_SECRET`], or fails with [`crate::ErrorCode::Encryption`] if no master
 /// key is on hand yet — i.e. before any account has been created or logged
 /// into on this device. Shared by [`derive_kek`] (which also decodes it)
 /// and [`ensure_master_key`] (which just needs to know one is present).
@@ -57,10 +57,11 @@ async fn encoded_master_key(secrets: &dyn SecretsService) -> Result<String> {
         .await
         .context("failed to read master key from the credential store")?
         .ok_or_else(|| {
-            Error::Encryption(
+            ErrorKind::Encryption(
                 "no master key found in the credential store; log in or create an account first"
                     .into(),
             )
+            .into()
         })
 }
 
@@ -81,7 +82,7 @@ pub(super) async fn ensure_master_key(secrets: &dyn SecretsService) -> Result<()
 /// the wrapped/encrypted form the server stores — a `change_password` call
 /// never touches this value, since the raw key it derives from never
 /// changes, only what protects it server-side). Fails with
-/// [`Error::Encryption`] if no master key is on hand yet — i.e. before any
+/// [`crate::ErrorCode::Encryption`] if no master key is on hand yet — i.e. before any
 /// account has been created or logged into on this device.
 async fn derive_kek(secrets: &dyn SecretsService) -> Result<[u8; KEY_LEN]> {
     let encoded_master_key = encoded_master_key(secrets).await?;
@@ -104,7 +105,7 @@ fn aead_encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
 
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
-        .map_err(|_| Error::Encryption("failed to encrypt data".into()))?;
+        .map_err(|_| ErrorKind::Encryption("failed to encrypt data".into()))?;
 
     let mut output = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     output.extend_from_slice(&nonce_bytes);
@@ -116,7 +117,7 @@ fn aead_encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
 /// [`aead_encrypt`] under `key`.
 fn aead_decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>> {
     if blob.len() < NONCE_LEN {
-        return Err(Error::Encryption("ciphertext too short".into()));
+        return Err(ErrorKind::Encryption("ciphertext too short".into()).into());
     }
     let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
     let nonce_bytes: [u8; NONCE_LEN] = nonce_bytes
@@ -127,7 +128,7 @@ fn aead_decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(key.into());
     cipher
         .decrypt(&nonce, ciphertext)
-        .map_err(|_| Error::Encryption("failed to decrypt data".into()))
+        .map_err(|_| ErrorKind::Encryption("failed to decrypt data".into()).into())
 }
 
 /// Encrypts a changelog event using envelope encryption, the same technique
@@ -180,7 +181,7 @@ pub(super) async fn decrypt_event(
     encrypted_content: &[u8],
 ) -> Result<DecryptedEvent> {
     if encrypted_content.len() < WRAPPED_KEY_LEN {
-        return Err(Error::Encryption("changelog event too short".into()));
+        return Err(ErrorKind::Encryption("changelog event too short".into()).into());
     }
     let (wrapped_dek, encrypted_payload) = encrypted_content.split_at(WRAPPED_KEY_LEN);
 
@@ -188,7 +189,7 @@ pub(super) async fn decrypt_event(
     let dek = aead_decrypt(&kek, wrapped_dek).context("failed to unwrap changelog event DEK")?;
     let dek: [u8; KEY_LEN] = dek
         .try_into()
-        .map_err(|_| Error::Encryption("unwrapped DEK has an invalid length".into()))?;
+        .map_err(|_| ErrorKind::Encryption("unwrapped DEK has an invalid length".into()))?;
 
     let bytes =
         aead_decrypt(&dek, encrypted_payload).context("failed to decrypt changelog event")?;
@@ -311,6 +312,6 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(err, Error::Encryption(_)));
+        assert!(matches!(err.kind(), ErrorKind::Encryption(_)));
     }
 }

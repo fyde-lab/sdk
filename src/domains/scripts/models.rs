@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::Error;
+use crate::{Error, ErrorKind};
 
 /// What kind of script this is, opaque to the server beyond storage and
 /// filtering (see `Script`/`CreateScriptRequest`/`UpdateScriptRequest`'s
@@ -42,7 +42,7 @@ impl FromStr for ScriptType {
         match s {
             "scraper" => Ok(Self::Scraper),
             "parser" => Ok(Self::Parser),
-            other => Err(Error::InvalidScriptType(other.to_string())),
+            other => Err(ErrorKind::InvalidScriptType(other.to_string()).into()),
         }
     }
 }

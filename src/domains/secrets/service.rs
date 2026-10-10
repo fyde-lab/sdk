@@ -95,7 +95,7 @@ mod tests {
     use super::super::storage::MockStorage;
     use super::super::{MASTER_KEY_SECRET, SESSION_TOKEN_SECRET};
     use super::*;
-    use crate::Error;
+    use crate::ErrorKind;
 
     #[tokio::test]
     async fn get_returns_none_when_never_set() {
@@ -144,7 +144,7 @@ mod tests {
             .expect_delete()
             .with(eq(MASTER_KEY_SECRET))
             .times(1)
-            .return_once(|_| Err(Error::Encryption("keystore locked".into())));
+            .return_once(|_| Err(ErrorKind::Encryption("keystore locked".into()).into()));
         storage
             .expect_delete()
             .with(eq(SESSION_TOKEN_SECRET))
@@ -204,7 +204,7 @@ mod tests {
         let mut storage = MockStorage::new();
         storage
             .expect_set()
-            .return_once(|_, _| Err(Error::Encryption("keychain locked".into())));
+            .return_once(|_, _| Err(ErrorKind::Encryption("keychain locked".into()).into()));
         storage.expect_get().times(1).return_once(|_| Ok(None));
         let client = SecretsClient::new(storage);
 

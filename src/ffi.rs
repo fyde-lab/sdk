@@ -20,7 +20,8 @@ use crate::domains::scripts::{
 };
 use crate::domains::sessions::Service as SessionsService;
 use crate::{
-    ChangelogEvent, Client, ClientConfig, Document, Error, ErrorContext as _, LogLevel, Storage,
+    ChangelogEvent, Client, ClientConfig, Document, Error, ErrorContext as _, ErrorKind, LogLevel,
+    Storage,
 };
 
 /// Error type surfaced to FFI callers. UniFFI requires exported errors to be
@@ -921,7 +922,7 @@ impl FydeClient {
             .documents()
             .get(id)
             .await?
-            .ok_or(Error::DocumentNotFound(id))?;
+            .ok_or(Error::from(ErrorKind::DocumentNotFound(id)))?;
         let metadata = self.inner.documents().run_scripts(&document).await?;
         if metadata != *document.metadata() {
             self.inner.documents().update_metadata(metadata).await?;
@@ -1080,7 +1081,7 @@ mod tests {
 
     #[test]
     fn ffi_error_flattens_the_source_error_to_its_display_message() {
-        let err = Error::UnsupportedDocumentExtension("txt".to_string());
+        let err = Error::from(ErrorKind::UnsupportedDocumentExtension("txt".to_string()));
         let message = err.to_string();
 
         let ffi_err: FfiError = err.into();
