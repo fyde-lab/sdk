@@ -28,7 +28,7 @@ pub use domains::users::Service as UsersService;
 pub use tools::log::LogLevel;
 
 use domains::sessions::{Service as SessionsService, SessionsClient};
-use tonic::transport::Endpoint;
+use tonic::transport::{Channel, Endpoint};
 use tools::log::CallbackLayer;
 use tools::sql::{self, SqliteClient};
 
@@ -95,49 +95,10 @@ pub struct Client {
 impl Client {
     /// Connects to a fyde server per `config`.
     pub async fn init(config: ClientConfig) -> Result<Self> {
-        // Ignore the result: a subscriber may already be installed by the
-        // consuming binary or by a previous `Client::init` call, and a
-        // library must not panic over it.
-        use tracing_subscriber::prelude::*;
-        let callback_layer = config
-            .on_log
-            .clone()
-            .map(|callback| CallbackLayer { callback });
-        let _ = tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer())
-            .with(callback_layer)
-            .with(tracing_subscriber::filter::LevelFilter::from(
-                config.log_level,
-            ))
-            .try_init();
-
-        let sqlite: Arc<SqliteClient> = Arc::new(
-            match &config.storage {
-                Storage::Disk(path) => SqliteClient::connect_at(path.clone()).await,
-                Storage::Memory => SqliteClient::connect_with(sql::IN_MEMORY_DB).await,
-            }
-            .context("failed to open local database")?,
-        );
-
-        // Secrets (master key, session token) live in the OS credential
-        // store next to an on-disk database, never in the database itself;
-        // an in-memory client keeps them in memory, like everything else.
-        let secrets = domains::secrets::init(match &config.storage {
-            Storage::Disk(path) => domains::secrets::StorageConfig::Keystore {
-                database_path: path,
-            },
-            Storage::Memory => domains::secrets::StorageConfig::Memory,
-        })
-        .context("failed to initialize secrets store")?;
-
-        // Opened lazily: `connect_lazy` doesn't dial the server here, only
-        // once some call actually needs it (see each domain's
-        // `grpc_client.rs`). The resulting `Channel` is cheap to clone and
-        // shared by every domain's gRPC client, so they all reuse the same
-        // underlying HTTP/2 connection instead of opening one each.
-        let channel = Endpoint::from_shared(config.url)
-            .map_err(|err| ErrorKind::InvalidEndpoint(err.to_string()))?
-            .connect_lazy();
+        install_tracing(config.log_level, config.on_log.clone());
+        let sqlite = open_database(&config.storage).await?;
+        let secrets = open_secrets(&config.storage)?;
+        let channel = lazy_channel(config.url)?;
 
         let settings = domains::settings::init(sqlite.pool().clone());
         let sessions = domains::sessions::init(secrets.clone());
@@ -257,6 +218,58 @@ impl Client {
     pub(crate) fn sessions(&self) -> &SessionsClient {
         self.sessions.as_ref()
     }
+}
+
+/// Routes the SDK's `tracing` output to the terminal and, when set, to
+/// `on_log`, at `log_level`. Ignores the result: a subscriber may already be
+/// installed by the consuming binary or by a previous `Client::init` call,
+/// and a library must not panic over it.
+fn install_tracing(
+    log_level: LogLevel,
+    on_log: Option<Arc<dyn Fn(LogLevel, String) + Send + Sync>>,
+) {
+    use tracing_subscriber::prelude::*;
+    let callback_layer = on_log.map(|callback| CallbackLayer { callback });
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(callback_layer)
+        .with(tracing_subscriber::filter::LevelFilter::from(log_level))
+        .try_init();
+}
+
+/// Opens the local SQLite database `storage` selects.
+async fn open_database(storage: &Storage) -> Result<Arc<SqliteClient>> {
+    let sqlite = match storage {
+        Storage::Disk(path) => SqliteClient::connect_at(path.clone()).await,
+        Storage::Memory => SqliteClient::connect_with(sql::IN_MEMORY_DB).await,
+    }
+    .context("failed to open local database")?;
+    Ok(Arc::new(sqlite))
+}
+
+/// Opens the secrets store matching `storage`. Secrets (master key, session
+/// token) live in the OS credential store next to an on-disk database, never
+/// in the database itself; an in-memory client keeps them in memory, like
+/// everything else.
+fn open_secrets(storage: &Storage) -> Result<Arc<dyn domains::secrets::Service>> {
+    domains::secrets::init(match storage {
+        Storage::Disk(path) => domains::secrets::StorageConfig::Keystore {
+            database_path: path,
+        },
+        Storage::Memory => domains::secrets::StorageConfig::Memory,
+    })
+    .context("failed to initialize secrets store")
+}
+
+/// Builds the gRPC channel to `url`. Opened lazily: `connect_lazy` doesn't
+/// dial the server here, only once some call actually needs it (see each
+/// domain's `grpc_client.rs`). The resulting `Channel` is cheap to clone and
+/// shared by every domain's gRPC client, so they all reuse the same
+/// underlying HTTP/2 connection instead of opening one each.
+fn lazy_channel(url: String) -> Result<Channel> {
+    Ok(Endpoint::from_shared(url)
+        .map_err(|err| ErrorKind::InvalidEndpoint(err.to_string()))?
+        .connect_lazy())
 }
 
 /// Testing hook, not part of the supported API: makes every [`Client`]
