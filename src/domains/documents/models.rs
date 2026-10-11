@@ -714,27 +714,29 @@ pub(crate) struct FakeSearchFacets {
 #[cfg(test)]
 impl FakeSearchFacets {
     pub(crate) fn new() -> Self {
-        let count = || 1 + crate::testing::random_u64(20);
+        let count = || 1 + crate::tools::testing::random_u64(20);
         let word = || FacetCount {
-            value: crate::testing::random_word().to_string(),
+            value: crate::tools::testing::random_word().to_string(),
             count: count(),
         };
-        let earliest = crate::testing::random_past_timestamp();
+        let earliest = crate::tools::testing::random_past_timestamp();
         Self {
             facets: SearchFacets {
                 source_categories: vec![FacetCount {
-                    value: SourceCategory::ALL
-                        [crate::testing::random_u64(SourceCategory::ALL.len() as u64) as usize],
+                    value: SourceCategory::ALL[crate::tools::testing::random_u64(
+                        SourceCategory::ALL.len() as u64,
+                    ) as usize],
                     count: count(),
                 }],
                 source_sub_categories: vec![FacetCount {
-                    value: SourceSubCategory::ALL
-                        [crate::testing::random_u64(SourceSubCategory::ALL.len() as u64) as usize],
+                    value: SourceSubCategory::ALL[crate::tools::testing::random_u64(
+                        SourceSubCategory::ALL.len() as u64,
+                    ) as usize],
                     count: count(),
                 }],
                 purposes: vec![FacetCount {
                     value: Purpose::ALL
-                        [crate::testing::random_u64(Purpose::ALL.len() as u64) as usize],
+                        [crate::tools::testing::random_u64(Purpose::ALL.len() as u64) as usize],
                     count: count(),
                 }],
                 types: vec![word()],
@@ -744,7 +746,9 @@ impl FakeSearchFacets {
                 }],
                 subjects: vec![word(), word()],
                 earliest_created_at: Some(earliest),
-                latest_created_at: Some(earliest + crate::testing::random_u64(86_400) as i64),
+                latest_created_at: Some(
+                    earliest + crate::tools::testing::random_u64(86_400) as i64,
+                ),
             },
         }
     }
