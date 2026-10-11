@@ -89,8 +89,16 @@ impl Service for ScrapersClient {
         allowed_domains: Vec<String>,
         browser_visible: bool,
     ) -> Result<()> {
-        let cookies = self.cookies.load(name).await?;
-        let session_data = self.session.load(name).await?;
+        let cookies = self
+            .cookies
+            .load(name)
+            .await
+            .with_context(|| format!("failed to load cookies for scraper {name:?}"))?;
+        let session_data = self
+            .session
+            .load(name)
+            .await
+            .with_context(|| format!("failed to load session for scraper {name:?}"))?;
         let recorder = Arc::new(Recorder::new(name));
         recorder.record("run_started", json!({ "script": name }));
 

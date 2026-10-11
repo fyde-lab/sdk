@@ -102,7 +102,9 @@ fn run_scripts_blocking(scripts: &[Script], document: &Document) -> Result<Metad
         vm::expose_set_purpose(&lua, source_metadata.clone())?;
         crate::tools::sandbox::load_source(&lua, script.script())
             .exec()
-            .context("failed to run script")?;
+            .with_context(|| {
+                format!("failed to run script {:?} ({})", script.name(), script.id())
+            })?;
 
         metadata = vm::read_metadata(&lua, working_document.metadata(), &source_metadata.borrow())?;
     }

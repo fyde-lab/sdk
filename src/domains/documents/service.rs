@@ -89,7 +89,11 @@ impl<S: Storage> Service for DocumentsClient<S> {
             }
         };
 
-        let mut metadata = self.parser.parse_content(&content, &original_name).await?;
+        let mut metadata = self
+            .parser
+            .parse_content(&content, &original_name)
+            .await
+            .with_context(|| format!("failed to parse document {original_name:?}"))?;
         if let Some(name) = request.name {
             metadata.name = name;
         }
