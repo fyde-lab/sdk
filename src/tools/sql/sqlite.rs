@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
+use std::sync::Mutex;
+
 use sqlx::{
-    SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    ConnectOptions as _, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePoolOptions},
 };
 
 use crate::{ErrorContext as _, Result};
@@ -16,6 +18,11 @@ pub const IN_MEMORY_DB: &str = ":memory:";
 /// doesn't exist.
 pub struct SqliteClient {
     pool: SqlitePool,
+    /// For an in-memory database only: a connection held open, outside the
+    /// pool, for as long as this client lives — see
+    /// [`Self::connect_in_memory`]. Never queried; the `Mutex` only makes
+    /// it `Sync`.
+    _in_memory_keeper: Option<Mutex<SqliteConnection>>,
 }
 
 impl SqliteClient {
@@ -42,18 +49,33 @@ impl SqliteClient {
     }
 
     async fn connect_in_memory() -> Result<Self> {
-        let options = SqliteConnectOptions::new().in_memory(true);
+        // A plain `:memory:` database is private to the connection that
+        // opened it, and sqlx closes and reopens a pooled connection on its
+        // own (e.g. after a query on it was cancelled midway) — which would
+        // silently swap in an empty, unmigrated database. Naming it and
+        // sharing its cache lets every connection the pool ever opens
+        // attach to the same one, and the keeper connection stops it from
+        // being freed in between, when the pool briefly has none open.
+        let options = SqliteConnectOptions::new()
+            .filename(format!("file:fyde-sdk-{}", uuid::Uuid::new_v4()))
+            .in_memory(true)
+            .shared_cache(true);
+        let keeper = options
+            .connect()
+            .await
+            .context("failed to open in-memory local database")?;
 
-        Self::connect_with_options(options).await
+        let mut client = Self::connect_with_options(options).await?;
+        client._in_memory_keeper = Some(Mutex::new(keeper));
+        Ok(client)
     }
 
     async fn connect_with_options(options: SqliteConnectOptions) -> Result<Self> {
         // SQLite only supports a single writer at a time, so a single
         // pooled connection avoids lock-contention errors under concurrent
-        // writes. For an in-memory database this also keeps the same
-        // connection (and thus the same in-memory database) alive for the
-        // lifetime of the pool, since each new connection would otherwise
-        // get its own private, empty database.
+        // writes. (It does not by itself keep an in-memory database alive:
+        // sqlx may still replace that one connection — see
+        // `connect_in_memory`.)
         // `secure_delete` makes SQLite overwrite deleted content with zeros
         // instead of just marking its pages free, so a cached document or a
         // scraper's cookies deleted on `wipe` can't be carved back out of the
@@ -71,7 +93,10 @@ impl SqliteClient {
             .await
             .context("failed to run local database migrations")?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            _in_memory_keeper: None,
+        })
     }
 
     /// Returns the underlying connection pool.
@@ -188,6 +213,42 @@ mod tests {
             .execute(client.pool())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_in_memory_database_survives_its_pooled_connection_being_replaced() {
+        let client = SqliteClient::connect_with(IN_MEMORY_DB).await.unwrap();
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('role', 'admin')")
+            .execute(client.pool())
+            .await
+            .unwrap();
+
+        // Takes the pool's only connection out of it and closes it, as sqlx
+        // does on its own when e.g. a query on it is cancelled midway; the
+        // next query then runs on a freshly opened connection.
+        client.pool().acquire().await.unwrap().detach();
+
+        let role: (String,) = sqlx::query_as("SELECT value FROM settings WHERE key = 'role'")
+            .fetch_one(client.pool())
+            .await
+            .unwrap();
+        assert_eq!(role.0, "admin");
+    }
+
+    #[tokio::test]
+    async fn in_memory_databases_are_private_to_their_client() {
+        let first = SqliteClient::connect_with(IN_MEMORY_DB).await.unwrap();
+        let second = SqliteClient::connect_with(IN_MEMORY_DB).await.unwrap();
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('role', 'admin')")
+            .execute(first.pool())
+            .await
+            .unwrap();
+
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM settings")
+            .fetch_one(second.pool())
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0);
     }
 
     #[tokio::test]
