@@ -28,6 +28,23 @@ use proto::{
     scripts_service_client::ScriptsServiceClient as GeneratedScriptsClient,
 };
 
+/// Every field a script is created or updated with, by name rather than as
+/// a long run of positional arguments — several of them are `String`s, so
+/// swapping two (say `description` and `short_description`) at a call site
+/// would otherwise still compile.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ScriptDraft {
+    pub(super) name: String,
+    pub(super) is_public: bool,
+    pub(super) icon: Vec<u8>,
+    pub(super) script: String,
+    pub(super) description: String,
+    pub(super) short_description: String,
+    pub(super) allowed_domains: Vec<String>,
+    pub(super) script_type: ScriptType,
+    pub(super) parameters: HashMap<String, ScriptParameter>,
+}
+
 /// A gRPC transport for talking to the fyde server's scripts service. Knows
 /// nothing about scripts business logic beyond translating between raw
 /// proto messages and the domain [`Script`] type. Abstracted as a trait so
@@ -37,39 +54,14 @@ use proto::{
 #[async_trait]
 pub(super) trait FydeClient: Send + Sync {
     /// Creates a new script owned by the authenticated user, at version 1.
-    #[allow(clippy::too_many_arguments)]
-    async fn create_script(
-        &self,
-        name: &str,
-        is_public: bool,
-        icon: Vec<u8>,
-        script: &str,
-        description: &str,
-        short_description: &str,
-        allowed_domains: Vec<String>,
-        script_type: ScriptType,
-        parameters: HashMap<String, ScriptParameter>,
-    ) -> Result<Script>;
+    async fn create_script(&self, draft: ScriptDraft) -> Result<Script>;
 
     /// Fetches the script matching `id`.
     async fn fetch_script(&self, id: Uuid) -> Result<Script>;
 
     /// Updates a script owned by the authenticated user, incrementing its
     /// version.
-    #[allow(clippy::too_many_arguments)]
-    async fn update_script(
-        &self,
-        id: Uuid,
-        name: &str,
-        is_public: bool,
-        icon: Vec<u8>,
-        script: &str,
-        description: &str,
-        short_description: &str,
-        allowed_domains: Vec<String>,
-        script_type: ScriptType,
-        parameters: HashMap<String, ScriptParameter>,
-    ) -> Result<Script>;
+    async fn update_script(&self, id: Uuid, draft: ScriptDraft) -> Result<Script>;
 
     /// Enables `script_id` for the authenticated user.
     async fn enable_script(&self, script_id: Uuid) -> Result<()>;
@@ -199,30 +191,19 @@ fn into_domain(script: proto::Script) -> Result<Script> {
 
 #[async_trait]
 impl FydeClient for GrpcClient {
-    async fn create_script(
-        &self,
-        name: &str,
-        is_public: bool,
-        icon: Vec<u8>,
-        script: &str,
-        description: &str,
-        short_description: &str,
-        allowed_domains: Vec<String>,
-        script_type: ScriptType,
-        parameters: HashMap<String, ScriptParameter>,
-    ) -> Result<Script> {
+    async fn create_script(&self, draft: ScriptDraft) -> Result<Script> {
         let request = self
             .sessions
             .authenticated_request(CreateScriptRequest {
-                name: name.to_string(),
-                is_public,
-                icon,
-                script: script.to_string(),
-                description: description.to_string(),
-                short_description: short_description.to_string(),
-                allowed_domains,
-                r#type: script_type.to_string(),
-                parameters: parameters_into_proto(parameters),
+                name: draft.name,
+                is_public: draft.is_public,
+                icon: draft.icon,
+                script: draft.script,
+                description: draft.description,
+                short_description: draft.short_description,
+                allowed_domains: draft.allowed_domains,
+                r#type: draft.script_type.to_string(),
+                parameters: parameters_into_proto(draft.parameters),
             })
             .await?;
 
@@ -256,32 +237,20 @@ impl FydeClient for GrpcClient {
         })?)
     }
 
-    async fn update_script(
-        &self,
-        id: Uuid,
-        name: &str,
-        is_public: bool,
-        icon: Vec<u8>,
-        script: &str,
-        description: &str,
-        short_description: &str,
-        allowed_domains: Vec<String>,
-        script_type: ScriptType,
-        parameters: HashMap<String, ScriptParameter>,
-    ) -> Result<Script> {
+    async fn update_script(&self, id: Uuid, draft: ScriptDraft) -> Result<Script> {
         let request = self
             .sessions
             .authenticated_request(UpdateScriptRequest {
                 id: id.to_string(),
-                name: name.to_string(),
-                is_public,
-                icon,
-                script: script.to_string(),
-                description: description.to_string(),
-                short_description: short_description.to_string(),
-                allowed_domains,
-                r#type: script_type.to_string(),
-                parameters: parameters_into_proto(parameters),
+                name: draft.name,
+                is_public: draft.is_public,
+                icon: draft.icon,
+                script: draft.script,
+                description: draft.description,
+                short_description: draft.short_description,
+                allowed_domains: draft.allowed_domains,
+                r#type: draft.script_type.to_string(),
+                parameters: parameters_into_proto(draft.parameters),
             })
             .await?;
 

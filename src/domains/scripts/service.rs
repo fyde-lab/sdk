@@ -9,7 +9,7 @@ use crate::domains::changelog::{EventType, Service as ChangelogService};
 use crate::domains::sessions::SessionsClient;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
-use super::grpc_client::{FydeClient, GrpcClient};
+use super::grpc_client::{FydeClient, GrpcClient, ScriptDraft};
 use super::storage::Storage;
 use super::{InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptType, Service};
 
@@ -68,19 +68,18 @@ impl<S: Storage> Service for ScriptsClient<S> {
         script_type: ScriptType,
         parameters: HashMap<String, ScriptParameter>,
     ) -> Result<Script> {
-        self.grpc
-            .create_script(
-                name,
-                is_public,
-                icon,
-                script,
-                description,
-                short_description,
-                allowed_domains,
-                script_type,
-                parameters,
-            )
-            .await
+        let draft = ScriptDraft {
+            name: name.to_string(),
+            is_public,
+            icon,
+            script: script.to_string(),
+            description: description.to_string(),
+            short_description: short_description.to_string(),
+            allowed_domains,
+            script_type,
+            parameters,
+        };
+        self.grpc.create_script(draft).await
     }
 
     async fn fetch_script(&self, id: Uuid) -> Result<Script> {
@@ -100,20 +99,18 @@ impl<S: Storage> Service for ScriptsClient<S> {
         script_type: ScriptType,
         parameters: HashMap<String, ScriptParameter>,
     ) -> Result<Script> {
-        self.grpc
-            .update_script(
-                id,
-                name,
-                is_public,
-                icon,
-                script,
-                description,
-                short_description,
-                allowed_domains,
-                script_type,
-                parameters,
-            )
-            .await
+        let draft = ScriptDraft {
+            name: name.to_string(),
+            is_public,
+            icon,
+            script: script.to_string(),
+            description: description.to_string(),
+            short_description: short_description.to_string(),
+            allowed_domains,
+            script_type,
+            parameters,
+        };
+        self.grpc.update_script(id, draft).await
     }
 
     async fn enable_script(&self, script_id: Uuid) -> Result<()> {
@@ -441,6 +438,22 @@ mod tests {
         assert_eq!(err.code(), crate::ErrorCode::ScriptNotInstalled);
     }
 
+    /// The [`ScriptDraft`] the `create_script`/`update_script` delegation
+    /// tests below expect their arguments to be forwarded as.
+    fn expected_draft() -> ScriptDraft {
+        ScriptDraft {
+            name: "my-script".to_string(),
+            is_public: true,
+            icon: b"icon-bytes".to_vec(),
+            script: "return 1".to_string(),
+            description: "does something".to_string(),
+            short_description: "does a thing".to_string(),
+            allowed_domains: vec!["example.com".to_string()],
+            script_type: ScriptType::Scraper,
+            parameters: no_parameters(),
+        }
+    }
+
     #[tokio::test]
     async fn create_script_delegates_to_grpc() {
         let expected = FakeScript::new().build();
@@ -448,29 +461,9 @@ mod tests {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_create_script()
-            .withf(
-                |name,
-                 is_public,
-                 icon,
-                 script,
-                 description,
-                 short_description,
-                 allowed_domains,
-                 script_type,
-                 parameters| {
-                    name == "my-script"
-                        && *is_public
-                        && icon == b"icon-bytes"
-                        && script == "return 1"
-                        && description == "does something"
-                        && short_description == "does a thing"
-                        && *allowed_domains == vec!["example.com".to_string()]
-                        && *script_type == ScriptType::Scraper
-                        && parameters.is_empty()
-                },
-            )
+            .withf(|draft| *draft == expected_draft())
             .times(1)
-            .returning(move |_, _, _, _, _, _, _, _, _| Ok(returned.clone()));
+            .returning(move |_| Ok(returned.clone()));
 
         let client = ScriptsClient::with_grpc(mock_grpc, MockStorage::new(), unused_changelog());
 
@@ -517,31 +510,9 @@ mod tests {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_update_script()
-            .withf(
-                move |requested_id,
-                      name,
-                      is_public,
-                      icon,
-                      script,
-                      description,
-                      short_description,
-                      allowed_domains,
-                      script_type,
-                      parameters| {
-                    *requested_id == id
-                        && name == "my-script"
-                        && *is_public
-                        && icon == b"icon-bytes"
-                        && script == "return 1"
-                        && description == "does something"
-                        && short_description == "does a thing"
-                        && *allowed_domains == vec!["example.com".to_string()]
-                        && *script_type == ScriptType::Scraper
-                        && parameters.is_empty()
-                },
-            )
+            .withf(move |requested_id, draft| *requested_id == id && *draft == expected_draft())
             .times(1)
-            .returning(move |_, _, _, _, _, _, _, _, _, _| Ok(returned.clone()));
+            .returning(move |_, _| Ok(returned.clone()));
 
         let client = ScriptsClient::with_grpc(mock_grpc, MockStorage::new(), unused_changelog());
 
