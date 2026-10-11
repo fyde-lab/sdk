@@ -77,3 +77,80 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallbackLayer {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use tracing_subscriber::prelude::*;
+
+    use super::*;
+
+    /// Runs `emit` under a subscriber whose only layer is a [`CallbackLayer`],
+    /// returning every `(level, line)` pair it forwarded.
+    fn forwarded(emit: impl FnOnce()) -> Vec<(LogLevel, String)> {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let layer = CallbackLayer {
+            callback: Arc::new(move |level, line| sink.lock().unwrap().push((level, line))),
+        };
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), emit);
+        Arc::try_unwrap(lines).unwrap().into_inner().unwrap()
+    }
+
+    #[test]
+    fn forwards_the_target_and_message() {
+        let lines = forwarded(|| tracing::info!(target: "fyde_sdk::sync", "caught up"));
+
+        assert_eq!(
+            lines,
+            vec![(LogLevel::Info, "fyde_sdk::sync: caught up".to_string())]
+        );
+    }
+
+    #[test]
+    fn appends_structured_fields_after_the_message() {
+        let lines = forwarded(
+            || tracing::warn!(target: "fyde_sdk::sync", attempt = 3, host = "example.com", "retrying"),
+        );
+
+        assert_eq!(
+            lines,
+            vec![(
+                LogLevel::Warn,
+                "fyde_sdk::sync: retrying attempt=3 host=\"example.com\"".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn maps_every_tracing_level() {
+        let lines = forwarded(|| {
+            tracing::error!("e");
+            tracing::warn!("w");
+            tracing::info!("i");
+            tracing::debug!("d");
+            tracing::trace!("t");
+        });
+
+        let levels: Vec<LogLevel> = lines.into_iter().map(|(level, _)| level).collect();
+        assert_eq!(
+            levels,
+            vec![
+                LogLevel::Error,
+                LogLevel::Warn,
+                LogLevel::Info,
+                LogLevel::Debug,
+                LogLevel::Trace,
+            ]
+        );
+    }
+
+    #[test]
+    fn off_maps_to_the_off_filter() {
+        assert_eq!(
+            tracing_subscriber::filter::LevelFilter::from(LogLevel::Off),
+            tracing_subscriber::filter::LevelFilter::OFF
+        );
+    }
+}
