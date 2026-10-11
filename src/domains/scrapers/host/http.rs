@@ -259,7 +259,7 @@ pub(super) fn table(
         .timeout(Duration::from_secs(30))
         .redirect(redirect_policy)
         .build()
-        .expect("building the shared HTTP client");
+        .map_err(mlua::Error::external)?;
 
     let http = lua.create_table()?;
 
