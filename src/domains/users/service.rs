@@ -418,6 +418,13 @@ mod tests {
             unimplemented!()
         }
 
+        async fn search(
+            &self,
+            _query: crate::domains::documents::SearchQuery,
+        ) -> Result<Vec<crate::domains::documents::Document>> {
+            unimplemented!()
+        }
+
         async fn update_metadata(
             &self,
             _metadata: crate::domains::documents::Metadata,

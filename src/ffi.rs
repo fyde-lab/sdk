@@ -13,7 +13,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::domains::documents::{
-    EventType, Metadata, Purpose, SourceCategory, SourceSubCategory, UploadRequest,
+    EventType, Metadata, Purpose, SearchFilters, SearchOrder, SearchQuery, SourceCategory,
+    SourceSubCategory, UploadRequest,
 };
 use crate::domains::scripts::{
     InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptParameterType, ScriptType,
@@ -323,6 +324,62 @@ impl From<Document> for FfiDocument {
             id: document.id().to_string(),
             content: document.content().to_vec(),
             metadata: document.metadata().clone().into(),
+        }
+    }
+}
+
+/// Which documents a search keeps, mirroring [`SearchFilters`] across the
+/// FFI boundary: any of the values within one list, every list that's
+/// non-empty, and every bound that's set.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSearchFilters {
+    pub source_categories: Vec<FfiSourceCategory>,
+    pub source_sub_categories: Vec<FfiSourceSubCategory>,
+    pub purposes: Vec<FfiPurpose>,
+    pub types: Vec<String>,
+    pub subjects: Vec<String>,
+    pub content_types: Vec<String>,
+    pub created_from: Option<i64>,
+    pub created_until: Option<i64>,
+}
+
+impl From<FfiSearchFilters> for SearchFilters {
+    fn from(filters: FfiSearchFilters) -> Self {
+        Self {
+            source_categories: filters
+                .source_categories
+                .into_iter()
+                .map(SourceCategory::from)
+                .collect(),
+            source_sub_categories: filters
+                .source_sub_categories
+                .into_iter()
+                .map(SourceSubCategory::from)
+                .collect(),
+            purposes: filters.purposes.into_iter().map(Purpose::from).collect(),
+            types: filters.types,
+            subjects: filters.subjects,
+            content_types: filters.content_types,
+            created_from: filters.created_from,
+            created_until: filters.created_until,
+        }
+    }
+}
+
+/// The order search results come back in, mirroring [`SearchOrder`].
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum FfiSearchOrder {
+    Relevance,
+    Newest,
+    Oldest,
+}
+
+impl From<FfiSearchOrder> for SearchOrder {
+    fn from(order: FfiSearchOrder) -> Self {
+        match order {
+            FfiSearchOrder::Relevance => Self::Relevance,
+            FfiSearchOrder::Newest => Self::Newest,
+            FfiSearchOrder::Oldest => Self::Oldest,
         }
     }
 }
@@ -834,6 +891,34 @@ impl FydeClient {
     ) -> Result<Vec<FfiDocument>, FfiError> {
         self.localized(async {
             let documents = self.inner.documents().list(offset, limit).await?;
+            Ok(documents.into_iter().map(FfiDocument::from).collect())
+        })
+        .await
+    }
+
+    /// Searches documents previously cached locally for `text`, keeping
+    /// only those matching `filters`, one page at a time in `order`.
+    /// Mirrors [`crate::DocumentsService::search`].
+    pub async fn search_documents(
+        &self,
+        text: String,
+        filters: FfiSearchFilters,
+        order: FfiSearchOrder,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<FfiDocument>, FfiError> {
+        self.localized(async {
+            let documents = self
+                .inner
+                .documents()
+                .search(SearchQuery {
+                    text,
+                    filters: filters.into(),
+                    order: order.into(),
+                    offset,
+                    limit,
+                })
+                .await?;
             Ok(documents.into_iter().map(FfiDocument::from).collect())
         })
         .await

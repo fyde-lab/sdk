@@ -7,8 +7,8 @@ use uuid::Uuid;
 use crate::{ErrorContext as _, Result};
 
 use super::{
-    Document, Metadata, Purpose, Service, SourceCategory, SourceSubCategory, UploadRequest,
-    UploadSource,
+    Document, Metadata, Purpose, SearchQuery, Service, SourceCategory, SourceSubCategory,
+    UploadRequest, UploadSource,
 };
 
 /// A [`Service`] implementation for standalone/dev use (see
@@ -117,6 +117,10 @@ impl Service for DevDocumentsClient {
     }
 
     async fn list(&self, _offset: i64, _limit: i64) -> Result<Vec<Document>> {
+        Ok(Vec::new())
+    }
+
+    async fn search(&self, _query: SearchQuery) -> Result<Vec<Document>> {
         Ok(Vec::new())
     }
 

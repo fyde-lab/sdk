@@ -99,6 +99,8 @@ macro_rules! for_each_error_code {
             InvalidSourceSubCategory = 4006,
             /// A document's purpose is unknown.
             InvalidPurpose = 4007,
+            /// A document search's parameters were invalid.
+            InvalidSearchQuery = 4008,
             /// No such script.
             ScriptNotFound = 5001,
             /// A script was run without one of its required parameters.
@@ -214,6 +216,8 @@ pub(crate) enum ErrorKind {
     InvalidSourceSubCategory(String),
     #[error("invalid purpose: {0:?}")]
     InvalidPurpose(String),
+    #[error("invalid search query: {0}")]
+    InvalidSearchQuery(String),
     #[error("invalid script type: {0:?}")]
     InvalidScriptType(String),
     #[error("invalid server response: {0}")]
@@ -260,6 +264,7 @@ impl ErrorKind {
             ErrorKind::InvalidSourceCategory(_) => ErrorCode::InvalidSourceCategory,
             ErrorKind::InvalidSourceSubCategory(_) => ErrorCode::InvalidSourceSubCategory,
             ErrorKind::InvalidPurpose(_) => ErrorCode::InvalidPurpose,
+            ErrorKind::InvalidSearchQuery(_) => ErrorCode::InvalidSearchQuery,
             ErrorKind::InvalidScriptType(_) => ErrorCode::InvalidScriptType,
             ErrorKind::InvalidResponse(_) => ErrorCode::InvalidServerResponse,
             ErrorKind::Encryption(_) => ErrorCode::Encryption,

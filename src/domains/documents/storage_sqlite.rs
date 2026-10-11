@@ -1,11 +1,14 @@
 use async_trait::async_trait;
-use sqlx::{Row, SqlitePool};
+use sqlx::sqlite::SqliteRow;
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use uuid::Uuid;
 
 use crate::{ErrorContext as _, Result};
 
 use super::storage::Storage;
-use super::{Document, Metadata, Purpose, SourceCategory, SourceSubCategory};
+use super::{
+    Document, Metadata, Purpose, SearchFilters, SearchOrder, SourceCategory, SourceSubCategory,
+};
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
 /// `documents` table).
@@ -76,6 +79,81 @@ fn purpose_from_column(column: String) -> Result<Option<Purpose>> {
         .parse()
         .map(Some)
         .with_context(|| format!("invalid purpose in local database: {column}"))
+}
+
+/// Maps a row selecting every `documents` column (`id` included) back to a
+/// [`Document`].
+fn document_from_row(row: &SqliteRow) -> Result<Document> {
+    let id: String = row.get("id");
+    let content: Vec<u8> = row.get("content");
+    let id = Uuid::parse_str(&id)
+        .with_context(|| format!("invalid document id in local database: {id}"))?;
+
+    Ok(Document {
+        id,
+        metadata: Metadata {
+            id,
+            name: row.get("name"),
+            original_name: row.get("original_name"),
+            content_type: row.get("content_type"),
+            created_at: row.get("created_at"),
+            size: content.len() as u64,
+            checksum: row.get("checksum"),
+            transcript: row.get("transcript"),
+            r#type: row.get("type"),
+            source_category: source_category_from_column(row.get("source_category"))?,
+            source_sub_category: source_sub_category_from_column(row.get("source_sub_category"))?,
+            subjects: subjects_from_column(row.get("subjects"))?,
+            purpose: purpose_from_column(row.get("purpose"))?,
+        },
+        content,
+    })
+}
+
+/// Orders `documents_fts` matches best first (`bm25` scores lower for a
+/// better match), weighting each column in its declaration order in the
+/// `0014_create_documents_fts` migration: a hit in the name counts the
+/// most, one in the (long, noisy) transcript the least.
+const FTS_RANK: &str = "bm25(documents_fts,
+    10.0, -- name
+    5.0,  -- original_name
+    1.0,  -- transcript
+    4.0,  -- type
+    4.0,  -- source_category
+    4.0,  -- source_sub_category
+    6.0,  -- subjects
+    4.0   -- purpose
+)";
+
+/// Builds an FTS5 query matching documents containing every one of `terms`
+/// as a token prefix, in any column. Each term is quoted as an FTS5 string
+/// (doubling any `"` inside it), so nothing in it is ever parsed as query
+/// syntax (`OR`, `NEAR`, `column:`...).
+fn fts_match_expression(terms: &[String]) -> String {
+    terms
+        .iter()
+        .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Appends ` AND <column> IN (?, ...)` to `query`, binding every one of
+/// `values`, or nothing at all when `values` is empty (no constraint).
+fn push_any_of<'a>(
+    query: &mut QueryBuilder<Sqlite>,
+    column: &str,
+    values: impl ExactSizeIterator<Item = &'a str>,
+) {
+    if values.len() == 0 {
+        return;
+    }
+
+    query.push(format_args!(" AND {column} IN ("));
+    let mut separated = query.separated(", ");
+    for value in values {
+        separated.push_bind(value.to_string());
+    }
+    query.push(")");
 }
 
 #[async_trait]
@@ -157,36 +235,109 @@ impl Storage for SqliteStorage {
         .await
         .with_context(|| format!("failed to list documents at offset {offset}"))?;
 
-        rows.into_iter()
-            .map(|row| {
-                let id: String = row.get("id");
-                let content: Vec<u8> = row.get("content");
-                let id = Uuid::parse_str(&id)
-                    .with_context(|| format!("invalid document id in local database: {id}"))?;
+        rows.iter().map(document_from_row).collect()
+    }
 
-                Ok(Document {
-                    id,
-                    metadata: Metadata {
-                        id,
-                        name: row.get("name"),
-                        original_name: row.get("original_name"),
-                        content_type: row.get("content_type"),
-                        created_at: row.get("created_at"),
-                        size: content.len() as u64,
-                        checksum: row.get("checksum"),
-                        transcript: row.get("transcript"),
-                        r#type: row.get("type"),
-                        source_category: source_category_from_column(row.get("source_category"))?,
-                        source_sub_category: source_sub_category_from_column(
-                            row.get("source_sub_category"),
-                        )?,
-                        subjects: subjects_from_column(row.get("subjects"))?,
-                        purpose: purpose_from_column(row.get("purpose"))?,
-                    },
-                    content,
-                })
-            })
-            .collect()
+    async fn search_documents(
+        &self,
+        terms: &[String],
+        filters: &SearchFilters,
+        order: SearchOrder,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Document>> {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT d.id, d.name, d.original_name, d.content_type, d.content, d.checksum, d.created_at, d.transcript, d.type, d.source_category, d.source_sub_category, d.subjects, d.purpose FROM documents d",
+        );
+
+        if terms.is_empty() {
+            query.push(" WHERE 1 = 1");
+        } else {
+            query.push(
+                " JOIN documents_fts_rowid_map m ON m.document_id = d.id
+                  JOIN documents_fts ON documents_fts.rowid = m.rowid
+                  WHERE documents_fts MATCH ",
+            );
+            query.push_bind(fts_match_expression(terms));
+        }
+
+        push_any_of(
+            &mut query,
+            "d.source_category",
+            filters.source_categories.iter().map(SourceCategory::as_str),
+        );
+        push_any_of(
+            &mut query,
+            "d.source_sub_category",
+            filters
+                .source_sub_categories
+                .iter()
+                .map(SourceSubCategory::as_str),
+        );
+        push_any_of(
+            &mut query,
+            "d.purpose",
+            filters.purposes.iter().map(Purpose::as_str),
+        );
+        push_any_of(
+            &mut query,
+            "d.type",
+            filters.types.iter().map(String::as_str),
+        );
+        push_any_of(
+            &mut query,
+            "d.content_type",
+            filters.content_types.iter().map(String::as_str),
+        );
+        if !filters.subjects.is_empty() {
+            query.push(
+                " AND EXISTS (SELECT 1 FROM json_each(d.subjects) WHERE json_each.value IN (",
+            );
+            let mut subjects = query.separated(", ");
+            for subject in &filters.subjects {
+                subjects.push_bind(subject.clone());
+            }
+            query.push("))");
+        }
+        if let Some(created_from) = filters.created_from {
+            query.push(" AND d.created_at >= ").push_bind(created_from);
+        }
+        if let Some(created_until) = filters.created_until {
+            query.push(" AND d.created_at <= ").push_bind(created_until);
+        }
+
+        query.push(" ORDER BY ");
+        match order {
+            SearchOrder::Relevance => {
+                // Without terms there's no `documents_fts` match to score,
+                // which leaves the newest-first tie-break below as the
+                // whole ordering.
+                if !terms.is_empty() {
+                    query.push(FTS_RANK).push(", ");
+                }
+                query.push("d.created_at DESC, d.id DESC");
+            }
+            SearchOrder::Newest => {
+                query.push("d.created_at DESC, d.id DESC");
+            }
+            SearchOrder::Oldest => {
+                query.push("d.created_at ASC, d.id ASC");
+            }
+        }
+
+        query
+            .push(" LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
+
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| format!("failed to search documents at offset {offset}"))?;
+
+        rows.iter().map(document_from_row).collect()
     }
 
     async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()> {
@@ -221,6 +372,7 @@ impl Storage for SqliteStorage {
 mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
+    use super::super::{FakeDocument, FakeMetadata};
     use super::*;
 
     async fn setup() -> SqliteStorage {
@@ -504,5 +656,472 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    /// Metadata for a search fixture named `name`, created at `created_at`,
+    /// with every other searchable field left blank — unlike
+    /// [`FakeMetadata::new`]'s random words, which could match a test's
+    /// search terms by accident. Tests set just the fields they search on.
+    fn searchable(name: &str, created_at: i64) -> FakeMetadata {
+        FakeMetadata::new()
+            .with_name(name)
+            .with_original_name(name)
+            .with_content_type("application/pdf")
+            .with_created_at(created_at)
+            .with_transcript("")
+            .with_type("")
+            .with_source_category(None)
+            .with_source_sub_category(None)
+            .with_subjects(Vec::<String>::new())
+            .with_purpose(None)
+    }
+
+    async fn save(storage: &SqliteStorage, metadata: FakeMetadata) {
+        let metadata = metadata.build();
+        storage
+            .save_document(
+                &FakeDocument::new()
+                    .with_id(metadata.id)
+                    .with_metadata(metadata)
+                    .build(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn search_names(
+        storage: &SqliteStorage,
+        terms: &[&str],
+        filters: &SearchFilters,
+        order: SearchOrder,
+    ) -> Vec<String> {
+        let terms: Vec<String> = terms.iter().map(|term| term.to_string()).collect();
+        storage
+            .search_documents(&terms, filters, order, 0, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|document| document.metadata.name)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn search_documents_without_terms_or_filters_returns_every_document_newest_first() {
+        let storage = setup().await;
+        save(&storage, searchable("old", 1)).await;
+        save(&storage, searchable("new", 3)).await;
+        save(&storage, searchable("middle", 2)).await;
+
+        let names = search_names(
+            &storage,
+            &[],
+            &SearchFilters::default(),
+            SearchOrder::Relevance,
+        )
+        .await;
+
+        assert_eq!(names, vec!["new", "middle", "old"]);
+    }
+
+    #[tokio::test]
+    async fn search_documents_matches_terms_as_case_and_accent_insensitive_prefixes() {
+        let storage = setup().await;
+        save(&storage, searchable("Échéancier EDF", 1)).await;
+        save(&storage, searchable("other", 2)).await;
+
+        let names = search_names(
+            &storage,
+            &["echea", "edf"],
+            &SearchFilters::default(),
+            SearchOrder::Relevance,
+        )
+        .await;
+
+        assert_eq!(names, vec!["Échéancier EDF"]);
+    }
+
+    #[tokio::test]
+    async fn search_documents_requires_every_term_to_match() {
+        let storage = setup().await;
+        save(&storage, searchable("facture electricite", 1)).await;
+        save(&storage, searchable("facture internet", 2)).await;
+
+        let names = search_names(
+            &storage,
+            &["facture", "internet"],
+            &SearchFilters::default(),
+            SearchOrder::Relevance,
+        )
+        .await;
+
+        assert_eq!(names, vec!["facture internet"]);
+    }
+
+    #[tokio::test]
+    async fn search_documents_matches_every_searchable_field() {
+        let storage = setup().await;
+        save(
+            &storage,
+            searchable("by-original", 1).with_original_name("scan-originalname.pdf"),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("by-transcript", 2).with_transcript("Montant total: 42 euros"),
+        )
+        .await;
+        save(&storage, searchable("by-type", 3).with_type("payslip")).await;
+        save(
+            &storage,
+            searchable("by-category", 4).with_source_category(SourceCategory::RealEstate),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("by-sub-category", 5).with_source_sub_category(SourceSubCategory::Mobile),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("by-subjects", 6).with_subjects(vec!["Loyer Paris".to_string()]),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("by-purpose", 7).with_purpose(Purpose::Attestation),
+        )
+        .await;
+
+        for (term, expected) in [
+            ("originalname", "by-original"),
+            ("euros", "by-transcript"),
+            ("payslip", "by-type"),
+            ("estate", "by-category"),
+            ("mobile", "by-sub-category"),
+            ("loyer", "by-subjects"),
+            ("attestation", "by-purpose"),
+        ] {
+            let names = search_names(
+                &storage,
+                &[term],
+                &SearchFilters::default(),
+                SearchOrder::Relevance,
+            )
+            .await;
+            assert_eq!(names, vec![expected], "searching for {term:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_documents_ranks_a_name_match_above_a_transcript_match() {
+        let storage = setup().await;
+        // Newer, so it would come first if relevance weren't ranked.
+        save(
+            &storage,
+            searchable("in-transcript", 2).with_transcript("contains the word quittance"),
+        )
+        .await;
+        save(&storage, searchable("quittance", 1)).await;
+
+        let names = search_names(
+            &storage,
+            &["quittance"],
+            &SearchFilters::default(),
+            SearchOrder::Relevance,
+        )
+        .await;
+
+        assert_eq!(names, vec!["quittance", "in-transcript"]);
+    }
+
+    #[tokio::test]
+    async fn search_documents_never_parses_terms_as_fts_query_syntax() {
+        let storage = setup().await;
+        save(&storage, searchable("plain", 1)).await;
+
+        let names = search_names(
+            &storage,
+            &["\"", "OR", "name:plain", "NEAR("],
+            &SearchFilters::default(),
+            SearchOrder::Relevance,
+        )
+        .await;
+
+        assert_eq!(names, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn search_documents_keeps_documents_matching_any_value_within_a_filter() {
+        let storage = setup().await;
+        save(
+            &storage,
+            searchable("bank", 1).with_source_category(SourceCategory::Bank),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("energy", 2).with_source_category(SourceCategory::Energy),
+        )
+        .await;
+        save(&storage, searchable("unclassified", 3)).await;
+
+        let names = search_names(
+            &storage,
+            &[],
+            &SearchFilters {
+                source_categories: vec![SourceCategory::Bank, SourceCategory::Energy],
+                ..Default::default()
+            },
+            SearchOrder::Oldest,
+        )
+        .await;
+
+        assert_eq!(names, vec!["bank", "energy"]);
+    }
+
+    #[tokio::test]
+    async fn search_documents_keeps_only_documents_matching_every_filter() {
+        let storage = setup().await;
+        save(
+            &storage,
+            searchable("match", 10)
+                .with_source_category(SourceCategory::Health)
+                .with_source_sub_category(SourceSubCategory::Tax)
+                .with_purpose(Purpose::Invoice)
+                .with_type("receipt")
+                .with_subjects(vec!["alice".to_string(), "bob".to_string()]),
+        )
+        .await;
+        // Each differs from "match" in exactly one filtered field.
+        save(
+            &storage,
+            searchable("wrong-category", 10)
+                .with_source_category(SourceCategory::Bank)
+                .with_source_sub_category(SourceSubCategory::Tax)
+                .with_purpose(Purpose::Invoice)
+                .with_type("receipt")
+                .with_subjects(vec!["bob".to_string()]),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("wrong-sub-category", 10)
+                .with_source_category(SourceCategory::Health)
+                .with_purpose(Purpose::Invoice)
+                .with_type("receipt")
+                .with_subjects(vec!["bob".to_string()]),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("wrong-purpose", 10)
+                .with_source_category(SourceCategory::Health)
+                .with_source_sub_category(SourceSubCategory::Tax)
+                .with_purpose(Purpose::Contract)
+                .with_type("receipt")
+                .with_subjects(vec!["bob".to_string()]),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("wrong-type", 10)
+                .with_source_category(SourceCategory::Health)
+                .with_source_sub_category(SourceSubCategory::Tax)
+                .with_purpose(Purpose::Invoice)
+                .with_type("statement")
+                .with_subjects(vec!["bob".to_string()]),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("wrong-subjects", 10)
+                .with_source_category(SourceCategory::Health)
+                .with_source_sub_category(SourceSubCategory::Tax)
+                .with_purpose(Purpose::Invoice)
+                .with_type("receipt")
+                .with_subjects(vec!["carol".to_string()]),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("wrong-content-type", 10)
+                .with_content_type("text/plain")
+                .with_source_category(SourceCategory::Health)
+                .with_source_sub_category(SourceSubCategory::Tax)
+                .with_purpose(Purpose::Invoice)
+                .with_type("receipt")
+                .with_subjects(vec!["bob".to_string()]),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("too-old", 1)
+                .with_source_category(SourceCategory::Health)
+                .with_source_sub_category(SourceSubCategory::Tax)
+                .with_purpose(Purpose::Invoice)
+                .with_type("receipt")
+                .with_subjects(vec!["bob".to_string()]),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("too-new", 100)
+                .with_source_category(SourceCategory::Health)
+                .with_source_sub_category(SourceSubCategory::Tax)
+                .with_purpose(Purpose::Invoice)
+                .with_type("receipt")
+                .with_subjects(vec!["bob".to_string()]),
+        )
+        .await;
+
+        let names = search_names(
+            &storage,
+            &[],
+            &SearchFilters {
+                source_categories: vec![SourceCategory::Health],
+                source_sub_categories: vec![SourceSubCategory::Tax],
+                purposes: vec![Purpose::Invoice],
+                types: vec!["receipt".to_string()],
+                subjects: vec!["bob".to_string(), "dave".to_string()],
+                content_types: vec!["application/pdf".to_string()],
+                created_from: Some(10),
+                created_until: Some(10),
+            },
+            SearchOrder::Relevance,
+        )
+        .await;
+
+        assert_eq!(names, vec!["match"]);
+    }
+
+    #[tokio::test]
+    async fn search_documents_combines_terms_with_filters() {
+        let storage = setup().await;
+        save(
+            &storage,
+            searchable("facture bank", 1).with_source_category(SourceCategory::Bank),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("facture telecom", 2).with_source_category(SourceCategory::Telecom),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("releve bank", 3).with_source_category(SourceCategory::Bank),
+        )
+        .await;
+
+        let names = search_names(
+            &storage,
+            &["facture"],
+            &SearchFilters {
+                source_categories: vec![SourceCategory::Bank],
+                ..Default::default()
+            },
+            SearchOrder::Relevance,
+        )
+        .await;
+
+        assert_eq!(names, vec!["facture bank"]);
+    }
+
+    #[tokio::test]
+    async fn search_documents_pages_in_the_requested_order() {
+        let storage = setup().await;
+        for (name, created_at) in [("one", 1), ("two", 2), ("three", 3)] {
+            save(&storage, searchable(name, created_at)).await;
+        }
+
+        let page = storage
+            .search_documents(&[], &SearchFilters::default(), SearchOrder::Oldest, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].metadata.name, "two");
+
+        let names = search_names(
+            &storage,
+            &[],
+            &SearchFilters::default(),
+            SearchOrder::Newest,
+        )
+        .await;
+        assert_eq!(names, vec!["three", "two", "one"]);
+    }
+
+    #[tokio::test]
+    async fn search_documents_reflects_metadata_updates() {
+        let storage = setup().await;
+        // A distinct original name, which the update below keeps, so only
+        // the updated `name` can match.
+        let metadata = searchable("before", 1)
+            .with_original_name("scan.pdf")
+            .build();
+        let id = metadata.id;
+        storage
+            .save_document(
+                &FakeDocument::new()
+                    .with_id(id)
+                    .with_metadata(metadata.clone())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        storage
+            .update_metadata(
+                id,
+                &Metadata {
+                    name: "after".to_string(),
+                    ..metadata
+                },
+            )
+            .await
+            .unwrap();
+
+        let filters = SearchFilters::default();
+        assert_eq!(
+            search_names(&storage, &["before"], &filters, SearchOrder::Relevance).await,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            search_names(&storage, &["after"], &filters, SearchOrder::Relevance).await,
+            vec!["after"]
+        );
+    }
+
+    #[tokio::test]
+    async fn search_index_migration_indexes_documents_saved_before_it() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let mut migrator = sqlx::migrate!();
+        let full = migrator.migrations.clone();
+        let index_migration = full
+            .iter()
+            .position(|migration| migration.description.contains("documents fts"))
+            .unwrap();
+        migrator.migrations = full[..index_migration].to_vec().into();
+        migrator.run(&pool).await.unwrap();
+        let storage = SqliteStorage::new(pool.clone());
+        save(&storage, searchable("preexisting", 1)).await;
+
+        migrator.migrations = full;
+        migrator.run(&pool).await.unwrap();
+
+        assert_eq!(
+            search_names(
+                &storage,
+                &["preexisting"],
+                &SearchFilters::default(),
+                SearchOrder::Relevance
+            )
+            .await,
+            vec!["preexisting"]
+        );
     }
 }

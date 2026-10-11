@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::Result;
 
-use super::{Document, Metadata};
+use super::{Document, Metadata, SearchFilters, SearchOrder};
 
 /// Caches documents, unencrypted, locally. Implementations are injected
 /// into [`super::service::DocumentsClient`] (to cache what it uploads) and
@@ -24,6 +24,20 @@ pub(crate) trait Storage: Send + Sync {
     /// Lists documents previously saved locally by [`Self::save_document`],
     /// ordered oldest first, skipping `offset` and returning at most `limit`.
     async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>>;
+
+    /// Lists documents previously saved locally by [`Self::save_document`]
+    /// that match every one of `terms` (each as a case- and
+    /// accent-insensitive prefix of a word in any searchable field — all of
+    /// them when `terms` is empty) and every one of `filters`, in `order`,
+    /// skipping `offset` and returning at most `limit`.
+    async fn search_documents(
+        &self,
+        terms: &[String],
+        filters: &SearchFilters,
+        order: SearchOrder,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Document>>;
 
     /// Replaces the metadata of the document `id`, leaving its content
     /// untouched. Does nothing if no document with `id` was previously

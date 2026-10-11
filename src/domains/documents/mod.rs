@@ -9,7 +9,8 @@ mod storage_sqlite;
 pub(crate) use crate::domains::changelog::FakeChangelogEvent;
 pub use crate::domains::changelog::{ChangelogEvent, EventType};
 pub use models::{
-    Document, Metadata, Purpose, SourceCategory, SourceSubCategory, UploadRequest, UploadSource,
+    Document, Metadata, Purpose, SearchFilters, SearchOrder, SearchQuery, SourceCategory,
+    SourceSubCategory, UploadRequest, UploadSource,
 };
 #[cfg(test)]
 pub(crate) use models::{FakeDocument, FakeMetadata};
@@ -60,6 +61,17 @@ pub trait Service: Send + Sync {
     /// Paginate by repeatedly incrementing `offset` by the returned page's
     /// length until it comes back shorter than `limit`.
     async fn list(&self, offset: i64, limit: i64) -> Result<Vec<Document>>;
+
+    /// Searches documents previously cached in local storage for
+    /// `query.text` (see [`SearchQuery::text`] for which fields it's
+    /// matched against and how), keeping only those matching every one of
+    /// `query.filters`, one page at a time in `query.order`. Like
+    /// [`Self::list`], never talks to the server.
+    ///
+    /// Fails with [`crate::ErrorCode::InvalidSearchQuery`] for a negative
+    /// `offset`, a non-positive `limit`, or a `created_from` later than
+    /// `created_until`.
+    async fn search(&self, query: SearchQuery) -> Result<Vec<Document>>;
 
     /// Encrypts `metadata` as given and publishes it as an "update metadata"
     /// changelog event, replacing whatever metadata was previously

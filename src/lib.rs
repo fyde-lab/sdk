@@ -22,7 +22,8 @@ use std::sync::Arc;
 
 pub use domains::documents::parser::{Service as ParserService, init as init_parser};
 pub use domains::documents::{
-    ChangelogEvent, Document, Metadata, Service as DocumentsService, UploadRequest,
+    ChangelogEvent, Document, Metadata, SearchFilters, SearchOrder, SearchQuery,
+    Service as DocumentsService, UploadRequest,
 };
 pub use domains::scrapers::{ProgressEvent, Service as ScrapersService};
 pub use domains::scripts::{

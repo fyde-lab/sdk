@@ -169,6 +169,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "The document's purpose is not recognized.",
             "L'usage du document n'est pas reconnu.",
         ),
+        ErrorCode::InvalidSearchQuery => (
+            "This search isn't valid.",
+            "Cette recherche n'est pas valide.",
+        ),
         ErrorCode::ScriptNotFound => (
             "This add-on couldn't be found.",
             "Cette extension est introuvable.",

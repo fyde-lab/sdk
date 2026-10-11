@@ -9,7 +9,7 @@ use crate::domains::changelog::{ChangelogEvent, EventType, Service as ChangelogS
 
 use super::parser::Service as ParserService;
 use super::storage::Storage;
-use super::{Document, Metadata, Service, UploadRequest, UploadSource};
+use super::{Document, Metadata, SearchQuery, Service, UploadRequest, UploadSource};
 
 /// The default [`Service`] implementation: publishes new documents as
 /// encrypted changelog events via an injected [`ChangelogService`], and
@@ -127,6 +127,44 @@ impl<S: Storage> Service for DocumentsClient<S> {
         self.storage.list_documents(offset, limit).await
     }
 
+    async fn search(&self, query: SearchQuery) -> Result<Vec<Document>> {
+        if query.offset < 0 {
+            return Err(ErrorKind::InvalidSearchQuery(format!(
+                "offset must not be negative, got {}",
+                query.offset
+            ))
+            .into());
+        }
+        if query.limit <= 0 {
+            return Err(ErrorKind::InvalidSearchQuery(format!(
+                "limit must be positive, got {}",
+                query.limit
+            ))
+            .into());
+        }
+        if let (Some(from), Some(until)) = (query.filters.created_from, query.filters.created_until)
+            && from > until
+        {
+            return Err(ErrorKind::InvalidSearchQuery(format!(
+                "created_from ({from}) is later than created_until ({until})"
+            ))
+            .into());
+        }
+
+        let terms = search_terms(&query.text);
+
+        self.storage
+            .search_documents(
+                &terms,
+                &query.filters,
+                query.order,
+                query.offset,
+                query.limit,
+            )
+            .await
+            .context("failed to search local documents")
+    }
+
     async fn run_scripts(&self, document: &Document) -> Result<Metadata> {
         self.parser.run_scripts(document).await
     }
@@ -156,6 +194,17 @@ impl<S: Storage> Service for DocumentsClient<S> {
     fn stop_sync(&self) {
         self.changelog.stop_consume_job();
     }
+}
+
+/// Splits a search's free text into the words that must each match: runs
+/// of letters/digits, everything else (spaces, punctuation, quotes...)
+/// separating them — the same boundaries the index tokenizes documents on,
+/// so "relevé-2024" searches for "relevé" and "2024".
+fn search_terms(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Validates that `name`'s extension is a supported document type; only
@@ -543,6 +592,100 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["two", "three"]
         );
+    }
+
+    #[tokio::test]
+    async fn search_splits_the_text_into_terms_and_forwards_the_query_to_storage() {
+        let filters = super::super::SearchFilters {
+            source_categories: vec![super::super::SourceCategory::Bank],
+            created_from: Some(1),
+            created_until: Some(2),
+            ..Default::default()
+        };
+        let found = vec![super::super::FakeDocument::new().build()];
+
+        let mut storage = MockStorage::new();
+        let expected_filters = filters.clone();
+        let returned = found.clone();
+        storage
+            .expect_search_documents()
+            .withf(move |terms, filters, order, offset, limit| {
+                terms == ["Relevé", "2024", "EDF"]
+                    && *filters == expected_filters
+                    && *order == super::super::SearchOrder::Oldest
+                    && *offset == 10
+                    && *limit == 5
+            })
+            .times(1)
+            .returning(move |_, _, _, _, _| Ok(returned.clone()));
+
+        let client = DocumentsClient::new(
+            storage,
+            Arc::new(RecordingChangelog::default()),
+            no_op_parser(),
+            None,
+        );
+
+        let documents = client
+            .search(SearchQuery {
+                text: "  Relevé-2024 \"EDF\" ".to_string(),
+                filters,
+                order: super::super::SearchOrder::Oldest,
+                offset: 10,
+                limit: 5,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(documents, found);
+    }
+
+    #[tokio::test]
+    async fn search_forwards_no_terms_for_blank_text() {
+        let mut storage = MockStorage::new();
+        storage
+            .expect_search_documents()
+            .withf(|terms, _, _, _, _| terms.is_empty())
+            .times(1)
+            .returning(|_, _, _, _, _| Ok(Vec::new()));
+
+        let client = DocumentsClient::new(
+            storage,
+            Arc::new(RecordingChangelog::default()),
+            no_op_parser(),
+            None,
+        );
+
+        client.search(SearchQuery::new(" - ", 0, 10)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_rejects_invalid_queries_without_querying_storage() {
+        let mut inverted_dates = SearchQuery::new("", 0, 10);
+        inverted_dates.filters.created_from = Some(2);
+        inverted_dates.filters.created_until = Some(1);
+
+        for query in [
+            SearchQuery::new("", -1, 10),
+            SearchQuery::new("", 0, 0),
+            inverted_dates,
+        ] {
+            // No `expect_search_documents()`: storage must never be reached.
+            let client = DocumentsClient::new(
+                MockStorage::new(),
+                Arc::new(RecordingChangelog::default()),
+                no_op_parser(),
+                None,
+            );
+
+            let err = client.search(query.clone()).await.unwrap_err();
+
+            assert_eq!(
+                err.code(),
+                crate::ErrorCode::InvalidSearchQuery,
+                "query {query:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -439,6 +439,73 @@ impl UploadRequest {
     }
 }
 
+/// Restricts a [`super::Service::search`] to documents whose fields match.
+///
+/// Within a single list, a document matches if its field equals *any* of
+/// the listed values; across fields, it must match *every* one that's set.
+/// An empty list, or a `None` bound, leaves that field unconstrained — so
+/// `SearchFilters::default()` matches every document.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchFilters {
+    pub source_categories: Vec<SourceCategory>,
+    pub source_sub_categories: Vec<SourceSubCategory>,
+    pub purposes: Vec<Purpose>,
+    /// Matched exactly against [`Metadata::type`].
+    pub types: Vec<String>,
+    /// Matches a document carrying at least one of these subjects, compared
+    /// exactly.
+    pub subjects: Vec<String>,
+    /// Matched exactly against [`Metadata::content_type`].
+    pub content_types: Vec<String>,
+    /// Inclusive lower bound on [`Metadata::created_at`].
+    pub created_from: Option<i64>,
+    /// Inclusive upper bound on [`Metadata::created_at`].
+    pub created_until: Option<i64>,
+}
+
+/// The order [`super::Service::search`] returns its matches in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SearchOrder {
+    /// Best text match first, newest first among equally good matches.
+    /// With no search text there's nothing to rank by, so this is the same
+    /// as [`Self::Newest`].
+    #[default]
+    Relevance,
+    Newest,
+    Oldest,
+}
+
+/// Parameters for [`super::Service::search`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchQuery {
+    /// Free text matched against a document's name, original name,
+    /// transcript, type, source category/sub-category, subjects and
+    /// purpose. Every word must match one of those fields, as a
+    /// case- and accent-insensitive prefix ("fact" matches "Facturé").
+    /// Blank matches every document, leaving only `filters` to narrow it.
+    pub text: String,
+    pub filters: SearchFilters,
+    pub order: SearchOrder,
+    /// Paginate by repeatedly incrementing this by the returned page's
+    /// length until it comes back shorter than `limit`.
+    pub offset: i64,
+    pub limit: i64,
+}
+
+impl SearchQuery {
+    /// Builds a query for the page `offset..offset + limit` of documents
+    /// matching `text`, unfiltered, ordered by relevance.
+    pub fn new(text: impl Into<String>, offset: i64, limit: i64) -> Self {
+        Self {
+            text: text.into(),
+            filters: SearchFilters::default(),
+            order: SearchOrder::default(),
+            offset,
+            limit,
+        }
+    }
+}
+
 /// Builds a [`Metadata`] filled with random-but-plausible data, overridable
 /// field by field, for use in tests.
 #[cfg(test)]
