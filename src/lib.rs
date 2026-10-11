@@ -19,8 +19,8 @@ pub use domains::documents::{
 };
 pub use domains::scrapers::{ProgressEvent, Service as ScrapersService};
 pub use domains::scripts::{
-    InMemoryScriptStorage, InstallScriptRequest, InstalledScript, Script, ScriptType,
-    Service as ScriptsService,
+    InMemoryScriptStorage, InstallScriptRequest, InstalledScript, Script, ScriptParameter,
+    ScriptParameterType, ScriptType, Service as ScriptsService,
 };
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
