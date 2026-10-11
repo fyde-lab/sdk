@@ -113,6 +113,7 @@ impl Client {
             secrets.clone(),
             sessions.clone(),
             server_state.clone(),
+            changelog_lock_path(&config.storage),
         )
         .await
         .context("failed to initialize changelog service")?;
@@ -245,6 +246,25 @@ async fn open_database(storage: &Storage) -> Result<Arc<SqliteClient>> {
     }
     .context("failed to open local database")?;
     Ok(Arc::new(sqlite))
+}
+
+/// The changelog write lock for the database `storage` selects (see
+/// `ChangelogClient::lock_path`): beside an on-disk database, so every
+/// process opening that file arbitrates over the same lock and no other
+/// process does; unique to the process for an in-memory one, which no
+/// other process can open.
+fn changelog_lock_path(storage: &Storage) -> std::path::PathBuf {
+    match storage {
+        Storage::Disk(path) => {
+            let mut lock = path.clone().into_os_string();
+            lock.push(".consume.lock");
+            lock.into()
+        }
+        Storage::Memory => std::env::temp_dir().join(format!(
+            "fyde-changelog-consume-{}.lock",
+            uuid::Uuid::new_v4()
+        )),
+    }
 }
 
 /// Opens the secrets store matching `storage`. Secrets (master key, session

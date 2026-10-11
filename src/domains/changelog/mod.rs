@@ -115,7 +115,9 @@ pub(crate) trait Service: Send + Sync {
 /// account master key `crypto` derives every event's KEK from, and `sessions` to
 /// attach the session token as a bearer `authorization` header on every
 /// outgoing call once a session is opened (see
-/// [`crate::domains::sessions::Service::authenticated_request`]).
+/// [`crate::domains::sessions::Service::authenticated_request`]), and
+/// `lock_path` to arbitrate, among processes sharing the database `pool`
+/// opens, which one stores what it consumes — unique to that database.
 pub(crate) async fn init(
     channel: Channel,
     pool: SqlitePool,
@@ -123,6 +125,7 @@ pub(crate) async fn init(
     secrets: Arc<dyn SecretsService>,
     sessions: Arc<SessionsClient>,
     server_state: Arc<dyn ServerStateService>,
+    lock_path: std::path::PathBuf,
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool.clone());
     let script_storage = scripts::SqliteStorage::new(pool);
@@ -135,6 +138,7 @@ pub(crate) async fn init(
         sessions,
         server_state,
         secrets,
+        lock_path,
     )
     .await
     .context("failed to create changelog client")?;

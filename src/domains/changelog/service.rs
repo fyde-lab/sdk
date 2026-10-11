@@ -48,18 +48,6 @@ impl ChangelogEvent {
     }
 }
 
-/// Path to the advisory lock file arbitrating write access to the local
-/// document cache across processes consuming the same changelog: only the
-/// process holding this lock is allowed to persist documents/metadata via
-/// [`ChangelogClient::consume_once`] (see [`ChangelogClient::write_lock`]'s
-/// doc comment). Lives in the OS default temporary directory, shared by
-/// every process on the machine, rather than under the per-account SQLite
-/// database, since the lock's purpose is to arbitrate across processes, not
-/// accounts.
-fn write_lock_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("fyde-changelog-consume.lock")
-}
-
 /// A client for the fyde server's changelog service. Generic over the
 /// [`DocumentStorage`] implementation used by [`Service::consume`] to cache
 /// documents materialized from consumed events, the [`ScriptStorage`]
@@ -78,11 +66,15 @@ pub(super) struct ChangelogClient<D: DocumentStorage, S: ScriptStorage, O: Curso
     /// `stop_consume_job()` call is never lost even if it lands before the
     /// task starts watching it or between two of its passes.
     stop: watch::Sender<bool>,
-    /// Path to this client's advisory write lock file — [`write_lock_path`]
-    /// for a real, `pub(super)::new`-constructed client, or a unique
-    /// per-instance path under test (see [`Self::with_grpc`]) so parallel
-    /// tests each arbitrate their own lock rather than contending over one
-    /// shared file.
+    /// Path to this client's advisory write lock file, arbitrating write
+    /// access to one local database between the processes sharing it: only
+    /// the process holding it persists documents, installed scripts and the
+    /// cursor in [`Self::consume_once`]. One per database (see
+    /// `changelog::init`'s `lock_path`), never one per machine — processes
+    /// with separate databases (the app, `fyde-scripts`, a second account's
+    /// app) have nothing to arbitrate, and a shared lock left all but one of
+    /// them read-only, so they never stored what they consumed. Under test,
+    /// a unique per-instance path (see [`Self::with_grpc`]).
     lock_path: std::path::PathBuf,
     /// Holds the open, OS-locked handle to [`Self::lock_path`] for as long
     /// as this process has exclusive write permission over the local
@@ -112,8 +104,10 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
     /// `script_storage` to save the scripts it materializes,
     /// `cursor_storage` to track its progress through the changelog,
     /// `server_state` to wait for the server to be reachable before opening
-    /// a changelog stream, and `secrets` to read the account master key
-    /// [`crypto`] derives every event's KEK from.
+    /// a changelog stream, `secrets` to read the account master key
+    /// [`crypto`] derives every event's KEK from, and `lock_path` as its
+    /// write lock (see [`Self::lock_path`]).
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn new(
         channel: Channel,
         document_storage: D,
@@ -122,6 +116,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
         sessions: Arc<SessionsClient>,
         server_state: Arc<dyn ServerStateService>,
         secrets: Arc<dyn SecretsService>,
+        lock_path: std::path::PathBuf,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(channel, sessions)),
@@ -131,7 +126,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
             server_state,
             secrets,
             stop: watch::Sender::new(false),
-            lock_path: write_lock_path(),
+            lock_path,
             write_lock: Mutex::new(None),
         })
     }
@@ -354,10 +349,17 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
                 }
             }
 
-            self.cursor_storage
-                .save_cursor(event.id)
-                .await
-                .with_context(|| format!("failed to persist changelog cursor {}", event.id))?;
+            // Only alongside what the event stored: a read-only pass that
+            // advanced the cursor would skip, for good, every event it saw
+            // without storing it — e.g. an installation the next run of
+            // that script then can't find. The lock holder (or this
+            // process, once it holds the lock) stores them instead.
+            if self.has_write_permission() {
+                self.cursor_storage
+                    .save_cursor(event.id)
+                    .await
+                    .with_context(|| format!("failed to persist changelog cursor {}", event.id))?;
+            }
 
             callback(event);
         }
@@ -612,7 +614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_still_invokes_the_callback_but_skips_saving_without_the_write_lock() {
+    async fn consume_still_invokes_the_callback_but_saves_nothing_without_the_write_lock() {
         let document_id = Uuid::now_v7();
         let event_id = Uuid::now_v7();
 
@@ -630,11 +632,8 @@ mod tests {
         cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
-        cursor_storage
-            .expect_save_cursor()
-            .withf(move |id| *id == event_id)
-            .times(1)
-            .returning(|_| Ok(()));
+        // No `expect_save_cursor()` either: the cursor only advances
+        // alongside what was stored, so the lock holder still stores it.
 
         let client = ChangelogClient::with_grpc(
             mock_grpc,
@@ -893,13 +892,18 @@ mod tests {
             .boxed())
         });
 
-        // No `expect_save_installed_script()`: the mock panics if it's
-        // called, proving nothing is persisted without the write lock.
+        // No `expect_save_installed_script()` nor `expect_save_cursor()`:
+        // the mocks panic if called, proving neither the installation nor
+        // the cursor past it is persisted without the write lock.
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
         let client = ChangelogClient::with_grpc(
             mock_grpc,
             MockStorage::new(),
             MockScriptStorage::new(),
-            cursor_storage_consuming(event_id),
+            cursor_storage,
             reachable_server_state(),
             fake_secrets(),
         );
@@ -985,6 +989,7 @@ mod tests {
             fake_secrets(),
         );
 
+        client.acquire_write_lock();
         client.consume_once(&mut |_| {}).await.unwrap();
     }
 
@@ -1124,6 +1129,7 @@ mod tests {
             fake_secrets(),
         );
 
+        client.acquire_write_lock();
         client.consume_once(&mut |_| {}).await.unwrap();
     }
 
