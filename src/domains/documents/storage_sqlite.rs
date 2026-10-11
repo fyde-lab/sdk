@@ -5,9 +5,10 @@ use uuid::Uuid;
 
 use crate::{ErrorContext as _, Result};
 
-use super::storage::Storage;
+use super::storage::{FacetField, Storage};
 use super::{
-    Document, Metadata, Purpose, SearchFilters, SearchOrder, SourceCategory, SourceSubCategory,
+    Document, FacetCount, Metadata, Purpose, SearchFilters, SearchOrder, SourceCategory,
+    SourceSubCategory,
 };
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
@@ -156,6 +157,62 @@ fn push_any_of<'a>(
     query.push(")");
 }
 
+/// Appends ` FROM documents d ... WHERE ...` to `query`, selecting (as `d`)
+/// every document that contains every one of `terms` as a token prefix (all
+/// of them when `terms` is empty) and matches every one of `filters`.
+fn push_matching(query: &mut QueryBuilder<Sqlite>, terms: &[String], filters: &SearchFilters) {
+    query.push(" FROM documents d");
+    if terms.is_empty() {
+        query.push(" WHERE 1 = 1");
+    } else {
+        query.push(
+            " JOIN documents_fts_rowid_map m ON m.document_id = d.id
+              JOIN documents_fts ON documents_fts.rowid = m.rowid
+              WHERE documents_fts MATCH ",
+        );
+        query.push_bind(fts_match_expression(terms));
+    }
+
+    push_any_of(
+        query,
+        "d.source_category",
+        filters.source_categories.iter().map(SourceCategory::as_str),
+    );
+    push_any_of(
+        query,
+        "d.source_sub_category",
+        filters
+            .source_sub_categories
+            .iter()
+            .map(SourceSubCategory::as_str),
+    );
+    push_any_of(
+        query,
+        "d.purpose",
+        filters.purposes.iter().map(Purpose::as_str),
+    );
+    push_any_of(query, "d.type", filters.types.iter().map(String::as_str));
+    push_any_of(
+        query,
+        "d.content_type",
+        filters.content_types.iter().map(String::as_str),
+    );
+    if !filters.subjects.is_empty() {
+        query.push(" AND EXISTS (SELECT 1 FROM json_each(d.subjects) WHERE json_each.value IN (");
+        let mut subjects = query.separated(", ");
+        for subject in &filters.subjects {
+            subjects.push_bind(subject.clone());
+        }
+        query.push("))");
+    }
+    if let Some(created_from) = filters.created_from {
+        query.push(" AND d.created_at >= ").push_bind(created_from);
+    }
+    if let Some(created_until) = filters.created_until {
+        query.push(" AND d.created_at <= ").push_bind(created_until);
+    }
+}
+
 #[async_trait]
 impl Storage for SqliteStorage {
     async fn save_document(&self, document: &Document) -> Result<()> {
@@ -247,64 +304,9 @@ impl Storage for SqliteStorage {
         limit: i64,
     ) -> Result<Vec<Document>> {
         let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT d.id, d.name, d.original_name, d.content_type, d.content, d.checksum, d.created_at, d.transcript, d.type, d.source_category, d.source_sub_category, d.subjects, d.purpose FROM documents d",
+            "SELECT d.id, d.name, d.original_name, d.content_type, d.content, d.checksum, d.created_at, d.transcript, d.type, d.source_category, d.source_sub_category, d.subjects, d.purpose",
         );
-
-        if terms.is_empty() {
-            query.push(" WHERE 1 = 1");
-        } else {
-            query.push(
-                " JOIN documents_fts_rowid_map m ON m.document_id = d.id
-                  JOIN documents_fts ON documents_fts.rowid = m.rowid
-                  WHERE documents_fts MATCH ",
-            );
-            query.push_bind(fts_match_expression(terms));
-        }
-
-        push_any_of(
-            &mut query,
-            "d.source_category",
-            filters.source_categories.iter().map(SourceCategory::as_str),
-        );
-        push_any_of(
-            &mut query,
-            "d.source_sub_category",
-            filters
-                .source_sub_categories
-                .iter()
-                .map(SourceSubCategory::as_str),
-        );
-        push_any_of(
-            &mut query,
-            "d.purpose",
-            filters.purposes.iter().map(Purpose::as_str),
-        );
-        push_any_of(
-            &mut query,
-            "d.type",
-            filters.types.iter().map(String::as_str),
-        );
-        push_any_of(
-            &mut query,
-            "d.content_type",
-            filters.content_types.iter().map(String::as_str),
-        );
-        if !filters.subjects.is_empty() {
-            query.push(
-                " AND EXISTS (SELECT 1 FROM json_each(d.subjects) WHERE json_each.value IN (",
-            );
-            let mut subjects = query.separated(", ");
-            for subject in &filters.subjects {
-                subjects.push_bind(subject.clone());
-            }
-            query.push("))");
-        }
-        if let Some(created_from) = filters.created_from {
-            query.push(" AND d.created_at >= ").push_bind(created_from);
-        }
-        if let Some(created_until) = filters.created_until {
-            query.push(" AND d.created_at <= ").push_bind(created_until);
-        }
+        push_matching(&mut query, terms, filters);
 
         query.push(" ORDER BY ");
         match order {
@@ -338,6 +340,75 @@ impl Storage for SqliteStorage {
             .with_context(|| format!("failed to search documents at offset {offset}"))?;
 
         rows.iter().map(document_from_row).collect()
+    }
+
+    async fn count_documents_by(
+        &self,
+        terms: &[String],
+        filters: &SearchFilters,
+        field: FacetField,
+    ) -> Result<Vec<FacetCount<String>>> {
+        let column = match field {
+            FacetField::SourceCategory => "d.source_category",
+            FacetField::SourceSubCategory => "d.source_sub_category",
+            FacetField::Purpose => "d.purpose",
+            FacetField::Type => "d.type",
+            FacetField::ContentType => "d.content_type",
+            FacetField::Subject => "d.subjects",
+        };
+
+        // `''` and `NULL` both mean "unset" here: see the `*_to_column`
+        // helpers above.
+        let mut query = QueryBuilder::<Sqlite>::new("");
+        if field == FacetField::Subject {
+            query.push(format_args!(
+                "SELECT j.value AS value, COUNT(DISTINCT m.id) AS count FROM (SELECT d.id AS id, {column} AS subjects"
+            ));
+            push_matching(&mut query, terms, filters);
+            query.push(") m, json_each(m.subjects) j WHERE j.value != '' GROUP BY j.value");
+        } else {
+            query.push(format_args!(
+                "SELECT value, COUNT(*) AS count FROM (SELECT {column} AS value"
+            ));
+            push_matching(&mut query, terms, filters);
+            query.push(") WHERE value IS NOT NULL AND value != '' GROUP BY value");
+        }
+        query.push(" ORDER BY count DESC, value ASC");
+
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| format!("failed to count documents by {field:?}"))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| FacetCount {
+                value: row.get("value"),
+                count: row.get::<i64, _>("count") as u64,
+            })
+            .collect())
+    }
+
+    async fn created_at_range(
+        &self,
+        terms: &[String],
+        filters: &SearchFilters,
+    ) -> Result<Option<(i64, i64)>> {
+        let mut query = QueryBuilder::<Sqlite>::new(
+            "SELECT MIN(d.created_at) AS earliest, MAX(d.created_at) AS latest",
+        );
+        push_matching(&mut query, terms, filters);
+
+        let row = query
+            .build()
+            .fetch_one(&self.pool)
+            .await
+            .context("failed to find the creation date range of matching documents")?;
+
+        let earliest: Option<i64> = row.get("earliest");
+        let latest: Option<i64> = row.get("latest");
+        Ok(earliest.zip(latest))
     }
 
     async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()> {
@@ -1122,6 +1193,173 @@ mod tests {
             )
             .await,
             vec!["preexisting"]
+        );
+    }
+
+    async fn facet(
+        storage: &SqliteStorage,
+        terms: &[&str],
+        filters: &SearchFilters,
+        field: FacetField,
+    ) -> Vec<(String, u64)> {
+        let terms: Vec<String> = terms.iter().map(|term| term.to_string()).collect();
+        storage
+            .count_documents_by(&terms, filters, field)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|facet| (facet.value, facet.count))
+            .collect()
+    }
+
+    fn counts(expected: &[(&str, u64)]) -> Vec<(String, u64)> {
+        expected
+            .iter()
+            .map(|(value, count)| (value.to_string(), *count))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn count_documents_by_counts_each_value_most_common_first_skipping_unset_ones() {
+        let storage = setup().await;
+        save(
+            &storage,
+            searchable("a", 1)
+                .with_source_category(SourceCategory::Energy)
+                .with_source_sub_category(SourceSubCategory::Tax)
+                .with_purpose(Purpose::Invoice)
+                .with_type("bill"),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("b", 2)
+                .with_source_category(SourceCategory::Bank)
+                .with_purpose(Purpose::Invoice)
+                .with_content_type("image/png"),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("c", 3).with_source_category(SourceCategory::Bank),
+        )
+        .await;
+        save(&storage, searchable("unclassified", 4)).await;
+        let filters = SearchFilters::default();
+
+        assert_eq!(
+            facet(&storage, &[], &filters, FacetField::SourceCategory).await,
+            counts(&[("bank", 2), ("energy", 1)])
+        );
+        assert_eq!(
+            facet(&storage, &[], &filters, FacetField::SourceSubCategory).await,
+            counts(&[("tax", 1)])
+        );
+        assert_eq!(
+            facet(&storage, &[], &filters, FacetField::Purpose).await,
+            counts(&[("invoice", 2)])
+        );
+        assert_eq!(
+            facet(&storage, &[], &filters, FacetField::Type).await,
+            counts(&[("bill", 1)])
+        );
+        assert_eq!(
+            facet(&storage, &[], &filters, FacetField::ContentType).await,
+            counts(&[("application/pdf", 3), ("image/png", 1)])
+        );
+    }
+
+    #[tokio::test]
+    async fn count_documents_by_only_counts_documents_matching_the_terms_and_filters() {
+        let storage = setup().await;
+        save(
+            &storage,
+            searchable("facture edf", 1)
+                .with_source_category(SourceCategory::Energy)
+                .with_purpose(Purpose::Invoice),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("facture orange", 2)
+                .with_source_category(SourceCategory::Telecom)
+                .with_purpose(Purpose::Contract),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("releve", 3)
+                .with_source_category(SourceCategory::Bank)
+                .with_purpose(Purpose::Invoice),
+        )
+        .await;
+
+        assert_eq!(
+            facet(
+                &storage,
+                &["facture"],
+                &SearchFilters {
+                    purposes: vec![Purpose::Invoice],
+                    ..Default::default()
+                },
+                FacetField::SourceCategory,
+            )
+            .await,
+            counts(&[("energy", 1)])
+        );
+    }
+
+    #[tokio::test]
+    async fn count_documents_by_subject_counts_each_document_once_per_subject() {
+        let storage = setup().await;
+        save(
+            &storage,
+            searchable("a", 1).with_subjects(vec![
+                "rent".to_string(),
+                "rent".to_string(),
+                "paris".to_string(),
+            ]),
+        )
+        .await;
+        save(
+            &storage,
+            searchable("b", 2).with_subjects(vec!["rent".to_string(), String::new()]),
+        )
+        .await;
+
+        assert_eq!(
+            facet(
+                &storage,
+                &[],
+                &SearchFilters::default(),
+                FacetField::Subject
+            )
+            .await,
+            counts(&[("rent", 2), ("paris", 1)])
+        );
+    }
+
+    #[tokio::test]
+    async fn created_at_range_spans_the_matching_documents_only() {
+        let storage = setup().await;
+        save(&storage, searchable("old facture", 10)).await;
+        save(&storage, searchable("new facture", 30)).await;
+        save(&storage, searchable("other", 50)).await;
+
+        let terms = vec!["facture".to_string()];
+        assert_eq!(
+            storage
+                .created_at_range(&terms, &SearchFilters::default())
+                .await
+                .unwrap(),
+            Some((10, 30))
+        );
+        assert_eq!(
+            storage
+                .created_at_range(&["nothing".to_string()], &SearchFilters::default())
+                .await
+                .unwrap(),
+            None
         );
     }
 }

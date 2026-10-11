@@ -463,6 +463,40 @@ pub struct SearchFilters {
     pub created_until: Option<i64>,
 }
 
+/// How many documents carry one value of a field, as listed in
+/// [`SearchFacets`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FacetCount<T> {
+    pub value: T,
+    pub count: u64,
+}
+
+/// The filter values still worth offering for a search, as returned by
+/// [`super::Service::search_facets`]: for each field [`SearchFilters`] can
+/// filter on, every value carried by at least one document the search would
+/// match, most common first — so a UI only ever proposes choices that lead
+/// somewhere. Unclassified documents (no category, purpose...) and empty
+/// values are left out.
+///
+/// Each field's values ignore that field's *own* filter (but honor every
+/// other one), so picking a category narrows the sub-categories, purposes...
+/// on offer to that category's, while every category still compatible with
+/// the rest of the search stays available to switch to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchFacets {
+    pub source_categories: Vec<FacetCount<SourceCategory>>,
+    pub source_sub_categories: Vec<FacetCount<SourceSubCategory>>,
+    pub purposes: Vec<FacetCount<Purpose>>,
+    pub types: Vec<FacetCount<String>>,
+    pub content_types: Vec<FacetCount<String>>,
+    pub subjects: Vec<FacetCount<String>>,
+    /// The oldest matching [`Metadata::created_at`], ignoring the
+    /// `created_from`/`created_until` filters; `None` when nothing matches.
+    pub earliest_created_at: Option<i64>,
+    /// The newest matching [`Metadata::created_at`], likewise.
+    pub latest_created_at: Option<i64>,
+}
+
 /// The order [`super::Service::search`] returns its matches in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SearchOrder {
@@ -670,6 +704,100 @@ impl FakeDocument {
     }
 }
 
+/// Builds a [`SearchFacets`] filled with random-but-plausible data,
+/// overridable field by field, for use in tests.
+#[cfg(test)]
+pub(crate) struct FakeSearchFacets {
+    facets: SearchFacets,
+}
+
+#[cfg(test)]
+impl FakeSearchFacets {
+    pub(crate) fn new() -> Self {
+        let count = || 1 + crate::testing::random_u64(20);
+        let word = || FacetCount {
+            value: crate::testing::random_word().to_string(),
+            count: count(),
+        };
+        let earliest = crate::testing::random_past_timestamp();
+        Self {
+            facets: SearchFacets {
+                source_categories: vec![FacetCount {
+                    value: SourceCategory::ALL
+                        [crate::testing::random_u64(SourceCategory::ALL.len() as u64) as usize],
+                    count: count(),
+                }],
+                source_sub_categories: vec![FacetCount {
+                    value: SourceSubCategory::ALL
+                        [crate::testing::random_u64(SourceSubCategory::ALL.len() as u64) as usize],
+                    count: count(),
+                }],
+                purposes: vec![FacetCount {
+                    value: Purpose::ALL
+                        [crate::testing::random_u64(Purpose::ALL.len() as u64) as usize],
+                    count: count(),
+                }],
+                types: vec![word()],
+                content_types: vec![FacetCount {
+                    value: "application/pdf".to_string(),
+                    count: count(),
+                }],
+                subjects: vec![word(), word()],
+                earliest_created_at: Some(earliest),
+                latest_created_at: Some(earliest + crate::testing::random_u64(86_400) as i64),
+            },
+        }
+    }
+
+    pub(crate) fn with_source_categories(
+        mut self,
+        source_categories: Vec<FacetCount<SourceCategory>>,
+    ) -> Self {
+        self.facets.source_categories = source_categories;
+        self
+    }
+
+    pub(crate) fn with_source_sub_categories(
+        mut self,
+        source_sub_categories: Vec<FacetCount<SourceSubCategory>>,
+    ) -> Self {
+        self.facets.source_sub_categories = source_sub_categories;
+        self
+    }
+
+    pub(crate) fn with_purposes(mut self, purposes: Vec<FacetCount<Purpose>>) -> Self {
+        self.facets.purposes = purposes;
+        self
+    }
+
+    pub(crate) fn with_types(mut self, types: Vec<FacetCount<String>>) -> Self {
+        self.facets.types = types;
+        self
+    }
+
+    pub(crate) fn with_content_types(mut self, content_types: Vec<FacetCount<String>>) -> Self {
+        self.facets.content_types = content_types;
+        self
+    }
+
+    pub(crate) fn with_subjects(mut self, subjects: Vec<FacetCount<String>>) -> Self {
+        self.facets.subjects = subjects;
+        self
+    }
+
+    /// Sets both `earliest_created_at` and `latest_created_at` at once,
+    /// since they're only ever both set or both `None`.
+    pub(crate) fn with_created_at_range(mut self, range: Option<(i64, i64)>) -> Self {
+        self.facets.earliest_created_at = range.map(|(earliest, _)| earliest);
+        self.facets.latest_created_at = range.map(|(_, latest)| latest);
+        self
+    }
+
+    pub(crate) fn build(self) -> SearchFacets {
+        self.facets
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +867,57 @@ mod tests {
         assert_eq!(document.id, id);
         assert_eq!(document.content, vec![1, 2, 3]);
         assert_eq!(document.metadata, metadata);
+    }
+
+    #[test]
+    fn fake_search_facets_builds_with_plausible_defaults() {
+        let facets = FakeSearchFacets::new().build();
+
+        assert!(!facets.source_categories.is_empty());
+        assert!(facets.source_categories.iter().all(|facet| facet.count > 0));
+        assert!(facets.earliest_created_at <= facets.latest_created_at);
+    }
+
+    #[test]
+    fn fake_search_facets_with_methods_override_defaults() {
+        let count = |value: &str| FacetCount {
+            value: value.to_string(),
+            count: 1,
+        };
+        let facets = FakeSearchFacets::new()
+            .with_source_categories(vec![FacetCount {
+                value: SourceCategory::Bank,
+                count: 2,
+            }])
+            .with_source_sub_categories(Vec::new())
+            .with_purposes(vec![FacetCount {
+                value: Purpose::Invoice,
+                count: 3,
+            }])
+            .with_types(vec![count("payslip")])
+            .with_content_types(vec![count("application/pdf")])
+            .with_subjects(vec![count("rent")])
+            .with_created_at_range(Some((10, 20)))
+            .build();
+
+        assert_eq!(
+            facets,
+            SearchFacets {
+                source_categories: vec![FacetCount {
+                    value: SourceCategory::Bank,
+                    count: 2
+                }],
+                source_sub_categories: Vec::new(),
+                purposes: vec![FacetCount {
+                    value: Purpose::Invoice,
+                    count: 3
+                }],
+                types: vec![count("payslip")],
+                content_types: vec![count("application/pdf")],
+                subjects: vec![count("rent")],
+                earliest_created_at: Some(10),
+                latest_created_at: Some(20),
+            }
+        );
     }
 }

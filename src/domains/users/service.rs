@@ -425,6 +425,14 @@ mod tests {
             unimplemented!()
         }
 
+        async fn search_facets(
+            &self,
+            _text: &str,
+            _filters: &crate::domains::documents::SearchFilters,
+        ) -> Result<crate::domains::documents::SearchFacets> {
+            unimplemented!()
+        }
+
         async fn update_metadata(
             &self,
             _metadata: crate::domains::documents::Metadata,

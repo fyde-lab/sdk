@@ -13,8 +13,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::domains::documents::{
-    EventType, Metadata, Purpose, SearchFilters, SearchOrder, SearchQuery, SourceCategory,
-    SourceSubCategory, UploadRequest,
+    EventType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters, SearchOrder,
+    SearchQuery, SourceCategory, SourceSubCategory, UploadRequest,
 };
 use crate::domains::scripts::{
     InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptParameterType, ScriptType,
@@ -380,6 +380,97 @@ impl From<FfiSearchOrder> for SearchOrder {
             FfiSearchOrder::Relevance => Self::Relevance,
             FfiSearchOrder::Newest => Self::Newest,
             FfiSearchOrder::Oldest => Self::Oldest,
+        }
+    }
+}
+
+/// How many documents carry one source category, mirroring
+/// `FacetCount<SourceCategory>` (UniFFI has no generic records).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSourceCategoryCount {
+    pub value: FfiSourceCategory,
+    pub count: u64,
+}
+
+/// How many documents carry one source sub-category, mirroring
+/// `FacetCount<SourceSubCategory>`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSourceSubCategoryCount {
+    pub value: FfiSourceSubCategory,
+    pub count: u64,
+}
+
+/// How many documents carry one purpose, mirroring `FacetCount<Purpose>`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiPurposeCount {
+    pub value: FfiPurpose,
+    pub count: u64,
+}
+
+/// How many documents carry one free-form value (a type, content type or
+/// subject), mirroring `FacetCount<String>`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiStringCount {
+    pub value: String,
+    pub count: u64,
+}
+
+/// The filter values still worth offering for a search, mirroring
+/// [`SearchFacets`] across the FFI boundary.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiSearchFacets {
+    pub source_categories: Vec<FfiSourceCategoryCount>,
+    pub source_sub_categories: Vec<FfiSourceSubCategoryCount>,
+    pub purposes: Vec<FfiPurposeCount>,
+    pub types: Vec<FfiStringCount>,
+    pub content_types: Vec<FfiStringCount>,
+    pub subjects: Vec<FfiStringCount>,
+    pub earliest_created_at: Option<i64>,
+    pub latest_created_at: Option<i64>,
+}
+
+impl From<SearchFacets> for FfiSearchFacets {
+    fn from(facets: SearchFacets) -> Self {
+        fn strings(counts: Vec<FacetCount<String>>) -> Vec<FfiStringCount> {
+            counts
+                .into_iter()
+                .map(|facet| FfiStringCount {
+                    value: facet.value,
+                    count: facet.count,
+                })
+                .collect()
+        }
+
+        Self {
+            source_categories: facets
+                .source_categories
+                .into_iter()
+                .map(|facet| FfiSourceCategoryCount {
+                    value: facet.value.into(),
+                    count: facet.count,
+                })
+                .collect(),
+            source_sub_categories: facets
+                .source_sub_categories
+                .into_iter()
+                .map(|facet| FfiSourceSubCategoryCount {
+                    value: facet.value.into(),
+                    count: facet.count,
+                })
+                .collect(),
+            purposes: facets
+                .purposes
+                .into_iter()
+                .map(|facet| FfiPurposeCount {
+                    value: facet.value.into(),
+                    count: facet.count,
+                })
+                .collect(),
+            types: strings(facets.types),
+            content_types: strings(facets.content_types),
+            subjects: strings(facets.subjects),
+            earliest_created_at: facets.earliest_created_at,
+            latest_created_at: facets.latest_created_at,
         }
     }
 }
@@ -920,6 +1011,25 @@ impl FydeClient {
                 })
                 .await?;
             Ok(documents.into_iter().map(FfiDocument::from).collect())
+        })
+        .await
+    }
+
+    /// Lists the filter values still worth offering for a search of `text`
+    /// narrowed by `filters` — each field's values ignoring that field's own
+    /// filter. Mirrors [`crate::DocumentsService::search_facets`].
+    pub async fn search_document_facets(
+        &self,
+        text: String,
+        filters: FfiSearchFilters,
+    ) -> Result<FfiSearchFacets, FfiError> {
+        self.localized(async {
+            let facets = self
+                .inner
+                .documents()
+                .search_facets(&text, &filters.into())
+                .await?;
+            Ok(facets.into())
         })
         .await
     }

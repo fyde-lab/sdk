@@ -9,11 +9,11 @@ mod storage_sqlite;
 pub(crate) use crate::domains::changelog::FakeChangelogEvent;
 pub use crate::domains::changelog::{ChangelogEvent, EventType};
 pub use models::{
-    Document, Metadata, Purpose, SearchFilters, SearchOrder, SearchQuery, SourceCategory,
-    SourceSubCategory, UploadRequest, UploadSource,
+    Document, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters, SearchOrder, SearchQuery,
+    SourceCategory, SourceSubCategory, UploadRequest, UploadSource,
 };
 #[cfg(test)]
-pub(crate) use models::{FakeDocument, FakeMetadata};
+pub(crate) use models::{FakeDocument, FakeMetadata, FakeSearchFacets};
 #[cfg(test)]
 pub(crate) use storage::MockStorage;
 pub(crate) use storage::Storage;
@@ -72,6 +72,17 @@ pub trait Service: Send + Sync {
     /// `offset`, a non-positive `limit`, or a `created_from` later than
     /// `created_until`.
     async fn search(&self, query: SearchQuery) -> Result<Vec<Document>>;
+
+    /// Lists, for every field [`SearchFilters`] can filter on, the values
+    /// still worth offering for a search of `text` narrowed by `filters`
+    /// (see [`SearchFacets`]): each field's values come from the documents
+    /// [`Self::search`] would match with every filter *but that field's
+    /// own*, so a UI can propose only the choices — and sub-choices, once a
+    /// parent filter is picked — that actually lead to documents.
+    ///
+    /// Fails with [`crate::ErrorCode::InvalidSearchQuery`] for a
+    /// `created_from` later than `created_until`.
+    async fn search_facets(&self, text: &str, filters: &SearchFilters) -> Result<SearchFacets>;
 
     /// Encrypts `metadata` as given and publishes it as an "update metadata"
     /// changelog event, replacing whatever metadata was previously

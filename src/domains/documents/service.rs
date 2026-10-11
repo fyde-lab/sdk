@@ -8,8 +8,11 @@ use crate::{ErrorContext as _, ErrorKind, Result};
 use crate::domains::changelog::{ChangelogEvent, EventType, Service as ChangelogService};
 
 use super::parser::Service as ParserService;
-use super::storage::Storage;
-use super::{Document, Metadata, SearchQuery, Service, UploadRequest, UploadSource};
+use super::storage::{FacetField, Storage};
+use super::{
+    Document, FacetCount, Metadata, SearchFacets, SearchFilters, SearchQuery, Service,
+    UploadRequest, UploadSource,
+};
 
 /// The default [`Service`] implementation: publishes new documents as
 /// encrypted changelog events via an injected [`ChangelogService`], and
@@ -42,6 +45,32 @@ impl<S: Storage> DocumentsClient<S> {
             parser,
             on_document_change,
         }
+    }
+}
+
+impl<S: Storage> DocumentsClient<S> {
+    /// Counts the documents matching `terms` and `filters` — minus
+    /// `field`'s own filter — per value of `field`.
+    async fn count_documents_by(
+        &self,
+        terms: &[String],
+        filters: &SearchFilters,
+        field: FacetField,
+    ) -> Result<Vec<FacetCount<String>>> {
+        let mut filters = filters.clone();
+        match field {
+            FacetField::SourceCategory => filters.source_categories.clear(),
+            FacetField::SourceSubCategory => filters.source_sub_categories.clear(),
+            FacetField::Purpose => filters.purposes.clear(),
+            FacetField::Type => filters.types.clear(),
+            FacetField::ContentType => filters.content_types.clear(),
+            FacetField::Subject => filters.subjects.clear(),
+        }
+
+        self.storage
+            .count_documents_by(terms, &filters, field)
+            .await
+            .with_context(|| format!("failed to count matching documents by {field:?}"))
     }
 }
 
@@ -146,14 +175,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
             ))
             .into());
         }
-        if let (Some(from), Some(until)) = (query.filters.created_from, query.filters.created_until)
-            && from > until
-        {
-            return Err(ErrorKind::InvalidSearchQuery(format!(
-                "created_from ({from}) is later than created_until ({until})"
-            ))
-            .into());
-        }
+        check_created_range(&query.filters)?;
 
         let terms = search_terms(&query.text);
 
@@ -167,6 +189,55 @@ impl<S: Storage> Service for DocumentsClient<S> {
             )
             .await
             .context("failed to search local documents")
+    }
+
+    async fn search_facets(&self, text: &str, filters: &SearchFilters) -> Result<SearchFacets> {
+        check_created_range(filters)?;
+
+        let terms = search_terms(text);
+
+        // Each field is counted with its own filter lifted, so the values on
+        // offer for it are every alternative compatible with the *rest* of
+        // the search, not only the one(s) already picked — while every other
+        // field narrows to what's left under the picked ones.
+        let source_categories = self
+            .count_documents_by(&terms, filters, FacetField::SourceCategory)
+            .await?;
+        let source_sub_categories = self
+            .count_documents_by(&terms, filters, FacetField::SourceSubCategory)
+            .await?;
+        let purposes = self
+            .count_documents_by(&terms, filters, FacetField::Purpose)
+            .await?;
+        let created_at_range = self
+            .storage
+            .created_at_range(
+                &terms,
+                &SearchFilters {
+                    created_from: None,
+                    created_until: None,
+                    ..filters.clone()
+                },
+            )
+            .await
+            .context("failed to find the creation date range of matching documents")?;
+
+        Ok(SearchFacets {
+            source_categories: parse_facet(source_categories, "source category")?,
+            source_sub_categories: parse_facet(source_sub_categories, "source sub-category")?,
+            purposes: parse_facet(purposes, "purpose")?,
+            types: self
+                .count_documents_by(&terms, filters, FacetField::Type)
+                .await?,
+            content_types: self
+                .count_documents_by(&terms, filters, FacetField::ContentType)
+                .await?,
+            subjects: self
+                .count_documents_by(&terms, filters, FacetField::Subject)
+                .await?,
+            earliest_created_at: created_at_range.map(|(earliest, _)| earliest),
+            latest_created_at: created_at_range.map(|(_, latest)| latest),
+        })
     }
 
     async fn run_scripts(&self, document: &Document) -> Result<Metadata> {
@@ -198,6 +269,40 @@ impl<S: Storage> Service for DocumentsClient<S> {
     fn stop_sync(&self) {
         self.changelog.stop_consume_job();
     }
+}
+
+/// Rejects a `created_from` later than `created_until`, a range no
+/// document can fall in.
+fn check_created_range(filters: &SearchFilters) -> Result<()> {
+    if let (Some(from), Some(until)) = (filters.created_from, filters.created_until)
+        && from > until
+    {
+        return Err(ErrorKind::InvalidSearchQuery(format!(
+            "created_from ({from}) is later than created_until ({until})"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Parses the canonical string form [`Storage::count_documents_by`] returns
+/// each value of a classification field in (e.g. `"real_estate"`) back into
+/// its enum, `field` naming it in the error.
+fn parse_facet<T: std::str::FromStr<Err = crate::Error>>(
+    counts: Vec<FacetCount<String>>,
+    field: &str,
+) -> Result<Vec<FacetCount<T>>> {
+    counts
+        .into_iter()
+        .map(|facet| {
+            Ok(FacetCount {
+                value: facet.value.parse().with_context(|| {
+                    format!("invalid {field} {:?} in local database", facet.value)
+                })?,
+                count: facet.count,
+            })
+        })
+        .collect()
 }
 
 /// Splits a search's free text into the words that must each match: runs
@@ -690,6 +795,181 @@ mod tests {
                 "query {query:?}"
             );
         }
+    }
+
+    /// `filters` minus `field`'s own filter: what the service must pass to
+    /// storage when counting `field`.
+    fn without_own_filter(
+        filters: &super::super::SearchFilters,
+        field: FacetField,
+    ) -> super::super::SearchFilters {
+        let mut filters = filters.clone();
+        match field {
+            FacetField::SourceCategory => filters.source_categories.clear(),
+            FacetField::SourceSubCategory => filters.source_sub_categories.clear(),
+            FacetField::Purpose => filters.purposes.clear(),
+            FacetField::Type => filters.types.clear(),
+            FacetField::ContentType => filters.content_types.clear(),
+            FacetField::Subject => filters.subjects.clear(),
+        }
+        filters
+    }
+
+    #[tokio::test]
+    async fn search_facets_counts_each_field_without_its_own_filter_but_with_every_other() {
+        use super::super::{Purpose, SearchFilters, SourceCategory, SourceSubCategory};
+
+        let filters = SearchFilters {
+            source_categories: vec![SourceCategory::Bank],
+            source_sub_categories: vec![SourceSubCategory::Tax],
+            purposes: vec![Purpose::Invoice],
+            types: vec!["statement".to_string()],
+            subjects: vec!["rent".to_string()],
+            content_types: vec!["application/pdf".to_string()],
+            created_from: Some(1),
+            created_until: Some(2),
+        };
+        let expected = super::super::FakeSearchFacets::new()
+            .with_created_at_range(Some((10, 20)))
+            .build();
+        let as_strings = |values: Vec<String>, counts: Vec<u64>| -> Vec<FacetCount<String>> {
+            values
+                .into_iter()
+                .zip(counts)
+                .map(|(value, count)| FacetCount { value, count })
+                .collect()
+        };
+        let per_field = [
+            (
+                FacetField::SourceCategory,
+                as_strings(
+                    expected
+                        .source_categories
+                        .iter()
+                        .map(|f| f.value.as_str().to_string())
+                        .collect(),
+                    expected.source_categories.iter().map(|f| f.count).collect(),
+                ),
+            ),
+            (
+                FacetField::SourceSubCategory,
+                as_strings(
+                    expected
+                        .source_sub_categories
+                        .iter()
+                        .map(|f| f.value.as_str().to_string())
+                        .collect(),
+                    expected
+                        .source_sub_categories
+                        .iter()
+                        .map(|f| f.count)
+                        .collect(),
+                ),
+            ),
+            (
+                FacetField::Purpose,
+                as_strings(
+                    expected
+                        .purposes
+                        .iter()
+                        .map(|f| f.value.as_str().to_string())
+                        .collect(),
+                    expected.purposes.iter().map(|f| f.count).collect(),
+                ),
+            ),
+            (FacetField::Type, expected.types.clone()),
+            (FacetField::ContentType, expected.content_types.clone()),
+            (FacetField::Subject, expected.subjects.clone()),
+        ];
+
+        let mut storage = MockStorage::new();
+        for (field, returned) in per_field {
+            let expected_filters = without_own_filter(&filters, field);
+            storage
+                .expect_count_documents_by()
+                .withf(move |terms, filters, queried_field| {
+                    terms == ["facture"] && *filters == expected_filters && *queried_field == field
+                })
+                .times(1)
+                .returning(move |_, _, _| Ok(returned.clone()));
+        }
+        let date_filters = SearchFilters {
+            created_from: None,
+            created_until: None,
+            ..filters.clone()
+        };
+        storage
+            .expect_created_at_range()
+            .withf(move |terms, filters| terms == ["facture"] && *filters == date_filters)
+            .times(1)
+            .returning(|_, _| Ok(Some((10, 20))));
+
+        let client = DocumentsClient::new(
+            storage,
+            Arc::new(RecordingChangelog::default()),
+            no_op_parser(),
+            None,
+        );
+
+        let facets = client.search_facets(" facture ", &filters).await.unwrap();
+
+        assert_eq!(facets, expected);
+    }
+
+    #[tokio::test]
+    async fn search_facets_fails_on_an_unknown_classification_value() {
+        let mut storage = MockStorage::new();
+        storage
+            .expect_count_documents_by()
+            .returning(|_, _, field| {
+                Ok(if field == FacetField::SourceCategory {
+                    vec![FacetCount {
+                        value: "not-a-category".to_string(),
+                        count: 1,
+                    }]
+                } else {
+                    Vec::new()
+                })
+            });
+        storage.expect_created_at_range().returning(|_, _| Ok(None));
+
+        let client = DocumentsClient::new(
+            storage,
+            Arc::new(RecordingChangelog::default()),
+            no_op_parser(),
+            None,
+        );
+
+        let err = client
+            .search_facets("", &super::super::SearchFilters::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::InvalidSourceCategory);
+    }
+
+    #[tokio::test]
+    async fn search_facets_rejects_an_inverted_date_range_without_querying_storage() {
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            Arc::new(RecordingChangelog::default()),
+            no_op_parser(),
+            None,
+        );
+
+        let err = client
+            .search_facets(
+                "",
+                &super::super::SearchFilters {
+                    created_from: Some(2),
+                    created_until: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::InvalidSearchQuery);
     }
 
     #[tokio::test]

@@ -5,7 +5,18 @@ use uuid::Uuid;
 
 use crate::Result;
 
-use super::{Document, Metadata, SearchFilters, SearchOrder};
+use super::{Document, FacetCount, Metadata, SearchFilters, SearchOrder};
+
+/// A document field [`Storage::count_documents_by`] can count values of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FacetField {
+    SourceCategory,
+    SourceSubCategory,
+    Purpose,
+    Type,
+    ContentType,
+    Subject,
+}
 
 /// Caches documents, unencrypted, locally. Implementations are injected
 /// into [`super::service::DocumentsClient`] (to cache what it uploads) and
@@ -38,6 +49,28 @@ pub(crate) trait Storage: Send + Sync {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<Document>>;
+
+    /// Counts, per distinct non-empty value of `field`, how many documents
+    /// [`Self::search_documents`] would match for `terms` and `filters`,
+    /// most common first (ties by value). Each value is that field's
+    /// canonical string form (e.g. [`super::SourceCategory::as_str`]); for
+    /// [`FacetField::Subject`], each subject a matching document carries,
+    /// counted once per document.
+    async fn count_documents_by(
+        &self,
+        terms: &[String],
+        filters: &SearchFilters,
+        field: FacetField,
+    ) -> Result<Vec<FacetCount<String>>>;
+
+    /// The oldest and newest `created_at` among the documents
+    /// [`Self::search_documents`] would match for `terms` and `filters`, or
+    /// `None` if it would match none.
+    async fn created_at_range(
+        &self,
+        terms: &[String],
+        filters: &SearchFilters,
+    ) -> Result<Option<(i64, i64)>>;
 
     /// Replaces the metadata of the document `id`, leaving its content
     /// untouched. Does nothing if no document with `id` was previously
