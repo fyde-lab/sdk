@@ -48,6 +48,10 @@ macro_rules! for_each_error_code {
             Encryption = 1101,
             /// The OS credential store (Keychain, Secret Service, ...) failed.
             CredentialStore = 1102,
+            /// No OS credential store is usable on this device, and the
+            /// account's secrets weren't allowed to fall back to the local
+            /// database (see `UsersService::create`'s `allow_insecure_storage`).
+            SecureStorageUnavailable = 1103,
             /// The configured server URL is malformed.
             InvalidServerUrl = 2001,
             /// No connection could be established with the server.
@@ -230,6 +234,8 @@ pub(crate) enum ErrorKind {
     AlreadyLoggedIn,
     #[error("credential store error: {0}")]
     Keystore(#[from] keyring_core::Error),
+    #[error("no OS credential store is available on this device")]
+    SecureStorageUnavailable,
     #[error("messagepack encode error: {0}")]
     MessagePackEncode(#[from] rmp_serde::encode::Error),
     #[error("messagepack decode error: {0}")]
@@ -271,6 +277,7 @@ impl ErrorKind {
             ErrorKind::InvalidCredentials => ErrorCode::InvalidCredentials,
             ErrorKind::AlreadyLoggedIn => ErrorCode::AlreadyLoggedIn,
             ErrorKind::Keystore(_) => ErrorCode::CredentialStore,
+            ErrorKind::SecureStorageUnavailable => ErrorCode::SecureStorageUnavailable,
             ErrorKind::MessagePackEncode(_) => ErrorCode::MessagePackEncode,
             ErrorKind::MessagePackDecode(_) => ErrorCode::MessagePackDecode,
             ErrorKind::TaskJoin(_) => ErrorCode::TaskFailed,

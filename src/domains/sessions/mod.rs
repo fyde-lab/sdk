@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use mockall::automock;
 
 use crate::Result;
-use crate::domains::secrets::Service as SecretsService;
+use crate::domains::secrets::{SecretLocation, Service as SecretsService};
 
 pub(crate) use service::SessionsClient;
 
@@ -30,11 +30,12 @@ pub(crate) trait Service: Send + Sync {
         message: T,
     ) -> Result<tonic::Request<T>>;
 
-    /// Persists `token` as the session token attached to subsequent
-    /// outgoing calls by [`Service::authenticated_request`]. Called by
-    /// `users::Service::create`/`login` once the server has opened a new
-    /// session, overwriting whatever token (if any) was persisted before.
-    async fn save_new_session(&self, token: &str) -> Result<()>;
+    /// Persists `token` at `location` as the session token attached to
+    /// subsequent outgoing calls by [`Service::authenticated_request`].
+    /// Called by `users::Service::create`/`login` once the server has opened
+    /// a new session, overwriting whatever token (if any) was persisted
+    /// before.
+    async fn save_new_session(&self, token: &str, location: SecretLocation) -> Result<()>;
 
     /// Returns whether a session token is currently persisted (i.e. a
     /// [`Service::save_new_session`] call happened since

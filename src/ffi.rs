@@ -19,6 +19,7 @@ use crate::domains::documents::{
 use crate::domains::scripts::{
     InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptParameterType, ScriptType,
 };
+use crate::domains::secrets::SecretLocation;
 use crate::domains::sessions::Service as SessionsService;
 use crate::domains::users::system_language;
 use crate::{
@@ -886,20 +887,32 @@ impl FydeClient {
     }
 
     /// Creates a new account and opens a session for the device named
-    /// `device_name`, returning its session token. Mirrors
-    /// [`crate::UsersService::create`].
+    /// `device_name`, returning its session token. `allow_insecure_storage`
+    /// lets the account's secrets fall back to the local database on a
+    /// device without secure storage (see `is_secure_storage_available`).
+    /// Mirrors [`crate::UsersService::create`].
     pub async fn create_user(
         &self,
         username: String,
         password: String,
         device_name: String,
+        allow_insecure_storage: bool,
     ) -> Result<String, FfiError> {
-        self.localized(
-            self.inner
-                .users()
-                .create(&username, &password, &device_name),
-        )
+        self.localized(self.inner.users().create(
+            &username,
+            &password,
+            &device_name,
+            allow_insecure_storage,
+        ))
         .await
+    }
+
+    /// Returns whether this device has a usable OS credential store for the
+    /// account's secrets; when it doesn't, `create_user` needs
+    /// `allow_insecure_storage`. Mirrors
+    /// [`crate::UsersService::is_secure_storage_available`].
+    pub async fn is_secure_storage_available(&self) -> bool {
+        self.inner.users().is_secure_storage_available().await
     }
 
     /// Verifies `username`/`password` and opens a session for the device
@@ -928,8 +941,12 @@ impl FydeClient {
     /// kept in secure storage across app restarts) without a network round
     /// trip. Mirrors `sessions::Service::save_new_session`.
     pub async fn save_new_session(&self, token: String) -> Result<(), FfiError> {
-        self.localized(self.inner.sessions().save_new_session(&token))
-            .await
+        self.localized(
+            self.inner
+                .sessions()
+                .save_new_session(&token, SecretLocation::SecureStorage),
+        )
+        .await
     }
 
     /// Returns whether a session token is currently persisted, i.e. a

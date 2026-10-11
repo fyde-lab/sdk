@@ -107,7 +107,15 @@ pub trait Service: Send + Sync {
     /// Also generates a random master key, encrypts it under a key derived
     /// from the OPAQUE export key produced by that exchange (never
     /// `password` directly), and persists the raw key in the OS credential
-    /// store (see [`crate::domains::secrets::MASTER_KEY_SECRET`]). The server's response carries only the new session's
+    /// store (see [`crate::domains::secrets::MASTER_KEY_SECRET`]). On a
+    /// device with no usable credential store (see
+    /// [`Service::is_secure_storage_available`]), the raw master key and the
+    /// session token are kept in plaintext in the local database instead if
+    /// `allow_insecure_storage` is set — the user must have explicitly
+    /// accepted that — and this fails with
+    /// [`crate::ErrorCode::SecureStorageUnavailable`], before contacting the
+    /// server, if it isn't; the flag is ignored whenever a credential store
+    /// is usable. The server's response carries only the new session's
     /// token (see `../api-protos/users.proto`), so there is no user payload
     /// to return here. Fails with [`crate::ErrorCode::AlreadyExists`]
     /// if the username is already taken, and with
@@ -115,7 +123,13 @@ pub trait Service: Send + Sync {
     /// session is already open on this device. Once the session and master
     /// key are persisted, starts changelog consumption via
     /// [`DocumentsService::start_sync`].
-    async fn create(&self, username: &str, password: &str, device_name: &str) -> Result<String>;
+    async fn create(
+        &self,
+        username: &str,
+        password: &str,
+        device_name: &str,
+        allow_insecure_storage: bool,
+    ) -> Result<String>;
 
     /// Verifies `username`/`password` and opens a session for the device
     /// named `device_name`, returning its session token, via a two-step
@@ -125,9 +139,14 @@ pub trait Service: Send + Sync {
     /// case; failure detected by the server instead surfaces the usual way,
     /// as [`crate::ErrorCode::Unauthenticated`]. Fails with
     /// [`crate::ErrorCode::AlreadyLoggedIn`] — before contacting the server — if a
-    /// session is already open on this device. Once the session and master
-    /// key are persisted, starts changelog consumption via
-    /// [`DocumentsService::start_sync`].
+    /// session is already open on this device, and with
+    /// [`crate::ErrorCode::SecureStorageUnavailable`] (also before contacting
+    /// the server) if this device has no usable OS credential store to
+    /// persist the session in. Once the session and master key are
+    /// persisted, starts changelog consumption via
+    /// [`DocumentsService::start_sync`]. A session restored on a later
+    /// start reads its secrets from the credential store first, then from
+    /// the local database `create` may have put them in.
     async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String>;
 
     /// Closes the session opened by the most recent `create`/`login` call
@@ -167,6 +186,13 @@ pub trait Service: Send + Sync {
         old_password: &str,
         new_password: &str,
     ) -> Result<()>;
+
+    /// Returns whether this device has a usable OS credential store
+    /// (Keychain, Secret Service, ...) to keep the account's secrets in —
+    /// when it doesn't, `create` needs `allow_insecure_storage` to keep them
+    /// in the local database instead, which a UI should ask the user to
+    /// accept explicitly. Never fails: an unreachable store reports `false`.
+    async fn is_secure_storage_available(&self) -> bool;
 
     /// Persists `language` (a short code, e.g. "en", "fr") as this device's
     /// UI language preference, read back by [`Service::get_language`].

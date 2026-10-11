@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tonic::transport::Channel;
 
 use crate::domains::documents::Service as DocumentsService;
-use crate::domains::secrets::{MASTER_KEY_SECRET, Service as SecretsService};
+use crate::domains::secrets::{MASTER_KEY_SECRET, SecretLocation, Service as SecretsService};
 use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
 use crate::tools::sql::LocalDatabase;
@@ -123,14 +123,43 @@ impl UsersClient {
         Ok(())
     }
 
-    /// Persists everything a freshly opened session needs locally, then
-    /// starts changelog consumption. The session token goes last: it's what
-    /// `is_connected` (and so `Client::init` on the next start) keys off, so
-    /// a failure partway through never leaves a session that looks open but
-    /// has no master key to decrypt anything with.
-    async fn open_session(&self, token: &str, raw_master_key: &[u8], role: Role) -> Result<()> {
+    /// Picks where `create`/`login` persist the new session's secrets: the
+    /// OS credential store whenever it's usable, otherwise the local
+    /// database only if `allow_insecure_storage` — i.e. the user explicitly
+    /// accepted it — and [`crate::ErrorCode::SecureStorageUnavailable`]
+    /// otherwise. Checked before contacting the server, so a refusal never
+    /// leaves an account or session behind on it.
+    async fn secret_location(&self, allow_insecure_storage: bool) -> Result<SecretLocation> {
+        if self.secrets.is_secure_storage_available().await {
+            return Ok(SecretLocation::SecureStorage);
+        }
+        if !allow_insecure_storage {
+            return Err(ErrorKind::SecureStorageUnavailable.into());
+        }
+        tracing::warn!(
+            "no OS credential store available, keeping the account's secrets in the local database"
+        );
+        Ok(SecretLocation::Database)
+    }
+
+    /// Persists everything a freshly opened session needs locally, at
+    /// `location`, then starts changelog consumption. The session token goes
+    /// last: it's what `is_connected` (and so `Client::init` on the next
+    /// start) keys off, so a failure partway through never leaves a session
+    /// that looks open but has no master key to decrypt anything with.
+    async fn open_session(
+        &self,
+        token: &str,
+        raw_master_key: &[u8],
+        role: Role,
+        location: SecretLocation,
+    ) -> Result<()> {
         self.secrets
-            .set(MASTER_KEY_SECRET, &encode_master_key(raw_master_key)?)
+            .set(
+                MASTER_KEY_SECRET,
+                &encode_master_key(raw_master_key)?,
+                location,
+            )
             .await
             .context("failed to persist master key")?;
 
@@ -139,7 +168,7 @@ impl UsersClient {
             .await
             .context("failed to persist role")?;
 
-        self.sessions.save_new_session(token).await?;
+        self.sessions.save_new_session(token, location).await?;
 
         self.documents
             .start_sync()
@@ -150,8 +179,15 @@ impl UsersClient {
 
 #[async_trait]
 impl Service for UsersClient {
-    async fn create(&self, username: &str, password: &str, device_name: &str) -> Result<String> {
+    async fn create(
+        &self,
+        username: &str,
+        password: &str,
+        device_name: &str,
+        allow_insecure_storage: bool,
+    ) -> Result<String> {
         self.ensure_no_open_session().await?;
+        let location = self.secret_location(allow_insecure_storage).await?;
 
         let (state, opaque_request) = self
             .opaque
@@ -184,13 +220,15 @@ impl Service for UsersClient {
             .await
             .context("failed to finish registration")?;
 
-        self.open_session(&token, &raw_master_key, role).await?;
+        self.open_session(&token, &raw_master_key, role, location)
+            .await?;
 
         Ok(token)
     }
 
     async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String> {
         self.ensure_no_open_session().await?;
+        let location = self.secret_location(false).await?;
 
         let (state, opaque_request) = self
             .opaque
@@ -220,7 +258,8 @@ impl Service for UsersClient {
         let raw_master_key = unwrap_master_key(&export_key, &wrapped_master_key)
             .context("failed to unwrap master key returned by the server")?;
 
-        self.open_session(&token, &raw_master_key, role).await?;
+        self.open_session(&token, &raw_master_key, role, location)
+            .await?;
 
         Ok(token)
     }
@@ -325,6 +364,10 @@ impl Service for UsersClient {
             .context("failed to finish change password")?;
 
         Ok(())
+    }
+
+    async fn is_secure_storage_available(&self) -> bool {
+        self.secrets.is_secure_storage_available().await
     }
 
     async fn set_language(&self, language: &str) -> Result<()> {
@@ -528,20 +571,23 @@ mod tests {
         let mut settings = MockSettingsService::new();
         let mut secrets = MockSecretsService::new();
         secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
+        secrets
             .expect_get()
             .withf(|key| key == SESSION_TOKEN_SECRET)
             .times(1)
             .returning(|_| Ok(None));
         secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SECRET)
+            .withf(|key, _, _| key == SESSION_TOKEN_SECRET)
             .times(1)
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SECRET)
+            .withf(|key, _, _| key == MASTER_KEY_SECRET)
             .times(1)
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         settings
             .expect_set()
             .withf(|key, _| key == ROLE_SETTING)
@@ -551,7 +597,12 @@ mod tests {
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         let token = client
-            .create("alice", "correct horse battery staple", "Pierre's iPhone")
+            .create(
+                "alice",
+                "correct horse battery staple",
+                "Pierre's iPhone",
+                false,
+            )
             .await
             .unwrap();
 
@@ -581,20 +632,23 @@ mod tests {
         let mut settings = MockSettingsService::new();
         let mut secrets = MockSecretsService::new();
         secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
+        secrets
             .expect_get()
             .withf(|key| key == SESSION_TOKEN_SECRET)
             .times(1)
             .returning(|_| Ok(None));
         secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SECRET)
-            .returning(|_, _| Ok(()));
+            .withf(|key, _, _| key == SESSION_TOKEN_SECRET)
+            .returning(|_, _, _| Ok(()));
         let set_master_key = persisted_master_key.clone();
         secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SECRET)
+            .withf(|key, _, _| key == MASTER_KEY_SECRET)
             .times(1)
-            .returning(move |_, value| {
+            .returning(move |_, value, _| {
                 *set_master_key.lock().unwrap() = Some(value.to_string());
                 Ok(())
             });
@@ -606,7 +660,7 @@ mod tests {
 
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
         client
-            .create("alice", "correct horse battery staple", "device")
+            .create("alice", "correct horse battery staple", "device", false)
             .await
             .unwrap();
 
@@ -644,21 +698,24 @@ mod tests {
         let mut settings = MockSettingsService::new();
         let mut secrets = MockSecretsService::new();
         secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
+        secrets
             .expect_get()
             .withf(|key| key == SESSION_TOKEN_SECRET)
             .times(1)
             .returning(|_| Ok(None));
         secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SECRET)
+            .withf(|key, _, _| key == SESSION_TOKEN_SECRET)
             .times(1)
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         let set_master_key = persisted_master_key.clone();
         secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SECRET)
+            .withf(|key, _, _| key == MASTER_KEY_SECRET)
             .times(1)
-            .returning(move |_, value| {
+            .returning(move |_, value, _| {
                 *set_master_key.lock().unwrap() = Some(value.to_string());
                 Ok(())
             });
@@ -671,7 +728,12 @@ mod tests {
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         client
-            .create("alice", "correct horse battery staple", "Pierre's iPhone")
+            .create(
+                "alice",
+                "correct horse battery staple",
+                "Pierre's iPhone",
+                false,
+            )
             .await
             .unwrap();
 
@@ -702,6 +764,9 @@ mod tests {
         let mut settings = MockSettingsService::new();
         let mut secrets = MockSecretsService::new();
         secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
+        secrets
             .expect_get()
             .withf(|key| key == SESSION_TOKEN_SECRET)
             .times(1)
@@ -709,17 +774,17 @@ mod tests {
         let set_token = persisted_token.clone();
         secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SECRET)
+            .withf(|key, _, _| key == SESSION_TOKEN_SECRET)
             .times(1)
-            .returning(move |_, value| {
+            .returning(move |_, value, _| {
                 *set_token.lock().unwrap() = Some(value.to_string());
                 Ok(())
             });
         secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SECRET)
+            .withf(|key, _, _| key == MASTER_KEY_SECRET)
             .times(1)
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         settings
             .expect_set()
             .withf(|key, _| key == ROLE_SETTING)
@@ -729,7 +794,12 @@ mod tests {
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         client
-            .create("alice", "correct horse battery staple", "Pierre's iPhone")
+            .create(
+                "alice",
+                "correct horse battery staple",
+                "Pierre's iPhone",
+                false,
+            )
             .await
             .unwrap();
 
@@ -759,20 +829,23 @@ mod tests {
         let mut settings = MockSettingsService::new();
         let mut secrets = MockSecretsService::new();
         secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
+        secrets
             .expect_get()
             .withf(|key| key == SESSION_TOKEN_SECRET)
             .times(1)
             .returning(|_| Ok(None));
         secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SECRET)
+            .withf(|key, _, _| key == SESSION_TOKEN_SECRET)
             .times(1)
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SECRET)
+            .withf(|key, _, _| key == MASTER_KEY_SECRET)
             .times(1)
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         settings
             .expect_set()
             .withf(|key, _| key == ROLE_SETTING)
@@ -805,6 +878,9 @@ mod tests {
         let mut settings = MockSettingsService::new();
         let mut secrets = MockSecretsService::new();
         secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
+        secrets
             .expect_get()
             .withf(|key| key == SESSION_TOKEN_SECRET)
             .times(1)
@@ -812,17 +888,17 @@ mod tests {
         let set_token = persisted_token.clone();
         secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SECRET)
+            .withf(|key, _, _| key == SESSION_TOKEN_SECRET)
             .times(1)
-            .returning(move |_, value| {
+            .returning(move |_, value, _| {
                 *set_token.lock().unwrap() = Some(value.to_string());
                 Ok(())
             });
         secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SECRET)
+            .withf(|key, _, _| key == MASTER_KEY_SECRET)
             .times(1)
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         settings
             .expect_set()
             .withf(|key, _| key == ROLE_SETTING)
@@ -864,20 +940,23 @@ mod tests {
         let mut settings = MockSettingsService::new();
         let mut secrets = MockSecretsService::new();
         secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
+        secrets
             .expect_get()
             .withf(|key| key == SESSION_TOKEN_SECRET)
             .times(1)
             .returning(|_| Ok(None));
         secrets
             .expect_set()
-            .withf(|key, _| key == SESSION_TOKEN_SECRET)
-            .returning(|_, _| Ok(()));
+            .withf(|key, _, _| key == SESSION_TOKEN_SECRET)
+            .returning(|_, _, _| Ok(()));
         let set_master_key = persisted_master_key.clone();
         secrets
             .expect_set()
-            .withf(|key, _| key == MASTER_KEY_SECRET)
+            .withf(|key, _, _| key == MASTER_KEY_SECRET)
             .times(1)
-            .returning(move |_, value| {
+            .returning(move |_, value, _| {
                 *set_master_key.lock().unwrap() = Some(value.to_string());
                 Ok(())
             });
@@ -930,11 +1009,127 @@ mod tests {
         );
 
         let err = client
-            .create("bob", "correct horse battery staple", "device")
+            .create("bob", "correct horse battery staple", "device", false)
             .await
             .unwrap_err();
 
         assert!(matches!(err.kind(), ErrorKind::AlreadyLoggedIn));
+    }
+
+    /// A [`MockSecretsService`] with no session open, on a device whose OS
+    /// credential store is `available` or not.
+    fn secrets_without_session(available: bool) -> MockSecretsService {
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .returning(|_| Ok(None));
+        secrets
+            .expect_is_secure_storage_available()
+            .returning(move || available);
+        secrets
+    }
+
+    #[tokio::test]
+    async fn create_refuses_without_contacting_the_server_when_secure_storage_is_unavailable() {
+        // No `MockOpaqueClient`/`MockFydeClient` expectations set up: either
+        // panics if called, so no account is created server-side for a
+        // session this device couldn't keep.
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            secrets_without_session(false),
+        );
+
+        let err = client
+            .create("alice", "correct horse battery staple", "device", false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err.kind(), ErrorKind::SecureStorageUnavailable));
+    }
+
+    #[tokio::test]
+    async fn create_keeps_secrets_in_the_database_when_allowed_without_secure_storage() {
+        let opaque = opaque_for_create(b"the-request", b"the-upload", b"the-export-key");
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_registration()
+            .returning(|_, _| Ok(b"the-response".to_vec()));
+        mock_grpc
+            .expect_finish_registration()
+            .returning(|_, _, _, _, _| Ok(("a-token".to_string(), Role::User)));
+        let mut settings = MockSettingsService::new();
+        settings.expect_set().returning(|_, _| Ok(()));
+        let mut secrets = secrets_without_session(false);
+        secrets
+            .expect_set()
+            .withf(|key, _, location| {
+                key == MASTER_KEY_SECRET && *location == SecretLocation::Database
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        secrets
+            .expect_set()
+            .withf(|key, value, location| {
+                key == SESSION_TOKEN_SECRET
+                    && value == "a-token"
+                    && *location == SecretLocation::Database
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
+
+        client
+            .create("alice", "correct horse battery staple", "device", true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_keeps_secrets_in_secure_storage_whenever_available() {
+        let opaque = opaque_for_create(b"the-request", b"the-upload", b"the-export-key");
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_registration()
+            .returning(|_, _| Ok(b"the-response".to_vec()));
+        mock_grpc
+            .expect_finish_registration()
+            .returning(|_, _, _, _, _| Ok(("a-token".to_string(), Role::User)));
+        let mut settings = MockSettingsService::new();
+        settings.expect_set().returning(|_, _| Ok(()));
+        let mut secrets = secrets_without_session(true);
+        // Both secrets, despite `allow_insecure_storage`: the flag only
+        // matters on a device without a credential store.
+        secrets
+            .expect_set()
+            .withf(|_, _, location| *location == SecretLocation::SecureStorage)
+            .times(2)
+            .returning(|_, _, _| Ok(()));
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
+
+        client
+            .create("alice", "correct horse battery staple", "device", true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn login_refuses_without_contacting_the_server_when_secure_storage_is_unavailable() {
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            secrets_without_session(false),
+        );
+
+        let err = client
+            .login("alice", "correct horse battery staple", "device")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err.kind(), ErrorKind::SecureStorageUnavailable));
     }
 
     #[tokio::test]
@@ -973,6 +1168,9 @@ mod tests {
         // persists anything — in particular the session token, which would
         // otherwise leave a session that looks open but can't decrypt.
         let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
         secrets
             .expect_get()
             .withf(|key| key == SESSION_TOKEN_SECRET)

@@ -44,7 +44,7 @@ async fn session_lifecycle() {
             let token = scenario
                 .client
                 .users()
-                .create(&username, TEST_PASSWORD, "e2e-session-device")
+                .create(&username, TEST_PASSWORD, "e2e-session-device", false)
                 .await
                 .context("failed to create account")?;
             ensure!(
@@ -62,7 +62,7 @@ async fn session_lifecycle() {
                 let err = scenario
                     .client
                     .users()
-                    .create(&random_username(), TEST_PASSWORD, "another-device")
+                    .create(&random_username(), TEST_PASSWORD, "another-device", false)
                     .await
                     .err()
                     .context("creating an account while logged in should fail")?;
@@ -123,7 +123,7 @@ async fn session_lifecycle() {
             let err = scenario
                 .client
                 .users()
-                .create(&username, TEST_PASSWORD, "another-device")
+                .create(&username, TEST_PASSWORD, "another-device", false)
                 .await
                 .err()
                 .context("re-registering the same username should fail")?;

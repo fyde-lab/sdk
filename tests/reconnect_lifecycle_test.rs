@@ -58,7 +58,7 @@ async fn reconnecting_with_a_persisted_session_resumes_sync_without_logging_in_a
 
         client
             .users()
-            .create(&username, TEST_PASSWORD, "device-one")
+            .create(&username, TEST_PASSWORD, "device-one", false)
             .await
             .context("failed to create account")
             .unwrap();

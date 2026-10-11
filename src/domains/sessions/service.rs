@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::domains::secrets::{SESSION_TOKEN_SECRET, Service as SecretsService};
+use crate::domains::secrets::{SESSION_TOKEN_SECRET, SecretLocation, Service as SecretsService};
 use crate::{ErrorContext as _, ErrorKind, Result};
 
 use super::Service;
@@ -42,9 +42,9 @@ impl Service for SessionsClient {
         Ok(request)
     }
 
-    async fn save_new_session(&self, token: &str) -> Result<()> {
+    async fn save_new_session(&self, token: &str, location: SecretLocation) -> Result<()> {
         self.secrets
-            .set(SESSION_TOKEN_SECRET, token)
+            .set(SESSION_TOKEN_SECRET, token, location)
             .await
             .context("failed to persist session token")
     }
@@ -100,12 +100,19 @@ mod tests {
         let mut secrets = MockSecretsService::new();
         secrets
             .expect_set()
-            .withf(|key, value| key == SESSION_TOKEN_SECRET && value == "a-token")
+            .withf(|key, value, location| {
+                key == SESSION_TOKEN_SECRET
+                    && value == "a-token"
+                    && *location == SecretLocation::Database
+            })
             .times(1)
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         let client = SessionsClient::new(Arc::new(secrets));
 
-        client.save_new_session("a-token").await.unwrap();
+        client
+            .save_new_session("a-token", SecretLocation::Database)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

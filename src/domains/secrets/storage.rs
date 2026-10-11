@@ -6,7 +6,8 @@ use crate::Result;
 
 /// Persistence for [`super::Service`]: a plain key/value store, no business
 /// rules. Implemented by `storage_keystore::KeystoreStorage` (the OS's native
-/// credential store) and `storage_memory::MemoryStorage` (process memory).
+/// credential store), `storage_memory::MemoryStorage` (process memory) and
+/// `storage_sqlite::SqliteStorage` (the local database's plaintext fallback).
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(super) trait Storage: Send + Sync {

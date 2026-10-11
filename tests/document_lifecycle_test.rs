@@ -35,7 +35,7 @@ async fn document_lifecycle() {
             scenario
                 .client
                 .users()
-                .create(&username, TEST_PASSWORD, "e2e-test-device")
+                .create(&username, TEST_PASSWORD, "e2e-test-device", false)
                 .await
                 .context("failed to create account")?;
             Ok(())

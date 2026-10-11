@@ -97,7 +97,7 @@ impl Client {
     pub async fn init(config: ClientConfig) -> Result<Self> {
         install_tracing(config.log_level, config.on_log.clone());
         let sqlite = open_database(&config.storage).await?;
-        let secrets = open_secrets(&config.storage)?;
+        let secrets = open_secrets(&config.storage, &sqlite)?;
         let channel = lazy_channel(config.url)?;
 
         let settings = domains::settings::init(sqlite.pool().clone());
@@ -248,16 +248,23 @@ async fn open_database(storage: &Storage) -> Result<Arc<SqliteClient>> {
 }
 
 /// Opens the secrets store matching `storage`. Secrets (master key, session
-/// token) live in the OS credential store next to an on-disk database, never
-/// in the database itself; an in-memory client keeps them in memory, like
-/// everything else.
-fn open_secrets(storage: &Storage) -> Result<Arc<dyn domains::secrets::Service>> {
-    domains::secrets::init(match storage {
-        Storage::Disk(path) => domains::secrets::StorageConfig::Keystore {
-            database_path: path,
+/// token) live in the OS credential store next to an on-disk database, and
+/// only in `sqlite` itself on a device without one whose user explicitly
+/// accepted it (see `UsersService::create`'s `allow_insecure_storage`); an
+/// in-memory client keeps them in memory, like everything else.
+fn open_secrets(
+    storage: &Storage,
+    sqlite: &SqliteClient,
+) -> Result<Arc<dyn domains::secrets::Service>> {
+    domains::secrets::init(
+        match storage {
+            Storage::Disk(path) => domains::secrets::StorageConfig::Keystore {
+                database_path: path,
+            },
+            Storage::Memory => domains::secrets::StorageConfig::Memory,
         },
-        Storage::Memory => domains::secrets::StorageConfig::Memory,
-    })
+        sqlite.pool().clone(),
+    )
     .context("failed to initialize secrets store")
 }
 

@@ -76,6 +76,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "This device's secure storage couldn't be accessed.",
             "Le stockage sécurisé de cet appareil est inaccessible.",
         ),
+        ErrorCode::SecureStorageUnavailable => (
+            "This device has no secure storage for your account's keys.",
+            "Cet appareil ne dispose d'aucun stockage sécurisé pour les clés de votre compte.",
+        ),
         ErrorCode::InvalidServerUrl => (
             "The server address is invalid.",
             "L'adresse du serveur est invalide.",
