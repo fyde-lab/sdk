@@ -37,12 +37,12 @@ impl FakeReport {
     pub(crate) fn new() -> Self {
         Self {
             report: Report {
-                scraper_name: crate::testing::random_word().to_string(),
-                started_at_ms: crate::testing::random_past_timestamp() * 1000,
+                scraper_name: crate::tools::testing::random_word().to_string(),
+                started_at_ms: crate::tools::testing::random_past_timestamp() * 1000,
                 entries: vec![ReportEntry {
-                    ts_ms: crate::testing::random_past_timestamp() * 1000,
+                    ts_ms: crate::tools::testing::random_past_timestamp() * 1000,
                     event: "log".to_string(),
-                    value: serde_json::json!({ "level": "info", "message": crate::testing::random_word() }),
+                    value: serde_json::json!({ "level": "info", "message": crate::tools::testing::random_word() }),
                 }],
             },
         }

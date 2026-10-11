@@ -8,7 +8,7 @@ use crate::domains::documents::Service as DocumentsService;
 use crate::domains::secrets::{MASTER_KEY_SECRET, Service as SecretsService};
 use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
-use crate::sql::LocalDatabase;
+use crate::tools::sql::LocalDatabase;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
 use super::crypto::{
@@ -366,7 +366,7 @@ mod tests {
     use super::*;
     use crate::domains::secrets::{MockService as MockSecretsService, SESSION_TOKEN_SECRET};
     use crate::domains::settings::MockService as MockSettingsService;
-    use crate::sql::MockLocalDatabase;
+    use crate::tools::sql::MockLocalDatabase;
 
     fn client_with_deps(
         grpc: impl FydeClient + 'static,

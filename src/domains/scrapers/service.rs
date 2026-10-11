@@ -277,7 +277,7 @@ fn merge_cookies(http_cookies: Vec<Cookie>, browser_cookies: Vec<Cookie>) -> Vec
 /// `documents::parser::vm::sandboxed`, which doesn't need it) is kept because
 /// `didaxis.lua` calls `utf8.len`.
 ///
-/// See [`crate::sandbox::new_vm`] for the globals it strips on top of that
+/// See [`crate::tools::sandbox::new_vm`] for the globals it strips on top of that
 /// and the limits it enforces, so a script that loops forever or allocates
 /// without bound fails on its own instead of hanging or crashing the host.
 /// The memory limit leaves room for the documents a script downloads, which
@@ -285,9 +285,9 @@ fn merge_cookies(http_cookies: Vec<Cookie>, browser_cookies: Vec<Cookie>) -> Vec
 /// them; the instruction budget only counts Lua code actually executing, not
 /// time spent blocked in host functions (network calls, `fyde.input.ask`).
 fn sandboxed_lua() -> Result<Lua> {
-    crate::sandbox::new_vm(
+    crate::tools::sandbox::new_vm(
         StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
-        crate::sandbox::Limits {
+        crate::tools::sandbox::Limits {
             memory_bytes: 512 * 1024 * 1024,
             max_instructions: 5_000_000_000,
         },
@@ -299,7 +299,7 @@ fn sandboxed_lua() -> Result<Lua> {
 /// and a Lua scraper script, same as `demo-rust-fyde`'s `main.rs`) and calls
 /// it with `parameters`.
 fn evaluate_and_run(lua: &Lua, name: &str, script: &str, parameters: Value) -> Result<()> {
-    let chunk = crate::sandbox::load_source(lua, script).set_name(name);
+    let chunk = crate::tools::sandbox::load_source(lua, script).set_name(name);
     let scraper: Table = chunk.eval().context("evaluating Lua scraper script")?;
 
     let run: Function = scraper

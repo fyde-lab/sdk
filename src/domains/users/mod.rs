@@ -14,7 +14,7 @@ use crate::domains::documents::Service as DocumentsService;
 use crate::domains::secrets::Service as SecretsService;
 use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
-use crate::sql::LocalDatabase;
+use crate::tools::sql::LocalDatabase;
 use crate::{ErrorContext as _, Result};
 
 /// The settings key under which this device's UI language preference (see

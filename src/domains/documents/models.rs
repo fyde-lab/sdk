@@ -516,35 +516,38 @@ pub(crate) struct FakeMetadata {
 #[cfg(test)]
 impl FakeMetadata {
     pub(crate) fn new() -> Self {
-        let name = format!("{}.pdf", crate::testing::random_word());
+        let name = format!("{}.pdf", crate::tools::testing::random_word());
         Self {
             metadata: Metadata {
                 id: Uuid::now_v7(),
                 original_name: name.clone(),
                 name,
                 content_type: "application/pdf".to_string(),
-                created_at: crate::testing::random_past_timestamp(),
-                size: 1024 + crate::testing::random_u64(10 * 1024 * 1024),
-                checksum: crate::testing::random_hex(32),
+                created_at: crate::tools::testing::random_past_timestamp(),
+                size: 1024 + crate::tools::testing::random_u64(10 * 1024 * 1024),
+                checksum: crate::tools::testing::random_hex(32),
                 transcript: format!(
                     "This is a fake transcript about {}.",
-                    crate::testing::random_word()
+                    crate::tools::testing::random_word()
                 ),
-                r#type: crate::testing::random_word().to_string(),
+                r#type: crate::tools::testing::random_word().to_string(),
                 source_category: Some(
-                    SourceCategory::ALL
-                        [crate::testing::random_u64(SourceCategory::ALL.len() as u64) as usize],
+                    SourceCategory::ALL[crate::tools::testing::random_u64(
+                        SourceCategory::ALL.len() as u64
+                    ) as usize],
                 ),
                 source_sub_category: Some(
-                    SourceSubCategory::ALL
-                        [crate::testing::random_u64(SourceSubCategory::ALL.len() as u64) as usize],
+                    SourceSubCategory::ALL[crate::tools::testing::random_u64(
+                        SourceSubCategory::ALL.len() as u64,
+                    ) as usize],
                 ),
                 subjects: vec![
-                    crate::testing::random_word().to_string(),
-                    crate::testing::random_word().to_string(),
+                    crate::tools::testing::random_word().to_string(),
+                    crate::tools::testing::random_word().to_string(),
                 ],
                 purpose: Some(
-                    Purpose::ALL[crate::testing::random_u64(Purpose::ALL.len() as u64) as usize],
+                    Purpose::ALL
+                        [crate::tools::testing::random_u64(Purpose::ALL.len() as u64) as usize],
                 ),
             },
         }
@@ -640,7 +643,7 @@ impl FakeDocument {
         Self {
             document: Document {
                 id,
-                content: crate::testing::random_bytes(64),
+                content: crate::tools::testing::random_bytes(64),
                 metadata: FakeMetadata::new().with_id(id).build(),
             },
         }

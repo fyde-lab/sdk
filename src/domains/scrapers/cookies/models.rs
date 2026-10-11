@@ -23,8 +23,11 @@ impl FakeCookie {
     pub(crate) fn new() -> Self {
         Self {
             cookie: Cookie {
-                origin: format!("https://{}.example.com", crate::testing::random_word()),
-                set_cookie: format!("session={}", crate::testing::random_hex(16)),
+                origin: format!(
+                    "https://{}.example.com",
+                    crate::tools::testing::random_word()
+                ),
+                set_cookie: format!("session={}", crate::tools::testing::random_hex(16)),
             },
         }
     }

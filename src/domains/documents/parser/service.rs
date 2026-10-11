@@ -100,7 +100,7 @@ fn run_scripts_blocking(scripts: &[Script], document: &Document) -> Result<Metad
         vm::expose_pdf_conversions(&lua, document.content())?;
         vm::expose_set_source(&lua, source_metadata.clone())?;
         vm::expose_set_purpose(&lua, source_metadata.clone())?;
-        crate::sandbox::load_source(&lua, script.script())
+        crate::tools::sandbox::load_source(&lua, script.script())
             .exec()
             .context("failed to run script")?;
 

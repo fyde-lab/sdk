@@ -72,7 +72,7 @@ impl FakeChangelogEvent {
                 id: Uuid::now_v7(),
                 event_type: EventType::Created,
                 subject_id: Uuid::now_v7(),
-                content: Some(crate::testing::random_bytes(64)),
+                content: Some(crate::tools::testing::random_bytes(64)),
                 metadata: Some(crate::domains::documents::FakeMetadata::new().build()),
             },
         }

@@ -208,15 +208,15 @@ impl FakeScript {
         Self {
             script: Script {
                 id: Uuid::now_v7(),
-                name: crate::testing::random_word().to_string(),
-                description: crate::testing::random_word().to_string(),
-                short_description: crate::testing::random_word().to_string(),
+                name: crate::tools::testing::random_word().to_string(),
+                description: crate::tools::testing::random_word().to_string(),
+                short_description: crate::tools::testing::random_word().to_string(),
                 is_public: false,
-                icon: crate::testing::random_bytes(16),
+                icon: crate::tools::testing::random_bytes(16),
                 allowed_domains: Vec::new(),
                 version: 1,
                 script: "return 1 + 1".to_string(),
-                last_updated: crate::testing::random_past_timestamp(),
+                last_updated: crate::tools::testing::random_past_timestamp(),
                 script_type: ScriptType::Scraper,
                 parameters: HashMap::new(),
             },
@@ -253,7 +253,7 @@ impl FakeInstalledScript {
                 script: FakeScript::new().build(),
                 parameters: HashMap::from([(
                     "username".to_string(),
-                    Value::String(crate::testing::random_word().to_string()),
+                    Value::String(crate::tools::testing::random_word().to_string()),
                 )]),
             },
         }

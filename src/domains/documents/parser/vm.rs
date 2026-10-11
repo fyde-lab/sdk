@@ -10,7 +10,7 @@ use crate::domains::documents::{Document, Metadata, Purpose, SourceCategory, Sou
 use crate::{ErrorContext as _, Result};
 
 /// Upper bound on the Lua instructions one classification script may run
-/// against one document (see [`crate::sandbox::Limits`]) — far more than a
+/// against one document (see [`crate::tools::sandbox::Limits`]) — far more than a
 /// script matching on a transcript ever needs, so only a runaway loop hits it.
 const MAX_INSTRUCTIONS: u64 = 200_000_000;
 
@@ -22,7 +22,7 @@ const BASE_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 /// `require`), `debug`, or FFI libraries are loaded, only the side-effect
 /// free `table`/`string`/`math` subset — so Lua code run in it has no path
 /// to the filesystem, OS environment, subprocesses, dynamic library loading,
-/// or the network. See [`crate::sandbox::new_vm`] for the globals it strips
+/// or the network. See [`crate::tools::sandbox::new_vm`] for the globals it strips
 /// on top of that and the limits it enforces: these scripts come from the
 /// server (any user's public script a user enabled), so one that loops
 /// forever or allocates without bound must fail on its own rather than
@@ -30,9 +30,9 @@ const BASE_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 /// (the document's size), since the document's content and its
 /// `pdf_as_markdown`/`pdf_as_html` conversions all live on the VM's heap.
 pub(super) fn sandboxed(content_len: usize) -> Result<Lua> {
-    crate::sandbox::new_vm(
+    crate::tools::sandbox::new_vm(
         StdLib::TABLE | StdLib::STRING | StdLib::MATH,
-        crate::sandbox::Limits {
+        crate::tools::sandbox::Limits {
             memory_bytes: BASE_MEMORY_BYTES.saturating_add(content_len.saturating_mul(4)),
             max_instructions: MAX_INSTRUCTIONS,
         },

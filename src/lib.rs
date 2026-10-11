@@ -1,15 +1,7 @@
 mod domains;
 mod error;
 mod ffi;
-#[path = "tools/log/mod.rs"]
-mod log;
-#[path = "tools/sandbox/mod.rs"]
-mod sandbox;
-#[path = "tools/sql/mod.rs"]
-mod sql;
-#[cfg(test)]
-#[path = "tools/testing/mod.rs"]
-mod testing;
+mod tools;
 
 uniffi::setup_scaffolding!();
 
@@ -33,12 +25,12 @@ pub use domains::scripts::{
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
 pub use domains::users::Service as UsersService;
-pub use log::LogLevel;
+pub use tools::log::LogLevel;
 
 use domains::sessions::{Service as SessionsService, SessionsClient};
-use log::CallbackLayer;
-use sql::SqliteClient;
 use tonic::transport::Endpoint;
+use tools::log::CallbackLayer;
+use tools::sql::{self, SqliteClient};
 
 /// Selects which SQLite backend a [`Client`] persists local state to.
 #[derive(Debug, Clone, PartialEq, Eq)]
