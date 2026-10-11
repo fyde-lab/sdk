@@ -66,7 +66,11 @@ sha2 = "0.11.0"
 sha2-opaque = { package = "sha2", version = "0.10.9" }
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "migrate"] }
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["full"] }
+# Only the features this crate's own code uses (a library enabling `full`
+# forces every runtime feature on every app that depends on it). `net`,
+# `io-util` and the multi-thread runtime are only needed by tests — see the
+# dev-dependency below.
+tokio = { version = "1.53.1", features = ["rt", "macros", "sync", "time", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["registry", "fmt"] }
 tonic = { version = "0.14.6", features = ["transport"] }
@@ -162,4 +166,4 @@ mockall = "0.15.0"
 # binaries `tests/` compiles into, not just threads within one binary.
 serial_test = "3.2.0"
 tempfile = "3.14.0"
-tokio = { version = "1.53.1", features = ["test-util"] }
+tokio = { version = "1.53.1", features = ["test-util", "rt-multi-thread", "net", "io-util"] }
