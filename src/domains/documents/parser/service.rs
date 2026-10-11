@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::domains::scripts::{Script, Service as ScriptsService};
@@ -38,9 +37,6 @@ impl Service for ParserClient {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let mut hasher = Sha256::new();
-        hasher.update(content);
-
         let doc_transcript =
             transcript::extract(content).context("failed to extract document transcript")?;
 
@@ -53,11 +49,7 @@ impl Service for ParserClient {
             content_type: PDF_CONTENT_TYPE.to_string(),
             created_at,
             size: content.len() as u64,
-            checksum: hasher
-                .finalize()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
+            checksum: super::checksum(content),
             transcript: doc_transcript,
             r#type: String::new(),
             source_category: None,

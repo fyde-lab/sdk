@@ -177,6 +177,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "This search isn't valid.",
             "Cette recherche n'est pas valide.",
         ),
+        ErrorCode::DuplicateDocument => (
+            "This document has already been added.",
+            "Ce document a déjà été ajouté.",
+        ),
         ErrorCode::ScriptNotFound => (
             "This add-on couldn't be found.",
             "Cette extension est introuvable.",

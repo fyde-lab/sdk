@@ -4,6 +4,7 @@ use std::sync::Arc;
 use mlua::{Function, Lua, Table, Value};
 use tokio::runtime::Handle;
 
+use crate::ErrorCode;
 use crate::domains::documents::{
     Purpose, Service as DocumentsService, SourceCategory, SourceSubCategory, UploadRequest,
 };
@@ -19,7 +20,10 @@ use crate::domains::documents::{
 /// returns). The optional `fields` table lets a script set any of
 /// [`UploadRequest`]'s other metadata overrides up front (`name`, `type`,
 /// `source_category`, `source_sub_category`, `subjects`, `purpose`) instead
-/// of leaving them to be derived later by a classification script.
+/// of leaving them to be derived later by a classification script. A
+/// document whose content is already saved locally is silently skipped,
+/// not an error, so re-running a scraper doesn't fail on what it already
+/// fetched.
 pub(super) fn save_document_fn(
     lua: &Lua,
     documents: Arc<dyn DocumentsService>,
@@ -46,9 +50,21 @@ pub(super) fn save_document_fn(
                 apply_upload_fields(&mut request, &fields)?;
             }
 
-            let id = runtime
-                .block_on(documents.upload(request))
-                .map_err(mlua::Error::external)?;
+            // A scraper re-run typically finds documents it already saved:
+            // that's not a failure, just nothing to do.
+            let id = match runtime.block_on(documents.upload(request)) {
+                Ok(id) => id,
+                Err(err) if err.code() == ErrorCode::DuplicateDocument => {
+                    tracing::debug!(
+                        target: "fyde::scrapers",
+                        scraper = %scraper_name,
+                        name,
+                        "document already saved, skipping: {err}"
+                    );
+                    return Ok(());
+                }
+                Err(err) => return Err(mlua::Error::external(err)),
+            };
 
             tracing::debug!(
                 target: "fyde::scrapers",
@@ -206,6 +222,55 @@ mod tests {
         )
         .exec()
         .unwrap();
+    }
+
+    #[test]
+    fn save_document_does_nothing_and_succeeds_for_a_document_already_saved() {
+        let mut documents = MockDocumentsService::new();
+        documents
+            .expect_upload()
+            .times(1)
+            .returning(|_| Err(crate::ErrorKind::DuplicateDocument(Uuid::now_v7()).into()));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let lua = Lua::new();
+        let f = save_document_fn(
+            &lua,
+            Arc::new(documents),
+            "didaxis",
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        lua.globals().set("save_document", f).unwrap();
+
+        lua.load(r#"save_document("january.pdf", "the pdf content")"#)
+            .exec()
+            .unwrap();
+    }
+
+    #[test]
+    fn save_document_propagates_any_other_upload_error() {
+        let mut documents = MockDocumentsService::new();
+        documents.expect_upload().times(1).returning(|_| {
+            Err(crate::ErrorKind::UnsupportedDocumentExtension("txt".into()).into())
+        });
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let lua = Lua::new();
+        let f = save_document_fn(
+            &lua,
+            Arc::new(documents),
+            "didaxis",
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        lua.globals().set("save_document", f).unwrap();
+
+        let result = lua
+            .load(r#"save_document("january.pdf", "the pdf content")"#)
+            .exec();
+
+        assert!(result.is_err());
     }
 
     #[test]

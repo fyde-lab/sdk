@@ -105,6 +105,8 @@ macro_rules! for_each_error_code {
             InvalidPurpose = 4007,
             /// A document search's parameters were invalid.
             InvalidSearchQuery = 4008,
+            /// A document with the same content is already saved locally.
+            DuplicateDocument = 4009,
             /// No such script.
             ScriptNotFound = 5001,
             /// A script was run without one of its required parameters.
@@ -203,6 +205,8 @@ pub(crate) enum ErrorKind {
     UnsupportedDocumentExtension(String),
     #[error("document {0} not found in local cache")]
     DocumentNotFound(uuid::Uuid),
+    #[error("a document with the same content is already saved locally as {0}")]
+    DuplicateDocument(uuid::Uuid),
     #[error("script {0} not found")]
     ScriptNotFound(uuid::Uuid),
     #[error("script {0} is not installed on this device")]
@@ -263,6 +267,7 @@ impl ErrorKind {
             ErrorKind::Lua(_) => ErrorCode::ScriptFailed,
             ErrorKind::UnsupportedDocumentExtension(_) => ErrorCode::UnsupportedDocumentExtension,
             ErrorKind::DocumentNotFound(_) => ErrorCode::DocumentNotFound,
+            ErrorKind::DuplicateDocument(_) => ErrorCode::DuplicateDocument,
             ErrorKind::ScriptNotFound(_) => ErrorCode::ScriptNotFound,
             ErrorKind::ScriptNotInstalled(_) => ErrorCode::ScriptNotInstalled,
             ErrorKind::MissingScriptParameter { .. } => ErrorCode::MissingScriptParameter,

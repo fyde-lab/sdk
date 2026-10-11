@@ -118,6 +118,20 @@ impl<S: Storage> Service for DocumentsClient<S> {
             }
         };
 
+        // Checked before parsing, which runs the user's scripts against the
+        // document: no point paying for that only to reject it. This only
+        // sees documents the sync job already cached locally, so the consume
+        // job checks again before caching one (see `changelog::service`).
+        let checksum = super::parser::checksum(&content);
+        if let Some(existing) = self
+            .storage
+            .find_document_by_checksum(&checksum)
+            .await
+            .context("failed to look up local documents with the same content")?
+        {
+            return Err(ErrorKind::DuplicateDocument(existing).into());
+        }
+
         let mut metadata = self
             .parser
             .parse_content(&content, &original_name)
@@ -497,13 +511,16 @@ mod tests {
             .times(1)
             .returning(move |_, _| Ok(returned_metadata.clone()));
 
+        let mut storage = MockStorage::new();
+        let expected_checksum = super::super::parser::checksum(&pdf);
+        storage
+            .expect_find_document_by_checksum()
+            .withf(move |checksum| checksum == expected_checksum)
+            .times(1)
+            .returning(|_| Ok(None));
+
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            changelog.clone(),
-            Arc::new(parser),
-            None,
-        );
+        let client = DocumentsClient::new(storage, changelog.clone(), Arc::new(parser), None);
 
         let id = client
             .upload(UploadRequest::from_path(file.path()))
@@ -518,6 +535,38 @@ mod tests {
         assert_eq!(*document_id, metadata.id);
         assert_eq!(content.as_deref(), Some(pdf.as_slice()));
         assert_eq!(sent_metadata.as_ref(), Some(&metadata));
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_a_document_already_saved_locally_before_parsing_or_publishing_it() {
+        let pdf = b"hello world".to_vec();
+        let file = write_temp_file("pdf", &pdf);
+        let existing = Uuid::now_v7();
+
+        let mut storage = MockStorage::new();
+        let expected_checksum = super::super::parser::checksum(&pdf);
+        storage
+            .expect_find_document_by_checksum()
+            .withf(move |checksum| checksum == expected_checksum)
+            .times(1)
+            .returning(move |_| Ok(Some(existing)));
+
+        // `no_op_parser` panics on any call, proving the duplicate is
+        // rejected before parsing (and so before running any script).
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = DocumentsClient::new(storage, changelog.clone(), no_op_parser(), None);
+
+        let err = client
+            .upload(UploadRequest::from_path(file.path()))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err.kind(), ErrorKind::DuplicateDocument(id) if *id == existing),
+            "unexpected error: {err}"
+        );
+        assert_eq!(err.code(), crate::ErrorCode::DuplicateDocument);
+        assert!(changelog.sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -553,13 +602,14 @@ mod tests {
             .times(1)
             .returning(move |_, _| Ok(returned_metadata.clone()));
 
+        let mut storage = MockStorage::new();
+        storage
+            .expect_find_document_by_checksum()
+            .times(1)
+            .returning(|_| Ok(None));
+
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            changelog.clone(),
-            Arc::new(parser),
-            None,
-        );
+        let client = DocumentsClient::new(storage, changelog.clone(), Arc::new(parser), None);
 
         let request = UploadRequest {
             source: super::super::UploadSource::Raw {

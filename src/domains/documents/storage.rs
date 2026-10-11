@@ -32,6 +32,11 @@ pub(crate) trait Storage: Send + Sync {
     /// or `None` if it doesn't exist.
     async fn get_document(&self, id: Uuid) -> Result<Option<Document>>;
 
+    /// Returns the id of a document previously saved locally by
+    /// [`Self::save_document`] whose content has the given hex-encoded
+    /// SHA-256 `checksum`, or `None` if there's none.
+    async fn find_document_by_checksum(&self, checksum: &str) -> Result<Option<Uuid>>;
+
     /// Lists documents previously saved locally by [`Self::save_document`],
     /// ordered oldest first, skipping `offset` and returning at most `limit`.
     async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>>;

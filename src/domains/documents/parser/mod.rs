@@ -7,6 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
+use sha2::{Digest, Sha256};
 
 use crate::Result;
 use crate::domains::scripts::Service as ScriptsService;
@@ -15,6 +16,15 @@ use super::{Document, Metadata};
 
 /// The only content type [`Service::parse_content`] currently accepts.
 pub(super) const PDF_CONTENT_TYPE: &str = "application/pdf";
+
+/// The hex-encoded SHA-256 checksum of a document's `content`, as stored in
+/// its [`Metadata::checksum`].
+pub(super) fn checksum(content: &[u8]) -> String {
+    Sha256::digest(content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 /// Derives a freshly uploaded document's [`Metadata`] and runs a user's
 /// enabled scripts against a document to fill in/update its classification

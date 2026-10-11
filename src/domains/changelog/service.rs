@@ -261,14 +261,44 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
                     };
 
                     if self.has_write_permission() {
-                        let document =
-                            Document::new(event.subject_id, content.clone(), metadata.clone());
-                        self.document_storage
-                            .save_document(&document)
-                            .await
-                            .with_context(|| {
-                                format!("failed to cache document {} locally", event.subject_id)
-                            })?;
+                        // `upload` only rejects a duplicate already cached
+                        // here, so two uploads of the same content that
+                        // haven't synced yet (or from two devices) both get
+                        // published: keep the first one cached, skip the
+                        // rest. Documents from before checksums existed
+                        // have an empty one, which matches nothing.
+                        let duplicate_of = if metadata.checksum.is_empty() {
+                            None
+                        } else {
+                            self.document_storage
+                                .find_document_by_checksum(&metadata.checksum)
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "failed to look up local documents with the same content as document {}",
+                                        event.subject_id
+                                    )
+                                })?
+                        };
+
+                        if let Some(existing) = duplicate_of {
+                            tracing::warn!(
+                                event_id = %event.id,
+                                document_id = %event.subject_id,
+                                existing_document_id = %existing,
+                                "skipping caching document {}: a document with the same content is already cached locally as {existing}",
+                                event.subject_id
+                            );
+                        } else {
+                            let document =
+                                Document::new(event.subject_id, content.clone(), metadata.clone());
+                            self.document_storage
+                                .save_document(&document)
+                                .await
+                                .with_context(|| {
+                                    format!("failed to cache document {} locally", event.subject_id)
+                                })?;
+                        }
                     }
                 }
                 EventType::UpdateMetadata => {
@@ -489,6 +519,10 @@ mod tests {
 
         let mut document_storage = MockStorage::new();
         document_storage
+            .expect_find_document_by_checksum()
+            .times(1)
+            .returning(|_| Ok(None));
+        document_storage
             .expect_save_document()
             .withf(move |document| document.id() == document_id && document.content() == b"content")
             .times(1)
@@ -524,6 +558,57 @@ mod tests {
         assert_eq!(received[0].id, event_id);
         assert_eq!(received[0].subject_id, document_id);
         assert_eq!(received[0].event_type, EventType::Created);
+    }
+
+    #[tokio::test]
+    async fn consume_skips_caching_a_document_whose_content_is_already_cached_but_still_calls_back()
+    {
+        let document_id = Uuid::now_v7();
+        let event_id = Uuid::now_v7();
+        let existing = Uuid::now_v7();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(vec![Ok(proto_event(event_id, document_id))]).boxed())
+        });
+
+        // No `expect_save_document()` set up: the mock panics if the
+        // duplicate is cached anyway.
+        let mut document_storage = MockStorage::new();
+        document_storage
+            .expect_find_document_by_checksum()
+            .withf(|checksum| !checksum.is_empty())
+            .times(1)
+            .returning(move |_| Ok(Some(existing)));
+
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+        cursor_storage
+            .expect_save_cursor()
+            .withf(move |id| *id == event_id)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let client = ChangelogClient::with_grpc(
+            mock_grpc,
+            document_storage,
+            MockScriptStorage::new(),
+            cursor_storage,
+            reachable_server_state(),
+            fake_secrets(),
+        );
+        client.acquire_write_lock();
+
+        let received = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let received_in_callback = received.clone();
+        let mut callback = move |event| received_in_callback.lock().unwrap().push(event);
+        client.consume_once(&mut callback).await.unwrap();
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].subject_id, document_id);
     }
 
     #[tokio::test]
@@ -655,6 +740,9 @@ mod tests {
         });
 
         let mut document_storage = MockStorage::new();
+        document_storage
+            .expect_find_document_by_checksum()
+            .returning(|_| Ok(None));
         document_storage
             .expect_save_document()
             .returning(|_| Ok(()));
@@ -1010,6 +1098,9 @@ mod tests {
             });
 
         let mut document_storage = MockStorage::new();
+        document_storage
+            .expect_find_document_by_checksum()
+            .returning(|_| Ok(None));
         document_storage
             .expect_save_document()
             .returning(|_| Ok(()));

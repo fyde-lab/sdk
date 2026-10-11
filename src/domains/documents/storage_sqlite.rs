@@ -280,6 +280,25 @@ impl Storage for SqliteStorage {
         }))
     }
 
+    async fn find_document_by_checksum(&self, checksum: &str) -> Result<Option<Uuid>> {
+        let row = sqlx::query("SELECT id FROM documents WHERE checksum = ?1 LIMIT 1")
+            .bind(checksum)
+            .fetch_optional(&self.pool)
+            .await
+            .with_context(|| {
+                format!("failed to look up document with checksum {checksum} in local database")
+            })?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let id: String = row.get("id");
+        let id = Uuid::parse_str(&id)
+            .with_context(|| format!("invalid document id in local database: {id}"))?;
+        Ok(Some(id))
+    }
+
     async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
         let rows = sqlx::query(
             "SELECT id, name, original_name, content_type, content, checksum, created_at, transcript, type, source_category, source_sub_category, subjects, purpose FROM documents
@@ -458,6 +477,32 @@ mod tests {
         sqlx::migrate!().run(&pool).await.unwrap();
 
         SqliteStorage::new(pool)
+    }
+
+    #[tokio::test]
+    async fn find_document_by_checksum_returns_the_id_of_a_document_with_that_checksum() {
+        let storage = setup().await;
+        let document = FakeDocument::new()
+            .with_metadata(FakeMetadata::new().with_checksum("cafebabe").build())
+            .build();
+        storage.save_document(&document).await.unwrap();
+
+        let found = storage.find_document_by_checksum("cafebabe").await.unwrap();
+
+        assert_eq!(found, Some(document.id()));
+    }
+
+    #[tokio::test]
+    async fn find_document_by_checksum_returns_none_when_no_document_has_that_checksum() {
+        let storage = setup().await;
+        let document = FakeDocument::new()
+            .with_metadata(FakeMetadata::new().with_checksum("cafebabe").build())
+            .build();
+        storage.save_document(&document).await.unwrap();
+
+        let found = storage.find_document_by_checksum("deadbeef").await.unwrap();
+
+        assert_eq!(found, None);
     }
 
     #[tokio::test]
