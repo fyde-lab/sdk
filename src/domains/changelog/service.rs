@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -94,7 +94,9 @@ pub(super) struct ChangelogClient<D: DocumentStorage, S: ScriptStorage, O: Curso
     /// lock holder is allowed to write. The OS releases the underlying
     /// `flock` automatically if the process exits without calling
     /// [`Service::stop_consume_job`] (e.g. a crash), so the lock can never
-    /// outlive the process holding it.
+    /// outlive the process holding it. Poisoning is ignored on every access:
+    /// the guarded `Option<File>` can't be left half-updated by a panic, so
+    /// one panicking consume pass must not make every later sync panic too.
     write_lock: Mutex<Option<File>>,
 }
 
@@ -182,7 +184,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
 
         match file.try_lock() {
             Ok(()) => {
-                *self.write_lock.lock().unwrap() = Some(file);
+                *self.write_lock_guard() = Some(file);
             }
             Err(err) => {
                 tracing::warn!(
@@ -193,18 +195,25 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
         }
     }
 
+    /// Locks [`Self::write_lock`], ignoring poisoning (see its doc comment).
+    fn write_lock_guard(&self) -> MutexGuard<'_, Option<File>> {
+        self.write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Releases the write lock taken by [`Self::acquire_write_lock`], if
     /// this process is holding it. Idempotent, and safe to call whether or
     /// not the lock was ever successfully acquired.
     fn release_write_lock(&self) {
-        self.write_lock.lock().unwrap().take();
+        self.write_lock_guard().take();
     }
 
     /// Whether this process currently holds [`Self::lock_path`], and is
     /// therefore allowed to persist documents/metadata locally in
     /// [`Self::consume_once`].
     fn has_write_permission(&self) -> bool {
-        self.write_lock.lock().unwrap().is_some()
+        self.write_lock_guard().is_some()
     }
 
     /// One pass of the consume loop spawned by [`Service::start_consume_job`]:

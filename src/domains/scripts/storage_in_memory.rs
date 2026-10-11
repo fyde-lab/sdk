@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -70,7 +70,7 @@ impl Service for InMemoryScriptStorage {
 
         self.scripts
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(created.id, created.clone());
 
         Ok(created)
@@ -79,7 +79,7 @@ impl Service for InMemoryScriptStorage {
     async fn fetch_script(&self, id: Uuid) -> Result<Script> {
         self.scripts
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(&id)
             .cloned()
             .ok_or(ErrorKind::ScriptNotFound(id).into())
@@ -98,7 +98,7 @@ impl Service for InMemoryScriptStorage {
         script_type: ScriptType,
         parameters: HashMap<String, ScriptParameter>,
     ) -> Result<Script> {
-        let mut scripts = self.scripts.lock().unwrap();
+        let mut scripts = self.scripts.lock().unwrap_or_else(PoisonError::into_inner);
 
         let existing = scripts.get(&id).ok_or(ErrorKind::ScriptNotFound(id))?;
 
@@ -123,18 +123,24 @@ impl Service for InMemoryScriptStorage {
     }
 
     async fn enable_script(&self, script_id: Uuid) -> Result<()> {
-        self.enabled.lock().unwrap().insert(script_id);
+        self.enabled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(script_id);
         Ok(())
     }
 
     async fn disable_script(&self, script_id: Uuid) -> Result<()> {
-        self.enabled.lock().unwrap().remove(&script_id);
+        self.enabled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&script_id);
         Ok(())
     }
 
     async fn list_user_scripts(&self) -> Result<Vec<Script>> {
-        let scripts = self.scripts.lock().unwrap();
-        let enabled = self.enabled.lock().unwrap();
+        let scripts = self.scripts.lock().unwrap_or_else(PoisonError::into_inner);
+        let enabled = self.enabled.lock().unwrap_or_else(PoisonError::into_inner);
 
         Ok(enabled
             .iter()
@@ -146,7 +152,7 @@ impl Service for InMemoryScriptStorage {
         Ok(self
             .scripts
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .values()
             .filter(|script| script.is_public)
             .cloned()
@@ -155,7 +161,10 @@ impl Service for InMemoryScriptStorage {
 
     async fn install_script(&self, request: InstallScriptRequest) -> Result<()> {
         let script = self.fetch_script(request.script_id).await?;
-        let mut installed = self.installed.lock().unwrap();
+        let mut installed = self
+            .installed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
 
         installed.retain(|existing| existing.script.id != script.id);
         installed.push(InstalledScript {
@@ -167,13 +176,17 @@ impl Service for InMemoryScriptStorage {
     }
 
     async fn list_installed_scripts(&self) -> Result<Vec<InstalledScript>> {
-        Ok(self.installed.lock().unwrap().clone())
+        Ok(self
+            .installed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone())
     }
 
     async fn fetch_installed_script(&self, script_id: Uuid) -> Result<InstalledScript> {
         self.installed
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .find(|installed| installed.script.id == script_id)
             .cloned()
