@@ -28,7 +28,7 @@ pub use domains::users::Service as UsersService;
 pub use tools::log::LogLevel;
 
 use domains::sessions::{Service as SessionsService, SessionsClient};
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tools::log::CallbackLayer;
 use tools::sql::{self, SqliteClient};
 
@@ -267,9 +267,17 @@ fn open_secrets(storage: &Storage) -> Result<Arc<dyn domains::secrets::Service>>
 /// shared by every domain's gRPC client, so they all reuse the same
 /// underlying HTTP/2 connection instead of opening one each.
 fn lazy_channel(url: String) -> Result<Channel> {
-    Ok(Endpoint::from_shared(url)
-        .map_err(|err| ErrorKind::InvalidEndpoint(err.to_string()))?
-        .connect_lazy())
+    let mut endpoint =
+        Endpoint::from_shared(url).map_err(|err| ErrorKind::InvalidEndpoint(err.to_string()))?;
+    // `from_shared` leaves TLS off even for `https://` URLs (only tonic's
+    // hidden `Endpoint::new` turns it on by itself), which would otherwise
+    // fail every call with "HttpsUriWithoutTlsSupport".
+    if endpoint.uri().scheme_str() == Some("https") {
+        endpoint = endpoint
+            .tls_config(ClientTlsConfig::new().with_webpki_roots())
+            .map_err(|err| ErrorKind::InvalidEndpoint(format!("failed to configure TLS: {err}")))?;
+    }
+    Ok(endpoint.connect_lazy())
 }
 
 /// Testing hook, not part of the supported API: makes every [`Client`]

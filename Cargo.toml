@@ -73,7 +73,11 @@ thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt", "macros", "sync", "time", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["registry", "fmt"] }
-tonic = { version = "0.14.6", features = ["transport"] }
+# `tls-ring`/`tls-webpki-roots`: TLS for `https://` server URLs (see
+# `lazy_channel` in `src/lib.rs`), with Mozilla's root store bundled in
+# rather than read from the OS, which Android/iOS don't expose the same way
+# desktops do.
+tonic = { version = "0.14.6", features = ["transport", "tls-ring", "tls-webpki-roots"] }
 tonic-health = "0.14.6"
 tonic-prost = "0.14.6"
 # Windows the real webview `fyde.browser` (`domains/scrapers/host/browser.rs`,
