@@ -9,11 +9,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 use tao::event::{Event, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::platform::run_return::EventLoopExtRunReturn as _;
-use tao::window::WindowBuilder;
+use tao::window::{Window, WindowBuilder};
 use uuid::Uuid;
-use wry::WebViewBuilder;
+use wry::{WebView, WebViewBuilder};
 
 use crate::{ErrorKind, Result};
 
@@ -353,6 +353,54 @@ fn run_event_loop(
     let mut event_loop = builder.build();
     let proxy = event_loop.create_proxy();
 
+    let setup = build_window(&event_loop, visible).and_then(|window| {
+        let webview = build_webview(&window, pending, pending_download, allowed_domains.clone())?;
+        Ok((window, webview))
+    });
+    // `_window` (not `_`) keeps the window alive for as long as the loop
+    // below runs: dropping it would close the webview's window under it.
+    let (_window, webview) = match setup {
+        Ok(setup) => setup,
+        Err(err) => {
+            let _ = ready_tx.send(Err(err));
+            return;
+        }
+    };
+
+    // Seeded before `ready_tx` fires, so no `open` can race ahead of them.
+    for saved in &initial_cookies {
+        let Some(cookie) = to_webview_cookie(saved) else {
+            tracing::warn!(origin = %saved.origin, "fyde.browser: skipping an unparseable saved cookie");
+            continue;
+        };
+        if let Err(err) = webview.set_cookie(&cookie) {
+            tracing::warn!(origin = %saved.origin, "fyde.browser: failed to restore a saved cookie: {err}");
+        }
+    }
+
+    if ready_tx.send(Ok(proxy)).is_err() {
+        return;
+    }
+
+    event_loop.run_return(move |event, _target, control_flow| {
+        *control_flow = ControlFlow::Wait;
+        match event {
+            Event::UserEvent(command) => {
+                handle_command(&webview, command, &allowed_domains, control_flow);
+            }
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                *control_flow = ControlFlow::Exit;
+            }
+            _ => {}
+        }
+    });
+}
+
+/// Builds the (hidden unless `visible`) window the webview attaches to.
+fn build_window(event_loop: &EventLoop<Command>, visible: bool) -> Result<Window> {
     let mut window_builder = WindowBuilder::new().with_visible(visible);
     if visible {
         window_builder = window_builder
@@ -374,17 +422,20 @@ fn run_event_loop(
         use tao::platform::unix::WindowBuilderExtUnix as _;
         window_builder = window_builder.with_default_vbox(false);
     }
-    let window = match window_builder.build(&event_loop) {
-        Ok(window) => window,
-        Err(err) => {
-            let _ = ready_tx.send(Err(ErrorKind::Browser(format!(
-                "failed to create browser window: {err}"
-            ))
-            .into()));
-            return;
-        }
-    };
+    window_builder
+        .build(event_loop)
+        .map_err(|err| ErrorKind::Browser(format!("failed to create browser window: {err}")).into())
+}
 
+/// Builds the webview inside `window`: replies to [`PendingReplies`] over
+/// IPC, gates navigations and popups against `allowed_domains`, and routes
+/// downloads to whichever `download` call [`PendingDownload`] holds.
+fn build_webview(
+    window: &Window,
+    pending: PendingReplies,
+    pending_download: PendingDownload,
+    allowed_domains: Arc<Vec<String>>,
+) -> Result<WebView> {
     let ipc_handler = move |request: wry::http::Request<String>| {
         let Ok(parsed) = serde_json::from_str::<Value>(request.body()) else {
             return;
@@ -401,7 +452,6 @@ fn run_event_loop(
         }
     };
 
-    let cookies_allowed_domains = allowed_domains.clone();
     let navigation_allowed_domains = allowed_domains.clone();
     let new_window_allowed_domains = allowed_domains;
     let builder = WebViewBuilder::new()
@@ -508,71 +558,44 @@ fn run_event_loop(
     #[cfg(not(target_os = "linux"))]
     let webview = builder.build(&window);
 
-    let webview = match webview {
-        Ok(webview) => webview,
-        Err(err) => {
-            let _ = ready_tx.send(Err(ErrorKind::Browser(format!(
-                "failed to create webview: {err}"
-            ))
-            .into()));
-            return;
-        }
-    };
+    webview.map_err(|err| ErrorKind::Browser(format!("failed to create webview: {err}")).into())
+}
 
-    // Seeded before `ready_tx` fires, so no `open` can race ahead of them.
-    for saved in &initial_cookies {
-        let Some(cookie) = to_webview_cookie(saved) else {
-            tracing::warn!(origin = %saved.origin, "fyde.browser: skipping an unparseable saved cookie");
-            continue;
-        };
-        if let Err(err) = webview.set_cookie(&cookie) {
-            tracing::warn!(origin = %saved.origin, "fyde.browser: failed to restore a saved cookie: {err}");
+/// Carries out one [`Command`] sent from [`BrowserDriver`] on the webview's
+/// own thread.
+fn handle_command(
+    webview: &WebView,
+    command: Command,
+    allowed_domains: &[String],
+    control_flow: &mut ControlFlow,
+) {
+    match command {
+        Command::Open(url) => {
+            if let Err(err) = webview.load_url(&url) {
+                tracing::error!("fyde.browser: load_url({url:?}) failed: {err}");
+            }
+        }
+        Command::Eval(script) => {
+            if let Err(err) = webview.evaluate_script(&script) {
+                tracing::error!("fyde.browser: evaluate_script failed: {err}");
+            }
+        }
+        Command::Cookies(reply) => {
+            let cookies = webview
+                .cookies()
+                .map(|cookies| {
+                    cookies
+                        .iter()
+                        .filter_map(|cookie| from_webview_cookie(cookie, allowed_domains))
+                        .collect()
+                })
+                .map_err(|err| err.to_string());
+            let _ = reply.send(cookies);
+        }
+        Command::Shutdown => {
+            *control_flow = ControlFlow::Exit;
         }
     }
-
-    if ready_tx.send(Ok(proxy)).is_err() {
-        return;
-    }
-
-    event_loop.run_return(move |event, _target, control_flow| {
-        *control_flow = ControlFlow::Wait;
-        match event {
-            Event::UserEvent(Command::Open(url)) => {
-                if let Err(err) = webview.load_url(&url) {
-                    tracing::error!("fyde.browser: load_url({url:?}) failed: {err}");
-                }
-            }
-            Event::UserEvent(Command::Eval(script)) => {
-                if let Err(err) = webview.evaluate_script(&script) {
-                    tracing::error!("fyde.browser: evaluate_script failed: {err}");
-                }
-            }
-            Event::UserEvent(Command::Cookies(reply)) => {
-                let cookies = webview
-                    .cookies()
-                    .map(|cookies| {
-                        cookies
-                            .iter()
-                            .filter_map(|cookie| {
-                                from_webview_cookie(cookie, &cookies_allowed_domains)
-                            })
-                            .collect()
-                    })
-                    .map_err(|err| err.to_string());
-                let _ = reply.send(cookies);
-            }
-            Event::UserEvent(Command::Shutdown) => {
-                *control_flow = ControlFlow::Exit;
-            }
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => {
-                *control_flow = ControlFlow::Exit;
-            }
-            _ => {}
-        }
-    });
 }
 
 /// JS that polls `document.querySelector(selector)` from inside the
