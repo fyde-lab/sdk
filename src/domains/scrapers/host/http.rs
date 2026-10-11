@@ -11,6 +11,7 @@ use wreq::header::{HeaderMap, HeaderName, HeaderValue};
 use wreq_util::Profile;
 
 use super::super::cookies::Cookie;
+use super::super::models::RunOptions;
 use super::super::reports::Recorder;
 
 /// Builds a fresh cookie jar pre-populated from `cookies` (as previously
@@ -188,20 +189,20 @@ fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
 /// Each call writes an `http_request` (or `error`) entry to `recorder` —
 /// method, url, status and timing only by default, never request header
 /// values, form/JSON body values, since those routinely carry
-/// credentials/session cookies. Passing `debug_http_dump: true` (ported from
+/// credentials/session cookies. `options.debug_http_dump` (ported from
 /// `demo-rust-fyde`'s own opt-in dump, threaded here from `Service::run`'s
 /// `debug_http_dump` parameter) additionally records the *response* body
 /// for `get`/`post_form`/`post_json` (never the request side) — enable it
 /// only for a trusted, local debugging run.
 ///
-/// `wreq_emulation` controls whether the client applies `wreq_util`'s
+/// `options.wreq_emulation` controls whether the client applies `wreq_util`'s
 /// Chrome TLS/HTTP2 fingerprint emulation (`Profile::Chrome131`) — some
 /// sites' WAFs block `wreq`'s TLS fingerprint outright regardless of
 /// whether emulation is on, so a scraper can opt out per its
 /// `scrapers/<name>/manifest.json`'s `wreq_emulation` field (in the
 /// `scripts` repo) rather than carrying a global toggle.
 ///
-/// `follow_redirects` controls whether the client follows HTTP redirects at
+/// `options.follow_redirects` controls whether the client follows HTTP redirects at
 /// all. Unlike `reqwest`, `wreq`'s builder defaults to not following
 /// redirects (`redirect::Policy::none()`); scripts generally rely on a
 /// real-browser-like client that follows them (e.g. to pick up cookies set
@@ -212,7 +213,7 @@ fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
 /// itself (e.g. reading a `Location` header) rather than carrying a global
 /// toggle.
 ///
-/// `allowed_domains` gates every method here (see
+/// `options.allowed_domains` gates every method here (see
 /// `host::ensure_domain_allowed`): a call whose `url` isn't on one of these
 /// domains (or a subdomain of one) fails before the request is ever sent —
 /// no DNS lookup, no connection, nothing recorded beyond the `error` entry
@@ -225,202 +226,75 @@ fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
 /// passes that check) — otherwise a page on an allowed domain could redirect
 /// a request straight to a disallowed one and `wreq` would follow it
 /// automatically, bypassing the check above entirely.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn table(
     lua: &Lua,
     jar: Arc<Jar>,
     visited_origins: Arc<Mutex<HashSet<String>>>,
     recorder: Arc<Recorder>,
     runtime: Handle,
-    debug_http_dump: bool,
-    wreq_emulation: bool,
-    follow_redirects: bool,
-    allowed_domains: Arc<Vec<String>>,
+    options: &RunOptions,
 ) -> LuaResult<Table> {
-    let mut builder = Client::builder().cookie_provider(jar.clone());
-    if wreq_emulation {
-        builder = builder.emulation(Profile::Chrome131);
-    }
-    let redirect_policy = if follow_redirects {
-        let redirect_allowed_domains = allowed_domains.clone();
-        wreq::redirect::Policy::custom(move |attempt| {
-            let target = attempt.uri.to_string();
-            if let Err(message) = super::ensure_domain_allowed(&target, &redirect_allowed_domains) {
-                return attempt.error(message);
-            }
-            // Delegates everything else (loop detection, the 10-hop cap) to
-            // the default policy — `custom` doesn't get that for free.
-            wreq::redirect::Policy::default().redirect(attempt)
-        })
-    } else {
-        wreq::redirect::Policy::none()
-    };
-    let client = builder
-        .timeout(Duration::from_secs(30))
-        .redirect(redirect_policy)
-        .build()
-        .map_err(mlua::Error::external)?;
+    let allowed_domains = Arc::new(options.allowed_domains.clone());
+    let host = Arc::new(HttpHost {
+        client: build_client(options, jar.clone(), allowed_domains.clone())?,
+        jar,
+        visited_origins,
+        recorder,
+        runtime,
+        allowed_domains,
+        debug_http_dump: options.debug_http_dump,
+    });
 
     let http = lua.create_table()?;
 
-    let get_client = client.clone();
-    let get_runtime = runtime.clone();
-    let get_origins = visited_origins.clone();
-    let get_recorder = recorder.clone();
-    let get_allowed_domains = allowed_domains.clone();
+    let get = host.clone();
     http.set(
         "get",
         lua.create_function(move |lua, (url, headers): (String, Option<Table>)| {
-            ensure_domain_allowed_or_record(&get_recorder, "http.get", &url, &get_allowed_domains)?;
-            track_origin(&get_origins, &url);
-            let header_map = to_header_map(headers)?;
-            let started = Instant::now();
-            let result = get_runtime.block_on(get_client.get(&url).headers(header_map).send());
-            match result {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    record_redirects(&get_recorder, "GET", &resp);
-                    let out = response_to_table(lua, &get_runtime, resp)?;
-                    let mut entry = json!({
-                        "method": "GET",
-                        "url": url,
-                        "status": status,
-                        "duration_ms": started.elapsed().as_millis(),
-                    });
-                    if debug_http_dump {
-                        let body: String = out.get("body").unwrap_or_default();
-                        if let Value::Object(fields) = &mut entry {
-                            fields.insert("response_body".into(), Value::String(body));
-                        }
-                    }
-                    get_recorder.record("http_request", entry);
-                    Ok(out)
-                }
-                Err(err) => {
-                    get_recorder.record(
-                        "error",
-                        json!({ "action": "http.get", "url": url, "message": err.to_string() }),
-                    );
-                    Err(mlua::Error::external(err))
-                }
-            }
+            get.admit("http.get", &url)?;
+            let request = get.client.get(&url).headers(to_header_map(headers)?);
+            get.send_text(lua, "http.get", "GET", &url, request, None)
         })?,
     )?;
 
-    let post_client = client.clone();
-    let post_runtime = runtime.clone();
-    let post_origins = visited_origins.clone();
-    let post_recorder = recorder.clone();
-    let post_allowed_domains = allowed_domains.clone();
+    let post_form = host.clone();
     http.set(
         "post_form",
         lua.create_function(
             move |lua, (url, form, headers): (String, Table, Option<Table>)| {
-                ensure_domain_allowed_or_record(
-                    &post_recorder,
-                    "http.post_form",
-                    &url,
-                    &post_allowed_domains,
-                )?;
-                track_origin(&post_origins, &url);
+                post_form.admit("http.post_form", &url)?;
                 let form_map = table_to_string_map(&form)?;
-                let form_fields: Vec<String> = form_map.keys().cloned().collect();
-                let header_map = to_header_map(headers)?;
-                let started = Instant::now();
-                let result = post_runtime.block_on(
-                    post_client
-                        .post(&url)
-                        .headers(header_map)
-                        .form(&form_map)
-                        .send(),
-                );
-                match result {
-                    Ok(resp) => {
-                        let status = resp.status().as_u16();
-                        record_redirects(&post_recorder, "POST", &resp);
-                        let out = response_to_table(lua, &post_runtime, resp)?;
-                        let mut entry = json!({
-                            "method": "POST",
-                            "url": url,
-                            "status": status,
-                            "form_fields": form_fields,
-                            "duration_ms": started.elapsed().as_millis(),
-                        });
-                        if debug_http_dump {
-                            let body: String = out.get("body").unwrap_or_default();
-                            if let Value::Object(fields) = &mut entry {
-                                fields.insert("response_body".into(), Value::String(body));
-                            }
-                        }
-                        post_recorder.record("http_request", entry);
-                        Ok(out)
-                    }
-                    Err(err) => {
-                        post_recorder.record(
-                            "error",
-                            json!({ "action": "http.post_form", "url": url, "message": err.to_string() }),
-                        );
-                        Err(mlua::Error::external(err))
-                    }
-                }
+                let form_fields = form_map.keys().cloned().collect();
+                let request = post_form
+                    .client
+                    .post(&url)
+                    .headers(to_header_map(headers)?)
+                    .form(&form_map);
+                post_form.send_text(
+                    lua,
+                    "http.post_form",
+                    "POST",
+                    &url,
+                    request,
+                    Some(form_fields),
+                )
             },
         )?,
     )?;
 
-    let post_json_client = client.clone();
-    let post_json_runtime = runtime.clone();
-    let post_json_origins = visited_origins.clone();
-    let post_json_recorder = recorder.clone();
-    let post_json_allowed_domains = allowed_domains.clone();
+    let post_json = host.clone();
     http.set(
         "post_json",
         lua.create_function(
             move |lua, (url, body, headers): (String, LuaValue, Option<Table>)| {
-                ensure_domain_allowed_or_record(
-                    &post_json_recorder,
-                    "http.post_json",
-                    &url,
-                    &post_json_allowed_domains,
-                )?;
-                track_origin(&post_json_origins, &url);
+                post_json.admit("http.post_json", &url)?;
                 let body_json: Value = lua.from_value(body)?;
-                let header_map = to_header_map(headers)?;
-                let started = Instant::now();
-                let result = post_json_runtime.block_on(
-                    post_json_client
-                        .post(&url)
-                        .headers(header_map)
-                        .json(&body_json)
-                        .send(),
-                );
-                match result {
-                    Ok(resp) => {
-                        let status = resp.status().as_u16();
-                        record_redirects(&post_json_recorder, "POST", &resp);
-                        let out = response_to_table(lua, &post_json_runtime, resp)?;
-                        let mut entry = json!({
-                            "method": "POST",
-                            "url": url,
-                            "status": status,
-                            "duration_ms": started.elapsed().as_millis(),
-                        });
-                        if debug_http_dump {
-                            let body: String = out.get("body").unwrap_or_default();
-                            if let Value::Object(fields) = &mut entry {
-                                fields.insert("response_body".into(), Value::String(body));
-                            }
-                        }
-                        post_json_recorder.record("http_request", entry);
-                        Ok(out)
-                    }
-                    Err(err) => {
-                        post_json_recorder.record(
-                            "error",
-                            json!({ "action": "http.post_json", "url": url, "message": err.to_string() }),
-                        );
-                        Err(mlua::Error::external(err))
-                    }
-                }
+                let request = post_json
+                    .client
+                    .post(&url)
+                    .headers(to_header_map(headers)?)
+                    .json(&body_json);
+                post_json.send_text(lua, "http.post_json", "POST", &url, request, None)
             },
         )?,
     )?;
@@ -433,78 +307,43 @@ pub(super) fn table(
     // entirely for a request that already carries one. Records nothing (the
     // value may be a session secret); gated by `allowed_domains` like every
     // other method here so a script can't plant cookies for other hosts.
-    let set_cookie_origins = visited_origins.clone();
-    let set_cookie_recorder = recorder.clone();
-    let set_cookie_allowed_domains = allowed_domains.clone();
+    let set_cookie = host.clone();
     http.set(
         "set_cookie",
-        lua.create_function(move |_, (url, set_cookie): (String, String)| {
-            ensure_domain_allowed_or_record(
-                &set_cookie_recorder,
-                "http.set_cookie",
-                &url,
-                &set_cookie_allowed_domains,
-            )?;
-            track_origin(&set_cookie_origins, &url);
-            jar.add(set_cookie.as_str(), url.as_str());
+        lua.create_function(move |_, (url, cookie): (String, String)| {
+            set_cookie.admit("http.set_cookie", &url)?;
+            set_cookie.jar.add(cookie.as_str(), url.as_str());
             Ok(())
         })?,
     )?;
 
-    let download_client = client.clone();
-    let download_runtime = runtime.clone();
-    let download_origins = visited_origins.clone();
-    let download_recorder = recorder;
-    let download_allowed_domains = allowed_domains;
+    let download = host;
     http.set(
         "download",
         lua.create_function(move |lua, (url, headers): (String, Option<Table>)| {
-            ensure_domain_allowed_or_record(
-                &download_recorder,
-                "http.download",
-                &url,
-                &download_allowed_domains,
-            )?;
-            track_origin(&download_origins, &url);
-            let header_map = to_header_map(headers)?;
+            download.admit("http.download", &url)?;
+            let request = download.client.get(&url).headers(to_header_map(headers)?);
             let started = Instant::now();
-            let result =
-                download_runtime.block_on(download_client.get(&url).headers(header_map).send());
-            let resp = match result {
-                Ok(resp) => resp,
-                Err(err) => {
-                    download_recorder.record(
-                        "error",
-                        json!({ "action": "http.download", "url": url, "message": err.to_string() }),
-                    );
-                    return Err(mlua::Error::external(err));
-                }
-            };
+            let resp = download.send("http.download", &url, request)?;
 
             let status = resp.status().as_u16();
-            record_redirects(&download_recorder, "DOWNLOAD", &resp);
+            record_redirects(&download.recorder, "DOWNLOAD", &resp);
             let content_type = resp
                 .headers()
                 .get(wreq::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            let bytes = match download_runtime.block_on(resp.bytes()) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    download_recorder.record(
-                        "error",
-                        json!({ "action": "http.download", "url": url, "message": err.to_string() }),
-                    );
-                    return Err(mlua::Error::external(err));
-                }
-            };
+            let bytes = download
+                .runtime
+                .block_on(resp.bytes())
+                .map_err(|err| download.record_error("http.download", &url, err))?;
 
             // The body is never dumped here, even under `debug_http_dump`:
             // downloads are routinely binary (PDFs, images), which wouldn't
             // round-trip as JSON text anyway, unlike `get`/`post_form`'s
             // textual response bodies.
-            download_recorder.record(
+            download.recorder.record(
                 "http_request",
                 json!({
                     "method": "DOWNLOAD",
@@ -527,6 +366,121 @@ pub(super) fn table(
     Ok(http)
 }
 
+/// Builds this run's `wreq` client on `jar`, per `options` (see [`table`]'s
+/// doc comment for `wreq_emulation`/`follow_redirects`), checking every
+/// redirect hop against `allowed_domains`.
+fn build_client(
+    options: &RunOptions,
+    jar: Arc<Jar>,
+    allowed_domains: Arc<Vec<String>>,
+) -> LuaResult<Client> {
+    let mut builder = Client::builder().cookie_provider(jar);
+    if options.wreq_emulation {
+        builder = builder.emulation(Profile::Chrome131);
+    }
+    let redirect_policy = if options.follow_redirects {
+        wreq::redirect::Policy::custom(move |attempt| {
+            let target = attempt.uri.to_string();
+            if let Err(message) = super::ensure_domain_allowed(&target, &allowed_domains) {
+                return attempt.error(message);
+            }
+            // Delegates everything else (loop detection, the 10-hop cap) to
+            // the default policy — `custom` doesn't get that for free.
+            wreq::redirect::Policy::default().redirect(attempt)
+        })
+    } else {
+        wreq::redirect::Policy::none()
+    };
+    builder
+        .timeout(Duration::from_secs(30))
+        .redirect(redirect_policy)
+        .build()
+        .map_err(mlua::Error::external)
+}
+
+/// The state every `fyde.http` function shares for one run, so each of them
+/// captures a single `Arc` of it instead of its own copy of every field.
+struct HttpHost {
+    client: Client,
+    jar: Arc<Jar>,
+    visited_origins: Arc<Mutex<HashSet<String>>>,
+    recorder: Arc<Recorder>,
+    runtime: Handle,
+    allowed_domains: Arc<Vec<String>>,
+    debug_http_dump: bool,
+}
+
+impl HttpHost {
+    /// The gate every method passes before touching the network: rejects
+    /// (and records) a `url` outside `allowed_domains`, then remembers its
+    /// origin for [`export_cookies`].
+    fn admit(&self, action: &str, url: &str) -> LuaResult<()> {
+        ensure_domain_allowed_or_record(&self.recorder, action, url, &self.allowed_domains)?;
+        track_origin(&self.visited_origins, url);
+        Ok(())
+    }
+
+    /// Sends `request`, recording an `error` entry if it fails.
+    fn send(
+        &self,
+        action: &str,
+        url: &str,
+        request: wreq::RequestBuilder,
+    ) -> LuaResult<wreq::Response> {
+        self.runtime
+            .block_on(request.send())
+            .map_err(|err| self.record_error(action, url, err))
+    }
+
+    /// Sends `request` for `get`/`post_form`/`post_json` and returns its
+    /// textual response as a `{status, url, body}` table, recording an
+    /// `http_request` entry (plus `form_fields`' names when given, and the
+    /// response body under `debug_http_dump`) or an `error` entry.
+    fn send_text(
+        &self,
+        lua: &Lua,
+        action: &str,
+        method: &str,
+        url: &str,
+        request: wreq::RequestBuilder,
+        form_fields: Option<Vec<String>>,
+    ) -> LuaResult<Table> {
+        let started = Instant::now();
+        let resp = self.send(action, url, request)?;
+        let status = resp.status().as_u16();
+        record_redirects(&self.recorder, method, &resp);
+        let out = response_to_table(lua, &self.runtime, resp)?;
+
+        let mut entry = json!({
+            "method": method,
+            "url": url,
+            "status": status,
+            "duration_ms": started.elapsed().as_millis(),
+        });
+        if let Value::Object(fields) = &mut entry {
+            if let Some(form_fields) = form_fields {
+                fields.insert("form_fields".into(), json!(form_fields));
+            }
+            if self.debug_http_dump {
+                let body: String = out.get("body").unwrap_or_default();
+                fields.insert("response_body".into(), Value::String(body));
+            }
+        }
+        self.recorder.record("http_request", entry);
+        Ok(out)
+    }
+
+    /// Records `err` as an `error` entry for `action` on `url` and converts
+    /// it into the Lua error that fails the script's call.
+    fn record_error(&self, action: &str, url: &str, err: wreq::Error) -> mlua::Error {
+        self.recorder.record(
+            "error",
+            json!({ "action": action, "url": url, "message": err.to_string() }),
+        );
+        mlua::Error::external(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,10 +500,13 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             recorder.clone(),
             runtime.handle().clone(),
-            false,
-            true,
-            true,
-            Arc::new(vec!["allowed.example.com".to_string()]),
+            &RunOptions {
+                debug_http_dump: false,
+                wreq_emulation: true,
+                follow_redirects: true,
+                allowed_domains: vec!["allowed.example.com".to_string()],
+                browser_visible: false,
+            },
         )
         .unwrap();
         lua.globals().set("http", http_table).unwrap();
@@ -612,13 +569,16 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             recorder.clone(),
             runtime.handle().clone(),
-            false,
-            false,
-            true,
-            // Allows the redirecting server's own host, but not the host
-            // it redirects to — proving the block happens on the redirect
-            // hop, not the (allowed) initial request.
-            Arc::new(vec!["127.0.0.1".to_string()]),
+            &RunOptions {
+                debug_http_dump: false,
+                wreq_emulation: false,
+                follow_redirects: true,
+                // Allows the redirecting server's own host, but not the host
+                // it redirects to — proving the block happens on the redirect
+                // hop, not the (allowed) initial request.
+                allowed_domains: vec!["127.0.0.1".to_string()],
+                browser_visible: false,
+            },
         )
         .unwrap();
         lua.globals().set("http", http_table).unwrap();
@@ -680,13 +640,16 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             recorder.clone(),
             runtime.handle().clone(),
-            false,
-            false,
-            true,
-            // Both servers are on 127.0.0.1 (just different ports, which
-            // the domain check ignores) — proving an allowed redirect still
-            // gets followed, not just that a disallowed one gets blocked.
-            Arc::new(vec!["127.0.0.1".to_string()]),
+            &RunOptions {
+                debug_http_dump: false,
+                wreq_emulation: false,
+                follow_redirects: true,
+                // Both servers are on 127.0.0.1 (just different ports, which
+                // the domain check ignores) — proving an allowed redirect still
+                // gets followed, not just that a disallowed one gets blocked.
+                allowed_domains: vec!["127.0.0.1".to_string()],
+                browser_visible: false,
+            },
         )
         .unwrap();
         lua.globals().set("http", http_table).unwrap();
@@ -725,10 +688,13 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             recorder,
             runtime.handle().clone(),
-            false,
-            true,
-            true,
-            Arc::new(vec!["allowed.example.com".to_string()]),
+            &RunOptions {
+                debug_http_dump: false,
+                wreq_emulation: true,
+                follow_redirects: true,
+                allowed_domains: vec!["allowed.example.com".to_string()],
+                browser_visible: false,
+            },
         )
         .unwrap();
         lua.globals().set("http", http_table).unwrap();

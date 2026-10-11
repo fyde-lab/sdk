@@ -152,9 +152,9 @@ pub(super) struct HostConfig {
 /// `host::browser::table`) — it opts this run into also recording response
 /// bodies for `fyde.http`, and the opened page's HTML for
 /// `fyde.browser:open`, on top of the method/url/status/timing always
-/// recorded. `wreq_emulation` is also forwarded to `fyde.http` only — it
-/// toggles `wreq`'s Chrome TLS/HTTP2 fingerprint emulation. `follow_redirects` is also forwarded to `fyde.http` only — it
-/// toggles whether the client automatically follows HTTP redirects.
+/// recorded. `wreq_emulation` and `follow_redirects` are forwarded to
+/// `fyde.http` only — they toggle `wreq`'s Chrome TLS/HTTP2 fingerprint
+/// emulation and whether the client automatically follows HTTP redirects.
 /// `allowed_domains` is forwarded to both `fyde.http` and `fyde.browser` —
 /// the only two tables with a network entry point of their own — and
 /// enforced by `ensure_domain_allowed` before any of their methods actually
@@ -172,19 +172,12 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
         on_question,
         recorder,
         runtime,
-        options:
-            RunOptions {
-                debug_http_dump,
-                wreq_emulation,
-                follow_redirects,
-                allowed_domains,
-                browser_visible: _,
-            },
+        options,
     } = config;
     let scraper_name = scraper_name.as_str();
     let cookie_jar = build_jar(&cookies);
     let visited_origins = Arc::new(Mutex::new(HashSet::new()));
-    let allowed_domains = Arc::new(allowed_domains);
+    let allowed_domains = Arc::new(options.allowed_domains.clone());
 
     let fyde = lua.create_table().context("creating the `fyde` table")?;
 
@@ -198,10 +191,7 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
             visited_origins.clone(),
             recorder.clone(),
             runtime.clone(),
-            debug_http_dump,
-            wreq_emulation,
-            follow_redirects,
-            allowed_domains.clone(),
+            &options,
         )?,
     )
     .context("installing fyde.http")?;
@@ -228,7 +218,7 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
             browser,
             recorder,
             runtime,
-            debug_http_dump,
+            options.debug_http_dump,
             allowed_domains,
         )?,
     )
