@@ -14,3 +14,15 @@ pub enum ProgressEvent {
         message: String,
     },
 }
+
+/// The per-run switches [`super::Service::run`] takes (see its doc comment
+/// for what each one does), carried together from there down to the Lua
+/// host tables and the browser driver instead of as five loose arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RunOptions {
+    pub(super) debug_http_dump: bool,
+    pub(super) wreq_emulation: bool,
+    pub(super) follow_redirects: bool,
+    pub(super) allowed_domains: Vec<String>,
+    pub(super) browser_visible: bool,
+}

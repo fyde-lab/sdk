@@ -23,6 +23,7 @@ use crate::{ErrorContext as _, Result};
 use super::ProgressEvent;
 use super::browser::Service as BrowserService;
 use super::cookies::Cookie;
+use super::models::RunOptions;
 use super::reports::Recorder;
 
 /// Handle returned by [`install`], letting `service.rs` read back
@@ -115,6 +116,23 @@ impl Installed {
     }
 }
 
+/// Everything [`install`] wires into the `fyde` table: the scraper's saved
+/// state, the services and callbacks its host functions call into, and the
+/// run's [`RunOptions`] (`browser_visible` aside, which only the browser
+/// driver itself reads).
+pub(super) struct HostConfig {
+    pub(super) scraper_name: String,
+    pub(super) session_data: JsonValue,
+    pub(super) cookies: Vec<Cookie>,
+    pub(super) documents: Arc<dyn DocumentsService>,
+    pub(super) browser: Arc<dyn BrowserService>,
+    pub(super) on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
+    pub(super) on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
+    pub(super) recorder: Arc<Recorder>,
+    pub(super) runtime: Handle,
+    pub(super) options: RunOptions,
+}
+
 /// Wires every host capability a scraper script is allowed to use into a
 /// single `fyde` global table: `fyde.log`, `fyde.http`, `fyde.html`,
 /// `fyde.json`, `fyde.progress`, `fyde.input`, `fyde.save_document`,
@@ -143,23 +161,27 @@ impl Installed {
 /// reaches the network: a scraper (conventionally reading its own
 /// `scrapers/<name>/manifest.json`'s `allowed_domains` list) can only ever
 /// make requests to hosts it explicitly declared.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn install(
-    lua: &Lua,
-    scraper_name: &str,
-    session_data: JsonValue,
-    cookies: Vec<Cookie>,
-    documents: Arc<dyn DocumentsService>,
-    browser: Arc<dyn BrowserService>,
-    on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
-    on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
-    recorder: Arc<Recorder>,
-    runtime: Handle,
-    debug_http_dump: bool,
-    wreq_emulation: bool,
-    follow_redirects: bool,
-    allowed_domains: Vec<String>,
-) -> Result<Installed> {
+pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
+    let HostConfig {
+        scraper_name,
+        session_data,
+        cookies,
+        documents,
+        browser,
+        on_progress,
+        on_question,
+        recorder,
+        runtime,
+        options:
+            RunOptions {
+                debug_http_dump,
+                wreq_emulation,
+                follow_redirects,
+                allowed_domains,
+                browser_visible: _,
+            },
+    } = config;
+    let scraper_name = scraper_name.as_str();
     let cookie_jar = build_jar(&cookies);
     let visited_origins = Arc::new(Mutex::new(HashSet::new()));
     let allowed_domains = Arc::new(allowed_domains);

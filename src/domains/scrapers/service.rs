@@ -10,7 +10,8 @@ use crate::domains::scripts::InstalledScript;
 use crate::{ErrorContext as _, Result};
 
 use super::cookies::{Cookie, Service as CookiesService};
-use super::host;
+use super::host::{self, HostConfig};
+use super::models::RunOptions;
 use super::reports::{Recorder, Service as ReportsService};
 use super::session::Service as SessionService;
 use super::{ProgressEvent, Service};
@@ -90,38 +91,33 @@ impl Service for ScrapersClient {
     ) -> Result<()> {
         let cookies = self.cookies.load(name).await?;
         let session_data = self.session.load(name).await?;
-        let handle = Handle::current();
         let recorder = Arc::new(Recorder::new(name));
         recorder.record("run_started", json!({ "script": name }));
 
-        let documents = self.documents.clone();
-        let on_progress = self.on_progress.clone();
-        let on_question = self.on_question.clone();
-        let name_owned = name.to_string();
-        let script_owned = script.to_string();
-        let recorder_for_run = recorder.clone();
-
-        let (session_data, cookies, run_result) = tokio::task::spawn_blocking(move || {
-            run_script(
-                &name_owned,
-                &script_owned,
-                parameters,
-                session_data,
-                cookies,
-                documents,
-                on_progress,
-                on_question,
-                recorder_for_run,
-                handle,
+        let job = ScraperJob {
+            name: name.to_string(),
+            script: script.to_string(),
+            parameters,
+            session_data,
+            cookies,
+            documents: self.documents.clone(),
+            on_progress: self.on_progress.clone(),
+            on_question: self.on_question.clone(),
+            recorder: recorder.clone(),
+            runtime: Handle::current(),
+            options: RunOptions {
                 debug_http_dump,
                 wreq_emulation,
                 follow_redirects,
                 allowed_domains,
                 browser_visible,
-            )
-        })
-        .await
-        .with_context(|| format!("scraper {name:?} task panicked"))??;
+            },
+        };
+
+        let (session_data, cookies, run_result) =
+            tokio::task::spawn_blocking(move || run_script(job))
+                .await
+                .with_context(|| format!("scraper {name:?} task panicked"))??;
 
         match &run_result {
             Ok(()) => recorder.record("run_finished", json!({ "status": "ok" })),
@@ -153,18 +149,11 @@ impl Service for ScrapersClient {
     }
 }
 
-/// Runs the whole blocking, synchronous half of a scraper run: builds a
-/// fresh Lua VM, installs the `fyde` host table (see `host::install`),
-/// evaluates `script` and calls its `run(parameters)` entrypoint, then reads
-/// back `fyde.session`'s final contents and every cookie picked up this run
-/// — regardless of whether the script's `run` succeeded or failed. The
-/// caller is responsible for persisting the returned session data/cookies
-/// (cookies only when `run_result` is `Ok`, see `Service::run`) and for
-/// propagating `run_result`.
-#[allow(clippy::too_many_arguments)]
-fn run_script(
-    name: &str,
-    script: &str,
+/// Everything the blocking half of a scraper run (see [`run_script`])
+/// needs, moved onto its blocking thread in one piece.
+struct ScraperJob {
+    name: String,
+    script: String,
     parameters: Value,
     session_data: Value,
     cookies: Vec<Cookie>,
@@ -173,12 +162,32 @@ fn run_script(
     on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
     recorder: Arc<Recorder>,
     runtime: Handle,
-    debug_http_dump: bool,
-    wreq_emulation: bool,
-    follow_redirects: bool,
-    allowed_domains: Vec<String>,
-    browser_visible: bool,
-) -> Result<(Value, Vec<Cookie>, Result<()>)> {
+    options: RunOptions,
+}
+
+/// Runs the whole blocking, synchronous half of a scraper run: builds a
+/// fresh Lua VM, installs the `fyde` host table (see `host::install`),
+/// evaluates `script` and calls its `run(parameters)` entrypoint, then reads
+/// back `fyde.session`'s final contents and every cookie picked up this run
+/// — regardless of whether the script's `run` succeeded or failed. The
+/// caller is responsible for persisting the returned session data/cookies
+/// (cookies only when `run_result` is `Ok`, see `Service::run`) and for
+/// propagating `run_result`.
+fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
+    let ScraperJob {
+        name,
+        script,
+        parameters,
+        session_data,
+        cookies,
+        documents,
+        on_progress,
+        on_question,
+        recorder,
+        runtime,
+        options,
+    } = job;
+
     let lua = sandboxed_lua().context("building sandboxed lua vm")?;
     // Built fresh per run, same as the Lua VM itself: the webview it lazily
     // spawns (see `browser::driver::BrowserDriver`) lives only as long as
@@ -188,8 +197,8 @@ fn run_script(
     // of this function. Its only state carried across runs is cookies,
     // seeded here from the same saved jar `fyde.http` gets.
     let browser = super::browser::init(
-        Arc::new(allowed_domains.clone()),
-        browser_visible,
+        Arc::new(options.allowed_domains.clone()),
+        options.browser_visible,
         cookies.clone(),
     );
     let browser_for_cookies = browser.clone();
@@ -197,23 +206,22 @@ fn run_script(
     let cookies_recorder = recorder.clone();
     let installed = host::install(
         &lua,
-        name,
-        session_data,
-        cookies,
-        documents,
-        browser,
-        on_progress,
-        on_question,
-        recorder,
-        runtime,
-        debug_http_dump,
-        wreq_emulation,
-        follow_redirects,
-        allowed_domains,
+        HostConfig {
+            scraper_name: name.clone(),
+            session_data,
+            cookies,
+            documents,
+            browser,
+            on_progress,
+            on_question,
+            recorder,
+            runtime,
+            options,
+        },
     )
     .context("installing host functions into the Lua VM")?;
 
-    let run_result = evaluate_and_run(&lua, name, script, parameters);
+    let run_result = evaluate_and_run(&lua, &name, &script, parameters);
 
     let (session_data, http_cookies) = installed
         .drain(&lua)
