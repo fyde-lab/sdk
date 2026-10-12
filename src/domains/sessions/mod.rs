@@ -1,6 +1,6 @@
 mod service;
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 #[cfg(test)]
@@ -42,6 +42,45 @@ pub(crate) trait Service: Send + Sync {
     /// `users::Service::logout` last cleared it). Called by
     /// `users::Service::create`/`login`/`logout`.
     async fn is_connected(&self) -> Result<bool>;
+
+    /// Checks the outcome of a call sent with
+    /// [`Service::authenticated_request`], passing a successful `response`
+    /// through and converting a failed one into an [`crate::Error`]. A
+    /// gRPC `UNAUTHENTICATED` rejection while a session is persisted means
+    /// the server no longer accepts this device's token (expired, revoked,
+    /// ...): the session is ended locally through the handler registered
+    /// with [`Service::on_session_expired`] — awaited, but run on its own
+    /// task, so it completes even if the caller is cancelled meanwhile
+    /// (e.g. the changelog consume job, which that handler stops) — and
+    /// this fails with [`crate::ErrorCode::SessionExpired`] — as does every
+    /// later rejection until [`Service::save_new_session`] opens a new
+    /// session, so calls racing the first one report it too, while the
+    /// session is only ended once. Otherwise, without a persisted session,
+    /// the rejection stays a plain [`crate::ErrorCode::Unauthenticated`]:
+    /// there is nothing to end.
+    /// Not used by the calls that open or close a session themselves
+    /// (registration, login, logout).
+    async fn check_response<R: Send + 'static>(
+        &self,
+        response: std::result::Result<R, tonic::Status>,
+    ) -> Result<R>;
+
+    /// Registers what [`Service::check_response`] runs to end a session
+    /// the server rejected. Held weakly, since the handler (`users`) itself
+    /// holds this service; once it's dropped, a rejected session is only
+    /// reported, not ended. Only the first registration is kept.
+    fn on_session_expired(&self, handler: Weak<dyn ExpiredSessionHandler>);
+}
+
+/// Ends a session the server rejected, clearing it from this device. Lets
+/// `sessions` trigger a logout without depending on `users` (which depends
+/// on `sessions`); see [`Service::on_session_expired`].
+#[cfg_attr(test, automock)]
+#[async_trait]
+pub(crate) trait ExpiredSessionHandler: Send + Sync {
+    /// Clears every trace of the rejected session from this device, the way
+    /// `users::Service::logout` does, minus telling the server.
+    async fn end_expired_session(&self) -> Result<()>;
 }
 
 /// Initializes the sessions service: uses `secrets` to read the session

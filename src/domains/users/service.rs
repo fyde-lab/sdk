@@ -6,7 +6,7 @@ use tonic::transport::Channel;
 
 use crate::domains::documents::Service as DocumentsService;
 use crate::domains::secrets::{MASTER_KEY_SECRET, SecretLocation, Service as SecretsService};
-use crate::domains::sessions::{Service as SessionsService, SessionsClient};
+use crate::domains::sessions::{ExpiredSessionHandler, Service as SessionsService, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
 use crate::tools::sql::LocalDatabase;
 use crate::{ErrorContext as _, ErrorKind, Result};
@@ -109,6 +109,25 @@ impl UsersClient {
             local_db,
             documents,
         }
+    }
+
+    /// Clears every trace of the account from this device: its secrets
+    /// from the credential store and every row of the local database. Both
+    /// always run, so a failure in one never leaves the other's data
+    /// behind. Changelog consumption must already be stopped, so it can't
+    /// write back what's being wiped.
+    async fn clear_local_state(&self) -> Result<()> {
+        let cleared = self
+            .secrets
+            .clear()
+            .await
+            .context("failed to clear secrets");
+        let wiped = self
+            .local_db
+            .wipe()
+            .await
+            .context("failed to wipe local database");
+        cleared.and(wiped)
     }
 
     /// Fails with [`crate::ErrorCode::AlreadyLoggedIn`] if a session is already open on
@@ -284,19 +303,7 @@ impl Service for UsersClient {
             ),
         }
 
-        // Both always run, so a failure in one never leaves the other's data
-        // behind.
-        let cleared = self
-            .secrets
-            .clear()
-            .await
-            .context("failed to clear secrets");
-        let wiped = self
-            .local_db
-            .wipe()
-            .await
-            .context("failed to wipe local database");
-        cleared.and(wiped)
+        self.clear_local_state().await
     }
 
     async fn change_password(
@@ -397,6 +404,23 @@ impl Service for UsersClient {
         role.parse()
             .map(Some)
             .map_err(|err| ErrorKind::InvalidResponse(format!("invalid cached role: {err}")).into())
+    }
+}
+
+/// Registered with `sessions` by [`super::init`]: a session the server
+/// rejected is logged out locally, the same way as [`Service::logout`] but
+/// without telling the server, which already considers it closed.
+#[async_trait]
+impl ExpiredSessionHandler for UsersClient {
+    async fn end_expired_session(&self) -> Result<()> {
+        if !self.sessions.is_connected().await? {
+            return Ok(());
+        }
+
+        self.documents.stop_sync();
+        self.clear_local_state()
+            .await
+            .context("failed to clear the rejected session's local state")
     }
 }
 
@@ -1311,6 +1335,86 @@ mod tests {
 
         assert!(
             documents
+                .stop_sync_called
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn end_expired_session_stops_sync_and_clears_local_state_without_telling_the_server() {
+        // No `expect_logout()`: the mock panics if the server is told.
+        let mut secrets = secrets_with_open_session();
+        secrets.expect_clear().times(1).returning(|| Ok(()));
+        let mut local_db = MockLocalDatabase::new();
+        local_db.expect_wipe().times(1).returning(|| Ok(()));
+        let documents = Arc::new(RecordingDocuments::default());
+
+        let client = UsersClient::with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            Arc::new(MockSettingsService::new()),
+            Arc::new(secrets),
+            Arc::new(local_db),
+            documents.clone(),
+        );
+
+        client.end_expired_session().await.unwrap();
+
+        assert!(
+            documents
+                .stop_sync_called
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn end_expired_session_still_wipes_the_local_database_if_clearing_secrets_fails() {
+        let mut secrets = secrets_with_open_session();
+        secrets
+            .expect_clear()
+            .times(1)
+            .returning(|| Err(ErrorKind::Encryption("keychain locked".into()).into()));
+        let mut local_db = MockLocalDatabase::new();
+        local_db.expect_wipe().times(1).returning(|| Ok(()));
+
+        let client = UsersClient::with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            Arc::new(MockSettingsService::new()),
+            Arc::new(secrets),
+            Arc::new(local_db),
+            Arc::new(RecordingDocuments::default()),
+        );
+
+        let err = client.end_expired_session().await.unwrap_err();
+
+        assert!(err.has_context());
+    }
+
+    #[tokio::test]
+    async fn end_expired_session_is_a_no_op_once_the_session_is_already_gone() {
+        // No `expect_clear()`/`expect_wipe()`: each mock panics if called.
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
+        let documents = Arc::new(RecordingDocuments::default());
+
+        let client = UsersClient::with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            Arc::new(MockSettingsService::new()),
+            Arc::new(secrets),
+            Arc::new(MockLocalDatabase::new()),
+            documents.clone(),
+        );
+
+        client.end_expired_session().await.unwrap();
+
+        assert!(
+            !documents
                 .stop_sync_called
                 .load(std::sync::atomic::Ordering::SeqCst)
         );

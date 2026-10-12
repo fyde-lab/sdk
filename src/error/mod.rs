@@ -64,7 +64,10 @@ macro_rules! for_each_error_code {
             ServerTimeout = 2005,
             /// The request was cancelled before completing (gRPC `CANCELLED`).
             RequestCancelled = 2006,
-            /// The session is missing, expired or revoked (gRPC `UNAUTHENTICATED`).
+            /// The server refused a call made without a session (gRPC
+            /// `UNAUTHENTICATED`). A call made *with* a session the server
+            /// no longer accepts fails with [`ErrorCode::SessionExpired`]
+            /// instead.
             Unauthenticated = 2007,
             /// The account isn't allowed to do this (gRPC `PERMISSION_DENIED`).
             PermissionDenied = 2008,
@@ -89,6 +92,10 @@ macro_rules! for_each_error_code {
             InvalidCredentials = 3001,
             /// A session is already open on this device.
             AlreadyLoggedIn = 3002,
+            /// The server rejected this device's session token (expired,
+            /// revoked or otherwise invalid), so the SDK logged the user out
+            /// locally: they must log in again.
+            SessionExpired = 3003,
             /// The document's file type isn't supported.
             UnsupportedDocumentExtension = 4001,
             /// No such document in the local cache.
@@ -236,6 +243,11 @@ pub(crate) enum ErrorKind {
     InvalidCredentials,
     #[error("a session is already open on this device; log out first")]
     AlreadyLoggedIn,
+    /// Not `#[from]`: a plain [`tonic::Status`] converts to
+    /// [`ErrorKind::Grpc`]; only `sessions::Service::check_response` decides
+    /// a rejection means the session itself is gone.
+    #[error("session rejected by the server, logged out: {0}")]
+    SessionExpired(tonic::Status),
     #[error("credential store error: {0}")]
     Keystore(#[from] keyring_core::Error),
     #[error("no OS credential store is available on this device")]
@@ -281,6 +293,7 @@ impl ErrorKind {
             ErrorKind::Encryption(_) => ErrorCode::Encryption,
             ErrorKind::InvalidCredentials => ErrorCode::InvalidCredentials,
             ErrorKind::AlreadyLoggedIn => ErrorCode::AlreadyLoggedIn,
+            ErrorKind::SessionExpired(_) => ErrorCode::SessionExpired,
             ErrorKind::Keystore(_) => ErrorCode::CredentialStore,
             ErrorKind::SecureStorageUnavailable => ErrorCode::SecureStorageUnavailable,
             ErrorKind::MessagePackEncode(_) => ErrorCode::MessagePackEncode,

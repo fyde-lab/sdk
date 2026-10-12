@@ -55,7 +55,9 @@ pub(super) trait FydeClient: Send + Sync {
 /// client is created per call. Every call is authenticated by attaching the
 /// session token currently persisted in the secrets store (if any) as a bearer
 /// `authorization` header (see
-/// [`crate::domains::sessions::Service::authenticated_request`]).
+/// [`crate::domains::sessions::Service::authenticated_request`]), and its
+/// outcome checked for a session the server rejected (see
+/// [`crate::domains::sessions::Service::check_response`]).
 pub(super) struct GrpcClient {
     channel: Channel,
     sessions: Arc<SessionsClient>,
@@ -84,8 +86,8 @@ impl FydeClient for GrpcClient {
             .await?;
 
         let response = self
-            .client()
-            .record_event(request)
+            .sessions
+            .check_response(self.client().record_event(request).await)
             .await
             .context("failed to record changelog event")?
             .into_inner();
@@ -107,8 +109,8 @@ impl FydeClient for GrpcClient {
             .await?;
 
         let response = self
-            .client()
-            .consume_since(request)
+            .sessions
+            .check_response(self.client().consume_since(request).await)
             .await
             .with_context(|| format!("failed to consume changelog events since id {id:?}"))?;
         Ok(Box::pin(response.into_inner()))

@@ -12,7 +12,7 @@ use tonic::transport::Channel;
 
 use crate::domains::documents::Service as DocumentsService;
 use crate::domains::secrets::Service as SecretsService;
-use crate::domains::sessions::SessionsClient;
+use crate::domains::sessions::{ExpiredSessionHandler, Service as _, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
 use crate::tools::sql::LocalDatabase;
 use crate::{ErrorContext as _, Result};
@@ -98,7 +98,11 @@ pub(crate) fn decode_master_key(encoded: &str) -> Result<Vec<u8>> {
 /// `create`/`login` refuse while a session is open, since the local cache —
 /// documents, changelog cursor, scraper cookies — isn't partitioned per
 /// account and would otherwise leak the previous account's data into the
-/// next one.
+/// next one. Should the server reject the session token on any
+/// authenticated call (expired, revoked, ...), the SDK logs out locally on
+/// its own — clearing the same state `logout` does — and that call fails
+/// with [`crate::ErrorCode::SessionExpired`], as does every call the
+/// server rejects until `create`/`login` open a new session.
 #[async_trait]
 pub trait Service: Send + Sync {
     /// Creates a new account and opens a session for the device named
@@ -221,7 +225,9 @@ pub trait Service: Send + Sync {
 /// `secrets` is cleared and `local_db` wiped by `logout`. `documents`'
 /// [`DocumentsService::start_sync`] is called by `create`/`login` once a
 /// session is open, and [`DocumentsService::stop_sync`] is called by
-/// `logout` to stop that consumption again.
+/// `logout` to stop that consumption again. The returned service is also
+/// registered with `sessions` to log out locally once the server rejects
+/// the session (see [`crate::domains::sessions::Service::check_response`]).
 pub(crate) async fn init(
     channel: Channel,
     settings: Arc<dyn SettingsService>,
@@ -230,7 +236,18 @@ pub(crate) async fn init(
     local_db: Arc<dyn LocalDatabase>,
     documents: Arc<dyn DocumentsService>,
 ) -> Result<Arc<dyn Service>> {
-    Ok(Arc::new(
-        UsersClient::new(channel, settings, secrets, sessions, local_db, documents).await?,
-    ))
+    let users = Arc::new(
+        UsersClient::new(
+            channel,
+            settings,
+            secrets,
+            sessions.clone(),
+            local_db,
+            documents,
+        )
+        .await?,
+    );
+    let handler: Arc<dyn ExpiredSessionHandler> = users.clone();
+    sessions.on_session_expired(Arc::downgrade(&handler));
+    Ok(users)
 }

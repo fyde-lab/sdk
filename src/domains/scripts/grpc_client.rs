@@ -84,7 +84,9 @@ pub(super) trait FydeClient: Send + Sync {
 /// is created per call. Every call is authenticated by attaching the
 /// session token currently persisted in the secrets store (if any) as a bearer
 /// `authorization` header (see
-/// [`crate::domains::sessions::Service::authenticated_request`]).
+/// [`crate::domains::sessions::Service::authenticated_request`]), and its
+/// outcome checked for a session the server rejected (see
+/// [`crate::domains::sessions::Service::check_response`]).
 pub(super) struct GrpcClient {
     channel: Channel,
     sessions: Arc<SessionsClient>,
@@ -123,8 +125,8 @@ impl FydeClient for GrpcClient {
             .await?;
 
         let response = self
-            .client()
-            .create_script(request)
+            .sessions
+            .check_response(self.client().create_script(request).await)
             .await
             .context("failed to create script")?
             .into_inner();
@@ -141,8 +143,8 @@ impl FydeClient for GrpcClient {
             .await?;
 
         let response = self
-            .client()
-            .fetch_script(request)
+            .sessions
+            .check_response(self.client().fetch_script(request).await)
             .await
             .context("failed to fetch script")?
             .into_inner();
@@ -170,8 +172,8 @@ impl FydeClient for GrpcClient {
             .await?;
 
         let response = self
-            .client()
-            .update_script(request)
+            .sessions
+            .check_response(self.client().update_script(request).await)
             .await
             .context("failed to update script")?
             .into_inner();
@@ -189,8 +191,8 @@ impl FydeClient for GrpcClient {
             })
             .await?;
 
-        self.client()
-            .enable_script(request)
+        self.sessions
+            .check_response(self.client().enable_script(request).await)
             .await
             .context("failed to enable script")?;
 
@@ -205,8 +207,8 @@ impl FydeClient for GrpcClient {
             })
             .await?;
 
-        self.client()
-            .disable_script(request)
+        self.sessions
+            .check_response(self.client().disable_script(request).await)
             .await
             .context("failed to disable script")?;
 
@@ -220,8 +222,8 @@ impl FydeClient for GrpcClient {
             .await?;
 
         let response = self
-            .client()
-            .list_user_scripts(request)
+            .sessions
+            .check_response(self.client().list_user_scripts(request).await)
             .await
             .context("failed to list user scripts")?
             .into_inner();
@@ -236,8 +238,8 @@ impl FydeClient for GrpcClient {
             .await?;
 
         let response = self
-            .client()
-            .list_public_scripts(request)
+            .sessions
+            .check_response(self.client().list_public_scripts(request).await)
             .await
             .context("failed to list public scripts")?
             .into_inner();

@@ -102,8 +102,8 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
         ),
         ErrorCode::RequestCancelled => ("The request was cancelled.", "La requête a été annulée."),
         ErrorCode::Unauthenticated => (
-            "Your session has expired. Please log in again.",
-            "Votre session a expiré. Veuillez vous reconnecter.",
+            "You need to be logged in to do this.",
+            "Vous devez être connecté pour effectuer cette action.",
         ),
         ErrorCode::PermissionDenied => (
             "You're not allowed to do this.",
@@ -144,6 +144,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
         ErrorCode::AlreadyLoggedIn => (
             "You're already logged in on this device. Log out first.",
             "Vous êtes déjà connecté sur cet appareil. Déconnectez-vous d'abord.",
+        ),
+        ErrorCode::SessionExpired => (
+            "Your session has expired. Please log in again.",
+            "Votre session a expiré. Veuillez vous reconnecter.",
         ),
         ErrorCode::UnsupportedDocumentExtension => (
             "This file type isn't supported. Only PDF files can be added.",

@@ -121,7 +121,11 @@ pub(super) trait FydeClient: Send + Sync {
 /// the secrets store (if any) as a bearer `authorization` header (see
 /// [`crate::domains::sessions::Service::authenticated_request`]) — harmless
 /// for the four registration/login steps, which the server doesn't require
-/// one for.
+/// one for. Only the change-password steps check their outcome for a
+/// session the server rejected (see
+/// [`crate::domains::sessions::Service::check_response`]): the
+/// registration/login steps run without a session, and `logout` is already
+/// ending it.
 pub(super) struct GrpcClient {
     channel: Channel,
     sessions: Arc<SessionsClient>,
@@ -266,8 +270,8 @@ impl FydeClient for GrpcClient {
             .await?;
 
         let response = self
-            .client()
-            .start_change_password(request)
+            .sessions
+            .check_response(self.client().start_change_password(request).await)
             .await
             .context("failed to start change password")?
             .into_inner();
@@ -288,8 +292,8 @@ impl FydeClient for GrpcClient {
             })
             .await?;
 
-        self.client()
-            .finish_change_password(request)
+        self.sessions
+            .check_response(self.client().finish_change_password(request).await)
             .await
             .context("failed to finish change password")?;
 
