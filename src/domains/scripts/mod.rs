@@ -130,8 +130,7 @@ pub(crate) fn init(
     changelog: Arc<dyn ChangelogService>,
 ) -> Arc<dyn Service> {
     Arc::new(service::ScriptsClient::new(
-        channel,
-        sessions,
+        grpc_client::GrpcClient::new(channel, sessions),
         SqliteStorage::new(pool),
         changelog,
     ))

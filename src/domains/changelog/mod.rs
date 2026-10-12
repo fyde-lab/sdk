@@ -21,7 +21,7 @@ use crate::domains::secrets::Service as SecretsService;
 use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
-use crate::{ErrorContext as _, Result};
+use crate::Result;
 
 /// Publishes and consumes the fyde server's changelog: a blind relay for
 /// opaque, client-encrypted write events — document writes, plus script
@@ -131,17 +131,14 @@ pub(crate) async fn init(
     let script_storage = scripts::SqliteStorage::new(pool);
     let cursor_storage = storage_settings::SettingsCursorStorage::new(settings);
     let client = service::ChangelogClient::new(
-        channel,
+        grpc_client::GrpcClient::new(channel, sessions),
         document_storage,
         script_storage,
         cursor_storage,
-        sessions,
         server_state,
         secrets,
         lock_path,
-    )
-    .await
-    .context("failed to create changelog client")?;
+    );
 
     Ok(Arc::new(client))
 }

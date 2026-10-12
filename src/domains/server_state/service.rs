@@ -1,11 +1,10 @@
 use async_trait::async_trait;
-use tonic::transport::Channel;
 use tonic_health::pb::health_check_response::ServingStatus;
 
 use crate::Result;
 
 use super::Service;
-use super::grpc_client::{FydeClient, GrpcClient};
+use super::grpc_client::FydeClient;
 
 /// The default [`Service`] implementation, checking reachability over an
 /// injected [`FydeClient`].
@@ -14,19 +13,8 @@ pub struct ServerStateClient {
 }
 
 impl ServerStateClient {
-    /// Creates a client for the server_state service using the shared
-    /// `channel` connection to the fyde server.
-    pub(super) fn new(channel: Channel) -> Self {
-        Self {
-            grpc: Box::new(GrpcClient::new(channel)),
-        }
-    }
-
-    /// Creates a client from an already-constructed [`FydeClient`], for
-    /// testing against a [`super::grpc_client::MockFydeClient`] instead of
-    /// a live server.
-    #[cfg(test)]
-    fn with_grpc(grpc: impl FydeClient + 'static) -> Self {
+    /// Creates a client checking reachability over `grpc`.
+    pub(super) fn new(grpc: impl FydeClient + 'static) -> Self {
         Self {
             grpc: Box::new(grpc),
         }
@@ -57,7 +45,7 @@ mod tests {
             .times(1)
             .returning(|| Ok(ServingStatus::Serving));
 
-        let client = ServerStateClient::with_grpc(mock_grpc);
+        let client = ServerStateClient::new(mock_grpc);
 
         assert!(client.is_server_reachable().await.unwrap());
     }
@@ -70,7 +58,7 @@ mod tests {
             .times(1)
             .returning(|| Ok(ServingStatus::NotServing));
 
-        let client = ServerStateClient::with_grpc(mock_grpc);
+        let client = ServerStateClient::new(mock_grpc);
 
         assert!(!client.is_server_reachable().await.unwrap());
     }
@@ -83,7 +71,7 @@ mod tests {
             .times(1)
             .returning(|| Err(ErrorKind::InvalidResponse("connection refused".to_string()).into()));
 
-        let client = ServerStateClient::with_grpc(mock_grpc);
+        let client = ServerStateClient::new(mock_grpc);
 
         assert!(!client.is_server_reachable().await.unwrap());
     }

@@ -4,19 +4,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::sync::watch;
-use tonic::transport::Channel;
 use uuid::Uuid;
 
 use crate::domains::documents::{Document, Metadata, Storage as DocumentStorage};
 use crate::domains::scripts::{InstalledScript, Storage as ScriptStorage};
 use crate::domains::secrets::Service as SecretsService;
 use crate::domains::server_state::Service as ServerStateService;
-use crate::domains::sessions::SessionsClient;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
 use super::Service;
 use super::crypto;
-use super::grpc_client::{ChangelogEvent as ProtoChangelogEvent, FydeClient, GrpcClient};
+use super::grpc_client::{ChangelogEvent as ProtoChangelogEvent, FydeClient};
 use super::models::{ChangelogEvent, EventType};
 use super::storage::CursorStorage;
 
@@ -74,7 +72,7 @@ pub(super) struct ChangelogClient<D: DocumentStorage, S: ScriptStorage, O: Curso
     /// with separate databases (the app, `fyde-scripts`, a second account's
     /// app) have nothing to arbitrate, and a shared lock left all but one of
     /// them read-only, so they never stored what they consumed. Under test,
-    /// a unique per-instance path (see [`Self::with_grpc`]).
+    /// a unique per-instance path (see `tests::test_lock_path`).
     lock_path: std::path::PathBuf,
     /// Holds the open, OS-locked handle to [`Self::lock_path`] for as long
     /// as this process has exclusive write permission over the local
@@ -98,50 +96,22 @@ const SERVER_REACHABILITY_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(200);
 
 impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, S, O> {
-    /// Creates a client for the changelog service using the shared
-    /// `channel` connection to the fyde server, using `document_storage` to
-    /// cache documents materialized by [`Service::consume`],
-    /// `script_storage` to save the scripts it materializes,
-    /// `cursor_storage` to track its progress through the changelog,
-    /// `server_state` to wait for the server to be reachable before opening
-    /// a changelog stream, `secrets` to read the account master key
-    /// [`crypto`] derives every event's KEK from, and `lock_path` as its
-    /// write lock (see [`Self::lock_path`]).
-    #[allow(clippy::too_many_arguments)]
-    pub(super) async fn new(
-        channel: Channel,
-        document_storage: D,
-        script_storage: S,
-        cursor_storage: O,
-        sessions: Arc<SessionsClient>,
-        server_state: Arc<dyn ServerStateService>,
-        secrets: Arc<dyn SecretsService>,
-        lock_path: std::path::PathBuf,
-    ) -> Result<Self> {
-        Ok(Self {
-            grpc: Box::new(GrpcClient::new(channel, sessions)),
-            document_storage,
-            script_storage,
-            cursor_storage,
-            server_state,
-            secrets,
-            stop: watch::Sender::new(false),
-            lock_path,
-            write_lock: Mutex::new(None),
-        })
-    }
-
-    /// Creates a client from an already-constructed [`FydeClient`], for
-    /// testing against a [`super::grpc_client::MockFydeClient`] instead of a
-    /// live server.
-    #[cfg(test)]
-    fn with_grpc(
+    /// Creates a client for the changelog service over `grpc`, using
+    /// `document_storage` to cache documents materialized by
+    /// [`Service::consume`], `script_storage` to save the scripts it
+    /// materializes, `cursor_storage` to track its progress through the
+    /// changelog, `server_state` to wait for the server to be reachable
+    /// before opening a changelog stream, `secrets` to read the account
+    /// master key [`crypto`] derives every event's KEK from, and `lock_path`
+    /// as its write lock (see [`Self::lock_path`]).
+    pub(super) fn new(
         grpc: impl FydeClient + 'static,
         document_storage: D,
         script_storage: S,
         cursor_storage: O,
         server_state: Arc<dyn ServerStateService>,
         secrets: Arc<dyn SecretsService>,
+        lock_path: std::path::PathBuf,
     ) -> Self {
         Self {
             grpc: Box::new(grpc),
@@ -151,8 +121,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
             server_state,
             secrets,
             stop: watch::Sender::new(false),
-            lock_path: std::env::temp_dir()
-                .join(format!("fyde-changelog-consume-{}.lock", Uuid::new_v4())),
+            lock_path,
             write_lock: Mutex::new(None),
         }
     }
@@ -462,6 +431,12 @@ mod tests {
     use crate::domains::secrets::MockService as MockSecretsService;
     use crate::domains::server_state::MockService as MockServerState;
 
+    /// A unique lock file path per client, so concurrently running tests
+    /// never contend for the same write lock.
+    fn test_lock_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("fyde-changelog-consume-{}.lock", Uuid::new_v4()))
+    }
+
     /// A [`ServerStateService`] mock reporting the server as always
     /// reachable, for tests where reachability isn't under test.
     fn reachable_server_state() -> Arc<dyn ServerStateService> {
@@ -540,13 +515,14 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
         client.acquire_write_lock();
 
@@ -593,13 +569,14 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
         client.acquire_write_lock();
 
@@ -635,13 +612,14 @@ mod tests {
         // No `expect_save_cursor()` either: the cursor only advances
         // alongside what was stored, so the lock holder still stores it.
 
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
         // No `acquire_write_lock()` call: this client never holds the lock.
 
@@ -661,26 +639,28 @@ mod tests {
         let document_storage = MockStorage::new();
         let cursor_storage = MockCursorStorage::new();
 
-        let first = ChangelogClient::with_grpc(
+        let first = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
         first.acquire_write_lock();
         assert!(first.has_write_permission());
 
         // Build a second client pointed at the same lock file as `first`,
         // simulating a second process/client instance racing for it.
-        let mut second = ChangelogClient::with_grpc(
+        let mut second = ChangelogClient::new(
             MockFydeClient::new(),
             MockStorage::new(),
             MockScriptStorage::new(),
             MockCursorStorage::new(),
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
         second.lock_path = first.lock_path.clone();
 
@@ -706,13 +686,14 @@ mod tests {
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
 
-        let client = Arc::new(ChangelogClient::with_grpc(
+        let client = Arc::new(ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         ));
 
         client
@@ -762,13 +743,14 @@ mod tests {
                 Ok(attempt >= 2)
             });
 
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             Arc::new(server_state),
             fake_secrets(),
+            test_lock_path(),
         );
 
         let mut callback = |_| {};
@@ -856,13 +838,14 @@ mod tests {
 
         // No `MockStorage` expectations: a script event must never touch
         // the documents cache.
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             MockStorage::new(),
             script_storage,
             cursor_storage_consuming(event_id),
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
         client.acquire_write_lock();
 
@@ -899,13 +882,14 @@ mod tests {
         cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             MockStorage::new(),
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
 
         client.consume_once(&mut |_| {}).await.unwrap();
@@ -932,13 +916,14 @@ mod tests {
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
 
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             MockStorage::new(),
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
         client.acquire_write_lock();
 
@@ -980,13 +965,14 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
 
         client.acquire_write_lock();
@@ -1025,13 +1011,14 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
         client.acquire_write_lock();
 
@@ -1071,13 +1058,14 @@ mod tests {
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
 
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
 
         let result = client.consume_once(&mut |_| {}).await;
@@ -1120,13 +1108,14 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
 
         client.acquire_write_lock();
@@ -1160,13 +1149,14 @@ mod tests {
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
 
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
 
         let mut callback = |_| {};
@@ -1196,13 +1186,14 @@ mod tests {
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
 
-        let client = Arc::new(ChangelogClient::with_grpc(
+        let client = Arc::new(ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         ));
 
         let loop_client = client.clone();
@@ -1230,13 +1221,14 @@ mod tests {
         let document_storage = MockStorage::new();
         let cursor_storage = MockCursorStorage::new();
 
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
 
         client.stop_consume_job();
@@ -1266,13 +1258,14 @@ mod tests {
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
 
-        let client = Arc::new(ChangelogClient::with_grpc(
+        let client = Arc::new(ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         ));
 
         tokio::time::timeout(
@@ -1309,13 +1302,14 @@ mod tests {
             })
             .returning(|_| Ok(Uuid::now_v7()));
 
-        let client = ChangelogClient::with_grpc(
+        let client = ChangelogClient::new(
             mock_grpc,
             MockStorage::new(),
             MockScriptStorage::new(),
             MockCursorStorage::new(),
             reachable_server_state(),
             fake_secrets(),
+            test_lock_path(),
         );
 
         client

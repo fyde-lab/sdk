@@ -2,14 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tonic::transport::Channel;
 use uuid::Uuid;
 
 use crate::domains::changelog::{EventType, Service as ChangelogService};
-use crate::domains::sessions::SessionsClient;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
-use super::grpc_client::{FydeClient, GrpcClient, ScriptDraft};
+use super::grpc_client::{FydeClient, ScriptDraft};
 use super::storage::Storage;
 use super::{InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptType, Service};
 
@@ -25,23 +23,6 @@ pub(super) struct ScriptsClient<S: Storage> {
 
 impl<S: Storage> ScriptsClient<S> {
     pub(super) fn new(
-        channel: Channel,
-        sessions: Arc<SessionsClient>,
-        storage: S,
-        changelog: Arc<dyn ChangelogService>,
-    ) -> Self {
-        Self {
-            grpc: Box::new(GrpcClient::new(channel, sessions)),
-            storage,
-            changelog,
-        }
-    }
-
-    /// Creates a client from an already-constructed [`FydeClient`], for
-    /// testing against a [`super::grpc_client::MockFydeClient`] instead of
-    /// a live server.
-    #[cfg(test)]
-    fn with_grpc(
         grpc: impl FydeClient + 'static,
         storage: S,
         changelog: Arc<dyn ChangelogService>,
@@ -279,7 +260,7 @@ mod tests {
             .build();
         let parameters = HashMap::from([("username".to_string(), json!("alice"))]);
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = ScriptsClient::with_grpc(
+        let client = ScriptsClient::new(
             grpc_fetching(script.clone()),
             MockStorage::new(),
             changelog.clone(),
@@ -311,7 +292,7 @@ mod tests {
             .with_parameter("username", required_parameter())
             .build();
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = ScriptsClient::with_grpc(
+        let client = ScriptsClient::new(
             grpc_fetching(script.clone()),
             MockStorage::new(),
             changelog.clone(),
@@ -344,7 +325,7 @@ mod tests {
             )
             .build();
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = ScriptsClient::with_grpc(
+        let client = ScriptsClient::new(
             grpc_fetching(script.clone()),
             MockStorage::new(),
             changelog.clone(),
@@ -370,7 +351,7 @@ mod tests {
             .times(1)
             .returning(|id| Err(ErrorKind::ScriptNotFound(id).into()));
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = ScriptsClient::with_grpc(mock_grpc, MockStorage::new(), changelog.clone());
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), changelog.clone());
 
         let err = client
             .install_script(InstallScriptRequest {
@@ -400,7 +381,7 @@ mod tests {
             .times(1)
             .returning(move || Ok(returned.clone()));
 
-        let client = ScriptsClient::with_grpc(MockFydeClient::new(), storage, unused_changelog());
+        let client = ScriptsClient::new(MockFydeClient::new(), storage, unused_changelog());
 
         assert_eq!(client.list_installed_scripts().await.unwrap(), expected);
     }
@@ -416,7 +397,7 @@ mod tests {
             .times(1)
             .returning(move || Ok(installed.clone()));
 
-        let client = ScriptsClient::with_grpc(MockFydeClient::new(), storage, unused_changelog());
+        let client = ScriptsClient::new(MockFydeClient::new(), storage, unused_changelog());
 
         assert_eq!(client.fetch_installed_script(id).await.unwrap(), wanted);
     }
@@ -429,7 +410,7 @@ mod tests {
             .times(1)
             .returning(|| Ok(vec![FakeInstalledScript::new().build()]));
 
-        let client = ScriptsClient::with_grpc(MockFydeClient::new(), storage, unused_changelog());
+        let client = ScriptsClient::new(MockFydeClient::new(), storage, unused_changelog());
 
         let err = client
             .fetch_installed_script(Uuid::new_v4())
@@ -465,7 +446,7 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(returned.clone()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, MockStorage::new(), unused_changelog());
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         let script = client
             .create_script(
@@ -497,7 +478,7 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(returned.clone()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, MockStorage::new(), unused_changelog());
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         assert_eq!(client.fetch_script(id).await.unwrap(), expected);
     }
@@ -514,7 +495,7 @@ mod tests {
             .times(1)
             .returning(move |_, _| Ok(returned.clone()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, MockStorage::new(), unused_changelog());
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         let script = client
             .update_script(
@@ -545,7 +526,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, MockStorage::new(), unused_changelog());
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         client.enable_script(id).await.unwrap();
     }
@@ -560,7 +541,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, MockStorage::new(), unused_changelog());
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         client.disable_script(id).await.unwrap();
     }
@@ -575,7 +556,7 @@ mod tests {
             .times(1)
             .returning(move || Ok(returned.clone()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, MockStorage::new(), unused_changelog());
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         assert_eq!(client.list_user_scripts().await.unwrap(), expected);
     }
@@ -590,7 +571,7 @@ mod tests {
             .times(1)
             .returning(move || Ok(returned.clone()));
 
-        let client = ScriptsClient::with_grpc(mock_grpc, MockStorage::new(), unused_changelog());
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         assert_eq!(client.list_public_scripts().await.unwrap(), expected);
     }

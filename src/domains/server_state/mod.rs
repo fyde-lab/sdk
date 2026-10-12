@@ -31,5 +31,7 @@ pub trait Service: Send + Sync {
 /// Initializes the server_state service: checks reachability over the
 /// shared `channel` connection to the fyde server.
 pub(crate) fn init(channel: Channel) -> Arc<dyn Service> {
-    Arc::new(ServerStateClient::new(channel))
+    Arc::new(ServerStateClient::new(grpc_client::GrpcClient::new(
+        channel,
+    )))
 }
