@@ -15,13 +15,13 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 use tonic::transport::Channel;
 
+use crate::Result;
 use crate::domains::documents::{self, Metadata};
 use crate::domains::scripts;
 use crate::domains::secrets::Service as SecretsService;
 use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
-use crate::Result;
 
 /// Publishes and consumes the fyde server's changelog: a blind relay for
 /// opaque, client-encrypted write events — document writes, plus script
