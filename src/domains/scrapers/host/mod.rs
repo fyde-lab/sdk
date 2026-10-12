@@ -34,6 +34,29 @@ pub(super) struct Installed {
     visited_origins: Arc<Mutex<HashSet<String>>>,
 }
 
+impl Installed {
+    /// Reads `fyde.session` back out of the Lua VM as JSON, and every cookie
+    /// now sitting in the jar for a host `fyde.http` actually visited this
+    /// run — ready for `service.rs` to persist via `session::Service::save`/
+    /// `cookies::Service::save`. Called once after the script's `run`
+    /// function returns, whether it succeeded or failed, so state from a
+    /// partial run isn't lost.
+    pub(super) fn drain(&self, lua: &Lua) -> Result<(JsonValue, Vec<Cookie>)> {
+        let fyde: Table = lua
+            .globals()
+            .get("fyde")
+            .context("fetching the `fyde` global")?;
+        let session_table: Table = fyde.get("session").context("fetching `fyde.session`")?;
+        let session_data: JsonValue = lua
+            .from_value(LuaValue::Table(session_table))
+            .context("converting fyde.session to JSON")?;
+
+        let cookies = export_cookies(&self.cookie_jar, &self.visited_origins);
+
+        Ok((session_data, cookies))
+    }
+}
+
 /// Enforced by every `fyde.http.get/post_form/post_json/download` call and
 /// `fyde.browser:open` — the one network entry point each of those has —
 /// before it ever reaches the network: `url`'s host must equal, or be a
@@ -91,29 +114,6 @@ pub(super) fn is_host_allowed(host: &str, allowed_domains: &[String]) -> bool {
         let domain = domain.to_ascii_lowercase();
         host == domain || (!is_ip_literal && host.ends_with(&format!(".{domain}")))
     })
-}
-
-impl Installed {
-    /// Reads `fyde.session` back out of the Lua VM as JSON, and every cookie
-    /// now sitting in the jar for a host `fyde.http` actually visited this
-    /// run — ready for `service.rs` to persist via `session::Service::save`/
-    /// `cookies::Service::save`. Called once after the script's `run`
-    /// function returns, whether it succeeded or failed, so state from a
-    /// partial run isn't lost.
-    pub(super) fn drain(&self, lua: &Lua) -> Result<(JsonValue, Vec<Cookie>)> {
-        let fyde: Table = lua
-            .globals()
-            .get("fyde")
-            .context("fetching the `fyde` global")?;
-        let session_table: Table = fyde.get("session").context("fetching `fyde.session`")?;
-        let session_data: JsonValue = lua
-            .from_value(LuaValue::Table(session_table))
-            .context("converting fyde.session to JSON")?;
-
-        let cookies = export_cookies(&self.cookie_jar, &self.visited_origins);
-
-        Ok((session_data, cookies))
-    }
 }
 
 /// Everything [`install`] wires into the `fyde` table: the scraper's saved

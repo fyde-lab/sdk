@@ -36,21 +36,6 @@ impl DevDocumentsClient {
     }
 }
 
-/// The metadata [`DevDocumentsClient::upload`] writes as JSON next to each
-/// saved document: only what the caller set on the [`UploadRequest`], since
-/// there is no parser (and so no transcript or script-derived fields) here.
-#[derive(Debug, Serialize)]
-struct DevMetadata<'a> {
-    id: Uuid,
-    original_name: &'a str,
-    name: Option<&'a str>,
-    r#type: Option<&'a str>,
-    source_category: Option<SourceCategory>,
-    source_sub_category: Option<SourceSubCategory>,
-    subjects: Option<&'a [String]>,
-    purpose: Option<Purpose>,
-}
-
 #[async_trait]
 impl Service for DevDocumentsClient {
     async fn upload(&self, request: UploadRequest) -> Result<Uuid> {
@@ -145,6 +130,21 @@ impl Service for DevDocumentsClient {
     }
 
     fn stop_sync(&self) {}
+}
+
+/// The metadata [`DevDocumentsClient::upload`] writes as JSON next to each
+/// saved document: only what the caller set on the [`UploadRequest`], since
+/// there is no parser (and so no transcript or script-derived fields) here.
+#[derive(Debug, Serialize)]
+struct DevMetadata<'a> {
+    id: Uuid,
+    original_name: &'a str,
+    name: Option<&'a str>,
+    r#type: Option<&'a str>,
+    source_category: Option<SourceCategory>,
+    source_sub_category: Option<SourceSubCategory>,
+    subjects: Option<&'a [String]>,
+    purpose: Option<Purpose>,
 }
 
 #[cfg(test)]

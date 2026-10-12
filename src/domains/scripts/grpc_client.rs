@@ -104,91 +104,6 @@ impl GrpcClient {
     }
 }
 
-/// Converts a generated `proto::script_parameter::Type` into the domain
-/// [`ScriptParameterType`]. Unknown/unspecified values fall back to
-/// [`ScriptParameterType::String`] rather than failing the whole script,
-/// since this is just a form-rendering hint.
-fn parameter_type_into_domain(parameter_type: i32) -> ScriptParameterType {
-    match proto::script_parameter::Type::try_from(parameter_type) {
-        Ok(proto::script_parameter::Type::Number) => ScriptParameterType::Number,
-        Ok(proto::script_parameter::Type::Boolean) => ScriptParameterType::Boolean,
-        _ => ScriptParameterType::String,
-    }
-}
-
-fn parameter_type_into_proto(parameter_type: ScriptParameterType) -> i32 {
-    match parameter_type {
-        ScriptParameterType::String => proto::script_parameter::Type::String as i32,
-        ScriptParameterType::Number => proto::script_parameter::Type::Number as i32,
-        ScriptParameterType::Boolean => proto::script_parameter::Type::Boolean as i32,
-    }
-}
-
-fn parameters_into_domain(
-    parameters: HashMap<String, proto::ScriptParameter>,
-) -> HashMap<String, ScriptParameter> {
-    parameters
-        .into_iter()
-        .map(|(key, parameter)| {
-            (
-                key,
-                ScriptParameter {
-                    label: parameter.label,
-                    placeholder: parameter.placeholder,
-                    parameter_type: parameter_type_into_domain(parameter.r#type),
-                    required: parameter.required,
-                    secret: parameter.secret,
-                },
-            )
-        })
-        .collect()
-}
-
-fn parameters_into_proto(
-    parameters: HashMap<String, ScriptParameter>,
-) -> HashMap<String, proto::ScriptParameter> {
-    parameters
-        .into_iter()
-        .map(|(key, parameter)| {
-            (
-                key,
-                proto::ScriptParameter {
-                    label: parameter.label,
-                    placeholder: parameter.placeholder,
-                    r#type: parameter_type_into_proto(parameter.parameter_type),
-                    required: parameter.required,
-                    secret: parameter.secret,
-                },
-            )
-        })
-        .collect()
-}
-
-/// Converts a generated `proto::Script` into the domain [`Script`] type,
-/// parsing its canonical UUIDv7 string id and its `type` string.
-fn into_domain(script: proto::Script) -> Result<Script> {
-    Ok(Script {
-        id: script
-            .id
-            .parse()
-            .context("failed to parse script id returned by the server")?,
-        name: script.name,
-        description: script.description,
-        short_description: script.short_description,
-        is_public: script.is_public,
-        icon: script.icon,
-        allowed_domains: script.allowed_domains,
-        version: script.version,
-        script: script.script,
-        last_updated: script.last_updated,
-        script_type: script
-            .r#type
-            .parse()
-            .context("failed to parse script type returned by the server")?,
-        parameters: parameters_into_domain(script.parameters),
-    })
-}
-
 #[async_trait]
 impl FydeClient for GrpcClient {
     async fn create_script(&self, draft: ScriptDraft) -> Result<Script> {
@@ -329,6 +244,91 @@ impl FydeClient for GrpcClient {
 
         response.scripts.into_iter().map(into_domain).collect()
     }
+}
+
+/// Converts a generated `proto::script_parameter::Type` into the domain
+/// [`ScriptParameterType`]. Unknown/unspecified values fall back to
+/// [`ScriptParameterType::String`] rather than failing the whole script,
+/// since this is just a form-rendering hint.
+fn parameter_type_into_domain(parameter_type: i32) -> ScriptParameterType {
+    match proto::script_parameter::Type::try_from(parameter_type) {
+        Ok(proto::script_parameter::Type::Number) => ScriptParameterType::Number,
+        Ok(proto::script_parameter::Type::Boolean) => ScriptParameterType::Boolean,
+        _ => ScriptParameterType::String,
+    }
+}
+
+fn parameter_type_into_proto(parameter_type: ScriptParameterType) -> i32 {
+    match parameter_type {
+        ScriptParameterType::String => proto::script_parameter::Type::String as i32,
+        ScriptParameterType::Number => proto::script_parameter::Type::Number as i32,
+        ScriptParameterType::Boolean => proto::script_parameter::Type::Boolean as i32,
+    }
+}
+
+fn parameters_into_domain(
+    parameters: HashMap<String, proto::ScriptParameter>,
+) -> HashMap<String, ScriptParameter> {
+    parameters
+        .into_iter()
+        .map(|(key, parameter)| {
+            (
+                key,
+                ScriptParameter {
+                    label: parameter.label,
+                    placeholder: parameter.placeholder,
+                    parameter_type: parameter_type_into_domain(parameter.r#type),
+                    required: parameter.required,
+                    secret: parameter.secret,
+                },
+            )
+        })
+        .collect()
+}
+
+fn parameters_into_proto(
+    parameters: HashMap<String, ScriptParameter>,
+) -> HashMap<String, proto::ScriptParameter> {
+    parameters
+        .into_iter()
+        .map(|(key, parameter)| {
+            (
+                key,
+                proto::ScriptParameter {
+                    label: parameter.label,
+                    placeholder: parameter.placeholder,
+                    r#type: parameter_type_into_proto(parameter.parameter_type),
+                    required: parameter.required,
+                    secret: parameter.secret,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Converts a generated `proto::Script` into the domain [`Script`] type,
+/// parsing its canonical UUIDv7 string id and its `type` string.
+fn into_domain(script: proto::Script) -> Result<Script> {
+    Ok(Script {
+        id: script
+            .id
+            .parse()
+            .context("failed to parse script id returned by the server")?,
+        name: script.name,
+        description: script.description,
+        short_description: script.short_description,
+        is_public: script.is_public,
+        icon: script.icon,
+        allowed_domains: script.allowed_domains,
+        version: script.version,
+        script: script.script,
+        last_updated: script.last_updated,
+        script_type: script
+            .r#type
+            .parse()
+            .context("failed to parse script type returned by the server")?,
+        parameters: parameters_into_domain(script.parameters),
+    })
 }
 
 #[cfg(test)]

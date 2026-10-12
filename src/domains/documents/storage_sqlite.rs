@@ -23,196 +23,6 @@ impl SqliteStorage {
     }
 }
 
-/// The `source_category` column has no NULL state (`NOT NULL DEFAULT ''`),
-/// so an unclassified document is stored as an empty string.
-fn source_category_to_column(source_category: Option<SourceCategory>) -> String {
-    source_category.map_or_else(String::new, |category| category.as_str().to_string())
-}
-
-fn source_category_from_column(column: String) -> Result<Option<SourceCategory>> {
-    if column.is_empty() {
-        return Ok(None);
-    }
-
-    column
-        .parse()
-        .map(Some)
-        .with_context(|| format!("invalid source category in local database: {column}"))
-}
-
-fn source_sub_category_to_column(source_sub_category: Option<SourceSubCategory>) -> Option<String> {
-    source_sub_category.map(|category| category.as_str().to_string())
-}
-
-fn source_sub_category_from_column(column: Option<String>) -> Result<Option<SourceSubCategory>> {
-    column
-        .map(|column| {
-            column
-                .parse()
-                .with_context(|| format!("invalid source sub-category in local database: {column}"))
-        })
-        .transpose()
-}
-
-/// The `subjects` column stores a JSON-encoded array, since SQLite has no
-/// native array type.
-fn subjects_to_column(subjects: &[String]) -> String {
-    serde_json::to_string(subjects).expect("serializing a Vec<String> to JSON cannot fail")
-}
-
-fn subjects_from_column(column: String) -> Result<Vec<String>> {
-    serde_json::from_str(&column)
-        .with_context(|| format!("invalid subjects json in local database: {column}"))
-}
-
-/// The `purpose` column has no NULL state (`NOT NULL DEFAULT ''`), so an
-/// unclassified document is stored as an empty string.
-fn purpose_to_column(purpose: Option<Purpose>) -> String {
-    purpose.map_or_else(String::new, |purpose| purpose.as_str().to_string())
-}
-
-fn purpose_from_column(column: String) -> Result<Option<Purpose>> {
-    if column.is_empty() {
-        return Ok(None);
-    }
-
-    column
-        .parse()
-        .map(Some)
-        .with_context(|| format!("invalid purpose in local database: {column}"))
-}
-
-/// Maps a row selecting every `documents` column (`id` included) back to a
-/// [`Document`].
-fn document_from_row(row: &SqliteRow) -> Result<Document> {
-    let id: String = row.get("id");
-    let content: Vec<u8> = row.get("content");
-    let id = Uuid::parse_str(&id)
-        .with_context(|| format!("invalid document id in local database: {id}"))?;
-
-    Ok(Document {
-        id,
-        metadata: Metadata {
-            id,
-            name: row.get("name"),
-            original_name: row.get("original_name"),
-            content_type: row.get("content_type"),
-            created_at: row.get("created_at"),
-            size: content.len() as u64,
-            checksum: row.get("checksum"),
-            transcript: row.get("transcript"),
-            r#type: row.get("type"),
-            source_category: source_category_from_column(row.get("source_category"))?,
-            source_sub_category: source_sub_category_from_column(row.get("source_sub_category"))?,
-            subjects: subjects_from_column(row.get("subjects"))?,
-            purpose: purpose_from_column(row.get("purpose"))?,
-        },
-        content,
-    })
-}
-
-/// Orders `documents_fts` matches best first (`bm25` scores lower for a
-/// better match), weighting each column in its declaration order in the
-/// `0014_create_documents_fts` migration: a hit in the name counts the
-/// most, one in the (long, noisy) transcript the least.
-const FTS_RANK: &str = "bm25(documents_fts,
-    10.0, -- name
-    5.0,  -- original_name
-    1.0,  -- transcript
-    4.0,  -- type
-    4.0,  -- source_category
-    4.0,  -- source_sub_category
-    6.0,  -- subjects
-    4.0   -- purpose
-)";
-
-/// Builds an FTS5 query matching documents containing every one of `terms`
-/// as a token prefix, in any column. Each term is quoted as an FTS5 string
-/// (doubling any `"` inside it), so nothing in it is ever parsed as query
-/// syntax (`OR`, `NEAR`, `column:`...).
-fn fts_match_expression(terms: &[String]) -> String {
-    terms
-        .iter()
-        .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Appends ` AND <column> IN (?, ...)` to `query`, binding every one of
-/// `values`, or nothing at all when `values` is empty (no constraint).
-fn push_any_of<'a>(
-    query: &mut QueryBuilder<Sqlite>,
-    column: &str,
-    values: impl ExactSizeIterator<Item = &'a str>,
-) {
-    if values.len() == 0 {
-        return;
-    }
-
-    query.push(format_args!(" AND {column} IN ("));
-    let mut separated = query.separated(", ");
-    for value in values {
-        separated.push_bind(value.to_string());
-    }
-    query.push(")");
-}
-
-/// Appends ` FROM documents d ... WHERE ...` to `query`, selecting (as `d`)
-/// every document that contains every one of `terms` as a token prefix (all
-/// of them when `terms` is empty) and matches every one of `filters`.
-fn push_matching(query: &mut QueryBuilder<Sqlite>, terms: &[String], filters: &SearchFilters) {
-    query.push(" FROM documents d");
-    if terms.is_empty() {
-        query.push(" WHERE 1 = 1");
-    } else {
-        query.push(
-            " JOIN documents_fts_rowid_map m ON m.document_id = d.id
-              JOIN documents_fts ON documents_fts.rowid = m.rowid
-              WHERE documents_fts MATCH ",
-        );
-        query.push_bind(fts_match_expression(terms));
-    }
-
-    push_any_of(
-        query,
-        "d.source_category",
-        filters.source_categories.iter().map(SourceCategory::as_str),
-    );
-    push_any_of(
-        query,
-        "d.source_sub_category",
-        filters
-            .source_sub_categories
-            .iter()
-            .map(SourceSubCategory::as_str),
-    );
-    push_any_of(
-        query,
-        "d.purpose",
-        filters.purposes.iter().map(Purpose::as_str),
-    );
-    push_any_of(query, "d.type", filters.types.iter().map(String::as_str));
-    push_any_of(
-        query,
-        "d.content_type",
-        filters.content_types.iter().map(String::as_str),
-    );
-    if !filters.subjects.is_empty() {
-        query.push(" AND EXISTS (SELECT 1 FROM json_each(d.subjects) WHERE json_each.value IN (");
-        let mut subjects = query.separated(", ");
-        for subject in &filters.subjects {
-            subjects.push_bind(subject.clone());
-        }
-        query.push("))");
-    }
-    if let Some(created_from) = filters.created_from {
-        query.push(" AND d.created_at >= ").push_bind(created_from);
-    }
-    if let Some(created_until) = filters.created_until {
-        query.push(" AND d.created_at <= ").push_bind(created_until);
-    }
-}
-
 #[async_trait]
 impl Storage for SqliteStorage {
     async fn save_document(&self, document: &Document) -> Result<()> {
@@ -455,6 +265,196 @@ impl Storage for SqliteStorage {
         .with_context(|| format!("failed to update document {id} metadata in local database"))?;
 
         Ok(())
+    }
+}
+
+/// The `source_category` column has no NULL state (`NOT NULL DEFAULT ''`),
+/// so an unclassified document is stored as an empty string.
+fn source_category_to_column(source_category: Option<SourceCategory>) -> String {
+    source_category.map_or_else(String::new, |category| category.as_str().to_string())
+}
+
+fn source_category_from_column(column: String) -> Result<Option<SourceCategory>> {
+    if column.is_empty() {
+        return Ok(None);
+    }
+
+    column
+        .parse()
+        .map(Some)
+        .with_context(|| format!("invalid source category in local database: {column}"))
+}
+
+fn source_sub_category_to_column(source_sub_category: Option<SourceSubCategory>) -> Option<String> {
+    source_sub_category.map(|category| category.as_str().to_string())
+}
+
+fn source_sub_category_from_column(column: Option<String>) -> Result<Option<SourceSubCategory>> {
+    column
+        .map(|column| {
+            column
+                .parse()
+                .with_context(|| format!("invalid source sub-category in local database: {column}"))
+        })
+        .transpose()
+}
+
+/// The `subjects` column stores a JSON-encoded array, since SQLite has no
+/// native array type.
+fn subjects_to_column(subjects: &[String]) -> String {
+    serde_json::to_string(subjects).expect("serializing a Vec<String> to JSON cannot fail")
+}
+
+fn subjects_from_column(column: String) -> Result<Vec<String>> {
+    serde_json::from_str(&column)
+        .with_context(|| format!("invalid subjects json in local database: {column}"))
+}
+
+/// The `purpose` column has no NULL state (`NOT NULL DEFAULT ''`), so an
+/// unclassified document is stored as an empty string.
+fn purpose_to_column(purpose: Option<Purpose>) -> String {
+    purpose.map_or_else(String::new, |purpose| purpose.as_str().to_string())
+}
+
+fn purpose_from_column(column: String) -> Result<Option<Purpose>> {
+    if column.is_empty() {
+        return Ok(None);
+    }
+
+    column
+        .parse()
+        .map(Some)
+        .with_context(|| format!("invalid purpose in local database: {column}"))
+}
+
+/// Maps a row selecting every `documents` column (`id` included) back to a
+/// [`Document`].
+fn document_from_row(row: &SqliteRow) -> Result<Document> {
+    let id: String = row.get("id");
+    let content: Vec<u8> = row.get("content");
+    let id = Uuid::parse_str(&id)
+        .with_context(|| format!("invalid document id in local database: {id}"))?;
+
+    Ok(Document {
+        id,
+        metadata: Metadata {
+            id,
+            name: row.get("name"),
+            original_name: row.get("original_name"),
+            content_type: row.get("content_type"),
+            created_at: row.get("created_at"),
+            size: content.len() as u64,
+            checksum: row.get("checksum"),
+            transcript: row.get("transcript"),
+            r#type: row.get("type"),
+            source_category: source_category_from_column(row.get("source_category"))?,
+            source_sub_category: source_sub_category_from_column(row.get("source_sub_category"))?,
+            subjects: subjects_from_column(row.get("subjects"))?,
+            purpose: purpose_from_column(row.get("purpose"))?,
+        },
+        content,
+    })
+}
+
+/// Orders `documents_fts` matches best first (`bm25` scores lower for a
+/// better match), weighting each column in its declaration order in the
+/// `0014_create_documents_fts` migration: a hit in the name counts the
+/// most, one in the (long, noisy) transcript the least.
+const FTS_RANK: &str = "bm25(documents_fts,
+    10.0, -- name
+    5.0,  -- original_name
+    1.0,  -- transcript
+    4.0,  -- type
+    4.0,  -- source_category
+    4.0,  -- source_sub_category
+    6.0,  -- subjects
+    4.0   -- purpose
+)";
+
+/// Builds an FTS5 query matching documents containing every one of `terms`
+/// as a token prefix, in any column. Each term is quoted as an FTS5 string
+/// (doubling any `"` inside it), so nothing in it is ever parsed as query
+/// syntax (`OR`, `NEAR`, `column:`...).
+fn fts_match_expression(terms: &[String]) -> String {
+    terms
+        .iter()
+        .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Appends ` AND <column> IN (?, ...)` to `query`, binding every one of
+/// `values`, or nothing at all when `values` is empty (no constraint).
+fn push_any_of<'a>(
+    query: &mut QueryBuilder<Sqlite>,
+    column: &str,
+    values: impl ExactSizeIterator<Item = &'a str>,
+) {
+    if values.len() == 0 {
+        return;
+    }
+
+    query.push(format_args!(" AND {column} IN ("));
+    let mut separated = query.separated(", ");
+    for value in values {
+        separated.push_bind(value.to_string());
+    }
+    query.push(")");
+}
+
+/// Appends ` FROM documents d ... WHERE ...` to `query`, selecting (as `d`)
+/// every document that contains every one of `terms` as a token prefix (all
+/// of them when `terms` is empty) and matches every one of `filters`.
+fn push_matching(query: &mut QueryBuilder<Sqlite>, terms: &[String], filters: &SearchFilters) {
+    query.push(" FROM documents d");
+    if terms.is_empty() {
+        query.push(" WHERE 1 = 1");
+    } else {
+        query.push(
+            " JOIN documents_fts_rowid_map m ON m.document_id = d.id
+              JOIN documents_fts ON documents_fts.rowid = m.rowid
+              WHERE documents_fts MATCH ",
+        );
+        query.push_bind(fts_match_expression(terms));
+    }
+
+    push_any_of(
+        query,
+        "d.source_category",
+        filters.source_categories.iter().map(SourceCategory::as_str),
+    );
+    push_any_of(
+        query,
+        "d.source_sub_category",
+        filters
+            .source_sub_categories
+            .iter()
+            .map(SourceSubCategory::as_str),
+    );
+    push_any_of(
+        query,
+        "d.purpose",
+        filters.purposes.iter().map(Purpose::as_str),
+    );
+    push_any_of(query, "d.type", filters.types.iter().map(String::as_str));
+    push_any_of(
+        query,
+        "d.content_type",
+        filters.content_types.iter().map(String::as_str),
+    );
+    if !filters.subjects.is_empty() {
+        query.push(" AND EXISTS (SELECT 1 FROM json_each(d.subjects) WHERE json_each.value IN (");
+        let mut subjects = query.separated(", ");
+        for subject in &filters.subjects {
+            subjects.push_bind(subject.clone());
+        }
+        query.push("))");
+    }
+    if let Some(created_from) = filters.created_from {
+        query.push(" AND d.created_at >= ").push_bind(created_from);
+    }
+    if let Some(created_until) = filters.created_until {
+        query.push(" AND d.created_at <= ").push_bind(created_until);
     }
 }
 

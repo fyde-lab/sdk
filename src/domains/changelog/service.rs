@@ -46,6 +46,11 @@ impl ChangelogEvent {
     }
 }
 
+/// Delay between reachability checks in [`ChangelogClient::consume_once`]
+/// while waiting for the server to come back up.
+const SERVER_REACHABILITY_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(200);
+
 /// A client for the fyde server's changelog service. Generic over the
 /// [`DocumentStorage`] implementation used by [`Service::consume`] to cache
 /// documents materialized from consumed events, the [`ScriptStorage`]
@@ -89,11 +94,6 @@ pub(super) struct ChangelogClient<D: DocumentStorage, S: ScriptStorage, O: Curso
     /// one panicking consume pass must not make every later sync panic too.
     write_lock: Mutex<Option<File>>,
 }
-
-/// Delay between reachability checks in [`ChangelogClient::consume_once`]
-/// while waiting for the server to come back up.
-const SERVER_REACHABILITY_POLL_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(200);
 
 impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, S, O> {
     /// Creates a client for the changelog service over `grpc`, using

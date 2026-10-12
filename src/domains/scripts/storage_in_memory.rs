@@ -32,13 +32,6 @@ impl InMemoryScriptStorage {
     }
 }
 
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
 #[async_trait]
 impl Service for InMemoryScriptStorage {
     async fn create_script(
@@ -192,6 +185,13 @@ impl Service for InMemoryScriptStorage {
             .cloned()
             .ok_or_else(|| ErrorKind::ScriptNotInstalled(script_id).into())
     }
+}
+
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 #[cfg(test)]
