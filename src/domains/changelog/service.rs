@@ -10,13 +10,13 @@ use crate::domains::documents::{Document, Metadata, Storage as DocumentStorage};
 use crate::domains::scripts::{InstalledScript, Storage as ScriptStorage};
 use crate::domains::secrets::Service as SecretsService;
 use crate::domains::server_state::Service as ServerStateService;
+use crate::domains::settings::Service as SettingsService;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
 use super::Service;
 use super::crypto;
 use super::grpc_client::{ChangelogEvent as ProtoChangelogEvent, FydeClient};
 use super::models::{ChangelogEvent, EventType};
-use super::storage::CursorStorage;
 
 impl ChangelogEvent {
     /// Decrypts a proto event received from the server into its domain
@@ -49,13 +49,14 @@ impl ChangelogEvent {
 /// A client for the fyde server's changelog service. Generic over the
 /// [`DocumentStorage`] implementation used by [`Service::consume`] to cache
 /// documents materialized from consumed events, the [`ScriptStorage`]
-/// implementation it saves installed scripts to, and the [`CursorStorage`]
-/// implementation used to track how far the changelog has been consumed.
-pub(super) struct ChangelogClient<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> {
+/// implementation it saves installed scripts to, and the
+/// [`SettingsService`] the cursor tracking how far the changelog has been
+/// consumed is persisted in.
+pub(super) struct ChangelogClient<D: DocumentStorage, S: ScriptStorage> {
     grpc: Box<dyn FydeClient>,
     document_storage: D,
     script_storage: S,
-    cursor_storage: O,
+    settings: Arc<dyn SettingsService>,
     server_state: Arc<dyn ServerStateService>,
     secrets: Arc<dyn SecretsService>,
     /// Signals [`Service::stop_consume_job`] to the task spawned by
@@ -90,16 +91,20 @@ pub(super) struct ChangelogClient<D: DocumentStorage, S: ScriptStorage, O: Curso
     write_lock: Mutex<Option<File>>,
 }
 
+/// The key under which the changelog consumption cursor is persisted in
+/// the SDK's local settings store, as its canonical UUID string.
+const CURSOR_KEY: &str = "changelog_cursor_id";
+
 /// Delay between reachability checks in [`ChangelogClient::consume_once`]
 /// while waiting for the server to come back up.
 const SERVER_REACHABILITY_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(200);
 
-impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, S, O> {
+impl<D: DocumentStorage, S: ScriptStorage> ChangelogClient<D, S> {
     /// Creates a client for the changelog service over `grpc`, using
     /// `document_storage` to cache documents materialized by
     /// [`Service::consume`], `script_storage` to save the scripts it
-    /// materializes, `cursor_storage` to track its progress through the
+    /// materializes, `settings` to persist its progress through the
     /// changelog, `server_state` to wait for the server to be reachable
     /// before opening a changelog stream, `secrets` to read the account
     /// master key [`crypto`] derives every event's KEK from, and `lock_path`
@@ -108,7 +113,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
         grpc: impl FydeClient + 'static,
         document_storage: D,
         script_storage: S,
-        cursor_storage: O,
+        settings: Arc<dyn SettingsService>,
         server_state: Arc<dyn ServerStateService>,
         secrets: Arc<dyn SecretsService>,
         lock_path: std::path::PathBuf,
@@ -117,7 +122,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
             grpc: Box::new(grpc),
             document_storage,
             script_storage,
-            cursor_storage,
+            settings,
             server_state,
             secrets,
             stop: watch::Sender::new(false),
@@ -180,6 +185,33 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
         self.write_lock_guard().is_some()
     }
 
+    /// Returns the cursor persisted by [`Self::save_cursor`], or
+    /// [`Uuid::nil`] if the changelog has never been consumed — the id
+    /// meaning "from the beginning".
+    async fn get_cursor(&self) -> Result<Uuid> {
+        let value = self
+            .settings
+            .get(CURSOR_KEY)
+            .await
+            .context("failed to read the local changelog cursor")?;
+
+        match value {
+            Some(value) => Uuid::parse_str(&value).with_context(|| {
+                format!("invalid changelog cursor {value:?} stored in local settings")
+            }),
+            None => Ok(Uuid::nil()),
+        }
+    }
+
+    /// Persists `id` in the local settings as the cursor to resume from on
+    /// the next pass.
+    async fn save_cursor(&self, id: Uuid) -> Result<()> {
+        self.settings
+            .set(CURSOR_KEY, &id.to_string())
+            .await
+            .with_context(|| format!("failed to persist changelog cursor {id}"))
+    }
+
     /// One pass of the consume loop spawned by [`Service::start_consume_job`]:
     /// opens a stream from the persisted
     /// cursor and processes events until the stream ends or an error
@@ -187,11 +219,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
     /// `consume`) so it can be retried in a loop without re-implementing
     /// the retry itself, and so tests can exercise a single pass directly.
     async fn consume_once(&self, callback: &mut (dyn FnMut(ChangelogEvent) + Send)) -> Result<()> {
-        let cursor = self
-            .cursor_storage
-            .get_cursor()
-            .await
-            .context("failed to read the local changelog cursor")?;
+        let cursor = self.get_cursor().await?;
 
         let since = if cursor.is_nil() { None } else { Some(cursor) };
 
@@ -324,10 +352,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
             // that script then can't find. The lock holder (or this
             // process, once it holds the lock) stores them instead.
             if self.has_write_permission() {
-                self.cursor_storage
-                    .save_cursor(event.id)
-                    .await
-                    .with_context(|| format!("failed to persist changelog cursor {}", event.id))?;
+                self.save_cursor(event.id).await?;
             }
 
             callback(event);
@@ -361,9 +386,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
 }
 
 #[async_trait]
-impl<D: DocumentStorage + 'static, S: ScriptStorage + 'static, O: CursorStorage + 'static> Service
-    for ChangelogClient<D, S, O>
-{
+impl<D: DocumentStorage + 'static, S: ScriptStorage + 'static> Service for ChangelogClient<D, S> {
     async fn ensure_master_key(&self) -> Result<()> {
         crypto::ensure_master_key(&*self.secrets).await
     }
@@ -424,12 +447,12 @@ mod tests {
     use std::sync::Mutex;
 
     use super::super::grpc_client::MockFydeClient;
-    use super::super::storage::MockCursorStorage;
     use super::*;
     use crate::domains::documents::{FakeMetadata, MockStorage};
     use crate::domains::scripts::{FakeInstalledScript, MockStorage as MockScriptStorage};
     use crate::domains::secrets::MockService as MockSecretsService;
     use crate::domains::server_state::MockService as MockServerState;
+    use crate::domains::settings::MockService as MockSettingsService;
 
     /// A unique lock file path per client, so concurrently running tests
     /// never contend for the same write lock.
@@ -505,21 +528,22 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
-        cursor_storage
-            .expect_save_cursor()
-            .withf(move |id| *id == event_id)
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
+        settings
+            .expect_set()
+            .withf(move |key, value| key == CURSOR_KEY && value == event_id.to_string())
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
 
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -559,21 +583,22 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(Some(existing)));
 
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
-        cursor_storage
-            .expect_save_cursor()
-            .withf(move |id| *id == event_id)
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
+        settings
+            .expect_set()
+            .withf(move |key, value| key == CURSOR_KEY && value == event_id.to_string())
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
 
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -605,18 +630,19 @@ mod tests {
         // persisted locally when this client doesn't hold the write lock.
         let document_storage = MockStorage::new();
 
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
-        // No `expect_save_cursor()` either: the cursor only advances
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
+        // No `expect_set()` either: the cursor only advances
         // alongside what was stored, so the lock holder still stores it.
 
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -637,13 +663,13 @@ mod tests {
     async fn a_second_client_holding_the_same_lock_path_fails_to_acquire_it() {
         let mock_grpc = MockFydeClient::new();
         let document_storage = MockStorage::new();
-        let cursor_storage = MockCursorStorage::new();
+        let settings = MockSettingsService::new();
 
         let first = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -657,7 +683,7 @@ mod tests {
             MockFydeClient::new(),
             MockStorage::new(),
             MockScriptStorage::new(),
-            MockCursorStorage::new(),
+            Arc::new(MockSettingsService::new()),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -681,16 +707,17 @@ mod tests {
 
         let document_storage = MockStorage::new();
 
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
 
         let client = Arc::new(ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -727,11 +754,12 @@ mod tests {
             .expect_save_document()
             .returning(|_| Ok(()));
 
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
-        cursor_storage.expect_save_cursor().returning(|_| Ok(()));
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
+        settings.expect_set().returning(|_, _| Ok(()));
 
         let reachability_checks = Arc::new(AtomicU32::new(0));
         let reachability_checks_in_mock = reachability_checks.clone();
@@ -747,7 +775,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             Arc::new(server_state),
             fake_secrets(),
             test_lock_path(),
@@ -800,17 +828,18 @@ mod tests {
 
     /// A cursor storage expecting a single pass from the very beginning of
     /// the changelog that consumes exactly `event_id`.
-    fn cursor_storage_consuming(event_id: Uuid) -> MockCursorStorage {
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
-        cursor_storage
-            .expect_save_cursor()
-            .withf(move |id| *id == event_id)
+    fn settings_consuming(event_id: Uuid) -> MockSettingsService {
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
+        settings
+            .expect_set()
+            .withf(move |key, value| key == CURSOR_KEY && value == event_id.to_string())
             .times(1)
-            .returning(|_| Ok(()));
-        cursor_storage
+            .returning(|_, _| Ok(()));
+        settings
     }
 
     #[tokio::test]
@@ -842,7 +871,7 @@ mod tests {
             mock_grpc,
             MockStorage::new(),
             script_storage,
-            cursor_storage_consuming(event_id),
+            Arc::new(settings_consuming(event_id)),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -875,18 +904,19 @@ mod tests {
             .boxed())
         });
 
-        // No `expect_save_installed_script()` nor `expect_save_cursor()`:
+        // No `expect_save_installed_script()` nor `expect_set()`:
         // the mocks panic if called, proving neither the installation nor
         // the cursor past it is persisted without the write lock.
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
         let client = ChangelogClient::new(
             mock_grpc,
             MockStorage::new(),
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -911,16 +941,17 @@ mod tests {
         });
 
         // The cursor must not advance past an event that failed to apply.
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
 
         let client = ChangelogClient::new(
             mock_grpc,
             MockStorage::new(),
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -955,21 +986,22 @@ mod tests {
         // neither is.
         let document_storage = MockStorage::new();
 
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
-        cursor_storage
-            .expect_save_cursor()
-            .withf(move |id| *id == event_id)
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
+        settings
+            .expect_set()
+            .withf(move |key, value| key == CURSOR_KEY && value == event_id.to_string())
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
 
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -1001,21 +1033,22 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
-        cursor_storage
-            .expect_save_cursor()
-            .withf(move |id| *id == event_id)
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
+        settings
+            .expect_set()
+            .withf(move |key, value| key == CURSOR_KEY && value == event_id.to_string())
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
 
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -1053,16 +1086,17 @@ mod tests {
         // mock needs `save_document`/`save_cursor` expectations: the mock
         // panics if it's called, which is how this test proves it isn't.
         let document_storage = MockStorage::new();
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
 
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -1098,21 +1132,22 @@ mod tests {
             .expect_save_document()
             .returning(|_| Ok(()));
 
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(move || Ok(cursor));
-        cursor_storage
-            .expect_save_cursor()
-            .withf(move |id| *id == event_id)
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(move |_| Ok(Some(cursor.to_string())));
+        settings
+            .expect_set()
+            .withf(move |key, value| key == CURSOR_KEY && value == event_id.to_string())
             .times(1)
-            .returning(|_| Ok(()));
+            .returning(|_, _| Ok(()));
 
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -1144,16 +1179,17 @@ mod tests {
 
         let document_storage = MockStorage::new();
 
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
 
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -1181,16 +1217,17 @@ mod tests {
 
         let document_storage = MockStorage::new();
 
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
 
         let client = Arc::new(ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -1219,13 +1256,13 @@ mod tests {
         // it's already been stopped.
         let mock_grpc = MockFydeClient::new();
         let document_storage = MockStorage::new();
-        let cursor_storage = MockCursorStorage::new();
+        let settings = MockSettingsService::new();
 
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -1253,16 +1290,17 @@ mod tests {
 
         let document_storage = MockStorage::new();
 
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == CURSOR_KEY)
+            .returning(|_| Ok(None));
 
         let client = Arc::new(ChangelogClient::new(
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
-            cursor_storage,
+            Arc::new(settings),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),
@@ -1306,7 +1344,7 @@ mod tests {
             mock_grpc,
             MockStorage::new(),
             MockScriptStorage::new(),
-            MockCursorStorage::new(),
+            Arc::new(MockSettingsService::new()),
             reachable_server_state(),
             fake_secrets(),
             test_lock_path(),

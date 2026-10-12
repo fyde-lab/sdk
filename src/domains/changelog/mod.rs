@@ -2,8 +2,6 @@ mod crypto;
 mod grpc_client;
 mod models;
 mod service;
-mod storage;
-mod storage_settings;
 
 #[cfg(test)]
 pub(crate) use models::FakeChangelogEvent;
@@ -110,8 +108,7 @@ pub(crate) trait Service: Send + Sync {
 /// shared `channel`, and uses `pool` to cache documents materialized from
 /// consumed events directly into the local `documents` table (and installed
 /// scripts into the `scripts` domain's `installed_scripts` table), `settings`
-/// to persist the changelog cursor consumed so far (see
-/// [`storage_settings::SettingsCursorStorage`]), `secrets` to read the
+/// to persist the changelog cursor consumed so far, `secrets` to read the
 /// account master key `crypto` derives every event's KEK from, and `sessions` to
 /// attach the session token as a bearer `authorization` header on every
 /// outgoing call once a session is opened (see
@@ -129,12 +126,11 @@ pub(crate) async fn init(
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool.clone());
     let script_storage = scripts::SqliteStorage::new(pool);
-    let cursor_storage = storage_settings::SettingsCursorStorage::new(settings);
     let client = service::ChangelogClient::new(
         grpc_client::GrpcClient::new(channel, sessions),
         document_storage,
         script_storage,
-        cursor_storage,
+        settings,
         server_state,
         secrets,
         lock_path,

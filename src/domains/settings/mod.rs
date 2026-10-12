@@ -14,7 +14,7 @@ use crate::Result;
 /// Persists arbitrary key/value settings in the SDK's local SQLite
 /// database — used both by other SDK modules for their own state (the
 /// session auth token, the local master key, the changelog consumption
-/// offset — see `changelog::storage_settings`) and, later, for
+/// cursor, kept by `changelog::service`) and, later, for
 /// user-facing settings. Trait methods take `&self` (not `&mut self`) so
 /// implementations can be shared behind `Arc<dyn Service>`.
 #[cfg_attr(test, automock)]
