@@ -1,6 +1,6 @@
 //! Shared harness for this directory's end-to-end tests: each test starts
 //! its own real `fyde-server` (see `fyde_server::spawn_test_server`,
-//! backed by a private in-memory database), connects a real `fyde-sdk`
+//! backed by a private throwaway Postgres database), connects a real `fyde-sdk`
 //! [`Client`] to it, and drives a sequence of named, stateful steps
 //! against that one long-lived server/client pair — mirroring a real
 //! client's lifetime rather than one independent `#[tokio::test]` per
@@ -19,23 +19,23 @@ use lopdf::{Object, Stream, dictionary};
 pub const TEST_PASSWORD: &str = "correct horse battery staple";
 
 /// A real `fyde-server`, started fresh for one [`Scenario`], backed by a
-/// private in-memory database. Runs on its own dedicated thread for the
-/// rest of the process's life (see `fyde_server::spawn_test_server`) —
-/// there's no shutdown, since each test gets its own isolated instance
-/// rather than sharing one across the binary.
+/// private throwaway Postgres database (`fyde-test-<random>`, on the
+/// server `TEST_DATABASE_URL` points at, `postgres://postgres@127.0.0.1:5432`
+/// by default). Runs on its own dedicated thread until dropped, which
+/// stops it and drops its database (see `fyde_server::spawn_test_server`).
 pub struct TestServer {
-    url: String,
+    server: fyde_server::TestServer,
 }
 
 impl TestServer {
     pub fn start() -> Self {
         Self {
-            url: fyde_server::spawn_test_server(),
+            server: fyde_server::spawn_test_server(),
         }
     }
 
     pub fn url(&self) -> &str {
-        &self.url
+        self.server.url()
     }
 }
 
