@@ -25,7 +25,7 @@ use crate::domains::settings::Service as SettingsService;
 
 /// Publishes and consumes the fyde server's changelog: a blind relay for
 /// opaque, client-encrypted write events — document writes, plus script
-/// installations (see [`EventType::ScriptInstalled`]). `send`/`stop_consume_job`
+/// installations (see [`EventType::InstallScript`]). `send`/`stop_consume_job`
 /// take `&self` so implementations can be shared behind `Arc<dyn Service>`;
 /// `start_consume_job` takes `self: Arc<Self>` since it spawns the consume
 /// loop onto its own background task, which needs an owned, `'static`
@@ -61,9 +61,9 @@ pub(crate) trait Service: Send + Sync {
     /// then continuing with the live tail — see `ConsumeSince` in
     /// `changelog.proto`), resuming from the cursor persisted locally in
     /// the settings store (from the very beginning of the changelog if it's
-    /// never been consumed before). For each `Created` event, caches the
+    /// never been consumed before). For each `SaveDocument` event, caches the
     /// resulting document in local storage before invoking `callback` (and
-    /// likewise saves the installed script for a `ScriptInstalled` event,
+    /// likewise saves the installed script for a `InstallScript` event,
     /// via the `scripts` domain's local storage); the
     /// cursor is persisted as each event is processed, so a later call
     /// resumes right after the last event seen.
@@ -71,8 +71,8 @@ pub(crate) trait Service: Send + Sync {
     /// Returns as soon as the task is spawned, not when consumption stops.
     /// The spawned task never exits on its own. If a pass over the stream
     /// fails — including with [`crate::ErrorCode::InvalidChangelogEvent`] if a
-    /// `Created` event is missing its `content` or `metadata`, since a
-    /// `Created` event must carry both, or if a `ScriptInstalled` event's
+    /// `SaveDocument` event is missing its `content` or `metadata`, since a
+    /// `SaveDocument` event must carry both, or if a `InstallScript` event's
     /// `content` is missing or isn't a valid installed script — the error is logged and
     /// consumption is retried immediately from the persisted cursor: the
     /// next pass's wait for

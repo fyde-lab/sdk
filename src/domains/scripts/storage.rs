@@ -9,7 +9,7 @@ use super::InstalledScript;
 /// Persists installed scripts, unencrypted, locally. Injected into
 /// [`super::service::ScriptsClient`] (to list them) and into
 /// `changelog::ChangelogClient` (to save the ones materialized from
-/// consumed `ScriptInstalled` events) at construction.
+/// consumed `InstallScript` events) at construction.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(crate) trait Storage: Send + Sync {

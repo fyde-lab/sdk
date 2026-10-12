@@ -215,7 +215,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
             let event = ChangelogEvent::from_proto(proto_event, &*self.secrets).await?;
 
             match event.event_type {
-                EventType::Created => {
+                EventType::SaveDocument => {
                     let (Some(content), Some(metadata)) = (&event.content, &event.metadata) else {
                         return Err(ErrorKind::InvalidChangelogEvent(format!(
                             "created event {} for document {} is missing content or metadata",
@@ -287,7 +287,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
                     }
                 }
                 EventType::Deleted => {}
-                EventType::ScriptInstalled => {
+                EventType::InstallScript => {
                     let Some(content) = &event.content else {
                         return Err(ErrorKind::InvalidChangelogEvent(format!(
                             "script installed event {} for script {} is missing content",
@@ -458,7 +458,7 @@ mod tests {
     }
 
     fn proto_event(id: Uuid, document_id: Uuid) -> ProtoChangelogEvent {
-        proto_event_with_type(id, document_id, EventType::Created)
+        proto_event_with_type(id, document_id, EventType::SaveDocument)
     }
 
     fn proto_event_with_type(
@@ -535,7 +535,7 @@ mod tests {
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].id, event_id);
         assert_eq!(received[0].subject_id, document_id);
-        assert_eq!(received[0].event_type, EventType::Created);
+        assert_eq!(received[0].event_type, EventType::SaveDocument);
     }
 
     #[tokio::test]
@@ -776,16 +776,16 @@ mod tests {
         assert_eq!(reachability_checks.load(Ordering::SeqCst), 3);
     }
 
-    /// A `ScriptInstalled` proto event for `script_id` carrying `content`
+    /// A `InstallScript` proto event for `script_id` carrying `content`
     /// as its (encrypted) payload.
-    fn script_installed_proto_event(
+    fn install_script_proto_event(
         id: Uuid,
         script_id: Uuid,
         content: &[u8],
     ) -> ProtoChangelogEvent {
         let encrypted_content = futures::executor::block_on(crypto::encrypt_event(
             &*fake_secrets(),
-            EventType::ScriptInstalled,
+            EventType::InstallScript,
             script_id,
             Some(content),
             None,
@@ -814,7 +814,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_saves_the_installed_script_for_a_script_installed_event() {
+    async fn consume_saves_the_installed_script_for_an_install_script_event() {
         let installed = FakeInstalledScript::new().build();
         let script_id = installed.script().id();
         let event_id = Uuid::now_v7();
@@ -822,7 +822,7 @@ mod tests {
 
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc.expect_consume_since().returning(move |_| {
-            Ok(futures::stream::iter(vec![Ok(script_installed_proto_event(
+            Ok(futures::stream::iter(vec![Ok(install_script_proto_event(
                 event_id, script_id, &content,
             ))])
             .boxed())
@@ -856,7 +856,7 @@ mod tests {
 
         let received = received.lock().unwrap();
         assert_eq!(received.len(), 1);
-        assert_eq!(received[0].event_type, EventType::ScriptInstalled);
+        assert_eq!(received[0].event_type, EventType::InstallScript);
         assert_eq!(received[0].subject_id, script_id);
     }
 
@@ -869,7 +869,7 @@ mod tests {
 
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc.expect_consume_since().returning(move |_| {
-            Ok(futures::stream::iter(vec![Ok(script_installed_proto_event(
+            Ok(futures::stream::iter(vec![Ok(install_script_proto_event(
                 event_id, script_id, &content,
             ))])
             .boxed())
@@ -896,13 +896,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_rejects_a_script_installed_event_with_an_invalid_payload() {
+    async fn consume_rejects_an_install_script_event_with_an_invalid_payload() {
         let script_id = Uuid::now_v7();
         let event_id = Uuid::now_v7();
 
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc.expect_consume_since().returning(move |_| {
-            Ok(futures::stream::iter(vec![Ok(script_installed_proto_event(
+            Ok(futures::stream::iter(vec![Ok(install_script_proto_event(
                 event_id,
                 script_id,
                 b"not json",
@@ -1026,13 +1026,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_errors_on_a_created_event_missing_content_or_metadata() {
+    async fn consume_errors_on_a_save_document_event_missing_content_or_metadata() {
         let document_id = Uuid::now_v7();
         let event_id = Uuid::now_v7();
 
         let encrypted_content = futures::executor::block_on(crypto::encrypt_event(
             &*fake_secrets(),
-            EventType::Created,
+            EventType::SaveDocument,
             document_id,
             None,
             None,
@@ -1295,7 +1295,7 @@ mod tests {
                     crypto::decrypt_event(&*fake_secrets(), encrypted_content),
                 )
                 .unwrap();
-                event_type == EventType::Created
+                event_type == EventType::SaveDocument
                     && id == document_id
                     && content == Some(b"body".to_vec())
                     && decrypted_metadata == Some(expected_metadata.clone())
@@ -1314,7 +1314,7 @@ mod tests {
 
         client
             .send(
-                EventType::Created,
+                EventType::SaveDocument,
                 document_id,
                 Some(b"body"),
                 Some(&metadata),

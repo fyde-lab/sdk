@@ -225,14 +225,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encrypt_event_roundtrips_a_created_event() {
+    async fn encrypt_event_roundtrips_a_save_document_event() {
         let secrets = secrets_with_master_key();
         let subject_id = Uuid::now_v7();
         let metadata = FakeMetadata::new().build();
 
         let encrypted = encrypt_event(
             &secrets,
-            EventType::Created,
+            EventType::SaveDocument,
             subject_id,
             Some(b"body"),
             Some(&metadata),
@@ -243,7 +243,7 @@ mod tests {
         let (event_type, decrypted_id, content, decrypted_metadata) =
             decrypt_event(&secrets, &encrypted).await.unwrap();
 
-        assert_eq!(event_type, EventType::Created);
+        assert_eq!(event_type, EventType::SaveDocument);
         assert_eq!(decrypted_id, subject_id);
         assert_eq!(content, Some(b"body".to_vec()));
         assert_eq!(decrypted_metadata, Some(metadata));
@@ -273,7 +273,7 @@ mod tests {
         let subject_id = Uuid::now_v7();
         let mut encrypted = encrypt_event(
             &secrets,
-            EventType::Created,
+            EventType::SaveDocument,
             subject_id,
             Some(b"body"),
             None,
@@ -304,7 +304,7 @@ mod tests {
 
         let err = encrypt_event(
             &secrets,
-            EventType::Created,
+            EventType::SaveDocument,
             subject_id,
             Some(b"body"),
             None,

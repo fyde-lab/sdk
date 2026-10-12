@@ -638,19 +638,19 @@ impl TryFrom<InstalledScript> for FfiInstalledScript {
 /// [`EventType`].
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
 pub enum FfiEventType {
-    Created,
+    SaveDocument,
     UpdateMetadata,
     Deleted,
-    ScriptInstalled,
+    InstallScript,
 }
 
 impl From<EventType> for FfiEventType {
     fn from(event_type: EventType) -> Self {
         match event_type {
-            EventType::Created => FfiEventType::Created,
+            EventType::SaveDocument => FfiEventType::SaveDocument,
             EventType::UpdateMetadata => FfiEventType::UpdateMetadata,
             EventType::Deleted => FfiEventType::Deleted,
-            EventType::ScriptInstalled => FfiEventType::ScriptInstalled,
+            EventType::InstallScript => FfiEventType::InstallScript,
         }
     }
 }
@@ -1398,8 +1398,8 @@ mod tests {
     #[test]
     fn event_type_conversion_maps_every_variant() {
         assert!(matches!(
-            FfiEventType::from(EventType::Created),
-            FfiEventType::Created
+            FfiEventType::from(EventType::SaveDocument),
+            FfiEventType::SaveDocument
         ));
         assert!(matches!(
             FfiEventType::from(EventType::UpdateMetadata),
@@ -1417,7 +1417,7 @@ mod tests {
         let document_id = Uuid::now_v7();
         let event = FakeChangelogEvent::new()
             .with_id(id)
-            .with_event_type(EventType::Created)
+            .with_event_type(EventType::SaveDocument)
             .with_subject_id(document_id)
             .with_content(b"body".to_vec())
             .with_metadata(FakeMetadata::new().build())
@@ -1426,7 +1426,7 @@ mod tests {
         let ffi: FfiChangelogEvent = event.into();
 
         assert_eq!(ffi.id, id.to_string());
-        assert!(matches!(ffi.event_type, FfiEventType::Created));
+        assert!(matches!(ffi.event_type, FfiEventType::SaveDocument));
         assert_eq!(ffi.subject_id, document_id.to_string());
         assert_eq!(ffi.content, Some(b"body".to_vec()));
         assert!(ffi.metadata.is_some());

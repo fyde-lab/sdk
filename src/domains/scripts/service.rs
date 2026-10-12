@@ -137,7 +137,7 @@ impl<S: Storage> Service for ScriptsClient<S> {
             .with_context(|| format!("failed to serialize installed script {script_id}"))?;
 
         self.changelog
-            .send(EventType::ScriptInstalled, script_id, Some(&content), None)
+            .send(EventType::InstallScript, script_id, Some(&content), None)
             .await
             .with_context(|| format!("failed to publish installation of script {script_id}"))
     }
@@ -277,7 +277,7 @@ mod tests {
         let sent = changelog.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         let (event_type, id, content, metadata) = &sent[0];
-        assert_eq!(*event_type, EventType::ScriptInstalled);
+        assert_eq!(*event_type, EventType::InstallScript);
         assert_eq!(*id, script.id());
         assert_eq!(*metadata, None);
         let installed: InstalledScript =

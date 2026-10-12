@@ -172,7 +172,7 @@ pub struct InstallScriptRequest {
 }
 
 /// A script installed for the authenticated user, as persisted locally once
-/// its `ScriptInstalled` changelog event has been consumed (see
+/// its `InstallScript` changelog event has been consumed (see
 /// [`super::Service::list_installed_scripts`]): the full script, plus the
 /// parameter values it was installed with, so it can be run without asking
 /// for them again. Also the exact JSON payload carried, encrypted, by that

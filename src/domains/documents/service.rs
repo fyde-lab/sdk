@@ -159,7 +159,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
         let id = metadata.id;
 
         self.changelog
-            .send(EventType::Created, id, Some(&content), Some(&metadata))
+            .send(EventType::SaveDocument, id, Some(&content), Some(&metadata))
             .await
             .with_context(|| format!("failed to publish changelog event for document {id}"))?;
 
@@ -487,7 +487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_publishes_a_created_event_for_the_document() {
+    async fn upload_publishes_a_save_document_event_for_the_document() {
         let pdf = b"hello world".to_vec();
         let file = write_temp_file("pdf", &pdf);
         let file_name = file
@@ -531,7 +531,7 @@ mod tests {
         let sent = changelog.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         let (event_type, document_id, content, sent_metadata) = &sent[0];
-        assert_eq!(*event_type, EventType::Created);
+        assert_eq!(*event_type, EventType::SaveDocument);
         assert_eq!(*document_id, metadata.id);
         assert_eq!(content.as_deref(), Some(pdf.as_slice()));
         assert_eq!(sent_metadata.as_ref(), Some(&metadata));

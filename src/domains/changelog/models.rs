@@ -3,25 +3,30 @@ use uuid::Uuid;
 
 use crate::domains::documents::Metadata;
 
-/// The kind of write recorded by a [`ChangelogEvent`]. Only [`Self::Created`]
+/// The kind of write recorded by a [`ChangelogEvent`]. Only [`Self::SaveDocument`]
 /// is producible today (there is no update/delete flow yet), but the shape
 /// is forward-compatible with the others.
+///
+/// Variants are serialized by name inside each encrypted event, so the
+/// `alias`es keep events recorded under their former names decodable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
-    Created,
+    #[serde(alias = "Created")]
+    SaveDocument,
     UpdateMetadata,
     Deleted,
     /// A script was installed for the account (see
     /// `scripts::Service::install_script`). The event's `subject_id` is the
     /// installed script's id, and its `content` the JSON-serialized
     /// `scripts::InstalledScript` (no `metadata`).
-    ScriptInstalled,
+    #[serde(alias = "ScriptInstalled")]
+    InstallScript,
 }
 
 /// A single recorded write, decrypted from the server's changelog.
 /// `subject_id` is the id of whatever the write is about, which depends on
-/// [`EventType`]: a document for `Created`/`UpdateMetadata`/`Deleted`, a
-/// script for `ScriptInstalled`. Inlines a document's fields rather than
+/// [`EventType`]: a document for `SaveDocument`/`UpdateMetadata`/`Deleted`, a
+/// script for `InstallScript`. Inlines a document's fields rather than
 /// wrapping a [`crate::domains::documents::Document`], since not every
 /// event type carries all of them: `content` is `None` for a metadata-only
 /// update, and both `content` and `metadata` are `None` for a deletion
@@ -70,7 +75,7 @@ impl FakeChangelogEvent {
         Self {
             event: ChangelogEvent {
                 id: Uuid::now_v7(),
-                event_type: EventType::Created,
+                event_type: EventType::SaveDocument,
                 subject_id: Uuid::now_v7(),
                 content: Some(crate::tools::testing::random_bytes(64)),
                 metadata: Some(crate::domains::documents::FakeMetadata::new().build()),
@@ -134,9 +139,24 @@ mod tests {
     fn fake_changelog_event_builds_with_plausible_defaults() {
         let event = FakeChangelogEvent::new().build();
 
-        assert_eq!(event.event_type, EventType::Created);
+        assert_eq!(event.event_type, EventType::SaveDocument);
         assert!(event.content.is_some());
         assert!(event.metadata.is_some());
+    }
+
+    #[test]
+    fn event_type_deserializes_its_former_variant_names() {
+        let created = rmp_serde::to_vec("Created").unwrap();
+        let script_installed = rmp_serde::to_vec("ScriptInstalled").unwrap();
+
+        assert_eq!(
+            rmp_serde::from_slice::<EventType>(&created).unwrap(),
+            EventType::SaveDocument
+        );
+        assert_eq!(
+            rmp_serde::from_slice::<EventType>(&script_installed).unwrap(),
+            EventType::InstallScript
+        );
     }
 
     #[test]
