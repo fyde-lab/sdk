@@ -916,16 +916,24 @@ impl FydeClient {
     }
 
     /// Verifies `username`/`password` and opens a session for the device
-    /// named `device_name`, returning its session token. Mirrors
-    /// [`crate::UsersService::login`].
+    /// named `device_name`, returning its session token.
+    /// `allow_insecure_storage` lets the session's secrets fall back to the
+    /// local database on a device without secure storage, as for
+    /// `create_user`. Mirrors [`crate::UsersService::login`].
     pub async fn login(
         &self,
         username: String,
         password: String,
         device_name: String,
+        allow_insecure_storage: bool,
     ) -> Result<String, FfiError> {
-        self.localized(self.inner.users().login(&username, &password, &device_name))
-            .await
+        self.localized(self.inner.users().login(
+            &username,
+            &password,
+            &device_name,
+            allow_insecure_storage,
+        ))
+        .await
     }
 
     /// Closes the session opened by the most recent `create_user`/`login`

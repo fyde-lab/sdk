@@ -245,9 +245,15 @@ impl Service for UsersClient {
         Ok(token)
     }
 
-    async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String> {
+    async fn login(
+        &self,
+        username: &str,
+        password: &str,
+        device_name: &str,
+        allow_insecure_storage: bool,
+    ) -> Result<String> {
         self.ensure_no_open_session().await?;
-        let location = self.secret_location(false).await?;
+        let location = self.secret_location(allow_insecure_storage).await?;
 
         let (state, opaque_request) = self
             .opaque
@@ -879,7 +885,12 @@ mod tests {
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         let token = client
-            .login("alice", "correct horse battery staple", "Pierre's iPhone")
+            .login(
+                "alice",
+                "correct horse battery staple",
+                "Pierre's iPhone",
+                false,
+            )
             .await
             .unwrap();
 
@@ -932,7 +943,7 @@ mod tests {
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         client
-            .login("alice", "correct horse battery staple", "device")
+            .login("alice", "correct horse battery staple", "device", false)
             .await
             .unwrap();
 
@@ -993,7 +1004,7 @@ mod tests {
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         client
-            .login("alice", "correct horse battery staple", "device")
+            .login("alice", "correct horse battery staple", "device", false)
             .await
             .unwrap();
 
@@ -1149,11 +1160,48 @@ mod tests {
         );
 
         let err = client
-            .login("alice", "correct horse battery staple", "device")
+            .login("alice", "correct horse battery staple", "device", false)
             .await
             .unwrap_err();
 
         assert!(matches!(err.kind(), ErrorKind::SecureStorageUnavailable));
+    }
+
+    #[tokio::test]
+    async fn login_keeps_secrets_in_the_database_when_allowed_without_secure_storage() {
+        let opaque = opaque_for_login(b"the-request", b"the-upload");
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_login()
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        mock_grpc
+            .expect_finish_login()
+            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
+        let mut settings = MockSettingsService::new();
+        settings.expect_set().returning(|_, _| Ok(()));
+        let mut secrets = secrets_without_session(false);
+        secrets
+            .expect_set()
+            .withf(|key, _, location| {
+                key == MASTER_KEY_SECRET && *location == SecretLocation::Database
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        secrets
+            .expect_set()
+            .withf(|key, value, location| {
+                key == SESSION_TOKEN_SECRET
+                    && value == "a-token"
+                    && *location == SecretLocation::Database
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
+
+        client
+            .login("alice", "correct horse battery staple", "device", true)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1166,7 +1214,7 @@ mod tests {
         );
 
         let err = client
-            .login("bob", "correct horse battery staple", "device")
+            .login("bob", "correct horse battery staple", "device", false)
             .await
             .unwrap_err();
 
@@ -1204,7 +1252,7 @@ mod tests {
         let client = client_with_deps(mock_grpc, opaque, MockSettingsService::new(), secrets);
 
         client
-            .login("alice", "correct horse battery staple", "device")
+            .login("alice", "correct horse battery staple", "device", false)
             .await
             .unwrap_err();
     }

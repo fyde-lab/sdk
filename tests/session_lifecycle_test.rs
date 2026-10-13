@@ -144,6 +144,7 @@ async fn session_lifecycle() {
                     &username,
                     "definitely the wrong password",
                     "e2e-session-device",
+                    false,
                 )
                 .await
                 .err()
@@ -161,7 +162,12 @@ async fn session_lifecycle() {
             let err = scenario
                 .client
                 .users()
-                .login(&random_username(), TEST_PASSWORD, "e2e-session-device")
+                .login(
+                    &random_username(),
+                    TEST_PASSWORD,
+                    "e2e-session-device",
+                    false,
+                )
                 .await
                 .err()
                 .context("login with an unknown username should fail")?;
@@ -180,7 +186,7 @@ async fn session_lifecycle() {
                 let token = scenario
                     .client
                     .users()
-                    .login(&username, TEST_PASSWORD, "e2e-session-device")
+                    .login(&username, TEST_PASSWORD, "e2e-session-device", false)
                     .await
                     .context("failed to log back in with the correct credentials")?;
                 ensure!(

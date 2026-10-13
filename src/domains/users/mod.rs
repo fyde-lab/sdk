@@ -143,15 +143,24 @@ pub trait Service: Send + Sync {
     /// case; failure detected by the server instead surfaces the usual way,
     /// as [`crate::ErrorCode::Unauthenticated`]. Fails with
     /// [`crate::ErrorCode::AlreadyLoggedIn`] — before contacting the server — if a
-    /// session is already open on this device, and with
+    /// session is already open on this device. On a device with no usable
+    /// OS credential store, the session's secrets are kept in plaintext in
+    /// the local database instead if `allow_insecure_storage` is set — the
+    /// same explicit opt-in as `create`'s — and this fails with
     /// [`crate::ErrorCode::SecureStorageUnavailable`] (also before contacting
-    /// the server) if this device has no usable OS credential store to
-    /// persist the session in. Once the session and master key are
-    /// persisted, starts changelog consumption via
-    /// [`DocumentsService::start_sync`]. A session restored on a later
-    /// start reads its secrets from the credential store first, then from
-    /// the local database `create` may have put them in.
-    async fn login(&self, username: &str, password: &str, device_name: &str) -> Result<String>;
+    /// the server) if it isn't; the flag is ignored whenever a credential
+    /// store is usable. Once the session and master key are persisted,
+    /// starts changelog consumption via [`DocumentsService::start_sync`]. A
+    /// session restored on a later start reads its secrets from the
+    /// credential store first, then from the local database
+    /// `create`/`login` may have put them in.
+    async fn login(
+        &self,
+        username: &str,
+        password: &str,
+        device_name: &str,
+        allow_insecure_storage: bool,
+    ) -> Result<String>;
 
     /// Closes the session opened by the most recent `create`/`login` call
     /// and clears every trace of the account from this device: its secrets
