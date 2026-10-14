@@ -7,7 +7,7 @@
 mod common;
 
 use anyhow::{Context as _, ensure};
-use fyde_sdk::UploadRequest;
+use fyde_sdk::{LoginOutcome, UploadRequest};
 use serial_test::serial;
 
 use common::{Scenario, TEST_PASSWORD, random_username, write_temp_pdf};
@@ -145,6 +145,7 @@ async fn session_lifecycle() {
                     "definitely the wrong password",
                     "e2e-session-device",
                     false,
+                    None,
                 )
                 .await
                 .err()
@@ -167,6 +168,7 @@ async fn session_lifecycle() {
                     TEST_PASSWORD,
                     "e2e-session-device",
                     false,
+                    None,
                 )
                 .await
                 .err()
@@ -183,15 +185,18 @@ async fn session_lifecycle() {
         .step(
             "logging back in with the right credentials reopens a session",
             || async {
-                let token = scenario
+                let outcome = scenario
                     .client
                     .users()
-                    .login(&username, TEST_PASSWORD, "e2e-session-device", false)
+                    .login(&username, TEST_PASSWORD, "e2e-session-device", false, None)
                     .await
                     .context("failed to log back in with the correct credentials")?;
                 ensure!(
-                    !token.is_empty(),
-                    "login should return a non-empty session token"
+                    matches!(
+                        &outcome,
+                        LoginOutcome::LoggedIn { session_token } if !session_token.is_empty()
+                    ),
+                    "login should return a non-empty session token, got {outcome:?}"
                 );
                 Ok(())
             },

@@ -189,7 +189,7 @@ async fn document_lifecycle() {
             scenario
                 .client
                 .users()
-                .login(&username, TEST_PASSWORD, "e2e-test-device", false)
+                .login(&username, TEST_PASSWORD, "e2e-test-device", false, None)
                 .await
                 .context("failed to log back in")?;
             Ok(())

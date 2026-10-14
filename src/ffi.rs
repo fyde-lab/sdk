@@ -24,7 +24,7 @@ use crate::domains::sessions::Service as SessionsService;
 use crate::domains::users::system_language;
 use crate::{
     ChangelogEvent, Client, ClientConfig, Document, Error, ErrorCode, ErrorContext as _, ErrorKind,
-    LogLevel, ProgressEvent, Storage,
+    LogLevel, LoginOutcome, OpenSession, ProgressEvent, Storage,
 };
 
 macro_rules! define_ffi_error {
@@ -681,6 +681,57 @@ impl From<ChangelogEvent> for FfiChangelogEvent {
     }
 }
 
+/// One of an account's open sessions, mirroring [`OpenSession`] across the
+/// FFI boundary.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiOpenSession {
+    /// The id to pass back as `login`'s `replace_session_id`.
+    pub id: String,
+    pub device_name: String,
+    /// Unix timestamp, in seconds, of when the session was opened.
+    pub created_at: i64,
+}
+
+impl From<OpenSession> for FfiOpenSession {
+    fn from(session: OpenSession) -> Self {
+        Self {
+            id: session.id().to_string(),
+            device_name: session.device_name().to_string(),
+            created_at: session.created_at(),
+        }
+    }
+}
+
+/// The outcome of [`FydeClient::login`], mirroring [`LoginOutcome`] across
+/// the FFI boundary.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum FfiLoginOutcome {
+    /// A session was opened.
+    LoggedIn { session_token: String },
+    /// The account's plan allows no more open sessions, so none was opened:
+    /// show `sessions` and let the user pick one to close, then call
+    /// `login` again with its id as `replace_session_id`.
+    SessionLimitReached {
+        max_sessions: u32,
+        sessions: Vec<FfiOpenSession>,
+    },
+}
+
+impl From<LoginOutcome> for FfiLoginOutcome {
+    fn from(outcome: LoginOutcome) -> Self {
+        match outcome {
+            LoginOutcome::LoggedIn { session_token } => Self::LoggedIn { session_token },
+            LoginOutcome::SessionLimitReached {
+                max_sessions,
+                sessions,
+            } => Self::SessionLimitReached {
+                max_sessions,
+                sessions: sessions.into_iter().map(Into::into).collect(),
+            },
+        }
+    }
+}
+
 /// Which SQLite backend a [`FydeClient`] persists local state to, mirroring
 /// [`Storage`].
 #[derive(Debug, Clone, uniffi::Enum)]
@@ -916,7 +967,9 @@ impl FydeClient {
     }
 
     /// Verifies `username`/`password` and opens a session for the device
-    /// named `device_name`, returning its session token.
+    /// named `device_name`, returning its session token — or, if the
+    /// account's plan allows no more open sessions, the sessions to pick
+    /// one from to close, passed back here as `replace_session_id`.
     /// `allow_insecure_storage` lets the session's secrets fall back to the
     /// local database on a device without secure storage, as for
     /// `create_user`. Mirrors [`crate::UsersService::login`].
@@ -926,14 +979,17 @@ impl FydeClient {
         password: String,
         device_name: String,
         allow_insecure_storage: bool,
-    ) -> Result<String, FfiError> {
+        replace_session_id: Option<String>,
+    ) -> Result<FfiLoginOutcome, FfiError> {
         self.localized(self.inner.users().login(
             &username,
             &password,
             &device_name,
             allow_insecure_storage,
+            replace_session_id.as_deref(),
         ))
         .await
+        .map(Into::into)
     }
 
     /// Closes the session opened by the most recent `create_user`/`login`
@@ -1312,6 +1368,7 @@ mod tests {
     use super::*;
     use crate::domains::documents::{EventType, FakeChangelogEvent, FakeDocument, FakeMetadata};
     use crate::domains::scripts::FakeScript;
+    use crate::domains::users::FakeOpenSession;
 
     #[test]
     fn parse_uuid_accepts_a_canonical_uuid() {
@@ -1401,6 +1458,41 @@ mod tests {
         assert_eq!(ffi.version, script.version());
         assert_eq!(ffi.script, script.script());
         assert_eq!(ffi.last_updated, script.last_updated());
+    }
+
+    #[test]
+    fn login_outcome_conversion_preserves_the_open_sessions() {
+        let session = FakeOpenSession::new().build();
+
+        let ffi = FfiLoginOutcome::from(LoginOutcome::SessionLimitReached {
+            max_sessions: 3,
+            sessions: vec![session.clone()],
+        });
+
+        let FfiLoginOutcome::SessionLimitReached {
+            max_sessions,
+            sessions,
+        } = ffi
+        else {
+            panic!("expected SessionLimitReached, got {ffi:?}");
+        };
+        assert_eq!(max_sessions, 3);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session.id());
+        assert_eq!(sessions[0].device_name, session.device_name());
+        assert_eq!(sessions[0].created_at, session.created_at());
+    }
+
+    #[test]
+    fn login_outcome_conversion_keeps_the_session_token() {
+        let ffi = FfiLoginOutcome::from(LoginOutcome::LoggedIn {
+            session_token: "a-token".to_string(),
+        });
+
+        assert!(matches!(
+            ffi,
+            FfiLoginOutcome::LoggedIn { session_token } if session_token == "a-token"
+        ));
     }
 
     #[test]

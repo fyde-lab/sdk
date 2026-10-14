@@ -67,6 +67,77 @@ impl std::str::FromStr for Role {
     }
 }
 
+/// The outcome of a [`Service::login`] whose credentials checked out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginOutcome {
+    /// A session was opened; carries its token.
+    LoggedIn { session_token: String },
+    /// The account already has as many open sessions as its plan allows
+    /// (`max_sessions`), so none was opened — and nothing was persisted
+    /// locally. `sessions` lists them, oldest first: call
+    /// [`Service::login`] again with one's [`OpenSession::id`] as
+    /// `replace_session_id` to close it in favor of the new session.
+    SessionLimitReached {
+        max_sessions: u32,
+        sessions: Vec<OpenSession>,
+    },
+}
+
+/// One of an account's open sessions (a device logged into it), as listed
+/// by [`LoginOutcome::SessionLimitReached`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenSession {
+    pub(super) id: String,
+    pub(super) device_name: String,
+    /// Unix timestamp, in seconds, of when the session was opened.
+    pub(super) created_at: i64,
+}
+
+impl OpenSession {
+    /// The id to pass as [`Service::login`]'s `replace_session_id`.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The name of the device, as given when the session was opened.
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    pub fn created_at(&self) -> i64 {
+        self.created_at
+    }
+}
+
+/// Builds an [`OpenSession`] filled with random-but-plausible data,
+/// overridable field by field, for use in tests.
+#[cfg(test)]
+pub(crate) struct FakeOpenSession {
+    session: OpenSession,
+}
+
+#[cfg(test)]
+impl FakeOpenSession {
+    pub(crate) fn new() -> Self {
+        Self {
+            session: OpenSession {
+                id: uuid::Uuid::now_v7().to_string(),
+                device_name: crate::tools::testing::random_word().to_string(),
+                created_at: crate::tools::testing::random_past_timestamp(),
+            },
+        }
+    }
+
+    pub(crate) fn with_device_name(mut self, device_name: &str) -> Self {
+        self.session.device_name = device_name.to_string();
+        self
+    }
+
+    pub(crate) fn build(self) -> OpenSession {
+        self.session
+    }
+}
+
 /// JSON-encodes `master_key`'s raw bytes for storage under
 /// [`crate::domains::secrets::MASTER_KEY_SECRET`].
 pub(crate) fn encode_master_key(master_key: &[u8]) -> Result<String> {
@@ -136,8 +207,16 @@ pub trait Service: Send + Sync {
     ) -> Result<String>;
 
     /// Verifies `username`/`password` and opens a session for the device
-    /// named `device_name`, returning its session token, via a two-step
-    /// OPAQUE login exchange (`StartLogin`/`FinishLogin`). An incorrect
+    /// named `device_name`, returning its session token
+    /// ([`LoginOutcome::LoggedIn`]), via a two-step OPAQUE login exchange
+    /// (`StartLogin`/`FinishLogin`). If the account's plan doesn't allow
+    /// another open session, opens none and returns
+    /// [`LoginOutcome::SessionLimitReached`] instead, listing the account's
+    /// sessions so the user can pick one to close: calling this again with
+    /// that session's id as `replace_session_id` closes it and opens the new
+    /// one in its place, atomically server-side. A `replace_session_id` that
+    /// isn't one of the account's sessions fails with
+    /// [`crate::ErrorCode::NotFoundOnServer`]. An incorrect
     /// password is often detected locally, without a round trip to the
     /// server, and fails with [`crate::ErrorCode::InvalidCredentials`] in that
     /// case; failure detected by the server instead surfaces the usual way,
@@ -160,7 +239,8 @@ pub trait Service: Send + Sync {
         password: &str,
         device_name: &str,
         allow_insecure_storage: bool,
-    ) -> Result<String>;
+        replace_session_id: Option<&str>,
+    ) -> Result<LoginOutcome>;
 
     /// Closes the session opened by the most recent `create`/`login` call
     /// and clears every trace of the account from this device: its secrets

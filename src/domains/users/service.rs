@@ -15,8 +15,11 @@ use super::crypto::{
     DefaultOpaqueClient, OpaqueClient, generate_and_wrap_master_key, unwrap_master_key,
     wrap_master_key,
 };
-use super::grpc_client::{FydeClient, GrpcClient};
-use super::{LANGUAGE_SETTING, ROLE_SETTING, Role, Service, decode_master_key, encode_master_key};
+use super::grpc_client::{FinishedLogin, FydeClient, GrpcClient};
+use super::{
+    LANGUAGE_SETTING, LoginOutcome, ROLE_SETTING, Role, Service, decode_master_key,
+    encode_master_key,
+};
 
 /// How long `logout` waits for the server to acknowledge closing the
 /// session before giving up on it and clearing local state anyway — an
@@ -251,7 +254,8 @@ impl Service for UsersClient {
         password: &str,
         device_name: &str,
         allow_insecure_storage: bool,
-    ) -> Result<String> {
+        replace_session_id: Option<&str>,
+    ) -> Result<LoginOutcome> {
         self.ensure_no_open_session().await?;
         let location = self.secret_location(allow_insecure_storage).await?;
 
@@ -271,11 +275,28 @@ impl Service for UsersClient {
             .finish_login(state, password, &opaque_response)
             .context("failed to finish OPAQUE login")?;
 
-        let (token, encrypted_master_key, role) = self
+        let (token, encrypted_master_key, role) = match self
             .grpc
-            .finish_login(&login_id, &opaque_upload, device_name)
+            .finish_login(&login_id, &opaque_upload, device_name, replace_session_id)
             .await
-            .context("failed to log in")?;
+            .context("failed to log in")?
+        {
+            FinishedLogin::Succeeded {
+                session_token,
+                encrypted_master_key,
+                role,
+            } => (session_token, encrypted_master_key, role),
+            // Nothing to persist: no session was opened.
+            FinishedLogin::SessionLimitReached {
+                max_sessions,
+                sessions,
+            } => {
+                return Ok(LoginOutcome::SessionLimitReached {
+                    max_sessions,
+                    sessions,
+                });
+            }
+        };
 
         let wrapped_master_key = String::from_utf8(encrypted_master_key)
             .map_err(|_| ErrorKind::Encryption("server returned a non-UTF-8 master key".into()))
@@ -286,7 +307,9 @@ impl Service for UsersClient {
         self.open_session(&token, &raw_master_key, role, location)
             .await?;
 
-        Ok(token)
+        Ok(LoginOutcome::LoggedIn {
+            session_token: token,
+        })
     }
 
     async fn logout(&self) -> Result<()> {
@@ -434,6 +457,7 @@ impl ExpiredSessionHandler for UsersClient {
 mod tests {
     use std::sync::Mutex;
 
+    use super::super::FakeOpenSession;
     use super::super::crypto::{MockOpaqueClient, fake_login_state, fake_registration_state};
     use super::super::grpc_client::MockFydeClient;
     use super::*;
@@ -581,6 +605,15 @@ mod tests {
             .unwrap()
             .1
             .into_bytes()
+    }
+
+    /// A successful `FinishLogin` answer carrying `encrypted_master_key`.
+    fn succeeded(encrypted_master_key: Vec<u8>) -> FinishedLogin {
+        FinishedLogin::Succeeded {
+            session_token: "a-token".to_string(),
+            encrypted_master_key,
+            role: Role::User,
+        }
     }
 
     #[tokio::test]
@@ -849,12 +882,13 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         mock_grpc
             .expect_finish_login()
-            .withf(|login_id, upload, device_name| {
+            .withf(|login_id, upload, device_name, replace_session_id| {
                 login_id == "a-login-id"
                     && upload == b"the-upload"
                     && device_name == "Pierre's iPhone"
+                    && replace_session_id.is_none()
             })
-            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
+            .returning(|_, _, _, _| Ok(succeeded(login_master_key())));
 
         let mut settings = MockSettingsService::new();
         let mut secrets = MockSecretsService::new();
@@ -890,11 +924,120 @@ mod tests {
                 "correct horse battery staple",
                 "Pierre's iPhone",
                 false,
+                None,
             )
             .await
             .unwrap();
 
-        assert_eq!(token, "a-token");
+        assert_eq!(
+            token,
+            LoginOutcome::LoggedIn {
+                session_token: "a-token".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn login_returns_the_open_sessions_at_the_limit_without_persisting_anything() {
+        let opaque = opaque_for_login(b"the-request", b"the-upload");
+        let open = vec![
+            FakeOpenSession::new().with_device_name("laptop").build(),
+            FakeOpenSession::new().with_device_name("phone").build(),
+        ];
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_login()
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        let returned = open.clone();
+        mock_grpc
+            .expect_finish_login()
+            .times(1)
+            .return_once(move |_, _, _, _| {
+                Ok(FinishedLogin::SessionLimitReached {
+                    max_sessions: 2,
+                    sessions: returned,
+                })
+            });
+
+        // No `expect_set()` on either mock: the mock panics if `login`
+        // persists anything, since no session was opened.
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
+
+        let client = client_with_deps(mock_grpc, opaque, MockSettingsService::new(), secrets);
+
+        let outcome = client
+            .login(
+                "alice",
+                "correct horse battery staple",
+                "device",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            LoginOutcome::SessionLimitReached {
+                max_sessions: 2,
+                sessions: open,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn login_forwards_the_session_to_replace() {
+        let opaque = opaque_for_login(b"the-request", b"the-upload");
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_login()
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        mock_grpc
+            .expect_finish_login()
+            .withf(|_, _, _, replace_session_id| *replace_session_id == Some("old-session"))
+            .times(1)
+            .returning(|_, _, _, _| Ok(succeeded(login_master_key())));
+
+        let mut settings = MockSettingsService::new();
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
+        secrets.expect_set().times(2).returning(|_, _, _| Ok(()));
+        settings.expect_set().times(1).returning(|_, _| Ok(()));
+
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
+
+        let outcome = client
+            .login(
+                "alice",
+                "correct horse battery staple",
+                "device",
+                false,
+                Some("old-session"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            LoginOutcome::LoggedIn {
+                session_token: "a-token".to_string()
+            }
+        );
     }
 
     #[tokio::test]
@@ -906,7 +1049,7 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         mock_grpc
             .expect_finish_login()
-            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
+            .returning(|_, _, _, _| Ok(succeeded(login_master_key())));
 
         let persisted_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
@@ -943,7 +1086,13 @@ mod tests {
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         client
-            .login("alice", "correct horse battery staple", "device", false)
+            .login(
+                "alice",
+                "correct horse battery staple",
+                "device",
+                false,
+                None,
+            )
             .await
             .unwrap();
 
@@ -962,13 +1111,9 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         let wrapped_master_key = login_master_key();
         let returned_master_key = wrapped_master_key.clone();
-        mock_grpc.expect_finish_login().returning(move |_, _, _| {
-            Ok((
-                "a-token".to_string(),
-                returned_master_key.clone(),
-                Role::User,
-            ))
-        });
+        mock_grpc
+            .expect_finish_login()
+            .returning(move |_, _, _, _| Ok(succeeded(returned_master_key.clone())));
 
         let persisted_master_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
@@ -1004,7 +1149,13 @@ mod tests {
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         client
-            .login("alice", "correct horse battery staple", "device", false)
+            .login(
+                "alice",
+                "correct horse battery staple",
+                "device",
+                false,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1160,7 +1311,13 @@ mod tests {
         );
 
         let err = client
-            .login("alice", "correct horse battery staple", "device", false)
+            .login(
+                "alice",
+                "correct horse battery staple",
+                "device",
+                false,
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -1176,7 +1333,7 @@ mod tests {
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
         mock_grpc
             .expect_finish_login()
-            .returning(|_, _, _| Ok(("a-token".to_string(), login_master_key(), Role::User)));
+            .returning(|_, _, _, _| Ok(succeeded(login_master_key())));
         let mut settings = MockSettingsService::new();
         settings.expect_set().returning(|_, _| Ok(()));
         let mut secrets = secrets_without_session(false);
@@ -1199,7 +1356,13 @@ mod tests {
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         client
-            .login("alice", "correct horse battery staple", "device", true)
+            .login(
+                "alice",
+                "correct horse battery staple",
+                "device",
+                true,
+                None,
+            )
             .await
             .unwrap();
     }
@@ -1214,7 +1377,7 @@ mod tests {
         );
 
         let err = client
-            .login("bob", "correct horse battery staple", "device", false)
+            .login("bob", "correct horse battery staple", "device", false, None)
             .await
             .unwrap_err();
 
@@ -1228,13 +1391,9 @@ mod tests {
         mock_grpc
             .expect_start_login()
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
-        mock_grpc.expect_finish_login().returning(|_, _, _| {
-            Ok((
-                "a-token".to_string(),
-                b"not a wrapped master key".to_vec(),
-                Role::User,
-            ))
-        });
+        mock_grpc
+            .expect_finish_login()
+            .returning(|_, _, _, _| Ok(succeeded(b"not a wrapped master key".to_vec())));
 
         // No `expect_set()` on either mock: the mock panics if `login`
         // persists anything — in particular the session token, which would
@@ -1252,7 +1411,13 @@ mod tests {
         let client = client_with_deps(mock_grpc, opaque, MockSettingsService::new(), secrets);
 
         client
-            .login("alice", "correct horse battery staple", "device", false)
+            .login(
+                "alice",
+                "correct horse battery staple",
+                "device",
+                false,
+                None,
+            )
             .await
             .unwrap_err();
     }

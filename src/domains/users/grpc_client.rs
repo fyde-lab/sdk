@@ -8,7 +8,7 @@ use tonic::transport::Channel;
 use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::{ErrorContext as _, Result};
 
-use super::Role;
+use super::{OpenSession, Role};
 
 /// Generated protobuf/gRPC bindings for the `users` service, compiled by
 /// `build.rs` from `users/v1/users.proto` in the `buf.build/fyde-lab/api`
@@ -19,7 +19,7 @@ mod proto {
 
 use proto::{
     FinishChangePasswordRequest, FinishLoginRequest, FinishRegistrationRequest, LogoutRequest,
-    StartChangePasswordRequest, StartLoginRequest, StartRegistrationRequest,
+    StartChangePasswordRequest, StartLoginRequest, StartRegistrationRequest, finish_login_response,
     users_service_client::UsersServiceClient as GeneratedUsersClient,
 };
 
@@ -33,6 +33,25 @@ fn to_role(value: i32) -> Role {
         Ok(proto::Role::Admin) => Role::Admin,
         Ok(proto::Role::User) | Ok(proto::Role::Unspecified) | Err(_) => Role::User,
     }
+}
+
+/// What the server's `FinishLogin` answered, once the credentials checked
+/// out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum FinishedLogin {
+    /// A session was opened. `encrypted_master_key` is the account's master
+    /// key, still encrypted client-side under a key derived from the OPAQUE
+    /// export key (see [`super::crypto::unwrap_master_key`]).
+    Succeeded {
+        session_token: String,
+        encrypted_master_key: Vec<u8>,
+        role: Role,
+    },
+    /// The account is at its plan's session limit: no session was opened.
+    SessionLimitReached {
+        max_sessions: u32,
+        sessions: Vec<OpenSession>,
+    },
 }
 
 /// A gRPC transport for talking to the fyde server's users service. Knows
@@ -73,16 +92,16 @@ pub(super) trait FydeClient: Send + Sync {
 
     /// Second and final step of logging in: sends the serialized OPAQUE
     /// `CredentialFinalization` for the exchange identified by `login_id`
-    /// and opens a session for `device_name`, returning its session token
-    /// alongside the account's master key, still encrypted client-side
-    /// under a key derived from the OPAQUE export key (see
-    /// [`super::crypto::unwrap_master_key`]), and the account's role.
-    async fn finish_login(
+    /// and opens a session for `device_name` — closing
+    /// `replace_session_id` in its place, if given — unless the account is
+    /// at its plan's session limit (see [`FinishedLogin`]).
+    async fn finish_login<'a>(
         &self,
         login_id: &str,
         opaque_upload: &[u8],
         device_name: &str,
-    ) -> Result<(String, Vec<u8>, Role)>;
+        replace_session_id: Option<&'a str>,
+    ) -> Result<FinishedLogin>;
 
     /// Closes the session currently authenticating outgoing calls (see
     /// [`crate::domains::sessions::Service::authenticated_request`]).
@@ -218,18 +237,20 @@ impl FydeClient for GrpcClient {
         Ok((response.login_id, response.opaque_response))
     }
 
-    async fn finish_login(
+    async fn finish_login<'a>(
         &self,
         login_id: &str,
         opaque_upload: &[u8],
         device_name: &str,
-    ) -> Result<(String, Vec<u8>, Role)> {
+        replace_session_id: Option<&'a str>,
+    ) -> Result<FinishedLogin> {
         let request = self
             .sessions
             .authenticated_request(FinishLoginRequest {
                 login_id: login_id.to_string(),
                 opaque_upload: opaque_upload.to_vec(),
                 device_name: device_name.to_string(),
+                replace_session_id: replace_session_id.unwrap_or_default().to_string(),
             })
             .await?;
 
@@ -240,11 +261,33 @@ impl FydeClient for GrpcClient {
             .context("failed to finish login")?
             .into_inner();
 
-        Ok((
-            response.session_token,
-            response.encrypted_master_key,
-            to_role(response.role),
-        ))
+        match response.result {
+            Some(finish_login_response::Result::Succeeded(succeeded)) => {
+                Ok(FinishedLogin::Succeeded {
+                    session_token: succeeded.session_token,
+                    encrypted_master_key: succeeded.encrypted_master_key,
+                    role: to_role(succeeded.role),
+                })
+            }
+            Some(finish_login_response::Result::SessionLimitReached(reached)) => {
+                Ok(FinishedLogin::SessionLimitReached {
+                    max_sessions: reached.max_sessions,
+                    sessions: reached
+                        .sessions
+                        .into_iter()
+                        .map(|session| OpenSession {
+                            id: session.id,
+                            device_name: session.device_name,
+                            created_at: session.created_at,
+                        })
+                        .collect(),
+                })
+            }
+            None => Err(crate::ErrorKind::InvalidResponse(
+                "finish login response had no result".to_string(),
+            ))
+            .context("failed to finish login"),
+        }
     }
 
     async fn logout(&self) -> Result<()> {

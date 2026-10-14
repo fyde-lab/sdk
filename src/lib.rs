@@ -24,7 +24,7 @@ pub use domains::scripts::{
 };
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
-pub use domains::users::Service as UsersService;
+pub use domains::users::{LoginOutcome, OpenSession, Service as UsersService};
 pub use tools::log::LogLevel;
 
 use domains::sessions::{Service as SessionsService, SessionsClient};
