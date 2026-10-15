@@ -10,8 +10,8 @@ use super::{Document, FacetCount, Metadata, SearchFilters, SearchOrder};
 /// A document field [`Storage::count_documents_by`] can count values of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FacetField {
-    SourceCategory,
-    SourceSubCategory,
+    Category,
+    Subcategory,
     Purpose,
     Type,
     ContentType,
@@ -58,7 +58,7 @@ pub(crate) trait Storage: Send + Sync {
     /// Counts, per distinct non-empty value of `field`, how many documents
     /// [`Self::search_documents`] would match for `terms` and `filters`,
     /// most common first (ties by value). Each value is that field's
-    /// canonical string form (e.g. [`super::SourceCategory::as_str`]); for
+    /// canonical string form (e.g. [`super::Category::as_str`]); for
     /// [`FacetField::Subject`], each subject a matching document carries,
     /// counted once per document.
     async fn count_documents_by(

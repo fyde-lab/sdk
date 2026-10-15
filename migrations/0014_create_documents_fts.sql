@@ -15,8 +15,8 @@ CREATE VIRTUAL TABLE documents_fts USING fts5(
     original_name,
     transcript,
     type,
-    source_category,
-    source_sub_category,
+    category,
+    subcategory,
     subjects,
     purpose,
     content = '',
@@ -32,17 +32,17 @@ CREATE TABLE documents_fts_rowid_map (
 
 INSERT INTO documents_fts_rowid_map (document_id) SELECT id FROM documents;
 
-INSERT INTO documents_fts (rowid, name, original_name, transcript, type, source_category, source_sub_category, subjects, purpose)
-SELECT m.rowid, d.name, d.original_name, d.transcript, d.type, d.source_category, d.source_sub_category, d.subjects, d.purpose
+INSERT INTO documents_fts (rowid, name, original_name, transcript, type, category, subcategory, subjects, purpose)
+SELECT m.rowid, d.name, d.original_name, d.transcript, d.type, d.category, d.subcategory, d.subjects, d.purpose
 FROM documents d
 JOIN documents_fts_rowid_map m ON m.document_id = d.id;
 
 CREATE TRIGGER documents_fts_after_insert AFTER INSERT ON documents BEGIN
     INSERT INTO documents_fts_rowid_map (document_id) VALUES (new.id);
-    INSERT INTO documents_fts (rowid, name, original_name, transcript, type, source_category, source_sub_category, subjects, purpose)
+    INSERT INTO documents_fts (rowid, name, original_name, transcript, type, category, subcategory, subjects, purpose)
     VALUES (
         (SELECT rowid FROM documents_fts_rowid_map WHERE document_id = new.id),
-        new.name, new.original_name, new.transcript, new.type, new.source_category, new.source_sub_category, new.subjects, new.purpose
+        new.name, new.original_name, new.transcript, new.type, new.category, new.subcategory, new.subjects, new.purpose
     );
 END;
 
@@ -52,8 +52,8 @@ CREATE TRIGGER documents_fts_after_update AFTER UPDATE ON documents BEGIN
         original_name = new.original_name,
         transcript = new.transcript,
         type = new.type,
-        source_category = new.source_category,
-        source_sub_category = new.source_sub_category,
+        category = new.category,
+        subcategory = new.subcategory,
         subjects = new.subjects,
         purpose = new.purpose
     WHERE rowid = (SELECT rowid FROM documents_fts_rowid_map WHERE document_id = old.id);

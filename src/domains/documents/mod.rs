@@ -9,8 +9,8 @@ mod storage_sqlite;
 pub(crate) use crate::domains::changelog::FakeChangelogEvent;
 pub use crate::domains::changelog::{ChangelogEvent, EventType};
 pub use models::{
-    Document, DocumentType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters,
-    SearchOrder, SearchQuery, SourceCategory, SourceSubCategory, UploadRequest, UploadSource,
+    Category, Document, DocumentType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters,
+    SearchOrder, SearchQuery, Subcategory, UploadRequest, UploadSource,
 };
 #[cfg(test)]
 pub(crate) use models::{FakeDocument, FakeMetadata, FakeSearchFacets};
@@ -42,7 +42,7 @@ pub trait Service: Send + Sync {
     /// disk or already-in-memory bytes), encrypts it and its metadata, then
     /// publishes it as a "created" changelog event, returning its
     /// generated id. Metadata fields set on `request` (`name`, `type`,
-    /// `source_category`, `source_sub_category`, `subjects`, `purpose`)
+    /// `category`, `subcategory`, `subjects`, `purpose`)
     /// override whatever would otherwise be derived from the document
     /// itself and any scripts run against it. A document left without a
     /// purpose gets the one its type implies (an invoice is for `invoice`,

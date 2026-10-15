@@ -7,8 +7,8 @@ use uuid::Uuid;
 use crate::{ErrorContext as _, Result};
 
 use super::{
-    Document, DocumentType, Metadata, Purpose, SearchFacets, SearchFilters, SearchQuery, Service,
-    SourceCategory, SourceSubCategory, UploadRequest, UploadSource,
+    Category, Document, DocumentType, Metadata, Purpose, SearchFacets, SearchFilters, SearchQuery,
+    Service, Subcategory, UploadRequest, UploadSource,
 };
 
 /// A [`Service`] implementation for standalone/dev use (see
@@ -38,7 +38,8 @@ impl DevDocumentsClient {
 
 #[async_trait]
 impl Service for DevDocumentsClient {
-    async fn upload(&self, request: UploadRequest) -> Result<Uuid> {
+    async fn upload(&self, mut request: UploadRequest) -> Result<Uuid> {
+        super::service::resolve_upload_request(&mut request)?;
         let id = Uuid::new_v4();
 
         let (name, content) = match request.source {
@@ -60,8 +61,8 @@ impl Service for DevDocumentsClient {
             original_name: &name,
             name: request.name.as_deref(),
             r#type: request.r#type,
-            source_category: request.source_category,
-            source_sub_category: request.source_sub_category,
+            category: request.category,
+            subcategory: request.subcategory,
             subjects: request.subjects.as_deref(),
             purpose: request.purpose,
         };
@@ -141,8 +142,8 @@ struct DevMetadata<'a> {
     original_name: &'a str,
     name: Option<&'a str>,
     r#type: Option<DocumentType>,
-    source_category: Option<SourceCategory>,
-    source_sub_category: Option<SourceSubCategory>,
+    category: Option<Category>,
+    subcategory: Option<Subcategory>,
     subjects: Option<&'a [String]>,
     purpose: Option<Purpose>,
 }
@@ -195,6 +196,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_rejects_a_subcategory_of_another_category() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = DevDocumentsClient::new(tmp.path().to_path_buf(), "didaxis");
+
+        let mut request = UploadRequest::from_raw("payslip.pdf", b"the pdf content".to_vec());
+        request.category = Some(Category::Money);
+        request.subcategory = Some(Subcategory::Payslips);
+
+        assert_eq!(
+            client.upload(request).await.unwrap_err().code(),
+            crate::ErrorCode::MismatchedSubcategory
+        );
+    }
+
+    #[tokio::test]
     async fn upload_writes_the_request_metadata_as_json_next_to_the_document() {
         let tmp = tempfile::tempdir().unwrap();
         let out_dir = tmp.path().join("out");
@@ -202,7 +218,7 @@ mod tests {
 
         let mut request = UploadRequest::from_raw("payslip.pdf", b"the pdf content".to_vec());
         request.name = Some("Payslip January".to_string());
-        request.source_category = Some(SourceCategory::Employer);
+        request.category = Some(Category::Work);
         request.subjects = Some(vec!["alice".to_string()]);
         let id = client.upload(request).await.unwrap();
 
@@ -219,8 +235,8 @@ mod tests {
                 "original_name": "payslip.pdf",
                 "name": "Payslip January",
                 "type": null,
-                "source_category": "employer",
-                "source_sub_category": null,
+                "category": "work",
+                "subcategory": null,
                 "subjects": ["alice"],
                 "purpose": null,
             })

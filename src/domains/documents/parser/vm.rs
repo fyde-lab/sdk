@@ -6,9 +6,7 @@ use pdf_oxide::PdfDocument;
 use pdf_oxide::converters::ConversionOptions;
 use uuid::Uuid;
 
-use crate::domains::documents::{
-    Document, DocumentType, Metadata, Purpose, SourceCategory, SourceSubCategory,
-};
+use crate::domains::documents::{Category, Document, DocumentType, Metadata, Purpose, Subcategory};
 use crate::{ErrorContext as _, Result};
 
 /// Upper bound on the Lua instructions one classification script may run
@@ -51,9 +49,9 @@ pub(super) fn sandboxed(content_len: usize) -> Result<Lua> {
 /// reachable from a script's Lua state.
 ///
 /// Returns a shared handle to `document`'s metadata, initialized to a clone
-/// of `document.metadata()`: [`expose_set_source`] writes straight into it
+/// of `document.metadata()`: [`expose_set_category`] writes straight into it
 /// (in addition to `document.metadata`'s table copy) so its validated
-/// `source_category`/`source_sub_category` are available to Rust code
+/// `category`/`subcategory` are available to Rust code
 /// without waiting for [`read_metadata`] to re-parse them back out of Lua.
 pub(super) fn expose_document(lua: &Lua, document: &Document) -> Result<Rc<RefCell<Metadata>>> {
     let metadata = Rc::new(RefCell::new(document.metadata().clone()));
@@ -120,53 +118,56 @@ pub(super) fn expose_pdf_conversions(lua: &Lua, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Exposes `set_source(category, sub_category)` as a global function in
-/// `lua`, letting a script set `document.metadata.source_category` and
-/// `document.metadata.source_sub_category` with immediate validation: an
-/// unknown category or sub-category name raises a Lua error right away,
+/// Exposes `set_category(category, subcategory)` as a global function in
+/// `lua`, letting a script set `document.metadata.category` and
+/// `document.metadata.subcategory` with immediate validation: an
+/// unknown category or subcategory name, or a subcategory belonging to
+/// another category, raises a Lua error right away,
 /// rather than leaving an invalid value sitting in `document.metadata` to
 /// only be caught later by [`read_metadata`], after the script has already
-/// finished running. `sub_category` is optional — omitting it (or passing
-/// `nil`) clears `document.metadata.source_sub_category`.
+/// finished running. `subcategory` is optional — omitting it (or passing
+/// `nil`) clears `document.metadata.subcategory`.
 ///
 /// `metadata` is the same handle [`expose_document`] returned for this
-/// document: a call writes the parsed category/sub-category into it
+/// document: a call writes the parsed category/subcategory into it
 /// directly, alongside the `document.metadata` table, so the original
 /// [`Metadata`] is updated immediately rather than only once
 /// [`read_metadata`] re-parses the table at the end of the script.
-pub(super) fn expose_set_source(lua: &Lua, metadata: Rc<RefCell<Metadata>>) -> Result<()> {
-    let set_source = lua
+pub(super) fn expose_set_category(lua: &Lua, metadata: Rc<RefCell<Metadata>>) -> Result<()> {
+    let set_category = lua
         .create_function(
-            move |lua, (category, sub_category): (String, Option<String>)| {
+            move |lua, (category, subcategory): (String, Option<String>)| {
                 let category = category
-                    .parse::<SourceCategory>()
+                    .parse::<Category>()
                     .map_err(mlua::Error::external)?;
-                let sub_category = sub_category
-                    .map(|value| value.parse::<SourceSubCategory>())
+                let subcategory = subcategory
+                    .map(|value| value.parse::<Subcategory>())
                     .transpose()
+                    .map_err(mlua::Error::external)?;
+                super::super::service::check_categories(Some(category), subcategory)
                     .map_err(mlua::Error::external)?;
 
                 {
                     let mut metadata = metadata.borrow_mut();
-                    metadata.source_category = Some(category);
-                    metadata.source_sub_category = sub_category;
+                    metadata.category = Some(category);
+                    metadata.subcategory = subcategory;
                 }
 
                 let document_table: mlua::Table = lua.globals().get("document")?;
                 let metadata_table: mlua::Table = document_table.get("metadata")?;
-                metadata_table.set("source_category", category.as_str())?;
+                metadata_table.set("category", category.as_str())?;
                 metadata_table.set(
-                    "source_sub_category",
-                    sub_category.map(|sub_category| sub_category.as_str()),
+                    "subcategory",
+                    subcategory.map(|subcategory| subcategory.as_str()),
                 )?;
 
                 Ok(())
             },
         )
-        .context("failed to create the set_source lua function")?;
+        .context("failed to create the set_category lua function")?;
     lua.globals()
-        .set("set_source", set_source)
-        .context("failed to expose set_source to the sandboxed lua vm")?;
+        .set("set_category", set_category)
+        .context("failed to expose set_category to the sandboxed lua vm")?;
 
     Ok(())
 }
@@ -239,20 +240,16 @@ fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
         .context("failed to set document.metadata.type")?;
     metadata_table
         .set(
-            "source_category",
-            metadata
-                .source_category()
-                .map_or("", |category| category.as_str()),
+            "category",
+            metadata.category().map_or("", |category| category.as_str()),
         )
-        .context("failed to set document.metadata.source_category")?;
+        .context("failed to set document.metadata.category")?;
     metadata_table
         .set(
-            "source_sub_category",
-            metadata
-                .source_sub_category()
-                .map(|category| category.as_str()),
+            "subcategory",
+            metadata.subcategory().map(|category| category.as_str()),
         )
-        .context("failed to set document.metadata.source_sub_category")?;
+        .context("failed to set document.metadata.subcategory")?;
     metadata_table
         .set("subjects", metadata.subjects().to_vec())
         .context("failed to set document.metadata.subjects")?;
@@ -271,9 +268,9 @@ fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
 /// `content_type`, `size`, `checksum`, and `transcript` — those describe the
 /// underlying file rather than user-editable metadata, so a script can't
 /// change them: they're always taken from `original` regardless of what a
-/// script assigned into the table. `source_category`/`source_sub_category`
+/// script assigned into the table. `category`/`subcategory`
 /// and `purpose` are likewise taken from `source` (the
-/// [`expose_document`]-returned handle [`expose_set_source`]/
+/// [`expose_document`]-returned handle [`expose_set_category`]/
 /// [`expose_set_purpose`] write into) rather than re-parsed out of the
 /// table, since that handle is already validated and is the only way those
 /// fields can change. Called once a script has finished running, so the
@@ -320,8 +317,8 @@ pub(super) fn read_metadata(lua: &Lua, original: &Metadata, source: &Metadata) -
         checksum: original.checksum().to_string(),
         transcript: original.transcript().to_string(),
         r#type,
-        source_category: source.source_category(),
-        source_sub_category: source.source_sub_category(),
+        category: source.category(),
+        subcategory: source.subcategory(),
         subjects: metadata_table
             .get("subjects")
             .context("failed to read document.metadata.subjects back")?,
@@ -483,68 +480,80 @@ mod tests {
     }
 
     #[test]
-    fn set_source_sets_the_category_and_sub_category() {
+    fn set_category_sets_the_category_and_subcategory() {
         let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
-        expose_set_source(&lua, source_metadata.clone()).unwrap();
-        lua.load(r#"set_source("bank", "tax")"#).exec().unwrap();
+        expose_set_category(&lua, source_metadata.clone()).unwrap();
+        lua.load(r#"set_category("money", "banking")"#)
+            .exec()
+            .unwrap();
 
+        assert_eq!(source_metadata.borrow().category, Some(Category::Money));
         assert_eq!(
-            source_metadata.borrow().source_category,
-            Some(SourceCategory::Bank)
-        );
-        assert_eq!(
-            source_metadata.borrow().source_sub_category,
-            Some(SourceSubCategory::Tax)
+            source_metadata.borrow().subcategory,
+            Some(Subcategory::Banking)
         );
 
         let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
 
-        assert_eq!(metadata.source_category, Some(SourceCategory::Bank));
-        assert_eq!(metadata.source_sub_category, Some(SourceSubCategory::Tax));
+        assert_eq!(metadata.category, Some(Category::Money));
+        assert_eq!(metadata.subcategory, Some(Subcategory::Banking));
     }
 
     #[test]
-    fn set_source_accepts_a_nil_sub_category() {
+    fn set_category_accepts_a_nil_subcategory() {
         let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
-        expose_set_source(&lua, source_metadata.clone()).unwrap();
-        lua.load(r#"set_source("bank")"#).exec().unwrap();
+        expose_set_category(&lua, source_metadata.clone()).unwrap();
+        lua.load(r#"set_category("money")"#).exec().unwrap();
 
         let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
 
-        assert_eq!(metadata.source_category, Some(SourceCategory::Bank));
-        assert_eq!(metadata.source_sub_category, None);
+        assert_eq!(metadata.category, Some(Category::Money));
+        assert_eq!(metadata.subcategory, None);
     }
 
     #[test]
-    fn set_source_errors_on_an_unknown_category() {
+    fn set_category_errors_on_an_unknown_category() {
         let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
-        expose_set_source(&lua, source_metadata).unwrap();
+        expose_set_category(&lua, source_metadata).unwrap();
 
-        let result = lua.load(r#"set_source("not-a-category")"#).exec();
+        let result = lua.load(r#"set_category("not-a-category")"#).exec();
 
         assert!(result.is_err());
     }
 
     #[test]
-    fn set_source_errors_on_an_unknown_sub_category() {
+    fn set_category_errors_on_an_unknown_subcategory() {
         let lua = sandboxed(0).unwrap();
         let document = FakeDocument::new().build();
 
         let source_metadata = expose_document(&lua, &document).unwrap();
-        expose_set_source(&lua, source_metadata).unwrap();
+        expose_set_category(&lua, source_metadata).unwrap();
 
         let result = lua
-            .load(r#"set_source("bank", "not-a-sub-category")"#)
+            .load(r#"set_category("money", "not-a-subcategory")"#)
             .exec();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn set_category_errors_on_a_subcategory_of_another_category() {
+        let lua = sandboxed(0).unwrap();
+        let document = FakeDocument::new().build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        expose_set_category(&lua, source_metadata).unwrap();
+
+        let result = lua.load(r#"set_category("money", "energy")"#).exec();
 
         assert!(result.is_err());
     }

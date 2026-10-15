@@ -104,10 +104,10 @@ macro_rules! for_each_error_code {
             UnreadablePdf = 4003,
             /// A changelog event was malformed.
             InvalidChangelogEvent = 4004,
-            /// A document's source category is unknown.
-            InvalidSourceCategory = 4005,
-            /// A document's source sub-category is unknown.
-            InvalidSourceSubCategory = 4006,
+            /// A document's category is unknown.
+            InvalidCategory = 4005,
+            /// A document's subcategory is unknown.
+            InvalidSubcategory = 4006,
             /// A document's purpose is unknown.
             InvalidPurpose = 4007,
             /// A document search's parameters were invalid.
@@ -116,6 +116,8 @@ macro_rules! for_each_error_code {
             DuplicateDocument = 4009,
             /// A document's type is unknown.
             InvalidDocumentType = 4010,
+            /// A document's subcategory doesn't belong to its category.
+            MismatchedSubcategory = 4011,
             /// No such script.
             ScriptNotFound = 5001,
             /// A script was run without one of its required parameters.
@@ -227,14 +229,16 @@ pub(crate) enum ErrorKind {
     },
     #[error("invalid changelog event: {0}")]
     InvalidChangelogEvent(String),
-    #[error("invalid source category: {0:?}")]
-    InvalidSourceCategory(String),
-    #[error("invalid source sub-category: {0:?}")]
-    InvalidSourceSubCategory(String),
+    #[error("invalid category: {0:?}")]
+    InvalidCategory(String),
+    #[error("invalid subcategory: {0:?}")]
+    InvalidSubcategory(String),
     #[error("invalid purpose: {0:?}")]
     InvalidPurpose(String),
     #[error("invalid document type: {0:?}")]
     InvalidDocumentType(String),
+    #[error("mismatched subcategory: {0}")]
+    MismatchedSubcategory(String),
     #[error("invalid search query: {0}")]
     InvalidSearchQuery(String),
     #[error("invalid script type: {0:?}")]
@@ -288,10 +292,11 @@ impl ErrorKind {
             ErrorKind::ScriptNotInstalled(_) => ErrorCode::ScriptNotInstalled,
             ErrorKind::MissingScriptParameter { .. } => ErrorCode::MissingScriptParameter,
             ErrorKind::InvalidChangelogEvent(_) => ErrorCode::InvalidChangelogEvent,
-            ErrorKind::InvalidSourceCategory(_) => ErrorCode::InvalidSourceCategory,
-            ErrorKind::InvalidSourceSubCategory(_) => ErrorCode::InvalidSourceSubCategory,
+            ErrorKind::InvalidCategory(_) => ErrorCode::InvalidCategory,
+            ErrorKind::InvalidSubcategory(_) => ErrorCode::InvalidSubcategory,
             ErrorKind::InvalidPurpose(_) => ErrorCode::InvalidPurpose,
             ErrorKind::InvalidDocumentType(_) => ErrorCode::InvalidDocumentType,
+            ErrorKind::MismatchedSubcategory(_) => ErrorCode::MismatchedSubcategory,
             ErrorKind::InvalidSearchQuery(_) => ErrorCode::InvalidSearchQuery,
             ErrorKind::InvalidScriptType(_) => ErrorCode::InvalidScriptType,
             ErrorKind::InvalidResponse(_) => ErrorCode::InvalidServerResponse,

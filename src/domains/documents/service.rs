@@ -10,8 +10,8 @@ use crate::domains::changelog::{ChangelogEvent, EventType, Service as ChangelogS
 use super::parser::Service as ParserService;
 use super::storage::{FacetField, Storage};
 use super::{
-    Document, DocumentType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters,
-    SearchQuery, Service, UploadRequest, UploadSource,
+    Category, Document, DocumentType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters,
+    SearchQuery, Service, Subcategory, UploadRequest, UploadSource,
 };
 
 /// The default [`Service`] implementation: publishes new documents as
@@ -59,8 +59,8 @@ impl<S: Storage> DocumentsClient<S> {
     ) -> Result<Vec<FacetCount<String>>> {
         let mut filters = filters.clone();
         match field {
-            FacetField::SourceCategory => filters.source_categories.clear(),
-            FacetField::SourceSubCategory => filters.source_sub_categories.clear(),
+            FacetField::Category => filters.categories.clear(),
+            FacetField::Subcategory => filters.subcategories.clear(),
             FacetField::Purpose => filters.purposes.clear(),
             FacetField::Type => filters.types.clear(),
             FacetField::ContentType => filters.content_types.clear(),
@@ -86,7 +86,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
     /// AES-256-GCM, and is itself wrapped under a key-encryption-key before
     /// being sent alongside the ciphertext. Only the wrapped DEK and
     /// ciphertext ever leave this process.
-    async fn upload(&self, request: UploadRequest) -> Result<Uuid> {
+    async fn upload(&self, mut request: UploadRequest) -> Result<Uuid> {
         // Checked before anything else — parsing below also lists and runs
         // the user's enabled scripts against the document (see
         // `Self::run_scripts`), which needs a session just as much as
@@ -98,6 +98,8 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .ensure_master_key()
             .await
             .context("cannot upload a document before logging in")?;
+
+        resolve_upload_request(&mut request)?;
 
         let (content, original_name) = match request.source {
             UploadSource::Path(path) => {
@@ -143,11 +145,9 @@ impl<S: Storage> Service for DocumentsClient<S> {
         if let Some(r#type) = request.r#type {
             metadata.r#type = Some(r#type);
         }
-        if let Some(source_category) = request.source_category {
-            metadata.source_category = Some(source_category);
-        }
-        if let Some(source_sub_category) = request.source_sub_category {
-            metadata.source_sub_category = Some(source_sub_category);
+        if let Some(category) = request.category {
+            metadata.category = Some(category);
+            metadata.subcategory = request.subcategory;
         }
         if let Some(subjects) = request.subjects {
             metadata.subjects = subjects;
@@ -217,11 +217,11 @@ impl<S: Storage> Service for DocumentsClient<S> {
         // offer for it are every alternative compatible with the *rest* of
         // the search, not only the one(s) already picked — while every other
         // field narrows to what's left under the picked ones.
-        let source_categories = self
-            .count_documents_by(&terms, filters, FacetField::SourceCategory)
+        let categories = self
+            .count_documents_by(&terms, filters, FacetField::Category)
             .await?;
-        let source_sub_categories = self
-            .count_documents_by(&terms, filters, FacetField::SourceSubCategory)
+        let subcategories = self
+            .count_documents_by(&terms, filters, FacetField::Subcategory)
             .await?;
         let purposes = self
             .count_documents_by(&terms, filters, FacetField::Purpose)
@@ -240,8 +240,8 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .context("failed to find the creation date range of matching documents")?;
 
         Ok(SearchFacets {
-            source_categories: parse_facet(source_categories, "source category")?,
-            source_sub_categories: parse_facet(source_sub_categories, "source sub-category")?,
+            categories: parse_facet(categories, "category")?,
+            subcategories: parse_facet(subcategories, "subcategory")?,
             purposes: parse_facet(purposes, "purpose")?,
             types: parse_facet(
                 self.count_documents_by(&terms, filters, FacetField::Type)
@@ -265,6 +265,8 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
     async fn update_metadata(&self, metadata: Metadata) -> Result<()> {
         let id = metadata.id;
+        check_categories(metadata.category, metadata.subcategory)
+            .with_context(|| format!("invalid metadata for document {id}"))?;
 
         self.changelog
             .send(EventType::UpdateMetadata, id, None, Some(&metadata))
@@ -288,6 +290,38 @@ impl<S: Storage> Service for DocumentsClient<S> {
     fn stop_sync(&self) {
         self.changelog.stop_consume_job();
     }
+}
+
+/// Completes `request` with what its fields imply — a subcategory alone
+/// implies its category — and rejects one whose fields contradict each
+/// other. Shared with the dev [`Service`] (see `super::dev`), so a scraper
+/// run without a server fails on the same requests a real upload would.
+pub(super) fn resolve_upload_request(request: &mut UploadRequest) -> Result<()> {
+    if request.category.is_none() {
+        request.category = request
+            .subcategory
+            .map(|subcategory| subcategory.category());
+    }
+    check_categories(request.category, request.subcategory)
+}
+
+/// Rejects a subcategory that doesn't narrow down `category` (or that's
+/// set without any category).
+pub(super) fn check_categories(
+    category: Option<Category>,
+    subcategory: Option<Subcategory>,
+) -> Result<()> {
+    if let Some(subcategory) = subcategory
+        && Some(subcategory.category()) != category
+    {
+        return Err(ErrorKind::MismatchedSubcategory(format!(
+            "subcategory {subcategory} belongs to {}, not {}",
+            subcategory.category(),
+            category.map_or("no category".to_string(), |category| category.to_string())
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// The purpose a document of type `r#type` serves, given to an uploaded
@@ -649,8 +683,8 @@ mod tests {
             },
             name: Some("overridden.pdf".to_string()),
             r#type: Some(DocumentType::Payslip),
-            source_category: Some(super::super::SourceCategory::Employer),
-            source_sub_category: None,
+            category: Some(super::super::Category::Work),
+            subcategory: None,
             subjects: Some(vec!["salary".to_string()]),
             purpose: Some(super::super::Purpose::Employment),
         };
@@ -663,10 +697,7 @@ mod tests {
         let sent_metadata = sent_metadata.as_ref().unwrap();
         assert_eq!(sent_metadata.name, "overridden.pdf");
         assert_eq!(sent_metadata.r#type, Some(DocumentType::Payslip));
-        assert_eq!(
-            sent_metadata.source_category,
-            Some(super::super::SourceCategory::Employer)
-        );
+        assert_eq!(sent_metadata.category, Some(super::super::Category::Work));
         assert_eq!(sent_metadata.subjects, vec!["salary".to_string()]);
         assert_eq!(
             sent_metadata.purpose,
@@ -742,6 +773,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_infers_the_category_of_a_lone_subcategory() {
+        let parsed = super::super::FakeMetadata::new().build();
+        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
+        request.subcategory = Some(Subcategory::Energy);
+
+        let metadata = upload_with(parsed, request).await;
+
+        assert_eq!(metadata.category, Some(Category::Housing));
+        assert_eq!(metadata.subcategory, Some(Subcategory::Energy));
+    }
+
+    #[tokio::test]
+    async fn upload_drops_the_parsed_subcategory_when_overriding_the_category() {
+        let parsed = super::super::FakeMetadata::new()
+            .with_category(Category::Housing)
+            .with_subcategory(Subcategory::Energy)
+            .build();
+        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
+        request.category = Some(Category::Donations);
+
+        let metadata = upload_with(parsed, request).await;
+
+        assert_eq!(metadata.category, Some(Category::Donations));
+        assert_eq!(metadata.subcategory, None);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_a_subcategory_of_another_category_before_parsing() {
+        // No `expect_parse_content()`: the parser must never be reached.
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            Arc::new(RecordingChangelog::default()),
+            Arc::new(MockParserService::new()),
+            None,
+        );
+        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
+        request.category = Some(Category::Money);
+        request.subcategory = Some(Subcategory::Energy);
+
+        let err = client.upload(request).await.unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::MismatchedSubcategory);
+    }
+
+    #[tokio::test]
+    async fn update_metadata_rejects_a_subcategory_of_another_category() {
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client =
+            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_parser(), None);
+        let metadata = super::super::FakeMetadata::new()
+            .with_category(Category::Money)
+            .with_subcategory(Subcategory::Energy)
+            .build();
+
+        let err = client.update_metadata(metadata).await.unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::MismatchedSubcategory);
+        assert!(changelog.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn get_returns_a_document_previously_cached_locally() {
         let id = Uuid::now_v7();
         let document = Document {
@@ -757,8 +849,8 @@ mod tests {
                 checksum: "deadbeef".to_string(),
                 transcript: String::new(),
                 r#type: None,
-                source_category: None,
-                source_sub_category: None,
+                category: None,
+                subcategory: None,
                 subjects: Vec::new(),
                 purpose: None,
             },
@@ -799,8 +891,8 @@ mod tests {
                     checksum: String::new(),
                     transcript: String::new(),
                     r#type: None,
-                    source_category: None,
-                    source_sub_category: None,
+                    category: None,
+                    subcategory: None,
                     subjects: Vec::new(),
                     purpose: None,
                 },
@@ -818,8 +910,8 @@ mod tests {
                     checksum: String::new(),
                     transcript: String::new(),
                     r#type: None,
-                    source_category: None,
-                    source_sub_category: None,
+                    category: None,
+                    subcategory: None,
                     subjects: Vec::new(),
                     purpose: None,
                 },
@@ -854,7 +946,7 @@ mod tests {
     #[tokio::test]
     async fn search_splits_the_text_into_terms_and_forwards_the_query_to_storage() {
         let filters = super::super::SearchFilters {
-            source_categories: vec![super::super::SourceCategory::Bank],
+            categories: vec![super::super::Category::Money],
             created_from: Some(1),
             created_until: Some(2),
             ..Default::default()
@@ -953,8 +1045,8 @@ mod tests {
     ) -> super::super::SearchFilters {
         let mut filters = filters.clone();
         match field {
-            FacetField::SourceCategory => filters.source_categories.clear(),
-            FacetField::SourceSubCategory => filters.source_sub_categories.clear(),
+            FacetField::Category => filters.categories.clear(),
+            FacetField::Subcategory => filters.subcategories.clear(),
             FacetField::Purpose => filters.purposes.clear(),
             FacetField::Type => filters.types.clear(),
             FacetField::ContentType => filters.content_types.clear(),
@@ -965,11 +1057,11 @@ mod tests {
 
     #[tokio::test]
     async fn search_facets_counts_each_field_without_its_own_filter_but_with_every_other() {
-        use super::super::{Purpose, SearchFilters, SourceCategory, SourceSubCategory};
+        use super::super::{Category, Purpose, SearchFilters, Subcategory};
 
         let filters = SearchFilters {
-            source_categories: vec![SourceCategory::Bank],
-            source_sub_categories: vec![SourceSubCategory::Tax],
+            categories: vec![Category::Money],
+            subcategories: vec![Subcategory::Banking],
             purposes: vec![Purpose::Invoice],
             types: vec![DocumentType::Statement],
             subjects: vec!["rent".to_string()],
@@ -989,29 +1081,25 @@ mod tests {
         };
         let per_field = [
             (
-                FacetField::SourceCategory,
+                FacetField::Category,
                 as_strings(
                     expected
-                        .source_categories
+                        .categories
                         .iter()
                         .map(|f| f.value.as_str().to_string())
                         .collect(),
-                    expected.source_categories.iter().map(|f| f.count).collect(),
+                    expected.categories.iter().map(|f| f.count).collect(),
                 ),
             ),
             (
-                FacetField::SourceSubCategory,
+                FacetField::Subcategory,
                 as_strings(
                     expected
-                        .source_sub_categories
+                        .subcategories
                         .iter()
                         .map(|f| f.value.as_str().to_string())
                         .collect(),
-                    expected
-                        .source_sub_categories
-                        .iter()
-                        .map(|f| f.count)
-                        .collect(),
+                    expected.subcategories.iter().map(|f| f.count).collect(),
                 ),
             ),
             (
@@ -1080,7 +1168,7 @@ mod tests {
         storage
             .expect_count_documents_by()
             .returning(|_, _, field| {
-                Ok(if field == FacetField::SourceCategory {
+                Ok(if field == FacetField::Category {
                     vec![FacetCount {
                         value: "not-a-category".to_string(),
                         count: 1,
@@ -1103,7 +1191,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(err.code(), crate::ErrorCode::InvalidSourceCategory);
+        assert_eq!(err.code(), crate::ErrorCode::InvalidCategory);
     }
 
     #[tokio::test]

@@ -52,8 +52,8 @@ impl Service for ParserClient {
             checksum: super::checksum(content),
             transcript: doc_transcript,
             r#type: None,
-            source_category: None,
-            source_sub_category: None,
+            category: None,
+            subcategory: None,
             subjects: Vec::new(),
             purpose: None,
         };
@@ -90,7 +90,7 @@ fn run_scripts_blocking(scripts: &[Script], document: &Document) -> Result<Metad
         let working_document = Document::new(document.id(), document.content().to_vec(), metadata);
         let source_metadata = vm::expose_document(&lua, &working_document)?;
         vm::expose_pdf_conversions(&lua, document.content())?;
-        vm::expose_set_source(&lua, source_metadata.clone())?;
+        vm::expose_set_category(&lua, source_metadata.clone())?;
         vm::expose_set_purpose(&lua, source_metadata.clone())?;
         crate::tools::sandbox::load_source(&lua, script.script())
             .exec()

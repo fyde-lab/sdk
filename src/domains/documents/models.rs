@@ -6,191 +6,219 @@ use uuid::Uuid;
 
 use crate::{Error, ErrorKind};
 
-/// The business domain a document's issuer belongs to (e.g. a bank, an
-/// insurer, a retailer), as filled in by a user's classification script.
+/// The part of life a document is about — where it would be filed — rather
+/// than who issued it: a bank's tax form is [`Self::Taxes`], an internet
+/// box's invoice [`Self::Housing`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SourceCategory {
-    Bank,
-    Insurance,
-    Retail,
+pub enum Category {
+    Housing,
     Telecom,
+    Money,
+    Taxes,
+    Health,
+    Work,
+    Family,
+    Transport,
+    Shopping,
+    Subscriptions,
+    Donations,
+}
+
+impl Category {
+    pub(crate) const ALL: &'static [Category] = &[
+        Self::Housing,
+        Self::Telecom,
+        Self::Money,
+        Self::Taxes,
+        Self::Health,
+        Self::Work,
+        Self::Family,
+        Self::Transport,
+        Self::Shopping,
+        Self::Subscriptions,
+        Self::Donations,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Housing => "housing",
+            Self::Telecom => "telecom",
+            Self::Money => "money",
+            Self::Taxes => "taxes",
+            Self::Health => "health",
+            Self::Work => "work",
+            Self::Family => "family",
+            Self::Transport => "transport",
+            Self::Shopping => "shopping",
+            Self::Subscriptions => "subscriptions",
+            Self::Donations => "donations",
+        }
+    }
+}
+
+impl fmt::Display for Category {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Category {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|value| value.as_str() == s)
+            .ok_or_else(|| ErrorKind::InvalidCategory(s.to_string()).into())
+    }
+}
+
+/// A finer-grained classification within one [`Category`] (see
+/// [`Self::category`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Subcategory {
     Energy,
     Water,
-    Health,
-    Gov,
-    Association,
-    Education,
-    Employer,
-    Transport,
-    Goods,
-    Alimentation,
-    Building,
-    RealEstate,
-    Web,
-    Individual,
-    Shopping,
+    Internet,
+    HomeInsurance,
+    HomeServices,
+    Mobile,
+    Banking,
+    Savings,
+    Gaming,
+    IncomeTax,
+    TaxCertificates,
+    HealthInsurance,
+    ComplementaryHealth,
+    Care,
+    Payslips,
+    Employment,
+    HouseholdEmployer,
+    Benefits,
+    ChildcareSchool,
+    Train,
+    Flight,
+    Road,
+    Ride,
+    Travel,
+    Online,
+    Pets,
+    Groceries,
+    FoodDelivery,
+    Media,
+    CloudSoftware,
 }
 
-impl SourceCategory {
-    #[cfg(test)]
-    pub(crate) const ALL: &'static [SourceCategory] = &[
-        Self::Bank,
-        Self::Insurance,
-        Self::Retail,
-        Self::Telecom,
+impl Subcategory {
+    pub(crate) const ALL: &'static [Subcategory] = &[
         Self::Energy,
         Self::Water,
-        Self::Health,
-        Self::Gov,
-        Self::Association,
-        Self::Education,
-        Self::Employer,
-        Self::Transport,
-        Self::Goods,
-        Self::Alimentation,
-        Self::Building,
-        Self::RealEstate,
-        Self::Web,
-        Self::Individual,
-        Self::Shopping,
+        Self::Internet,
+        Self::HomeInsurance,
+        Self::HomeServices,
+        Self::Mobile,
+        Self::Banking,
+        Self::Savings,
+        Self::Gaming,
+        Self::IncomeTax,
+        Self::TaxCertificates,
+        Self::HealthInsurance,
+        Self::ComplementaryHealth,
+        Self::Care,
+        Self::Payslips,
+        Self::Employment,
+        Self::HouseholdEmployer,
+        Self::Benefits,
+        Self::ChildcareSchool,
+        Self::Train,
+        Self::Flight,
+        Self::Road,
+        Self::Ride,
+        Self::Travel,
+        Self::Online,
+        Self::Pets,
+        Self::Groceries,
+        Self::FoodDelivery,
+        Self::Media,
+        Self::CloudSoftware,
     ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Bank => "bank",
-            Self::Insurance => "insurance",
-            Self::Retail => "retail",
-            Self::Telecom => "telecom",
             Self::Energy => "energy",
             Self::Water => "water",
-            Self::Health => "health",
-            Self::Gov => "gov",
-            Self::Association => "association",
-            Self::Education => "education",
-            Self::Employer => "employer",
-            Self::Transport => "transport",
-            Self::Goods => "goods",
-            Self::Alimentation => "alimentation",
-            Self::Building => "building",
-            Self::RealEstate => "real_estate",
-            Self::Web => "web",
-            Self::Individual => "individual",
-            Self::Shopping => "shopping",
-        }
-    }
-}
-
-impl fmt::Display for SourceCategory {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for SourceCategory {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "bank" => Ok(Self::Bank),
-            "insurance" => Ok(Self::Insurance),
-            "retail" => Ok(Self::Retail),
-            "telecom" => Ok(Self::Telecom),
-            "energy" => Ok(Self::Energy),
-            "water" => Ok(Self::Water),
-            "health" => Ok(Self::Health),
-            "gov" => Ok(Self::Gov),
-            "association" => Ok(Self::Association),
-            "education" => Ok(Self::Education),
-            "employer" => Ok(Self::Employer),
-            "transport" => Ok(Self::Transport),
-            "goods" => Ok(Self::Goods),
-            "alimentation" => Ok(Self::Alimentation),
-            "building" => Ok(Self::Building),
-            "real_estate" => Ok(Self::RealEstate),
-            "web" => Ok(Self::Web),
-            "individual" => Ok(Self::Individual),
-            "shopping" => Ok(Self::Shopping),
-            other => Err(ErrorKind::InvalidSourceCategory(other.to_string()).into()),
-        }
-    }
-}
-
-/// A finer-grained classification within a document's [`SourceCategory`],
-/// as filled in by a user's classification script.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceSubCategory {
-    CivilRegistration,
-    Immigration,
-    Transport,
-    Family,
-    Tax,
-    Health,
-    RealEstate,
-    Mobile,
-    Internet,
-    Citizen,
-    Sport,
-}
-
-impl SourceSubCategory {
-    #[cfg(test)]
-    pub(crate) const ALL: &'static [SourceSubCategory] = &[
-        Self::CivilRegistration,
-        Self::Immigration,
-        Self::Transport,
-        Self::Family,
-        Self::Tax,
-        Self::Health,
-        Self::RealEstate,
-        Self::Mobile,
-        Self::Internet,
-        Self::Citizen,
-        Self::Sport,
-    ];
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::CivilRegistration => "civil_registration",
-            Self::Immigration => "immigration",
-            Self::Transport => "transport",
-            Self::Family => "family",
-            Self::Tax => "tax",
-            Self::Health => "health",
-            Self::RealEstate => "real_estate",
-            Self::Mobile => "mobile",
             Self::Internet => "internet",
-            Self::Citizen => "citizen",
-            Self::Sport => "sport",
+            Self::HomeInsurance => "home_insurance",
+            Self::HomeServices => "home_services",
+            Self::Mobile => "mobile",
+            Self::Banking => "banking",
+            Self::Savings => "savings",
+            Self::Gaming => "gaming",
+            Self::IncomeTax => "income_tax",
+            Self::TaxCertificates => "tax_certificates",
+            Self::HealthInsurance => "health_insurance",
+            Self::ComplementaryHealth => "complementary_health",
+            Self::Care => "care",
+            Self::Payslips => "payslips",
+            Self::Employment => "employment",
+            Self::HouseholdEmployer => "household_employer",
+            Self::Benefits => "benefits",
+            Self::ChildcareSchool => "childcare_school",
+            Self::Train => "train",
+            Self::Flight => "flight",
+            Self::Road => "road",
+            Self::Ride => "ride",
+            Self::Travel => "travel",
+            Self::Online => "online",
+            Self::Pets => "pets",
+            Self::Groceries => "groceries",
+            Self::FoodDelivery => "food_delivery",
+            Self::Media => "media",
+            Self::CloudSoftware => "cloud_software",
+        }
+    }
+
+    /// The [`Category`] this subcategory narrows down.
+    pub fn category(&self) -> Category {
+        match self {
+            Self::Energy
+            | Self::Water
+            | Self::Internet
+            | Self::HomeInsurance
+            | Self::HomeServices => Category::Housing,
+            Self::Mobile => Category::Telecom,
+            Self::Banking | Self::Savings | Self::Gaming => Category::Money,
+            Self::IncomeTax | Self::TaxCertificates => Category::Taxes,
+            Self::HealthInsurance | Self::ComplementaryHealth | Self::Care => Category::Health,
+            Self::Payslips | Self::Employment | Self::HouseholdEmployer => Category::Work,
+            Self::Benefits | Self::ChildcareSchool => Category::Family,
+            Self::Train | Self::Flight | Self::Road | Self::Ride | Self::Travel => {
+                Category::Transport
+            }
+            Self::Online | Self::Pets | Self::Groceries | Self::FoodDelivery => Category::Shopping,
+            Self::Media | Self::CloudSoftware => Category::Subscriptions,
         }
     }
 }
 
-impl fmt::Display for SourceSubCategory {
+impl fmt::Display for Subcategory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-impl FromStr for SourceSubCategory {
+impl FromStr for Subcategory {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "civil_registration" => Ok(Self::CivilRegistration),
-            "immigration" => Ok(Self::Immigration),
-            "transport" => Ok(Self::Transport),
-            "family" => Ok(Self::Family),
-            "tax" => Ok(Self::Tax),
-            "health" => Ok(Self::Health),
-            "real_estate" => Ok(Self::RealEstate),
-            "mobile" => Ok(Self::Mobile),
-            "internet" => Ok(Self::Internet),
-            "citizen" => Ok(Self::Citizen),
-            "sport" => Ok(Self::Sport),
-            other => Err(ErrorKind::InvalidSourceSubCategory(other.to_string()).into()),
-        }
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|value| value.as_str() == s)
+            .ok_or_else(|| ErrorKind::InvalidSubcategory(s.to_string()).into())
     }
 }
 
@@ -370,8 +398,8 @@ pub struct Metadata {
     /// `None` until a classification script sets it — scripts never
     /// persist anything themselves, so a freshly parsed document has no
     /// category yet.
-    pub source_category: Option<SourceCategory>,
-    pub source_sub_category: Option<SourceSubCategory>,
+    pub category: Option<Category>,
+    pub subcategory: Option<Subcategory>,
     pub subjects: Vec<String>,
     /// `None` until a classification script sets it — scripts never
     /// persist anything themselves, so a freshly parsed document has no
@@ -416,12 +444,12 @@ impl Metadata {
         self.r#type
     }
 
-    pub fn source_category(&self) -> Option<SourceCategory> {
-        self.source_category
+    pub fn category(&self) -> Option<Category> {
+        self.category
     }
 
-    pub fn source_sub_category(&self) -> Option<SourceSubCategory> {
-        self.source_sub_category
+    pub fn subcategory(&self) -> Option<Subcategory> {
+        self.subcategory
     }
 
     pub fn subjects(&self) -> &[String] {
@@ -494,8 +522,8 @@ pub struct UploadRequest {
     pub source: UploadSource,
     pub name: Option<String>,
     pub r#type: Option<DocumentType>,
-    pub source_category: Option<SourceCategory>,
-    pub source_sub_category: Option<SourceSubCategory>,
+    pub category: Option<Category>,
+    pub subcategory: Option<Subcategory>,
     pub subjects: Option<Vec<String>>,
     pub purpose: Option<Purpose>,
 }
@@ -508,8 +536,8 @@ impl UploadRequest {
             source: UploadSource::Path(path.into()),
             name: None,
             r#type: None,
-            source_category: None,
-            source_sub_category: None,
+            category: None,
+            subcategory: None,
             subjects: None,
             purpose: None,
         }
@@ -525,8 +553,8 @@ impl UploadRequest {
             },
             name: None,
             r#type: None,
-            source_category: None,
-            source_sub_category: None,
+            category: None,
+            subcategory: None,
             subjects: None,
             purpose: None,
         }
@@ -541,8 +569,8 @@ impl UploadRequest {
 /// `SearchFilters::default()` matches every document.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchFilters {
-    pub source_categories: Vec<SourceCategory>,
-    pub source_sub_categories: Vec<SourceSubCategory>,
+    pub categories: Vec<Category>,
+    pub subcategories: Vec<Subcategory>,
     pub purposes: Vec<Purpose>,
     pub types: Vec<DocumentType>,
     /// Matches a document carrying at least one of these subjects, compared
@@ -572,13 +600,13 @@ pub struct FacetCount<T> {
 /// values are left out.
 ///
 /// Each field's values ignore that field's *own* filter (but honor every
-/// other one), so picking a category narrows the sub-categories, purposes...
+/// other one), so picking a category narrows the subcategories, purposes...
 /// on offer to that category's, while every category still compatible with
 /// the rest of the search stays available to switch to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchFacets {
-    pub source_categories: Vec<FacetCount<SourceCategory>>,
-    pub source_sub_categories: Vec<FacetCount<SourceSubCategory>>,
+    pub categories: Vec<FacetCount<Category>>,
+    pub subcategories: Vec<FacetCount<Subcategory>>,
     pub purposes: Vec<FacetCount<Purpose>>,
     pub types: Vec<FacetCount<DocumentType>>,
     pub content_types: Vec<FacetCount<String>>,
@@ -606,7 +634,7 @@ pub enum SearchOrder {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchQuery {
     /// Free text matched against a document's name, original name,
-    /// transcript, type, source category/sub-category, subjects and
+    /// transcript, type, category/subcategory, subjects and
     /// purpose. Every word must match one of those fields, as a
     /// case- and accent-insensitive prefix ("fact" matches "Facturé").
     /// Blank matches every document, leaving only `filters` to narrow it.
@@ -644,6 +672,8 @@ pub(crate) struct FakeMetadata {
 impl FakeMetadata {
     pub(crate) fn new() -> Self {
         let name = format!("{}.pdf", crate::tools::testing::random_word());
+        let subcategory = Subcategory::ALL
+            [crate::tools::testing::random_u64(Subcategory::ALL.len() as u64) as usize];
         Self {
             metadata: Metadata {
                 id: Uuid::now_v7(),
@@ -662,16 +692,8 @@ impl FakeMetadata {
                         DocumentType::ALL.len() as u64
                     ) as usize],
                 ),
-                source_category: Some(
-                    SourceCategory::ALL[crate::tools::testing::random_u64(
-                        SourceCategory::ALL.len() as u64
-                    ) as usize],
-                ),
-                source_sub_category: Some(
-                    SourceSubCategory::ALL[crate::tools::testing::random_u64(
-                        SourceSubCategory::ALL.len() as u64,
-                    ) as usize],
-                ),
+                category: Some(subcategory.category()),
+                subcategory: Some(subcategory),
                 subjects: vec![
                     crate::tools::testing::random_word().to_string(),
                     crate::tools::testing::random_word().to_string(),
@@ -729,19 +751,13 @@ impl FakeMetadata {
         self
     }
 
-    pub(crate) fn with_source_category(
-        mut self,
-        source_category: impl Into<Option<SourceCategory>>,
-    ) -> Self {
-        self.metadata.source_category = source_category.into();
+    pub(crate) fn with_category(mut self, category: impl Into<Option<Category>>) -> Self {
+        self.metadata.category = category.into();
         self
     }
 
-    pub(crate) fn with_source_sub_category(
-        mut self,
-        source_sub_category: impl Into<Option<SourceSubCategory>>,
-    ) -> Self {
-        self.metadata.source_sub_category = source_sub_category.into();
+    pub(crate) fn with_subcategory(mut self, subcategory: impl Into<Option<Subcategory>>) -> Self {
+        self.metadata.subcategory = subcategory.into();
         self
     }
 
@@ -819,16 +835,14 @@ impl FakeSearchFacets {
         let earliest = crate::tools::testing::random_past_timestamp();
         Self {
             facets: SearchFacets {
-                source_categories: vec![FacetCount {
-                    value: SourceCategory::ALL[crate::tools::testing::random_u64(
-                        SourceCategory::ALL.len() as u64,
-                    ) as usize],
+                categories: vec![FacetCount {
+                    value: Category::ALL
+                        [crate::tools::testing::random_u64(Category::ALL.len() as u64) as usize],
                     count: count(),
                 }],
-                source_sub_categories: vec![FacetCount {
-                    value: SourceSubCategory::ALL[crate::tools::testing::random_u64(
-                        SourceSubCategory::ALL.len() as u64,
-                    ) as usize],
+                subcategories: vec![FacetCount {
+                    value: Subcategory::ALL
+                        [crate::tools::testing::random_u64(Subcategory::ALL.len() as u64) as usize],
                     count: count(),
                 }],
                 purposes: vec![FacetCount {
@@ -855,19 +869,16 @@ impl FakeSearchFacets {
         }
     }
 
-    pub(crate) fn with_source_categories(
-        mut self,
-        source_categories: Vec<FacetCount<SourceCategory>>,
-    ) -> Self {
-        self.facets.source_categories = source_categories;
+    pub(crate) fn with_categories(mut self, categories: Vec<FacetCount<Category>>) -> Self {
+        self.facets.categories = categories;
         self
     }
 
-    pub(crate) fn with_source_sub_categories(
+    pub(crate) fn with_subcategories(
         mut self,
-        source_sub_categories: Vec<FacetCount<SourceSubCategory>>,
+        subcategories: Vec<FacetCount<Subcategory>>,
     ) -> Self {
-        self.facets.source_sub_categories = source_sub_categories;
+        self.facets.subcategories = subcategories;
         self
     }
 
@@ -930,8 +941,8 @@ mod tests {
             .with_checksum("deadbeef")
             .with_transcript("hello world")
             .with_type(DocumentType::Invoice)
-            .with_source_category(SourceCategory::Bank)
-            .with_source_sub_category(SourceSubCategory::Tax)
+            .with_category(Category::Money)
+            .with_subcategory(Subcategory::Banking)
             .with_subjects(vec!["Q1 report".to_string()])
             .with_purpose(Purpose::Invoice)
             .build();
@@ -945,8 +956,8 @@ mod tests {
         assert_eq!(metadata.checksum, "deadbeef");
         assert_eq!(metadata.transcript, "hello world");
         assert_eq!(metadata.r#type, Some(DocumentType::Invoice));
-        assert_eq!(metadata.source_category, Some(SourceCategory::Bank));
-        assert_eq!(metadata.source_sub_category, Some(SourceSubCategory::Tax));
+        assert_eq!(metadata.category, Some(Category::Money));
+        assert_eq!(metadata.subcategory, Some(Subcategory::Banking));
         assert_eq!(metadata.subjects, vec!["Q1 report".to_string()]);
         assert_eq!(metadata.purpose, Some(Purpose::Invoice));
     }
@@ -955,6 +966,30 @@ mod tests {
     fn document_type_round_trips_through_its_string_form() {
         for r#type in DocumentType::ALL {
             assert_eq!(r#type.as_str().parse::<DocumentType>().unwrap(), *r#type);
+        }
+    }
+
+    #[test]
+    fn metadata_round_trips_through_its_encoding() {
+        let metadata = FakeMetadata::new().build();
+
+        let decoded: Metadata =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&metadata).unwrap()).unwrap();
+
+        assert_eq!(decoded, metadata);
+    }
+
+    #[test]
+    fn every_category_but_donations_has_a_subcategory() {
+        for category in Category::ALL {
+            let has_subcategory = Subcategory::ALL
+                .iter()
+                .any(|subcategory| subcategory.category() == *category);
+            assert_eq!(
+                has_subcategory,
+                *category != Category::Donations,
+                "{category}"
+            );
         }
     }
 
@@ -986,8 +1021,8 @@ mod tests {
     fn fake_search_facets_builds_with_plausible_defaults() {
         let facets = FakeSearchFacets::new().build();
 
-        assert!(!facets.source_categories.is_empty());
-        assert!(facets.source_categories.iter().all(|facet| facet.count > 0));
+        assert!(!facets.categories.is_empty());
+        assert!(facets.categories.iter().all(|facet| facet.count > 0));
         assert!(facets.earliest_created_at <= facets.latest_created_at);
     }
 
@@ -998,11 +1033,11 @@ mod tests {
             count: 1,
         };
         let facets = FakeSearchFacets::new()
-            .with_source_categories(vec![FacetCount {
-                value: SourceCategory::Bank,
+            .with_categories(vec![FacetCount {
+                value: Category::Money,
                 count: 2,
             }])
-            .with_source_sub_categories(Vec::new())
+            .with_subcategories(Vec::new())
             .with_purposes(vec![FacetCount {
                 value: Purpose::Invoice,
                 count: 3,
@@ -1019,11 +1054,11 @@ mod tests {
         assert_eq!(
             facets,
             SearchFacets {
-                source_categories: vec![FacetCount {
-                    value: SourceCategory::Bank,
+                categories: vec![FacetCount {
+                    value: Category::Money,
                     count: 2
                 }],
-                source_sub_categories: Vec::new(),
+                subcategories: Vec::new(),
                 purposes: vec![FacetCount {
                     value: Purpose::Invoice,
                     count: 3

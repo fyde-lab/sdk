@@ -13,8 +13,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::domains::documents::{
-    DocumentType, EventType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters,
-    SearchOrder, SearchQuery, SourceCategory, SourceSubCategory, UploadRequest,
+    Category, DocumentType, EventType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters,
+    SearchOrder, SearchQuery, Subcategory, UploadRequest,
 };
 use crate::domains::scripts::{
     InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptParameterType, ScriptType,
@@ -76,132 +76,165 @@ fn parse_uuid(id: &str) -> crate::Result<Uuid> {
     Uuid::parse_str(id).with_context(|| format!("invalid id {id:?}"))
 }
 
-/// The business domain a document's issuer belongs to, mirroring
-/// [`SourceCategory`] across the FFI boundary.
+/// The part of life a document is about, mirroring [`Category`] across the
+/// FFI boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum FfiSourceCategory {
-    Bank,
-    Insurance,
-    Retail,
+pub enum FfiCategory {
+    Housing,
     Telecom,
+    Money,
+    Taxes,
+    Health,
+    Work,
+    Family,
+    Transport,
+    Shopping,
+    Subscriptions,
+    Donations,
+}
+
+impl From<Category> for FfiCategory {
+    fn from(category: Category) -> Self {
+        match category {
+            Category::Housing => Self::Housing,
+            Category::Telecom => Self::Telecom,
+            Category::Money => Self::Money,
+            Category::Taxes => Self::Taxes,
+            Category::Health => Self::Health,
+            Category::Work => Self::Work,
+            Category::Family => Self::Family,
+            Category::Transport => Self::Transport,
+            Category::Shopping => Self::Shopping,
+            Category::Subscriptions => Self::Subscriptions,
+            Category::Donations => Self::Donations,
+        }
+    }
+}
+
+impl From<FfiCategory> for Category {
+    fn from(category: FfiCategory) -> Self {
+        match category {
+            FfiCategory::Housing => Self::Housing,
+            FfiCategory::Telecom => Self::Telecom,
+            FfiCategory::Money => Self::Money,
+            FfiCategory::Taxes => Self::Taxes,
+            FfiCategory::Health => Self::Health,
+            FfiCategory::Work => Self::Work,
+            FfiCategory::Family => Self::Family,
+            FfiCategory::Transport => Self::Transport,
+            FfiCategory::Shopping => Self::Shopping,
+            FfiCategory::Subscriptions => Self::Subscriptions,
+            FfiCategory::Donations => Self::Donations,
+        }
+    }
+}
+
+/// A finer-grained classification within a document's [`FfiCategory`],
+/// mirroring [`Subcategory`] across the FFI boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSubcategory {
     Energy,
     Water,
-    Health,
-    Gov,
-    Association,
-    Education,
-    Employer,
-    Transport,
-    Goods,
-    Alimentation,
-    Building,
-    RealEstate,
-    Web,
-    Individual,
-    Shopping,
-}
-
-impl From<SourceCategory> for FfiSourceCategory {
-    fn from(category: SourceCategory) -> Self {
-        match category {
-            SourceCategory::Bank => Self::Bank,
-            SourceCategory::Insurance => Self::Insurance,
-            SourceCategory::Retail => Self::Retail,
-            SourceCategory::Telecom => Self::Telecom,
-            SourceCategory::Energy => Self::Energy,
-            SourceCategory::Water => Self::Water,
-            SourceCategory::Health => Self::Health,
-            SourceCategory::Gov => Self::Gov,
-            SourceCategory::Association => Self::Association,
-            SourceCategory::Education => Self::Education,
-            SourceCategory::Employer => Self::Employer,
-            SourceCategory::Transport => Self::Transport,
-            SourceCategory::Goods => Self::Goods,
-            SourceCategory::Alimentation => Self::Alimentation,
-            SourceCategory::Building => Self::Building,
-            SourceCategory::RealEstate => Self::RealEstate,
-            SourceCategory::Web => Self::Web,
-            SourceCategory::Individual => Self::Individual,
-            SourceCategory::Shopping => Self::Shopping,
-        }
-    }
-}
-
-impl From<FfiSourceCategory> for SourceCategory {
-    fn from(category: FfiSourceCategory) -> Self {
-        match category {
-            FfiSourceCategory::Bank => Self::Bank,
-            FfiSourceCategory::Insurance => Self::Insurance,
-            FfiSourceCategory::Retail => Self::Retail,
-            FfiSourceCategory::Telecom => Self::Telecom,
-            FfiSourceCategory::Energy => Self::Energy,
-            FfiSourceCategory::Water => Self::Water,
-            FfiSourceCategory::Health => Self::Health,
-            FfiSourceCategory::Gov => Self::Gov,
-            FfiSourceCategory::Association => Self::Association,
-            FfiSourceCategory::Education => Self::Education,
-            FfiSourceCategory::Employer => Self::Employer,
-            FfiSourceCategory::Transport => Self::Transport,
-            FfiSourceCategory::Goods => Self::Goods,
-            FfiSourceCategory::Alimentation => Self::Alimentation,
-            FfiSourceCategory::Building => Self::Building,
-            FfiSourceCategory::RealEstate => Self::RealEstate,
-            FfiSourceCategory::Web => Self::Web,
-            FfiSourceCategory::Individual => Self::Individual,
-            FfiSourceCategory::Shopping => Self::Shopping,
-        }
-    }
-}
-
-/// A finer-grained classification within a document's [`FfiSourceCategory`],
-/// mirroring [`SourceSubCategory`] across the FFI boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum FfiSourceSubCategory {
-    CivilRegistration,
-    Immigration,
-    Transport,
-    Family,
-    Tax,
-    Health,
-    RealEstate,
-    Mobile,
     Internet,
-    Citizen,
-    Sport,
+    HomeInsurance,
+    HomeServices,
+    Mobile,
+    Banking,
+    Savings,
+    Gaming,
+    IncomeTax,
+    TaxCertificates,
+    HealthInsurance,
+    ComplementaryHealth,
+    Care,
+    Payslips,
+    Employment,
+    HouseholdEmployer,
+    Benefits,
+    ChildcareSchool,
+    Train,
+    Flight,
+    Road,
+    Ride,
+    Travel,
+    Online,
+    Pets,
+    Groceries,
+    FoodDelivery,
+    Media,
+    CloudSoftware,
 }
 
-impl From<SourceSubCategory> for FfiSourceSubCategory {
-    fn from(category: SourceSubCategory) -> Self {
-        match category {
-            SourceSubCategory::CivilRegistration => Self::CivilRegistration,
-            SourceSubCategory::Immigration => Self::Immigration,
-            SourceSubCategory::Transport => Self::Transport,
-            SourceSubCategory::Family => Self::Family,
-            SourceSubCategory::Tax => Self::Tax,
-            SourceSubCategory::Health => Self::Health,
-            SourceSubCategory::RealEstate => Self::RealEstate,
-            SourceSubCategory::Mobile => Self::Mobile,
-            SourceSubCategory::Internet => Self::Internet,
-            SourceSubCategory::Citizen => Self::Citizen,
-            SourceSubCategory::Sport => Self::Sport,
+impl From<Subcategory> for FfiSubcategory {
+    fn from(subcategory: Subcategory) -> Self {
+        match subcategory {
+            Subcategory::Energy => Self::Energy,
+            Subcategory::Water => Self::Water,
+            Subcategory::Internet => Self::Internet,
+            Subcategory::HomeInsurance => Self::HomeInsurance,
+            Subcategory::HomeServices => Self::HomeServices,
+            Subcategory::Mobile => Self::Mobile,
+            Subcategory::Banking => Self::Banking,
+            Subcategory::Savings => Self::Savings,
+            Subcategory::Gaming => Self::Gaming,
+            Subcategory::IncomeTax => Self::IncomeTax,
+            Subcategory::TaxCertificates => Self::TaxCertificates,
+            Subcategory::HealthInsurance => Self::HealthInsurance,
+            Subcategory::ComplementaryHealth => Self::ComplementaryHealth,
+            Subcategory::Care => Self::Care,
+            Subcategory::Payslips => Self::Payslips,
+            Subcategory::Employment => Self::Employment,
+            Subcategory::HouseholdEmployer => Self::HouseholdEmployer,
+            Subcategory::Benefits => Self::Benefits,
+            Subcategory::ChildcareSchool => Self::ChildcareSchool,
+            Subcategory::Train => Self::Train,
+            Subcategory::Flight => Self::Flight,
+            Subcategory::Road => Self::Road,
+            Subcategory::Ride => Self::Ride,
+            Subcategory::Travel => Self::Travel,
+            Subcategory::Online => Self::Online,
+            Subcategory::Pets => Self::Pets,
+            Subcategory::Groceries => Self::Groceries,
+            Subcategory::FoodDelivery => Self::FoodDelivery,
+            Subcategory::Media => Self::Media,
+            Subcategory::CloudSoftware => Self::CloudSoftware,
         }
     }
 }
 
-impl From<FfiSourceSubCategory> for SourceSubCategory {
-    fn from(category: FfiSourceSubCategory) -> Self {
-        match category {
-            FfiSourceSubCategory::CivilRegistration => Self::CivilRegistration,
-            FfiSourceSubCategory::Immigration => Self::Immigration,
-            FfiSourceSubCategory::Transport => Self::Transport,
-            FfiSourceSubCategory::Family => Self::Family,
-            FfiSourceSubCategory::Tax => Self::Tax,
-            FfiSourceSubCategory::Health => Self::Health,
-            FfiSourceSubCategory::RealEstate => Self::RealEstate,
-            FfiSourceSubCategory::Mobile => Self::Mobile,
-            FfiSourceSubCategory::Internet => Self::Internet,
-            FfiSourceSubCategory::Citizen => Self::Citizen,
-            FfiSourceSubCategory::Sport => Self::Sport,
+impl From<FfiSubcategory> for Subcategory {
+    fn from(subcategory: FfiSubcategory) -> Self {
+        match subcategory {
+            FfiSubcategory::Energy => Self::Energy,
+            FfiSubcategory::Water => Self::Water,
+            FfiSubcategory::Internet => Self::Internet,
+            FfiSubcategory::HomeInsurance => Self::HomeInsurance,
+            FfiSubcategory::HomeServices => Self::HomeServices,
+            FfiSubcategory::Mobile => Self::Mobile,
+            FfiSubcategory::Banking => Self::Banking,
+            FfiSubcategory::Savings => Self::Savings,
+            FfiSubcategory::Gaming => Self::Gaming,
+            FfiSubcategory::IncomeTax => Self::IncomeTax,
+            FfiSubcategory::TaxCertificates => Self::TaxCertificates,
+            FfiSubcategory::HealthInsurance => Self::HealthInsurance,
+            FfiSubcategory::ComplementaryHealth => Self::ComplementaryHealth,
+            FfiSubcategory::Care => Self::Care,
+            FfiSubcategory::Payslips => Self::Payslips,
+            FfiSubcategory::Employment => Self::Employment,
+            FfiSubcategory::HouseholdEmployer => Self::HouseholdEmployer,
+            FfiSubcategory::Benefits => Self::Benefits,
+            FfiSubcategory::ChildcareSchool => Self::ChildcareSchool,
+            FfiSubcategory::Train => Self::Train,
+            FfiSubcategory::Flight => Self::Flight,
+            FfiSubcategory::Road => Self::Road,
+            FfiSubcategory::Ride => Self::Ride,
+            FfiSubcategory::Travel => Self::Travel,
+            FfiSubcategory::Online => Self::Online,
+            FfiSubcategory::Pets => Self::Pets,
+            FfiSubcategory::Groceries => Self::Groceries,
+            FfiSubcategory::FoodDelivery => Self::FoodDelivery,
+            FfiSubcategory::Media => Self::Media,
+            FfiSubcategory::CloudSoftware => Self::CloudSoftware,
         }
     }
 }
@@ -337,8 +370,8 @@ pub struct FfiMetadata {
     pub checksum: String,
     pub transcript: String,
     pub r#type: Option<FfiDocumentType>,
-    pub source_category: Option<FfiSourceCategory>,
-    pub source_sub_category: Option<FfiSourceSubCategory>,
+    pub category: Option<FfiCategory>,
+    pub subcategory: Option<FfiSubcategory>,
     pub subjects: Vec<String>,
     pub purpose: Option<FfiPurpose>,
 }
@@ -355,10 +388,8 @@ impl From<Metadata> for FfiMetadata {
             checksum: metadata.checksum().to_string(),
             transcript: metadata.transcript().to_string(),
             r#type: metadata.r#type().map(FfiDocumentType::from),
-            source_category: metadata.source_category().map(FfiSourceCategory::from),
-            source_sub_category: metadata
-                .source_sub_category()
-                .map(FfiSourceSubCategory::from),
+            category: metadata.category().map(FfiCategory::from),
+            subcategory: metadata.subcategory().map(FfiSubcategory::from),
             subjects: metadata.subjects().to_vec(),
             purpose: metadata.purpose().map(FfiPurpose::from),
         }
@@ -379,8 +410,8 @@ impl TryFrom<FfiMetadata> for Metadata {
             checksum: metadata.checksum,
             transcript: metadata.transcript,
             r#type: metadata.r#type.map(DocumentType::from),
-            source_category: metadata.source_category.map(SourceCategory::from),
-            source_sub_category: metadata.source_sub_category.map(SourceSubCategory::from),
+            category: metadata.category.map(Category::from),
+            subcategory: metadata.subcategory.map(Subcategory::from),
             subjects: metadata.subjects,
             purpose: metadata.purpose.map(Purpose::from),
         })
@@ -411,8 +442,8 @@ impl From<Document> for FfiDocument {
 /// non-empty, and every bound that's set.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiSearchFilters {
-    pub source_categories: Vec<FfiSourceCategory>,
-    pub source_sub_categories: Vec<FfiSourceSubCategory>,
+    pub categories: Vec<FfiCategory>,
+    pub subcategories: Vec<FfiSubcategory>,
     pub purposes: Vec<FfiPurpose>,
     pub types: Vec<FfiDocumentType>,
     pub subjects: Vec<String>,
@@ -424,15 +455,11 @@ pub struct FfiSearchFilters {
 impl From<FfiSearchFilters> for SearchFilters {
     fn from(filters: FfiSearchFilters) -> Self {
         Self {
-            source_categories: filters
-                .source_categories
+            categories: filters.categories.into_iter().map(Category::from).collect(),
+            subcategories: filters
+                .subcategories
                 .into_iter()
-                .map(SourceCategory::from)
-                .collect(),
-            source_sub_categories: filters
-                .source_sub_categories
-                .into_iter()
-                .map(SourceSubCategory::from)
+                .map(Subcategory::from)
                 .collect(),
             purposes: filters.purposes.into_iter().map(Purpose::from).collect(),
             types: filters.types.into_iter().map(DocumentType::from).collect(),
@@ -462,19 +489,19 @@ impl From<FfiSearchOrder> for SearchOrder {
     }
 }
 
-/// How many documents carry one source category, mirroring
-/// `FacetCount<SourceCategory>` (UniFFI has no generic records).
+/// How many documents carry one category, mirroring
+/// `FacetCount<Category>` (UniFFI has no generic records).
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct FfiSourceCategoryCount {
-    pub value: FfiSourceCategory,
+pub struct FfiCategoryCount {
+    pub value: FfiCategory,
     pub count: u64,
 }
 
-/// How many documents carry one source sub-category, mirroring
-/// `FacetCount<SourceSubCategory>`.
+/// How many documents carry one subcategory, mirroring
+/// `FacetCount<Subcategory>`.
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct FfiSourceSubCategoryCount {
-    pub value: FfiSourceSubCategory,
+pub struct FfiSubcategoryCount {
+    pub value: FfiSubcategory,
     pub count: u64,
 }
 
@@ -504,8 +531,8 @@ pub struct FfiStringCount {
 /// [`SearchFacets`] across the FFI boundary.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiSearchFacets {
-    pub source_categories: Vec<FfiSourceCategoryCount>,
-    pub source_sub_categories: Vec<FfiSourceSubCategoryCount>,
+    pub categories: Vec<FfiCategoryCount>,
+    pub subcategories: Vec<FfiSubcategoryCount>,
     pub purposes: Vec<FfiPurposeCount>,
     pub types: Vec<FfiDocumentTypeCount>,
     pub content_types: Vec<FfiStringCount>,
@@ -527,18 +554,18 @@ impl From<SearchFacets> for FfiSearchFacets {
         }
 
         Self {
-            source_categories: facets
-                .source_categories
+            categories: facets
+                .categories
                 .into_iter()
-                .map(|facet| FfiSourceCategoryCount {
+                .map(|facet| FfiCategoryCount {
                     value: facet.value.into(),
                     count: facet.count,
                 })
                 .collect(),
-            source_sub_categories: facets
-                .source_sub_categories
+            subcategories: facets
+                .subcategories
                 .into_iter()
-                .map(|facet| FfiSourceSubCategoryCount {
+                .map(|facet| FfiSubcategoryCount {
                     value: facet.value.into(),
                     count: facet.count,
                 })
@@ -1487,15 +1514,10 @@ mod tests {
         assert_eq!(ffi.checksum, metadata.checksum());
         assert_eq!(ffi.transcript, metadata.transcript());
         assert_eq!(ffi.r#type, metadata.r#type().map(FfiDocumentType::from));
+        assert_eq!(ffi.category, metadata.category().map(FfiCategory::from));
         assert_eq!(
-            ffi.source_category,
-            metadata.source_category().map(FfiSourceCategory::from)
-        );
-        assert_eq!(
-            ffi.source_sub_category,
-            metadata
-                .source_sub_category()
-                .map(FfiSourceSubCategory::from)
+            ffi.subcategory,
+            metadata.subcategory().map(FfiSubcategory::from)
         );
         assert_eq!(ffi.subjects, metadata.subjects());
         assert_eq!(ffi.purpose, metadata.purpose().map(FfiPurpose::from));

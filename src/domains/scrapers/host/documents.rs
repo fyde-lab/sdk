@@ -6,8 +6,7 @@ use tokio::runtime::Handle;
 
 use crate::ErrorCode;
 use crate::domains::documents::{
-    DocumentType, Purpose, Service as DocumentsService, SourceCategory, SourceSubCategory,
-    UploadRequest,
+    Category, DocumentType, Purpose, Service as DocumentsService, Subcategory, UploadRequest,
 };
 
 /// `fyde.save_document(name, content, [fields])`: uploads `content` (raw
@@ -20,7 +19,7 @@ use crate::domains::documents::{
 /// not the uploaded document's real identity (that's the id `upload`
 /// returns). The optional `fields` table lets a script set any of
 /// [`UploadRequest`]'s other metadata overrides up front (`name`, `type`,
-/// `source_category`, `source_sub_category`, `subjects`, `purpose`) instead
+/// `category`, `subcategory`, `subjects`, `purpose`) instead
 /// of leaving them to be derived later by a classification script. A
 /// document whose content is already saved locally is silently skipped,
 /// not an error, so re-running a scraper doesn't fail on what it already
@@ -91,13 +90,12 @@ fn apply_upload_fields(request: &mut UploadRequest, fields: &Table) -> mlua::Res
     if let Some(r#type) = fields.get::<Option<String>>("type")? {
         request.r#type = Some(DocumentType::from_str(&r#type).map_err(mlua::Error::external)?);
     }
-    if let Some(source_category) = fields.get::<Option<String>>("source_category")? {
-        request.source_category =
-            Some(SourceCategory::from_str(&source_category).map_err(mlua::Error::external)?);
+    if let Some(category) = fields.get::<Option<String>>("category")? {
+        request.category = Some(Category::from_str(&category).map_err(mlua::Error::external)?);
     }
-    if let Some(source_sub_category) = fields.get::<Option<String>>("source_sub_category")? {
-        request.source_sub_category =
-            Some(SourceSubCategory::from_str(&source_sub_category).map_err(mlua::Error::external)?);
+    if let Some(subcategory) = fields.get::<Option<String>>("subcategory")? {
+        request.subcategory =
+            Some(Subcategory::from_str(&subcategory).map_err(mlua::Error::external)?);
     }
     if let Some(subjects) = fields.get::<Option<Vec<String>>>("subjects")? {
         request.subjects = Some(subjects);
@@ -190,10 +188,8 @@ mod tests {
             .withf(|request| {
                 request.name.as_deref() == Some("January payslip")
                     && request.r#type == Some(crate::domains::documents::DocumentType::Payslip)
-                    && request.source_category
-                        == Some(crate::domains::documents::SourceCategory::Employer)
-                    && request.source_sub_category
-                        == Some(crate::domains::documents::SourceSubCategory::Family)
+                    && request.category == Some(crate::domains::documents::Category::Work)
+                    && request.subcategory == Some(crate::domains::documents::Subcategory::Payslips)
                     && request.subjects.as_deref() == Some(["Alice".to_string()].as_slice())
                     && request.purpose == Some(crate::domains::documents::Purpose::Employment)
             })
@@ -215,8 +211,8 @@ mod tests {
             r#"save_document("january.pdf", "the pdf content", {
                 name = "January payslip",
                 type = "payslip",
-                source_category = "employer",
-                source_sub_category = "family",
+                category = "work",
+                subcategory = "payslips",
                 subjects = {"Alice"},
                 purpose = "employment",
             })"#,
@@ -275,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn save_document_rejects_an_invalid_source_category() {
+    fn save_document_rejects_an_invalid_category() {
         let documents = MockDocumentsService::new();
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -290,7 +286,7 @@ mod tests {
         lua.globals().set("save_document", f).unwrap();
 
         let result = lua
-            .load(r#"save_document("a.pdf", "content", {source_category = "not_a_category"})"#)
+            .load(r#"save_document("a.pdf", "content", {category = "not_a_category"})"#)
             .exec();
 
         assert!(result.is_err());

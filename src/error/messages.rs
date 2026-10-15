@@ -165,12 +165,12 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "A change received from the server couldn't be applied.",
             "Une modification reçue du serveur n'a pas pu être appliquée.",
         ),
-        ErrorCode::InvalidSourceCategory => (
+        ErrorCode::InvalidCategory => (
             "The document's category is not recognized.",
             "La catégorie du document n'est pas reconnue.",
         ),
-        ErrorCode::InvalidSourceSubCategory => (
-            "The document's sub-category is not recognized.",
+        ErrorCode::InvalidSubcategory => (
+            "The document's subcategory is not recognized.",
             "La sous-catégorie du document n'est pas reconnue.",
         ),
         ErrorCode::InvalidPurpose => (
@@ -180,6 +180,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
         ErrorCode::InvalidDocumentType => (
             "The document's type is not recognized.",
             "Le type du document n'est pas reconnu.",
+        ),
+        ErrorCode::MismatchedSubcategory => (
+            "The document's subcategory doesn't belong to its category.",
+            "La sous-catégorie du document n'appartient pas à sa catégorie.",
         ),
         ErrorCode::InvalidSearchQuery => (
             "This search isn't valid.",
