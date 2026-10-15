@@ -4,6 +4,7 @@ pub(crate) mod parser;
 mod service;
 mod storage;
 mod storage_sqlite;
+pub mod well_known;
 
 #[cfg(test)]
 pub(crate) use crate::domains::changelog::FakeChangelogEvent;
@@ -46,8 +47,9 @@ pub trait Service: Send + Sync {
     /// override whatever would otherwise be derived from the document
     /// itself and any scripts run against it; `request.attributes` are
     /// merged over the scripts' attributes, replacing those of the same
-    /// name. An attribute with a blank name, or a value that doesn't fit
-    /// its type, is rejected with [`crate::ErrorCode::InvalidAttribute`].
+    /// name. An attribute with a blank name, a value that doesn't fit its
+    /// type, or a [`well_known`] name with a value of another type is
+    /// rejected with [`crate::ErrorCode::InvalidAttribute`].
     ///
     /// The file type is determined from the source's name's extension;
     /// only `.pdf` is currently accepted, anything else is rejected with

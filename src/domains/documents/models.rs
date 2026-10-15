@@ -426,7 +426,8 @@ impl Attribute {
     }
 }
 
-/// The type of an [`Attribute`], without its value.
+/// The type of an [`Attribute`], without its value — what a
+/// [`super::well_known::WellKnownAttribute`] expects its values to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AttributeType {
     String,

@@ -13,6 +13,7 @@ pub(crate) use error::{ErrorContext, ErrorKind};
 use std::sync::Arc;
 
 pub use domains::documents::parser::{Service as ParserService, init as init_parser};
+pub use domains::documents::well_known as well_known_attributes;
 pub use domains::documents::{
     Attribute, AttributeType, ChangelogEvent, Document, FacetCount, Metadata, SearchFacets,
     SearchFilters, SearchOrder, SearchQuery, Service as DocumentsService, UploadRequest,

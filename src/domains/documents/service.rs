@@ -10,6 +10,7 @@ use crate::domains::changelog::{ChangelogEvent, EventType, Service as ChangelogS
 
 use super::parser::Service as ParserService;
 use super::storage::{FacetField, Storage};
+use super::well_known;
 use super::{
     Attribute, Category, Document, FacetCount, Metadata, SearchFacets, SearchFilters, SearchQuery,
     Service, Subcategory, UploadRequest, UploadSource,
@@ -314,7 +315,8 @@ fn check_attributes(attributes: &BTreeMap<String, Attribute>) -> Result<()> {
     Ok(())
 }
 
-/// Rejects an attribute whose value doesn't fit its type:
+/// Rejects an attribute of another type than the [`well_known`] attribute
+/// of the same name, or whose value doesn't fit its type:
 /// - a float that isn't finite (`NaN`/infinity have no JSON representation,
 ///   so couldn't be cached),
 /// - a date that isn't a real `YYYY-MM-DD` calendar date,
@@ -325,6 +327,16 @@ fn check_attribute_value(name: &str, attribute: &Attribute) -> Result<()> {
     let invalid = |reason: String| -> Result<()> {
         Err(ErrorKind::InvalidAttribute(format!("attribute {name:?} {reason}")).into())
     };
+
+    if let Some(well_known) = well_known::get(name)
+        && well_known.r#type != attribute.r#type()
+    {
+        return invalid(format!(
+            "is a {}, but must be a {}",
+            attribute.r#type(),
+            well_known.r#type
+        ));
+    }
 
     match attribute {
         Attribute::String(_) | Attribute::Integer(_) | Attribute::Boolean(_) => {}
@@ -957,6 +969,15 @@ mod tests {
         ]);
 
         check_attributes(&attributes).unwrap();
+    }
+
+    #[test]
+    fn check_attributes_rejects_a_well_known_attribute_of_another_type() {
+        assert_invalid(check_one("net_pay", Attribute::Float(2150.5)));
+        assert_invalid(check_one(
+            "issued_on",
+            Attribute::String("2026-10-15".to_string()),
+        ));
     }
 
     #[test]

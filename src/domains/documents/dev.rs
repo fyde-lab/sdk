@@ -218,7 +218,13 @@ mod tests {
         let mut request = UploadRequest::from_raw("payslip.pdf", b"the pdf content".to_vec());
         request.name = Some("Payslip January".to_string());
         request.category = Some(Category::Work);
-        request.attributes = BTreeMap::from([("net_pay".to_string(), Attribute::Float(2150.5))]);
+        request.attributes = BTreeMap::from([(
+            "net_pay".to_string(),
+            Attribute::Amount {
+                minor_units: 215050,
+                currency: "EUR".to_string(),
+            },
+        )]);
         let id = client.upload(request).await.unwrap();
 
         let json: serde_json::Value = serde_json::from_slice(
@@ -236,7 +242,9 @@ mod tests {
                 "type": null,
                 "category": "work",
                 "subcategory": null,
-                "attributes": {"net_pay": {"type": "float", "value": 2150.5}},
+                "attributes": {
+                    "net_pay": {"type": "amount", "value": {"minor_units": 215050, "currency": "EUR"}},
+                },
             })
         );
     }
