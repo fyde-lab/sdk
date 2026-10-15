@@ -302,14 +302,53 @@ fn check_metadata(metadata: &Metadata) -> Result<()> {
     check_attributes(&metadata.attributes)
 }
 
-/// Rejects an attribute with a blank name, or one that isn't valid (see
-/// [`check_attribute_value`]).
+/// The most attributes a single document can carry: every one of them is
+/// re-encrypted into each of the document's changelog events, and cached on
+/// every device of the account.
+const MAX_ATTRIBUTES: usize = 64;
+/// The longest an attribute name can be, in bytes.
+const MAX_ATTRIBUTE_NAME_LEN: usize = 64;
+/// The longest a string, or select option, attribute value can be, in bytes.
+const MAX_ATTRIBUTE_TEXT_LEN: usize = 1024;
+/// The most options a select attribute can offer.
+const MAX_SELECT_OPTIONS: usize = 64;
+
+/// Rejects attributes that are too many, or one that isn't valid: see
+/// [`check_attribute_name`] and [`check_attribute_value`].
 fn check_attributes(attributes: &BTreeMap<String, Attribute>) -> Result<()> {
+    if attributes.len() > MAX_ATTRIBUTES {
+        return Err(ErrorKind::InvalidAttribute(format!(
+            "a document can't have more than {MAX_ATTRIBUTES} attributes, got {}",
+            attributes.len()
+        ))
+        .into());
+    }
     for (name, attribute) in attributes {
-        if name.trim().is_empty() {
-            return Err(ErrorKind::InvalidAttribute("attribute name is blank".to_string()).into());
-        }
+        check_attribute_name(name)?;
         check_attribute_value(name, attribute)?;
+    }
+
+    Ok(())
+}
+
+/// Rejects a name that isn't `snake_case` ASCII (a lowercase letter, then
+/// lowercase letters, digits or underscores), or is longer than
+/// [`MAX_ATTRIBUTE_NAME_LEN`].
+fn check_attribute_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let is_snake_case = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !is_snake_case {
+        return Err(ErrorKind::InvalidAttribute(format!(
+            "attribute name {name:?} isn't snake_case (a lowercase letter, then lowercase letters, digits or underscores)"
+        ))
+        .into());
+    }
+    if name.len() > MAX_ATTRIBUTE_NAME_LEN {
+        return Err(ErrorKind::InvalidAttribute(format!(
+            "attribute name {name:?} is longer than {MAX_ATTRIBUTE_NAME_LEN} bytes"
+        ))
+        .into());
     }
 
     Ok(())
@@ -319,10 +358,12 @@ fn check_attributes(attributes: &BTreeMap<String, Attribute>) -> Result<()> {
 /// of the same name, or whose value doesn't fit its type:
 /// - a float that isn't finite (`NaN`/infinity have no JSON representation,
 ///   so couldn't be cached),
+/// - a string, or select option, longer than [`MAX_ATTRIBUTE_TEXT_LEN`],
 /// - a date that isn't a real `YYYY-MM-DD` calendar date,
 /// - an amount whose currency isn't an ISO 4217 code (three uppercase
 ///   letters),
-/// - a select with no options, a blank or duplicate one, or a `selected` value that isn't one of them.
+/// - a select with no options, more than [`MAX_SELECT_OPTIONS`], a blank or
+///   duplicate one, or a `selected` value that isn't one of them.
 fn check_attribute_value(name: &str, attribute: &Attribute) -> Result<()> {
     let invalid = |reason: String| -> Result<()> {
         Err(ErrorKind::InvalidAttribute(format!("attribute {name:?} {reason}")).into())
@@ -339,10 +380,15 @@ fn check_attribute_value(name: &str, attribute: &Attribute) -> Result<()> {
     }
 
     match attribute {
-        Attribute::String(_) | Attribute::Integer(_) | Attribute::Boolean(_) => {}
+        Attribute::Integer(_) | Attribute::Boolean(_) => {}
         Attribute::Float(value) => {
             if !value.is_finite() {
                 return invalid(format!("has a non-finite value {value}"));
+            }
+        }
+        Attribute::String(value) => {
+            if value.len() > MAX_ATTRIBUTE_TEXT_LEN {
+                return invalid(format!("is longer than {MAX_ATTRIBUTE_TEXT_LEN} bytes"));
             }
         }
         Attribute::Date(value) => {
@@ -361,9 +407,20 @@ fn check_attribute_value(name: &str, attribute: &Attribute) -> Result<()> {
             if options.is_empty() {
                 return invalid("is a select without any option".to_string());
             }
+            if options.len() > MAX_SELECT_OPTIONS {
+                return invalid(format!(
+                    "has more than {MAX_SELECT_OPTIONS} options, got {}",
+                    options.len()
+                ));
+            }
             for (i, option) in options.iter().enumerate() {
                 if option.trim().is_empty() {
                     return invalid("has a blank option".to_string());
+                }
+                if option.len() > MAX_ATTRIBUTE_TEXT_LEN {
+                    return invalid(format!(
+                        "has an option longer than {MAX_ATTRIBUTE_TEXT_LEN} bytes"
+                    ));
                 }
                 if options[..i].contains(option) {
                     return invalid(format!("has option {option:?} more than once"));
@@ -972,11 +1029,43 @@ mod tests {
     }
 
     #[test]
+    fn check_attributes_rejects_a_name_that_isnt_snake_case() {
+        for name in ["", " ", "Price", "net-pay", "2nd", "_price", "prix_été"] {
+            assert_invalid(check_one(name, Attribute::Integer(1)));
+        }
+    }
+
+    #[test]
+    fn check_attributes_rejects_a_name_longer_than_the_limit() {
+        assert_invalid(check_one(
+            &"a".repeat(MAX_ATTRIBUTE_NAME_LEN + 1),
+            Attribute::Integer(1),
+        ));
+    }
+
+    #[test]
+    fn check_attributes_rejects_more_attributes_than_the_limit() {
+        let attributes = (0..=MAX_ATTRIBUTES)
+            .map(|i| (format!("attribute_{i}"), Attribute::Integer(1)))
+            .collect();
+
+        assert_invalid(check_attributes(&attributes));
+    }
+
+    #[test]
     fn check_attributes_rejects_a_well_known_attribute_of_another_type() {
         assert_invalid(check_one("net_pay", Attribute::Float(2150.5)));
         assert_invalid(check_one(
             "issued_on",
             Attribute::String("2026-10-15".to_string()),
+        ));
+    }
+
+    #[test]
+    fn check_attributes_rejects_a_string_longer_than_the_limit() {
+        assert_invalid(check_one(
+            "note",
+            Attribute::String("a".repeat(MAX_ATTRIBUTE_TEXT_LEN + 1)),
         ));
     }
 
@@ -1015,6 +1104,9 @@ mod tests {
         assert_invalid(check_one("status", select("paid", &["unpaid"])));
         assert_invalid(check_one("status", select("paid", &["paid", "paid"])));
         assert_invalid(check_one("status", select("paid", &["paid", " "])));
+        let options: Vec<String> = (0..=MAX_SELECT_OPTIONS).map(|i| format!("o{i}")).collect();
+        let options: Vec<&str> = options.iter().map(String::as_str).collect();
+        assert_invalid(check_one("status", select("o0", &options)));
     }
 
     #[tokio::test]

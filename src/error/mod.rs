@@ -118,8 +118,9 @@ macro_rules! for_each_error_code {
             /// A document's subcategory doesn't belong to its category.
             MismatchedSubcategory = 4011,
             // 4012 (InvalidSubject) is retired: never reuse it.
-            /// A document's attribute has an unknown type, or a value that
-            /// doesn't match its type.
+            /// A document's attribute has an unknown type, a value that
+            /// doesn't match its type, or an invalid name; or a document
+            /// has too many of them.
             InvalidAttribute = 4013,
             /// No such script.
             ScriptNotFound = 5001,

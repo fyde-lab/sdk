@@ -504,8 +504,11 @@ pub struct Metadata {
     pub category: Option<Category>,
     pub subcategory: Option<Subcategory>,
     /// Every unstructured piece of data a document carries beyond the
-    /// fields above (e.g. `"price"` → `Attribute::Float(32.3)`), keyed by
-    /// name.
+    /// fields above (e.g. `"reference"` → `Attribute::String("F-42")`),
+    /// keyed by a `snake_case` name — one of [`super::well_known`]'s
+    /// whenever one fits. A piece of data that needs to be filtered,
+    /// faceted or sorted on across documents belongs in a field of its
+    /// own instead, the way `category` is.
     pub attributes: BTreeMap<String, Attribute>,
 }
 

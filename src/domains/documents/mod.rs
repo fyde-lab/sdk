@@ -47,8 +47,9 @@ pub trait Service: Send + Sync {
     /// override whatever would otherwise be derived from the document
     /// itself and any scripts run against it; `request.attributes` are
     /// merged over the scripts' attributes, replacing those of the same
-    /// name. An attribute with a blank name, a value that doesn't fit its
-    /// type, or a [`well_known`] name with a value of another type is
+    /// name. Attributes that aren't valid — a name that isn't `snake_case`,
+    /// a value that doesn't fit its type, a [`well_known`] name with a value
+    /// of another type, or more of them than a document can carry — are
     /// rejected with [`crate::ErrorCode::InvalidAttribute`].
     ///
     /// The file type is determined from the source's name's extension;
