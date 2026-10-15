@@ -51,7 +51,7 @@ impl Service for ParserClient {
             size: content.len() as u64,
             checksum: super::checksum(content),
             transcript: doc_transcript,
-            r#type: String::new(),
+            r#type: None,
             source_category: None,
             source_sub_category: None,
             subjects: Vec::new(),

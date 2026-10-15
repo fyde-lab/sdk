@@ -7,8 +7,8 @@ use crate::{ErrorContext as _, Result};
 
 use super::storage::{FacetField, Storage};
 use super::{
-    Document, FacetCount, Metadata, Purpose, SearchFilters, SearchOrder, SourceCategory,
-    SourceSubCategory,
+    Document, DocumentType, FacetCount, Metadata, Purpose, SearchFilters, SearchOrder,
+    SourceCategory, SourceSubCategory,
 };
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
@@ -38,7 +38,7 @@ impl Storage for SqliteStorage {
         .bind(&document.metadata.checksum)
         .bind(document.metadata.created_at)
         .bind(&document.metadata.transcript)
-        .bind(&document.metadata.r#type)
+        .bind(type_to_column(document.metadata.r#type))
         .bind(source_category_to_column(document.metadata.source_category))
         .bind(source_sub_category_to_column(
             document.metadata.source_sub_category,
@@ -78,7 +78,7 @@ impl Storage for SqliteStorage {
                 size: content.len() as u64,
                 checksum: row.get("checksum"),
                 transcript: row.get("transcript"),
-                r#type: row.get("type"),
+                r#type: type_from_column(row.get("type"))?,
                 source_category: source_category_from_column(row.get("source_category"))?,
                 source_sub_category: source_sub_category_from_column(
                     row.get("source_sub_category"),
@@ -252,7 +252,7 @@ impl Storage for SqliteStorage {
         .bind(&metadata.checksum)
         .bind(metadata.created_at)
         .bind(&metadata.transcript)
-        .bind(&metadata.r#type)
+        .bind(type_to_column(metadata.r#type))
         .bind(source_category_to_column(metadata.source_category))
         .bind(source_sub_category_to_column(
             metadata.source_sub_category,
@@ -297,6 +297,23 @@ fn source_sub_category_from_column(column: Option<String>) -> Result<Option<Sour
                 .with_context(|| format!("invalid source sub-category in local database: {column}"))
         })
         .transpose()
+}
+
+/// The `type` column has no NULL state (`NOT NULL DEFAULT ''`), so an
+/// untyped document is stored as an empty string.
+fn type_to_column(r#type: Option<DocumentType>) -> String {
+    r#type.map_or_else(String::new, |r#type| r#type.as_str().to_string())
+}
+
+fn type_from_column(column: String) -> Result<Option<DocumentType>> {
+    if column.is_empty() {
+        return Ok(None);
+    }
+
+    column
+        .parse()
+        .map(Some)
+        .with_context(|| format!("invalid document type in local database: {column}"))
 }
 
 /// The `subjects` column stores a JSON-encoded array, since SQLite has no
@@ -346,7 +363,7 @@ fn document_from_row(row: &SqliteRow) -> Result<Document> {
             size: content.len() as u64,
             checksum: row.get("checksum"),
             transcript: row.get("transcript"),
-            r#type: row.get("type"),
+            r#type: type_from_column(row.get("type"))?,
             source_category: source_category_from_column(row.get("source_category"))?,
             source_sub_category: source_sub_category_from_column(row.get("source_sub_category"))?,
             subjects: subjects_from_column(row.get("subjects"))?,
@@ -436,7 +453,11 @@ fn push_matching(query: &mut QueryBuilder<Sqlite>, terms: &[String], filters: &S
         "d.purpose",
         filters.purposes.iter().map(Purpose::as_str),
     );
-    push_any_of(query, "d.type", filters.types.iter().map(String::as_str));
+    push_any_of(
+        query,
+        "d.type",
+        filters.types.iter().map(DocumentType::as_str),
+    );
     push_any_of(
         query,
         "d.content_type",
@@ -532,7 +553,7 @@ mod tests {
                     size: 5,
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
-                    r#type: String::new(),
+                    r#type: None,
                     source_category: None,
                     source_sub_category: None,
                     subjects: Vec::new(),
@@ -558,7 +579,7 @@ mod tests {
                     size: 5,
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
-                    r#type: String::new(),
+                    r#type: None,
                     source_category: None,
                     source_sub_category: None,
                     subjects: Vec::new(),
@@ -586,7 +607,7 @@ mod tests {
                     size: 3,
                     checksum: "checksum-one".to_string(),
                     transcript: String::new(),
-                    r#type: String::new(),
+                    r#type: None,
                     source_category: None,
                     source_sub_category: None,
                     subjects: Vec::new(),
@@ -608,7 +629,7 @@ mod tests {
                     size: 3,
                     checksum: "checksum-two".to_string(),
                     transcript: String::new(),
-                    r#type: String::new(),
+                    r#type: None,
                     source_category: None,
                     source_sub_category: None,
                     subjects: Vec::new(),
@@ -640,7 +661,7 @@ mod tests {
                         size: 0,
                         checksum: String::new(),
                         transcript: String::new(),
-                        r#type: String::new(),
+                        r#type: None,
                         source_category: None,
                         source_sub_category: None,
                         subjects: Vec::new(),
@@ -709,7 +730,7 @@ mod tests {
                     size: 5,
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
-                    r#type: String::new(),
+                    r#type: None,
                     source_category: None,
                     source_sub_category: None,
                     subjects: Vec::new(),
@@ -731,7 +752,7 @@ mod tests {
                     size: 0,
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
-                    r#type: String::new(),
+                    r#type: None,
                     source_category: None,
                     source_sub_category: None,
                     subjects: Vec::new(),
@@ -762,7 +783,7 @@ mod tests {
                     size: 0,
                     checksum: String::new(),
                     transcript: String::new(),
-                    r#type: String::new(),
+                    r#type: None,
                     source_category: None,
                     source_sub_category: None,
                     subjects: Vec::new(),
@@ -785,7 +806,7 @@ mod tests {
             .with_content_type("application/pdf")
             .with_created_at(created_at)
             .with_transcript("")
-            .with_type("")
+            .with_type(None)
             .with_source_category(None)
             .with_source_sub_category(None)
             .with_subjects(Vec::<String>::new())
@@ -886,7 +907,11 @@ mod tests {
             searchable("by-transcript", 2).with_transcript("Montant total: 42 euros"),
         )
         .await;
-        save(&storage, searchable("by-type", 3).with_type("payslip")).await;
+        save(
+            &storage,
+            searchable("by-type", 3).with_type(DocumentType::Payslip),
+        )
+        .await;
         save(
             &storage,
             searchable("by-category", 4).with_source_category(SourceCategory::RealEstate),
@@ -1004,7 +1029,7 @@ mod tests {
                 .with_source_category(SourceCategory::Health)
                 .with_source_sub_category(SourceSubCategory::Tax)
                 .with_purpose(Purpose::Invoice)
-                .with_type("receipt")
+                .with_type(DocumentType::Receipt)
                 .with_subjects(vec!["alice".to_string(), "bob".to_string()]),
         )
         .await;
@@ -1015,7 +1040,7 @@ mod tests {
                 .with_source_category(SourceCategory::Bank)
                 .with_source_sub_category(SourceSubCategory::Tax)
                 .with_purpose(Purpose::Invoice)
-                .with_type("receipt")
+                .with_type(DocumentType::Receipt)
                 .with_subjects(vec!["bob".to_string()]),
         )
         .await;
@@ -1024,7 +1049,7 @@ mod tests {
             searchable("wrong-sub-category", 10)
                 .with_source_category(SourceCategory::Health)
                 .with_purpose(Purpose::Invoice)
-                .with_type("receipt")
+                .with_type(DocumentType::Receipt)
                 .with_subjects(vec!["bob".to_string()]),
         )
         .await;
@@ -1034,7 +1059,7 @@ mod tests {
                 .with_source_category(SourceCategory::Health)
                 .with_source_sub_category(SourceSubCategory::Tax)
                 .with_purpose(Purpose::Contract)
-                .with_type("receipt")
+                .with_type(DocumentType::Receipt)
                 .with_subjects(vec!["bob".to_string()]),
         )
         .await;
@@ -1044,7 +1069,7 @@ mod tests {
                 .with_source_category(SourceCategory::Health)
                 .with_source_sub_category(SourceSubCategory::Tax)
                 .with_purpose(Purpose::Invoice)
-                .with_type("statement")
+                .with_type(DocumentType::Statement)
                 .with_subjects(vec!["bob".to_string()]),
         )
         .await;
@@ -1054,7 +1079,7 @@ mod tests {
                 .with_source_category(SourceCategory::Health)
                 .with_source_sub_category(SourceSubCategory::Tax)
                 .with_purpose(Purpose::Invoice)
-                .with_type("receipt")
+                .with_type(DocumentType::Receipt)
                 .with_subjects(vec!["carol".to_string()]),
         )
         .await;
@@ -1065,7 +1090,7 @@ mod tests {
                 .with_source_category(SourceCategory::Health)
                 .with_source_sub_category(SourceSubCategory::Tax)
                 .with_purpose(Purpose::Invoice)
-                .with_type("receipt")
+                .with_type(DocumentType::Receipt)
                 .with_subjects(vec!["bob".to_string()]),
         )
         .await;
@@ -1075,7 +1100,7 @@ mod tests {
                 .with_source_category(SourceCategory::Health)
                 .with_source_sub_category(SourceSubCategory::Tax)
                 .with_purpose(Purpose::Invoice)
-                .with_type("receipt")
+                .with_type(DocumentType::Receipt)
                 .with_subjects(vec!["bob".to_string()]),
         )
         .await;
@@ -1085,7 +1110,7 @@ mod tests {
                 .with_source_category(SourceCategory::Health)
                 .with_source_sub_category(SourceSubCategory::Tax)
                 .with_purpose(Purpose::Invoice)
-                .with_type("receipt")
+                .with_type(DocumentType::Receipt)
                 .with_subjects(vec!["bob".to_string()]),
         )
         .await;
@@ -1097,7 +1122,7 @@ mod tests {
                 source_categories: vec![SourceCategory::Health],
                 source_sub_categories: vec![SourceSubCategory::Tax],
                 purposes: vec![Purpose::Invoice],
-                types: vec!["receipt".to_string()],
+                types: vec![DocumentType::Receipt],
                 subjects: vec!["bob".to_string(), "dave".to_string()],
                 content_types: vec!["application/pdf".to_string()],
                 created_from: Some(10),
@@ -1273,7 +1298,7 @@ mod tests {
                 .with_source_category(SourceCategory::Energy)
                 .with_source_sub_category(SourceSubCategory::Tax)
                 .with_purpose(Purpose::Invoice)
-                .with_type("bill"),
+                .with_type(DocumentType::Invoice),
         )
         .await;
         save(
@@ -1306,7 +1331,7 @@ mod tests {
         );
         assert_eq!(
             facet(&storage, &[], &filters, FacetField::Type).await,
-            counts(&[("bill", 1)])
+            counts(&[("invoice", 1)])
         );
         assert_eq!(
             facet(&storage, &[], &filters, FacetField::ContentType).await,

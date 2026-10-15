@@ -13,8 +13,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::domains::documents::{
-    EventType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters, SearchOrder,
-    SearchQuery, SourceCategory, SourceSubCategory, UploadRequest,
+    DocumentType, EventType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters,
+    SearchOrder, SearchQuery, SourceCategory, SourceSubCategory, UploadRequest,
 };
 use crate::domains::scripts::{
     InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptParameterType, ScriptType,
@@ -247,6 +247,83 @@ impl From<FfiPurpose> for Purpose {
     }
 }
 
+/// What kind of paper a document is, mirroring [`DocumentType`] across the
+/// FFI boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiDocumentType {
+    Invoice,
+    Receipt,
+    Statement,
+    ReimbursementStatement,
+    Payslip,
+    Contract,
+    InsuranceCertificate,
+    InsuranceCard,
+    RightsCertificate,
+    ProofOfResidence,
+    Rib,
+    TaxNotice,
+    TaxReturn,
+    TaxCertificate,
+    EmploymentCertificate,
+    FeeSummary,
+    Booking,
+    MedicalDocument,
+    Other,
+}
+
+impl From<DocumentType> for FfiDocumentType {
+    fn from(r#type: DocumentType) -> Self {
+        match r#type {
+            DocumentType::Invoice => Self::Invoice,
+            DocumentType::Receipt => Self::Receipt,
+            DocumentType::Statement => Self::Statement,
+            DocumentType::ReimbursementStatement => Self::ReimbursementStatement,
+            DocumentType::Payslip => Self::Payslip,
+            DocumentType::Contract => Self::Contract,
+            DocumentType::InsuranceCertificate => Self::InsuranceCertificate,
+            DocumentType::InsuranceCard => Self::InsuranceCard,
+            DocumentType::RightsCertificate => Self::RightsCertificate,
+            DocumentType::ProofOfResidence => Self::ProofOfResidence,
+            DocumentType::Rib => Self::Rib,
+            DocumentType::TaxNotice => Self::TaxNotice,
+            DocumentType::TaxReturn => Self::TaxReturn,
+            DocumentType::TaxCertificate => Self::TaxCertificate,
+            DocumentType::EmploymentCertificate => Self::EmploymentCertificate,
+            DocumentType::FeeSummary => Self::FeeSummary,
+            DocumentType::Booking => Self::Booking,
+            DocumentType::MedicalDocument => Self::MedicalDocument,
+            DocumentType::Other => Self::Other,
+        }
+    }
+}
+
+impl From<FfiDocumentType> for DocumentType {
+    fn from(r#type: FfiDocumentType) -> Self {
+        match r#type {
+            FfiDocumentType::Invoice => Self::Invoice,
+            FfiDocumentType::Receipt => Self::Receipt,
+            FfiDocumentType::Statement => Self::Statement,
+            FfiDocumentType::ReimbursementStatement => Self::ReimbursementStatement,
+            FfiDocumentType::Payslip => Self::Payslip,
+            FfiDocumentType::Contract => Self::Contract,
+            FfiDocumentType::InsuranceCertificate => Self::InsuranceCertificate,
+            FfiDocumentType::InsuranceCard => Self::InsuranceCard,
+            FfiDocumentType::RightsCertificate => Self::RightsCertificate,
+            FfiDocumentType::ProofOfResidence => Self::ProofOfResidence,
+            FfiDocumentType::Rib => Self::Rib,
+            FfiDocumentType::TaxNotice => Self::TaxNotice,
+            FfiDocumentType::TaxReturn => Self::TaxReturn,
+            FfiDocumentType::TaxCertificate => Self::TaxCertificate,
+            FfiDocumentType::EmploymentCertificate => Self::EmploymentCertificate,
+            FfiDocumentType::FeeSummary => Self::FeeSummary,
+            FfiDocumentType::Booking => Self::Booking,
+            FfiDocumentType::MedicalDocument => Self::MedicalDocument,
+            FfiDocumentType::Other => Self::Other,
+        }
+    }
+}
+
 /// A document's cleartext metadata, mirroring [`Metadata`] across the FFI
 /// boundary.
 #[derive(Debug, Clone, uniffi::Record)]
@@ -259,7 +336,7 @@ pub struct FfiMetadata {
     pub size: u64,
     pub checksum: String,
     pub transcript: String,
-    pub r#type: String,
+    pub r#type: Option<FfiDocumentType>,
     pub source_category: Option<FfiSourceCategory>,
     pub source_sub_category: Option<FfiSourceSubCategory>,
     pub subjects: Vec<String>,
@@ -277,7 +354,7 @@ impl From<Metadata> for FfiMetadata {
             size: metadata.size(),
             checksum: metadata.checksum().to_string(),
             transcript: metadata.transcript().to_string(),
-            r#type: metadata.r#type().to_string(),
+            r#type: metadata.r#type().map(FfiDocumentType::from),
             source_category: metadata.source_category().map(FfiSourceCategory::from),
             source_sub_category: metadata
                 .source_sub_category()
@@ -301,7 +378,7 @@ impl TryFrom<FfiMetadata> for Metadata {
             size: metadata.size,
             checksum: metadata.checksum,
             transcript: metadata.transcript,
-            r#type: metadata.r#type,
+            r#type: metadata.r#type.map(DocumentType::from),
             source_category: metadata.source_category.map(SourceCategory::from),
             source_sub_category: metadata.source_sub_category.map(SourceSubCategory::from),
             subjects: metadata.subjects,
@@ -337,7 +414,7 @@ pub struct FfiSearchFilters {
     pub source_categories: Vec<FfiSourceCategory>,
     pub source_sub_categories: Vec<FfiSourceSubCategory>,
     pub purposes: Vec<FfiPurpose>,
-    pub types: Vec<String>,
+    pub types: Vec<FfiDocumentType>,
     pub subjects: Vec<String>,
     pub content_types: Vec<String>,
     pub created_from: Option<i64>,
@@ -358,7 +435,7 @@ impl From<FfiSearchFilters> for SearchFilters {
                 .map(SourceSubCategory::from)
                 .collect(),
             purposes: filters.purposes.into_iter().map(Purpose::from).collect(),
-            types: filters.types,
+            types: filters.types.into_iter().map(DocumentType::from).collect(),
             subjects: filters.subjects,
             content_types: filters.content_types,
             created_from: filters.created_from,
@@ -408,7 +485,14 @@ pub struct FfiPurposeCount {
     pub count: u64,
 }
 
-/// How many documents carry one free-form value (a type, content type or
+/// How many documents carry one type, mirroring `FacetCount<DocumentType>`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiDocumentTypeCount {
+    pub value: FfiDocumentType,
+    pub count: u64,
+}
+
+/// How many documents carry one free-form value (a content type or
 /// subject), mirroring `FacetCount<String>`.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiStringCount {
@@ -423,7 +507,7 @@ pub struct FfiSearchFacets {
     pub source_categories: Vec<FfiSourceCategoryCount>,
     pub source_sub_categories: Vec<FfiSourceSubCategoryCount>,
     pub purposes: Vec<FfiPurposeCount>,
-    pub types: Vec<FfiStringCount>,
+    pub types: Vec<FfiDocumentTypeCount>,
     pub content_types: Vec<FfiStringCount>,
     pub subjects: Vec<FfiStringCount>,
     pub earliest_created_at: Option<i64>,
@@ -467,7 +551,14 @@ impl From<SearchFacets> for FfiSearchFacets {
                     count: facet.count,
                 })
                 .collect(),
-            types: strings(facets.types),
+            types: facets
+                .types
+                .into_iter()
+                .map(|facet| FfiDocumentTypeCount {
+                    value: facet.value.into(),
+                    count: facet.count,
+                })
+                .collect(),
             content_types: strings(facets.content_types),
             subjects: strings(facets.subjects),
             earliest_created_at: facets.earliest_created_at,
@@ -1395,7 +1486,7 @@ mod tests {
         assert_eq!(ffi.size, metadata.size());
         assert_eq!(ffi.checksum, metadata.checksum());
         assert_eq!(ffi.transcript, metadata.transcript());
-        assert_eq!(ffi.r#type, metadata.r#type());
+        assert_eq!(ffi.r#type, metadata.r#type().map(FfiDocumentType::from));
         assert_eq!(
             ffi.source_category,
             metadata.source_category().map(FfiSourceCategory::from)

@@ -6,7 +6,8 @@ use tokio::runtime::Handle;
 
 use crate::ErrorCode;
 use crate::domains::documents::{
-    Purpose, Service as DocumentsService, SourceCategory, SourceSubCategory, UploadRequest,
+    DocumentType, Purpose, Service as DocumentsService, SourceCategory, SourceSubCategory,
+    UploadRequest,
 };
 
 /// `fyde.save_document(name, content, [fields])`: uploads `content` (raw
@@ -88,7 +89,7 @@ fn apply_upload_fields(request: &mut UploadRequest, fields: &Table) -> mlua::Res
         request.name = Some(name);
     }
     if let Some(r#type) = fields.get::<Option<String>>("type")? {
-        request.r#type = Some(r#type);
+        request.r#type = Some(DocumentType::from_str(&r#type).map_err(mlua::Error::external)?);
     }
     if let Some(source_category) = fields.get::<Option<String>>("source_category")? {
         request.source_category =
@@ -188,7 +189,7 @@ mod tests {
             .expect_upload()
             .withf(|request| {
                 request.name.as_deref() == Some("January payslip")
-                    && request.r#type.as_deref() == Some("payslip")
+                    && request.r#type == Some(crate::domains::documents::DocumentType::Payslip)
                     && request.source_category
                         == Some(crate::domains::documents::SourceCategory::Employer)
                     && request.source_sub_category
@@ -290,6 +291,28 @@ mod tests {
 
         let result = lua
             .load(r#"save_document("a.pdf", "content", {source_category = "not_a_category"})"#)
+            .exec();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn save_document_rejects_an_invalid_type() {
+        let documents = MockDocumentsService::new();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let lua = Lua::new();
+        let f = save_document_fn(
+            &lua,
+            Arc::new(documents),
+            "didaxis",
+            runtime.handle().clone(),
+        )
+        .unwrap();
+        lua.globals().set("save_document", f).unwrap();
+
+        let result = lua
+            .load(r#"save_document("a.pdf", "content", {type = "energy_invoice"})"#)
             .exec();
 
         assert!(result.is_err());

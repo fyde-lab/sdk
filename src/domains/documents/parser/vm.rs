@@ -6,7 +6,9 @@ use pdf_oxide::PdfDocument;
 use pdf_oxide::converters::ConversionOptions;
 use uuid::Uuid;
 
-use crate::domains::documents::{Document, Metadata, Purpose, SourceCategory, SourceSubCategory};
+use crate::domains::documents::{
+    Document, DocumentType, Metadata, Purpose, SourceCategory, SourceSubCategory,
+};
 use crate::{ErrorContext as _, Result};
 
 /// Upper bound on the Lua instructions one classification script may run
@@ -230,7 +232,10 @@ fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
         .set("transcript", metadata.transcript())
         .context("failed to set document.metadata.transcript")?;
     metadata_table
-        .set("type", metadata.r#type())
+        .set(
+            "type",
+            metadata.r#type().map_or("", |r#type| r#type.as_str()),
+        )
         .context("failed to set document.metadata.type")?;
     metadata_table
         .set(
@@ -288,6 +293,19 @@ pub(super) fn read_metadata(lua: &Lua, original: &Metadata, source: &Metadata) -
         .context("failed to read document.metadata.id back")?;
     let id = Uuid::parse_str(&id).context("script left document.metadata.id as an invalid uuid")?;
 
+    let r#type: String = metadata_table
+        .get("type")
+        .context("failed to read document.metadata.type back")?;
+    let r#type = if r#type.is_empty() {
+        None
+    } else {
+        Some(
+            r#type
+                .parse::<DocumentType>()
+                .with_context(|| format!("script set document.metadata.type to {type:?}"))?,
+        )
+    };
+
     Ok(Metadata {
         id,
         name: metadata_table
@@ -301,9 +319,7 @@ pub(super) fn read_metadata(lua: &Lua, original: &Metadata, source: &Metadata) -
         size: original.size(),
         checksum: original.checksum().to_string(),
         transcript: original.transcript().to_string(),
-        r#type: metadata_table
-            .get("type")
-            .context("failed to read document.metadata.type back")?,
+        r#type,
         source_category: source.source_category(),
         source_sub_category: source.source_sub_category(),
         subjects: metadata_table
@@ -409,6 +425,39 @@ mod tests {
         let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
 
         assert_eq!(metadata.name, "second.pdf");
+    }
+
+    #[test]
+    fn read_metadata_parses_a_type_a_script_assigned() {
+        let lua = sandboxed(0).unwrap();
+        let document = FakeDocument::new().build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        lua.load(r#"document.metadata.type = "payslip""#)
+            .exec()
+            .unwrap();
+
+        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
+
+        assert_eq!(metadata.r#type, Some(DocumentType::Payslip));
+    }
+
+    #[test]
+    fn read_metadata_errors_on_an_unknown_type() {
+        let lua = sandboxed(0).unwrap();
+        let document = FakeDocument::new().build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        lua.load(r#"document.metadata.type = "energy_invoice""#)
+            .exec()
+            .unwrap();
+
+        let result = read_metadata(&lua, document.metadata(), &source_metadata.borrow());
+
+        assert_eq!(
+            result.unwrap_err().code(),
+            crate::ErrorCode::InvalidDocumentType
+        );
     }
 
     #[test]

@@ -114,6 +114,8 @@ macro_rules! for_each_error_code {
             InvalidSearchQuery = 4008,
             /// A document with the same content is already saved locally.
             DuplicateDocument = 4009,
+            /// A document's type is unknown.
+            InvalidDocumentType = 4010,
             /// No such script.
             ScriptNotFound = 5001,
             /// A script was run without one of its required parameters.
@@ -231,6 +233,8 @@ pub(crate) enum ErrorKind {
     InvalidSourceSubCategory(String),
     #[error("invalid purpose: {0:?}")]
     InvalidPurpose(String),
+    #[error("invalid document type: {0:?}")]
+    InvalidDocumentType(String),
     #[error("invalid search query: {0}")]
     InvalidSearchQuery(String),
     #[error("invalid script type: {0:?}")]
@@ -287,6 +291,7 @@ impl ErrorKind {
             ErrorKind::InvalidSourceCategory(_) => ErrorCode::InvalidSourceCategory,
             ErrorKind::InvalidSourceSubCategory(_) => ErrorCode::InvalidSourceSubCategory,
             ErrorKind::InvalidPurpose(_) => ErrorCode::InvalidPurpose,
+            ErrorKind::InvalidDocumentType(_) => ErrorCode::InvalidDocumentType,
             ErrorKind::InvalidSearchQuery(_) => ErrorCode::InvalidSearchQuery,
             ErrorKind::InvalidScriptType(_) => ErrorCode::InvalidScriptType,
             ErrorKind::InvalidResponse(_) => ErrorCode::InvalidServerResponse,

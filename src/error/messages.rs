@@ -177,6 +177,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "The document's purpose is not recognized.",
             "L'usage du document n'est pas reconnu.",
         ),
+        ErrorCode::InvalidDocumentType => (
+            "The document's type is not recognized.",
+            "Le type du document n'est pas reconnu.",
+        ),
         ErrorCode::InvalidSearchQuery => (
             "This search isn't valid.",
             "Cette recherche n'est pas valide.",

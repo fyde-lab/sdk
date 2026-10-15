@@ -9,8 +9,8 @@ mod storage_sqlite;
 pub(crate) use crate::domains::changelog::FakeChangelogEvent;
 pub use crate::domains::changelog::{ChangelogEvent, EventType};
 pub use models::{
-    Document, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters, SearchOrder, SearchQuery,
-    SourceCategory, SourceSubCategory, UploadRequest, UploadSource,
+    Document, DocumentType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters,
+    SearchOrder, SearchQuery, SourceCategory, SourceSubCategory, UploadRequest, UploadSource,
 };
 #[cfg(test)]
 pub(crate) use models::{FakeDocument, FakeMetadata, FakeSearchFacets};
@@ -44,7 +44,9 @@ pub trait Service: Send + Sync {
     /// generated id. Metadata fields set on `request` (`name`, `type`,
     /// `source_category`, `source_sub_category`, `subjects`, `purpose`)
     /// override whatever would otherwise be derived from the document
-    /// itself and any scripts run against it.
+    /// itself and any scripts run against it. A document left without a
+    /// purpose gets the one its type implies (an invoice is for `invoice`,
+    /// a payslip for `employment`...).
     ///
     /// The file type is determined from the source's name's extension;
     /// only `.pdf` is currently accepted, anything else is rejected with

@@ -7,8 +7,8 @@ use uuid::Uuid;
 use crate::{ErrorContext as _, Result};
 
 use super::{
-    Document, Metadata, Purpose, SearchFacets, SearchFilters, SearchQuery, Service, SourceCategory,
-    SourceSubCategory, UploadRequest, UploadSource,
+    Document, DocumentType, Metadata, Purpose, SearchFacets, SearchFilters, SearchQuery, Service,
+    SourceCategory, SourceSubCategory, UploadRequest, UploadSource,
 };
 
 /// A [`Service`] implementation for standalone/dev use (see
@@ -59,7 +59,7 @@ impl Service for DevDocumentsClient {
             id,
             original_name: &name,
             name: request.name.as_deref(),
-            r#type: request.r#type.as_deref(),
+            r#type: request.r#type,
             source_category: request.source_category,
             source_sub_category: request.source_sub_category,
             subjects: request.subjects.as_deref(),
@@ -140,7 +140,7 @@ struct DevMetadata<'a> {
     id: Uuid,
     original_name: &'a str,
     name: Option<&'a str>,
-    r#type: Option<&'a str>,
+    r#type: Option<DocumentType>,
     source_category: Option<SourceCategory>,
     source_sub_category: Option<SourceSubCategory>,
     subjects: Option<&'a [String]>,

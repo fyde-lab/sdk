@@ -10,8 +10,8 @@ use crate::domains::changelog::{ChangelogEvent, EventType, Service as ChangelogS
 use super::parser::Service as ParserService;
 use super::storage::{FacetField, Storage};
 use super::{
-    Document, FacetCount, Metadata, SearchFacets, SearchFilters, SearchQuery, Service,
-    UploadRequest, UploadSource,
+    Document, DocumentType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters,
+    SearchQuery, Service, UploadRequest, UploadSource,
 };
 
 /// The default [`Service`] implementation: publishes new documents as
@@ -141,7 +141,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
             metadata.name = name;
         }
         if let Some(r#type) = request.r#type {
-            metadata.r#type = r#type;
+            metadata.r#type = Some(r#type);
         }
         if let Some(source_category) = request.source_category {
             metadata.source_category = Some(source_category);
@@ -154,6 +154,9 @@ impl<S: Storage> Service for DocumentsClient<S> {
         }
         if let Some(purpose) = request.purpose {
             metadata.purpose = Some(purpose);
+        }
+        if metadata.purpose.is_none() {
+            metadata.purpose = metadata.r#type.and_then(purpose_of);
         }
 
         let id = metadata.id;
@@ -240,9 +243,11 @@ impl<S: Storage> Service for DocumentsClient<S> {
             source_categories: parse_facet(source_categories, "source category")?,
             source_sub_categories: parse_facet(source_sub_categories, "source sub-category")?,
             purposes: parse_facet(purposes, "purpose")?,
-            types: self
-                .count_documents_by(&terms, filters, FacetField::Type)
-                .await?,
+            types: parse_facet(
+                self.count_documents_by(&terms, filters, FacetField::Type)
+                    .await?,
+                "document type",
+            )?,
             content_types: self
                 .count_documents_by(&terms, filters, FacetField::ContentType)
                 .await?,
@@ -282,6 +287,32 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
     fn stop_sync(&self) {
         self.changelog.stop_consume_job();
+    }
+}
+
+/// The purpose a document of type `r#type` serves, given to an uploaded
+/// document nothing else gave a purpose to; `None` for
+/// [`DocumentType::Other`], which says nothing about it.
+fn purpose_of(r#type: DocumentType) -> Option<Purpose> {
+    match r#type {
+        DocumentType::Invoice | DocumentType::Receipt | DocumentType::Booking => {
+            Some(Purpose::Invoice)
+        }
+        DocumentType::Statement
+        | DocumentType::ReimbursementStatement
+        | DocumentType::FeeSummary
+        | DocumentType::TaxReturn
+        | DocumentType::MedicalDocument => Some(Purpose::Report),
+        DocumentType::InsuranceCertificate
+        | DocumentType::InsuranceCard
+        | DocumentType::RightsCertificate
+        | DocumentType::ProofOfResidence
+        | DocumentType::Rib
+        | DocumentType::TaxNotice
+        | DocumentType::TaxCertificate => Some(Purpose::Attestation),
+        DocumentType::Contract => Some(Purpose::Contract),
+        DocumentType::Payslip | DocumentType::EmploymentCertificate => Some(Purpose::Employment),
+        DocumentType::Other => None,
     }
 }
 
@@ -617,7 +648,7 @@ mod tests {
                 content: raw.clone(),
             },
             name: Some("overridden.pdf".to_string()),
-            r#type: Some("payslip".to_string()),
+            r#type: Some(DocumentType::Payslip),
             source_category: Some(super::super::SourceCategory::Employer),
             source_sub_category: None,
             subjects: Some(vec!["salary".to_string()]),
@@ -631,7 +662,7 @@ mod tests {
         let (_, _, _, sent_metadata) = &sent[0];
         let sent_metadata = sent_metadata.as_ref().unwrap();
         assert_eq!(sent_metadata.name, "overridden.pdf");
-        assert_eq!(sent_metadata.r#type, "payslip");
+        assert_eq!(sent_metadata.r#type, Some(DocumentType::Payslip));
         assert_eq!(
             sent_metadata.source_category,
             Some(super::super::SourceCategory::Employer)
@@ -641,6 +672,73 @@ mod tests {
             sent_metadata.purpose,
             Some(super::super::Purpose::Employment)
         );
+    }
+
+    /// Uploads a document whose parsed metadata is `parsed` with `request`'s
+    /// overrides, returning the metadata it was published with.
+    async fn upload_with(parsed: Metadata, mut request: UploadRequest) -> Metadata {
+        let mut parser = MockParserService::new();
+        parser
+            .expect_parse_content()
+            .times(1)
+            .returning(move |_, _| Ok(parsed.clone()));
+        let mut storage = MockStorage::new();
+        storage
+            .expect_find_document_by_checksum()
+            .times(1)
+            .returning(|_| Ok(None));
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = DocumentsClient::new(storage, changelog.clone(), Arc::new(parser), None);
+
+        request.source = super::super::UploadSource::Raw {
+            name: "raw.pdf".to_string(),
+            content: b"hello world".to_vec(),
+        };
+        client.upload(request).await.unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        sent[0].3.clone().unwrap()
+    }
+
+    #[tokio::test]
+    async fn upload_derives_a_missing_purpose_from_the_type() {
+        let parsed = super::super::FakeMetadata::new()
+            .with_type(None)
+            .with_purpose(None)
+            .build();
+        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
+        request.r#type = Some(DocumentType::Payslip);
+
+        let metadata = upload_with(parsed, request).await;
+
+        assert_eq!(metadata.purpose, Some(Purpose::Employment));
+    }
+
+    #[tokio::test]
+    async fn upload_keeps_a_purpose_already_set() {
+        let parsed = super::super::FakeMetadata::new()
+            .with_purpose(Purpose::Report)
+            .build();
+        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
+        request.r#type = Some(DocumentType::Invoice);
+
+        let metadata = upload_with(parsed, request).await;
+
+        assert_eq!(metadata.purpose, Some(Purpose::Report));
+    }
+
+    #[tokio::test]
+    async fn upload_leaves_the_purpose_empty_for_an_other_type() {
+        let parsed = super::super::FakeMetadata::new()
+            .with_type(None)
+            .with_purpose(None)
+            .build();
+        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
+        request.r#type = Some(DocumentType::Other);
+
+        let metadata = upload_with(parsed, request).await;
+
+        assert_eq!(metadata.purpose, None);
     }
 
     #[tokio::test]
@@ -658,7 +756,7 @@ mod tests {
                 size: 5,
                 checksum: "deadbeef".to_string(),
                 transcript: String::new(),
-                r#type: String::new(),
+                r#type: None,
                 source_category: None,
                 source_sub_category: None,
                 subjects: Vec::new(),
@@ -700,7 +798,7 @@ mod tests {
                     size: 0,
                     checksum: String::new(),
                     transcript: String::new(),
-                    r#type: String::new(),
+                    r#type: None,
                     source_category: None,
                     source_sub_category: None,
                     subjects: Vec::new(),
@@ -719,7 +817,7 @@ mod tests {
                     size: 0,
                     checksum: String::new(),
                     transcript: String::new(),
-                    r#type: String::new(),
+                    r#type: None,
                     source_category: None,
                     source_sub_category: None,
                     subjects: Vec::new(),
@@ -873,7 +971,7 @@ mod tests {
             source_categories: vec![SourceCategory::Bank],
             source_sub_categories: vec![SourceSubCategory::Tax],
             purposes: vec![Purpose::Invoice],
-            types: vec!["statement".to_string()],
+            types: vec![DocumentType::Statement],
             subjects: vec!["rent".to_string()],
             content_types: vec!["application/pdf".to_string()],
             created_from: Some(1),
@@ -927,7 +1025,17 @@ mod tests {
                     expected.purposes.iter().map(|f| f.count).collect(),
                 ),
             ),
-            (FacetField::Type, expected.types.clone()),
+            (
+                FacetField::Type,
+                as_strings(
+                    expected
+                        .types
+                        .iter()
+                        .map(|f| f.value.as_str().to_string())
+                        .collect(),
+                    expected.types.iter().map(|f| f.count).collect(),
+                ),
+            ),
             (FacetField::ContentType, expected.content_types.clone()),
             (FacetField::Subject, expected.subjects.clone()),
         ];

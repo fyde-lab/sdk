@@ -256,6 +256,99 @@ impl FromStr for Purpose {
     }
 }
 
+/// What kind of paper a document is, independent of who issued it or which
+/// part of life it's about (an EDF bill and an Amazon order are both
+/// [`Self::Invoice`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentType {
+    Invoice,
+    Receipt,
+    Statement,
+    ReimbursementStatement,
+    Payslip,
+    Contract,
+    InsuranceCertificate,
+    InsuranceCard,
+    RightsCertificate,
+    ProofOfResidence,
+    Rib,
+    TaxNotice,
+    TaxReturn,
+    TaxCertificate,
+    EmploymentCertificate,
+    FeeSummary,
+    Booking,
+    MedicalDocument,
+    Other,
+}
+
+impl DocumentType {
+    pub(crate) const ALL: &'static [DocumentType] = &[
+        Self::Invoice,
+        Self::Receipt,
+        Self::Statement,
+        Self::ReimbursementStatement,
+        Self::Payslip,
+        Self::Contract,
+        Self::InsuranceCertificate,
+        Self::InsuranceCard,
+        Self::RightsCertificate,
+        Self::ProofOfResidence,
+        Self::Rib,
+        Self::TaxNotice,
+        Self::TaxReturn,
+        Self::TaxCertificate,
+        Self::EmploymentCertificate,
+        Self::FeeSummary,
+        Self::Booking,
+        Self::MedicalDocument,
+        Self::Other,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Invoice => "invoice",
+            Self::Receipt => "receipt",
+            Self::Statement => "statement",
+            Self::ReimbursementStatement => "reimbursement_statement",
+            Self::Payslip => "payslip",
+            Self::Contract => "contract",
+            Self::InsuranceCertificate => "insurance_certificate",
+            Self::InsuranceCard => "insurance_card",
+            Self::RightsCertificate => "rights_certificate",
+            Self::ProofOfResidence => "proof_of_residence",
+            Self::Rib => "rib",
+            Self::TaxNotice => "tax_notice",
+            Self::TaxReturn => "tax_return",
+            Self::TaxCertificate => "tax_certificate",
+            Self::EmploymentCertificate => "employment_certificate",
+            Self::FeeSummary => "fee_summary",
+            Self::Booking => "booking",
+            Self::MedicalDocument => "medical_document",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl fmt::Display for DocumentType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DocumentType {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|r#type| r#type.as_str() == s)
+            .ok_or_else(|| ErrorKind::InvalidDocumentType(s.to_string()).into())
+    }
+}
+
 /// Cleartext metadata encrypted under a document's DEK before upload, and
 /// decrypted back out of it on download.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,7 +365,8 @@ pub struct Metadata {
     /// Plaintext transcript of the document's PDF text content, extracted
     /// on upload.
     pub transcript: String,
-    pub r#type: String,
+    /// `None` until a classification script, or the uploader, sets it.
+    pub r#type: Option<DocumentType>,
     /// `None` until a classification script sets it — scripts never
     /// persist anything themselves, so a freshly parsed document has no
     /// category yet.
@@ -318,8 +412,8 @@ impl Metadata {
         &self.transcript
     }
 
-    pub fn r#type(&self) -> &str {
-        &self.r#type
+    pub fn r#type(&self) -> Option<DocumentType> {
+        self.r#type
     }
 
     pub fn source_category(&self) -> Option<SourceCategory> {
@@ -399,7 +493,7 @@ pub enum UploadSource {
 pub struct UploadRequest {
     pub source: UploadSource,
     pub name: Option<String>,
-    pub r#type: Option<String>,
+    pub r#type: Option<DocumentType>,
     pub source_category: Option<SourceCategory>,
     pub source_sub_category: Option<SourceSubCategory>,
     pub subjects: Option<Vec<String>>,
@@ -450,8 +544,7 @@ pub struct SearchFilters {
     pub source_categories: Vec<SourceCategory>,
     pub source_sub_categories: Vec<SourceSubCategory>,
     pub purposes: Vec<Purpose>,
-    /// Matched exactly against [`Metadata::type`].
-    pub types: Vec<String>,
+    pub types: Vec<DocumentType>,
     /// Matches a document carrying at least one of these subjects, compared
     /// exactly.
     pub subjects: Vec<String>,
@@ -487,7 +580,7 @@ pub struct SearchFacets {
     pub source_categories: Vec<FacetCount<SourceCategory>>,
     pub source_sub_categories: Vec<FacetCount<SourceSubCategory>>,
     pub purposes: Vec<FacetCount<Purpose>>,
-    pub types: Vec<FacetCount<String>>,
+    pub types: Vec<FacetCount<DocumentType>>,
     pub content_types: Vec<FacetCount<String>>,
     pub subjects: Vec<FacetCount<String>>,
     /// The oldest matching [`Metadata::created_at`], ignoring the
@@ -564,7 +657,11 @@ impl FakeMetadata {
                     "This is a fake transcript about {}.",
                     crate::tools::testing::random_word()
                 ),
-                r#type: crate::tools::testing::random_word().to_string(),
+                r#type: Some(
+                    DocumentType::ALL[crate::tools::testing::random_u64(
+                        DocumentType::ALL.len() as u64
+                    ) as usize],
+                ),
                 source_category: Some(
                     SourceCategory::ALL[crate::tools::testing::random_u64(
                         SourceCategory::ALL.len() as u64
@@ -627,7 +724,7 @@ impl FakeMetadata {
         self
     }
 
-    pub(crate) fn with_type(mut self, r#type: impl Into<String>) -> Self {
+    pub(crate) fn with_type(mut self, r#type: impl Into<Option<DocumentType>>) -> Self {
         self.metadata.r#type = r#type.into();
         self
     }
@@ -739,7 +836,12 @@ impl FakeSearchFacets {
                         [crate::tools::testing::random_u64(Purpose::ALL.len() as u64) as usize],
                     count: count(),
                 }],
-                types: vec![word()],
+                types: vec![FacetCount {
+                    value: DocumentType::ALL[crate::tools::testing::random_u64(
+                        DocumentType::ALL.len() as u64,
+                    ) as usize],
+                    count: count(),
+                }],
                 content_types: vec![FacetCount {
                     value: "application/pdf".to_string(),
                     count: count(),
@@ -774,7 +876,7 @@ impl FakeSearchFacets {
         self
     }
 
-    pub(crate) fn with_types(mut self, types: Vec<FacetCount<String>>) -> Self {
+    pub(crate) fn with_types(mut self, types: Vec<FacetCount<DocumentType>>) -> Self {
         self.facets.types = types;
         self
     }
@@ -827,7 +929,7 @@ mod tests {
             .with_size(42)
             .with_checksum("deadbeef")
             .with_transcript("hello world")
-            .with_type("invoice")
+            .with_type(DocumentType::Invoice)
             .with_source_category(SourceCategory::Bank)
             .with_source_sub_category(SourceSubCategory::Tax)
             .with_subjects(vec!["Q1 report".to_string()])
@@ -842,11 +944,18 @@ mod tests {
         assert_eq!(metadata.size, 42);
         assert_eq!(metadata.checksum, "deadbeef");
         assert_eq!(metadata.transcript, "hello world");
-        assert_eq!(metadata.r#type, "invoice");
+        assert_eq!(metadata.r#type, Some(DocumentType::Invoice));
         assert_eq!(metadata.source_category, Some(SourceCategory::Bank));
         assert_eq!(metadata.source_sub_category, Some(SourceSubCategory::Tax));
         assert_eq!(metadata.subjects, vec!["Q1 report".to_string()]);
         assert_eq!(metadata.purpose, Some(Purpose::Invoice));
+    }
+
+    #[test]
+    fn document_type_round_trips_through_its_string_form() {
+        for r#type in DocumentType::ALL {
+            assert_eq!(r#type.as_str().parse::<DocumentType>().unwrap(), *r#type);
+        }
     }
 
     #[test]
@@ -898,7 +1007,10 @@ mod tests {
                 value: Purpose::Invoice,
                 count: 3,
             }])
-            .with_types(vec![count("payslip")])
+            .with_types(vec![FacetCount {
+                value: DocumentType::Payslip,
+                count: 1,
+            }])
             .with_content_types(vec![count("application/pdf")])
             .with_subjects(vec![count("rent")])
             .with_created_at_range(Some((10, 20)))
@@ -916,7 +1028,10 @@ mod tests {
                     value: Purpose::Invoice,
                     count: 3
                 }],
-                types: vec![count("payslip")],
+                types: vec![FacetCount {
+                    value: DocumentType::Payslip,
+                    count: 1
+                }],
                 content_types: vec![count("application/pdf")],
                 subjects: vec![count("rent")],
                 earliest_created_at: Some(10),
