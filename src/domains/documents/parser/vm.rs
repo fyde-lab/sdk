@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use mlua::{Lua, StdLib};
@@ -6,8 +7,10 @@ use pdf_oxide::PdfDocument;
 use pdf_oxide::converters::ConversionOptions;
 use uuid::Uuid;
 
-use crate::domains::documents::{Category, Document, DocumentType, Metadata, Purpose, Subcategory};
-use crate::{ErrorContext as _, Result};
+use crate::domains::documents::{
+    Attribute, Category, Document, DocumentType, Metadata, Purpose, Subcategory,
+};
+use crate::{ErrorContext as _, ErrorKind, Result};
 
 /// Upper bound on the Lua instructions one classification script may run
 /// against one document (see [`crate::tools::sandbox::Limits`]) — far more than a
@@ -259,8 +262,97 @@ fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
             metadata.purpose().map_or("", |purpose| purpose.as_str()),
         )
         .context("failed to set document.metadata.purpose")?;
+    metadata_table
+        .set(
+            "attributes",
+            attributes_to_table(lua, metadata.attributes())?,
+        )
+        .context("failed to set document.metadata.attributes")?;
 
     Ok(metadata_table)
+}
+
+/// Mirrors `attributes` as a Lua table of `{ type = ..., value = ... }`
+/// entries keyed by name — the same shape [`Attribute`] serializes to — so
+/// a script adds one with e.g.
+/// `document.metadata.attributes.price = { type = "float", value = 32.3 }`.
+fn attributes_to_table(lua: &Lua, attributes: &BTreeMap<String, Attribute>) -> Result<mlua::Table> {
+    let attributes_table = lua
+        .create_table()
+        .context("failed to create the document.metadata.attributes lua table")?;
+    for (name, attribute) in attributes {
+        let attribute_table = lua
+            .create_table()
+            .with_context(|| format!("failed to create the lua table for attribute {name:?}"))?;
+        attribute_table
+            .set("type", attribute.type_name())
+            .with_context(|| format!("failed to set the type of attribute {name:?}"))?;
+        let value = match attribute {
+            Attribute::String(value) => attribute_table.set("value", value.as_str()),
+            Attribute::Integer(value) => attribute_table.set("value", *value),
+            Attribute::Float(value) => attribute_table.set("value", *value),
+            Attribute::Boolean(value) => attribute_table.set("value", *value),
+        };
+        value.with_context(|| format!("failed to set the value of attribute {name:?}"))?;
+        attributes_table
+            .set(name.as_str(), attribute_table)
+            .with_context(|| format!("failed to set attribute {name:?}"))?;
+    }
+
+    Ok(attributes_table)
+}
+
+/// Reads `document.metadata.attributes` back out of the table
+/// [`attributes_to_table`] wrote, validating every entry a script added or
+/// changed: an unknown `type`, or a `value` that doesn't fit it, fails with
+/// [`ErrorKind::InvalidAttribute`]. A script that set the whole table to
+/// `nil` cleared every attribute.
+fn attributes_from_table(
+    attributes_table: Option<mlua::Table>,
+) -> Result<BTreeMap<String, Attribute>> {
+    let Some(attributes_table) = attributes_table else {
+        return Ok(BTreeMap::new());
+    };
+
+    let mut attributes = BTreeMap::new();
+    for pair in attributes_table.pairs::<String, mlua::Table>() {
+        let (name, attribute_table) =
+            pair.context("script left an invalid entry in document.metadata.attributes")?;
+        let r#type: String = attribute_table
+            .get("type")
+            .with_context(|| format!("failed to read the type of attribute {name:?} back"))?;
+        let value: mlua::Value = attribute_table
+            .get("value")
+            .with_context(|| format!("failed to read the value of attribute {name:?} back"))?;
+        let attribute = match (r#type.as_str(), value) {
+            ("string", mlua::Value::String(value)) => Attribute::String(
+                value
+                    .to_str()
+                    .with_context(|| format!("attribute {name:?} has a non-UTF-8 value"))?
+                    .to_string(),
+            ),
+            ("integer", mlua::Value::Integer(value)) => Attribute::Integer(value),
+            ("float", mlua::Value::Number(value)) => Attribute::Float(value),
+            ("float", mlua::Value::Integer(value)) => Attribute::Float(value as f64),
+            ("boolean", mlua::Value::Boolean(value)) => Attribute::Boolean(value),
+            ("string" | "integer" | "float" | "boolean", value) => {
+                return Err(ErrorKind::InvalidAttribute(format!(
+                    "attribute {name:?} has a {} value, not a valid {type}",
+                    value.type_name()
+                ))
+                .into());
+            }
+            (other, _) => {
+                return Err(ErrorKind::InvalidAttribute(format!(
+                    "attribute {name:?} has unknown type {other:?}"
+                ))
+                .into());
+            }
+        };
+        attributes.insert(name, attribute);
+    }
+
+    Ok(attributes)
 }
 
 /// Reads `document.metadata` back out of `lua` into a [`Metadata`], mirroring
@@ -323,6 +415,11 @@ pub(super) fn read_metadata(lua: &Lua, original: &Metadata, source: &Metadata) -
             .get("subjects")
             .context("failed to read document.metadata.subjects back")?,
         purpose: source.purpose(),
+        attributes: attributes_from_table(
+            metadata_table
+                .get("attributes")
+                .context("script left document.metadata.attributes as a non-table value")?,
+        )?,
     })
 }
 
@@ -454,6 +551,98 @@ mod tests {
         assert_eq!(
             result.unwrap_err().code(),
             crate::ErrorCode::InvalidDocumentType
+        );
+    }
+
+    #[test]
+    fn expose_document_exposes_existing_attributes_as_typed_tables() {
+        let lua = sandboxed(0).unwrap();
+        let metadata = crate::domains::documents::FakeMetadata::new()
+            .with_attributes([("price".to_string(), Attribute::Float(32.3))])
+            .build();
+        let document = FakeDocument::new().with_metadata(metadata).build();
+
+        expose_document(&lua, &document).unwrap();
+        let (r#type, value): (String, f64) = lua
+            .load(
+                "return document.metadata.attributes.price.type, document.metadata.attributes.price.value",
+            )
+            .eval()
+            .unwrap();
+
+        assert_eq!(r#type, "float");
+        assert_eq!(value, 32.3);
+    }
+
+    #[test]
+    fn read_metadata_reflects_attributes_a_script_assigned() {
+        let lua = sandboxed(0).unwrap();
+        let metadata = crate::domains::documents::FakeMetadata::new()
+            .with_attributes([("paid".to_string(), Attribute::Boolean(false))])
+            .build();
+        let document = FakeDocument::new().with_metadata(metadata).build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        lua.load(
+            r#"
+            document.metadata.attributes.price = { type = "float", value = 32.3 }
+            document.metadata.attributes.quantity = { type = "integer", value = 2 }
+            document.metadata.attributes.reference = { type = "string", value = "F-42" }
+            document.metadata.attributes.paid.value = true
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
+
+        assert_eq!(
+            metadata.attributes,
+            BTreeMap::from([
+                ("paid".to_string(), Attribute::Boolean(true)),
+                ("price".to_string(), Attribute::Float(32.3)),
+                ("quantity".to_string(), Attribute::Integer(2)),
+                (
+                    "reference".to_string(),
+                    Attribute::String("F-42".to_string())
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn read_metadata_errors_on_an_attribute_of_unknown_type() {
+        let lua = sandboxed(0).unwrap();
+        let document = FakeDocument::new().build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        lua.load(r#"document.metadata.attributes.price = { type = "money", value = 32.3 }"#)
+            .exec()
+            .unwrap();
+
+        let result = read_metadata(&lua, document.metadata(), &source_metadata.borrow());
+
+        assert_eq!(
+            result.unwrap_err().code(),
+            crate::ErrorCode::InvalidAttribute
+        );
+    }
+
+    #[test]
+    fn read_metadata_errors_on_an_attribute_value_not_matching_its_type() {
+        let lua = sandboxed(0).unwrap();
+        let document = FakeDocument::new().build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        lua.load(r#"document.metadata.attributes.paid = { type = "boolean", value = "yes" }"#)
+            .exec()
+            .unwrap();
+
+        let result = read_metadata(&lua, document.metadata(), &source_metadata.borrow());
+
+        assert_eq!(
+            result.unwrap_err().code(),
+            crate::ErrorCode::InvalidAttribute
         );
     }
 

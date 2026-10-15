@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
@@ -7,8 +9,8 @@ use crate::{ErrorContext as _, Result};
 
 use super::storage::{FacetField, Storage};
 use super::{
-    Category, Document, DocumentType, FacetCount, Metadata, Purpose, SearchFilters, SearchOrder,
-    Subcategory,
+    Attribute, Category, Document, DocumentType, FacetCount, Metadata, Purpose, SearchFilters,
+    SearchOrder, Subcategory,
 };
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
@@ -27,8 +29,8 @@ impl SqliteStorage {
 impl Storage for SqliteStorage {
     async fn save_document(&self, document: &Document) -> Result<()> {
         sqlx::query(
-            "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, subjects, purpose)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, subjects, purpose, attributes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )
         .bind(document.id.to_string())
         .bind(&document.metadata.name)
@@ -45,6 +47,7 @@ impl Storage for SqliteStorage {
         ))
         .bind(subjects_to_column(&document.metadata.subjects))
         .bind(purpose_to_column(document.metadata.purpose))
+        .bind(attributes_to_column(&document.metadata.attributes))
         .execute(&self.pool)
         .await
         .with_context(|| format!("failed to save document {} to local database", document.id))?;
@@ -54,7 +57,7 @@ impl Storage for SqliteStorage {
 
     async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
         let row = sqlx::query(
-            "SELECT name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, subjects, purpose FROM documents WHERE id = ?1",
+            "SELECT name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, subjects, purpose, attributes FROM documents WHERE id = ?1",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -83,6 +86,7 @@ impl Storage for SqliteStorage {
                 subcategory: subcategory_from_column(row.get("subcategory"))?,
                 subjects: subjects_from_column(row.get("subjects"))?,
                 purpose: purpose_from_column(row.get("purpose"))?,
+                attributes: attributes_from_column(row.get("attributes"))?,
             },
             content,
         }))
@@ -109,7 +113,7 @@ impl Storage for SqliteStorage {
 
     async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
         let rows = sqlx::query(
-            "SELECT id, name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, subjects, purpose FROM documents
+            "SELECT id, name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, subjects, purpose, attributes FROM documents
              ORDER BY created_at ASC, id ASC
              LIMIT ?1 OFFSET ?2",
         )
@@ -131,7 +135,7 @@ impl Storage for SqliteStorage {
         limit: i64,
     ) -> Result<Vec<Document>> {
         let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT d.id, d.name, d.original_name, d.content_type, d.content, d.checksum, d.created_at, d.transcript, d.type, d.category, d.subcategory, d.subjects, d.purpose",
+            "SELECT d.id, d.name, d.original_name, d.content_type, d.content, d.checksum, d.created_at, d.transcript, d.type, d.category, d.subcategory, d.subjects, d.purpose, d.attributes",
         );
         push_matching(&mut query, terms, filters);
 
@@ -241,8 +245,8 @@ impl Storage for SqliteStorage {
     async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()> {
         sqlx::query(
             "UPDATE documents
-             SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6, type = ?7, category = ?8, subcategory = ?9, subjects = ?10, purpose = ?11
-             WHERE id = ?12",
+             SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6, type = ?7, category = ?8, subcategory = ?9, subjects = ?10, purpose = ?11, attributes = ?12
+             WHERE id = ?13",
         )
         .bind(&metadata.name)
         .bind(&metadata.original_name)
@@ -257,6 +261,7 @@ impl Storage for SqliteStorage {
         ))
         .bind(subjects_to_column(&metadata.subjects))
         .bind(purpose_to_column(metadata.purpose))
+        .bind(attributes_to_column(&metadata.attributes))
         .bind(id.to_string())
         .execute(&self.pool)
         .await
@@ -342,6 +347,17 @@ fn purpose_from_column(column: String) -> Result<Option<Purpose>> {
         .with_context(|| format!("invalid purpose in local database: {column}"))
 }
 
+/// The `attributes` column stores a JSON-encoded map, since SQLite has no
+/// native map type.
+fn attributes_to_column(attributes: &BTreeMap<String, Attribute>) -> String {
+    serde_json::to_string(attributes).expect("serializing attributes to JSON cannot fail")
+}
+
+fn attributes_from_column(column: String) -> Result<BTreeMap<String, Attribute>> {
+    serde_json::from_str(&column)
+        .with_context(|| format!("invalid attributes json in local database: {column}"))
+}
+
 /// Maps a row selecting every `documents` column (`id` included) back to a
 /// [`Document`].
 fn document_from_row(row: &SqliteRow) -> Result<Document> {
@@ -366,6 +382,7 @@ fn document_from_row(row: &SqliteRow) -> Result<Document> {
             subcategory: subcategory_from_column(row.get("subcategory"))?,
             subjects: subjects_from_column(row.get("subjects"))?,
             purpose: purpose_from_column(row.get("purpose"))?,
+            attributes: attributes_from_column(row.get("attributes"))?,
         },
         content,
     })
@@ -553,6 +570,7 @@ mod tests {
                     subcategory: None,
                     subjects: Vec::new(),
                     purpose: None,
+                    attributes: BTreeMap::new(),
                 },
             })
             .await
@@ -579,9 +597,33 @@ mod tests {
                     subcategory: None,
                     subjects: Vec::new(),
                     purpose: None,
+                    attributes: BTreeMap::new(),
                 },
             }
         );
+    }
+
+    #[tokio::test]
+    async fn attributes_roundtrip_through_save_and_update() {
+        let storage = setup().await;
+        let metadata = FakeMetadata::new()
+            .with_attributes([("price".to_string(), Attribute::Float(32.3))])
+            .build();
+        let document = FakeDocument::new().with_metadata(metadata).build();
+        let id = document.id;
+
+        storage.save_document(&document).await.unwrap();
+        let saved = storage.get_document(id).await.unwrap().unwrap();
+        assert_eq!(saved.metadata.attributes, document.metadata.attributes);
+
+        let mut updated = saved.metadata.clone();
+        updated
+            .attributes
+            .insert("paid".to_string(), Attribute::Boolean(true));
+        storage.update_metadata(id, &updated).await.unwrap();
+
+        let reloaded = storage.get_document(id).await.unwrap().unwrap();
+        assert_eq!(reloaded.metadata.attributes, updated.attributes);
     }
 
     #[tokio::test]
@@ -607,6 +649,7 @@ mod tests {
                     subcategory: None,
                     subjects: Vec::new(),
                     purpose: None,
+                    attributes: BTreeMap::new(),
                 },
             })
             .await
@@ -629,6 +672,7 @@ mod tests {
                     subcategory: None,
                     subjects: Vec::new(),
                     purpose: None,
+                    attributes: BTreeMap::new(),
                 },
             })
             .await
@@ -661,6 +705,7 @@ mod tests {
                         subcategory: None,
                         subjects: Vec::new(),
                         purpose: None,
+                        attributes: BTreeMap::new(),
                     },
                 })
                 .await
@@ -730,6 +775,7 @@ mod tests {
                     subcategory: None,
                     subjects: Vec::new(),
                     purpose: None,
+                    attributes: BTreeMap::new(),
                 },
             })
             .await
@@ -752,6 +798,7 @@ mod tests {
                     subcategory: None,
                     subjects: Vec::new(),
                     purpose: None,
+                    attributes: BTreeMap::new(),
                 },
             )
             .await
@@ -783,6 +830,7 @@ mod tests {
                     subcategory: None,
                     subjects: Vec::new(),
                     purpose: None,
+                    attributes: BTreeMap::new(),
                 },
             )
             .await;
@@ -1243,8 +1291,17 @@ mod tests {
             .unwrap();
         migrator.migrations = full[..index_migration].to_vec().into();
         migrator.run(&pool).await.unwrap();
+        // Inserted by hand rather than through `save_document`, which writes
+        // columns later migrations add.
+        sqlx::query(
+            "INSERT INTO documents (id, name, original_name, content_type, content, created_at, subjects)
+             VALUES (?1, 'preexisting', 'preexisting', 'application/pdf', x'', 1, '[]')",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
         let storage = SqliteStorage::new(pool.clone());
-        save(&storage, searchable("preexisting", 1)).await;
 
         migrator.migrations = full;
         migrator.run(&pool).await.unwrap();

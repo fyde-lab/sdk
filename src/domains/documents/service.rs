@@ -435,6 +435,7 @@ fn check_extension(name: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::Write as _;
     use std::sync::Mutex;
 
@@ -934,6 +935,7 @@ mod tests {
                 subcategory: None,
                 subjects: Vec::new(),
                 purpose: None,
+                attributes: BTreeMap::new(),
             },
         };
 
@@ -976,6 +978,7 @@ mod tests {
                     subcategory: None,
                     subjects: Vec::new(),
                     purpose: None,
+                    attributes: BTreeMap::new(),
                 },
             },
             Document {
@@ -995,6 +998,7 @@ mod tests {
                     subcategory: None,
                     subjects: Vec::new(),
                     purpose: None,
+                    attributes: BTreeMap::new(),
                 },
             },
         ];

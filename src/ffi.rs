@@ -13,8 +13,8 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::domains::documents::{
-    Category, DocumentType, EventType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters,
-    SearchOrder, SearchQuery, Subcategory, UploadRequest,
+    Attribute, Category, DocumentType, EventType, FacetCount, Metadata, Purpose, SearchFacets,
+    SearchFilters, SearchOrder, SearchQuery, Subcategory, UploadRequest,
 };
 use crate::domains::scripts::{
     InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptParameterType, ScriptType,
@@ -374,6 +374,39 @@ pub struct FfiMetadata {
     pub subcategory: Option<FfiSubcategory>,
     pub subjects: Vec<String>,
     pub purpose: Option<FfiPurpose>,
+    pub attributes: HashMap<String, FfiAttribute>,
+}
+
+/// One typed value of a document's attributes, mirroring [`Attribute`]
+/// across the FFI boundary.
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum FfiAttribute {
+    String { value: String },
+    Integer { value: i64 },
+    Float { value: f64 },
+    Boolean { value: bool },
+}
+
+impl From<Attribute> for FfiAttribute {
+    fn from(attribute: Attribute) -> Self {
+        match attribute {
+            Attribute::String(value) => Self::String { value },
+            Attribute::Integer(value) => Self::Integer { value },
+            Attribute::Float(value) => Self::Float { value },
+            Attribute::Boolean(value) => Self::Boolean { value },
+        }
+    }
+}
+
+impl From<FfiAttribute> for Attribute {
+    fn from(attribute: FfiAttribute) -> Self {
+        match attribute {
+            FfiAttribute::String { value } => Self::String(value),
+            FfiAttribute::Integer { value } => Self::Integer(value),
+            FfiAttribute::Float { value } => Self::Float(value),
+            FfiAttribute::Boolean { value } => Self::Boolean(value),
+        }
+    }
 }
 
 impl From<Metadata> for FfiMetadata {
@@ -392,6 +425,11 @@ impl From<Metadata> for FfiMetadata {
             subcategory: metadata.subcategory().map(FfiSubcategory::from),
             subjects: metadata.subjects().to_vec(),
             purpose: metadata.purpose().map(FfiPurpose::from),
+            attributes: metadata
+                .attributes()
+                .iter()
+                .map(|(name, attribute)| (name.clone(), attribute.clone().into()))
+                .collect(),
         }
     }
 }
@@ -414,6 +452,11 @@ impl TryFrom<FfiMetadata> for Metadata {
             subcategory: metadata.subcategory.map(Subcategory::from),
             subjects: metadata.subjects,
             purpose: metadata.purpose.map(Purpose::from),
+            attributes: metadata
+                .attributes
+                .into_iter()
+                .map(|(name, attribute)| (name, attribute.into()))
+                .collect(),
         })
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -359,6 +360,31 @@ impl DocumentType {
     }
 }
 
+/// One typed value of a document's [`Metadata::attributes`]. Serialized
+/// adjacently tagged, so `Float(32.3)` round-trips as
+/// `{"type": "float", "value": 32.3}`: the type always travels with the
+/// value, and can never disagree with it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum Attribute {
+    String(String),
+    Integer(i64),
+    Float(f64),
+    Boolean(bool),
+}
+
+impl Attribute {
+    /// The name this attribute's type is serialized under (`"float"`...).
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::String(_) => "string",
+            Self::Integer(_) => "integer",
+            Self::Float(_) => "float",
+            Self::Boolean(_) => "boolean",
+        }
+    }
+}
+
 impl fmt::Display for DocumentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -443,7 +469,7 @@ impl fmt::Display for SubjectKind {
 
 /// Cleartext metadata encrypted under a document's DEK before upload, and
 /// decrypted back out of it on download.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Metadata {
     pub id: Uuid,
     pub name: String,
@@ -471,6 +497,12 @@ pub struct Metadata {
     /// persist anything themselves, so a freshly parsed document has no
     /// purpose yet.
     pub purpose: Option<Purpose>,
+    /// Every unstructured piece of data a document carries beyond the
+    /// fields above (e.g. `"price"` → `Attribute::Float(32.3)`), keyed by
+    /// name. Defaults to empty so metadata encrypted before this field
+    /// existed still decodes.
+    #[serde(default)]
+    pub attributes: BTreeMap<String, Attribute>,
 }
 
 impl Metadata {
@@ -525,10 +557,14 @@ impl Metadata {
     pub fn purpose(&self) -> Option<Purpose> {
         self.purpose
     }
+
+    pub fn attributes(&self) -> &BTreeMap<String, Attribute> {
+        &self.attributes
+    }
 }
 
 /// A file, as returned by [`super::Service::get`]/[`super::Service::list`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Document {
     pub(super) id: Uuid,
     #[serde(with = "serde_bytes")]
@@ -768,6 +804,10 @@ impl FakeMetadata {
                     Purpose::ALL
                         [crate::tools::testing::random_u64(Purpose::ALL.len() as u64) as usize],
                 ),
+                attributes: BTreeMap::from([(
+                    crate::tools::testing::random_word().to_string(),
+                    Attribute::Integer(crate::tools::testing::random_u64(1000) as i64),
+                )]),
             },
         }
     }
@@ -834,6 +874,14 @@ impl FakeMetadata {
 
     pub(crate) fn with_purpose(mut self, purpose: impl Into<Option<Purpose>>) -> Self {
         self.metadata.purpose = purpose.into();
+        self
+    }
+
+    pub(crate) fn with_attributes(
+        mut self,
+        attributes: impl Into<BTreeMap<String, Attribute>>,
+    ) -> Self {
+        self.metadata.attributes = attributes.into();
         self
     }
 
@@ -1011,6 +1059,7 @@ mod tests {
             .with_subcategory(Subcategory::Banking)
             .with_subjects(vec!["Q1 report".to_string()])
             .with_purpose(Purpose::Invoice)
+            .with_attributes([("price".to_string(), Attribute::Float(32.3))])
             .build();
 
         assert_eq!(metadata.id, id);
@@ -1026,6 +1075,60 @@ mod tests {
         assert_eq!(metadata.subcategory, Some(Subcategory::Banking));
         assert_eq!(metadata.subjects, vec!["Q1 report".to_string()]);
         assert_eq!(metadata.purpose, Some(Purpose::Invoice));
+        assert_eq!(
+            metadata.attributes,
+            BTreeMap::from([("price".to_string(), Attribute::Float(32.3))])
+        );
+    }
+
+    #[test]
+    fn attribute_serializes_its_type_alongside_its_value() {
+        let attributes = BTreeMap::from([
+            ("price".to_string(), Attribute::Float(32.3)),
+            ("paid".to_string(), Attribute::Boolean(true)),
+        ]);
+
+        let json = serde_json::to_value(&attributes).unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "price": {"type": "float", "value": 32.3},
+                "paid": {"type": "boolean", "value": true},
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<BTreeMap<String, Attribute>>(json).unwrap(),
+            attributes
+        );
+    }
+
+    #[test]
+    fn metadata_encoded_as_messagepack_before_attributes_existed_still_decodes() {
+        // Changelog events are MessagePack-encoded positionally (a struct is
+        // an array of its fields), so an event recorded before `attributes`
+        // existed is the same array minus its last element: here, a
+        // fixarray header one shorter and no trailing empty map.
+        let metadata = FakeMetadata::new().with_attributes(BTreeMap::new()).build();
+        let mut legacy = rmp_serde::to_vec(&metadata).unwrap();
+        assert_eq!(legacy[0], 0x9e, "expected a 14-field fixarray");
+        assert_eq!(legacy.pop(), Some(0x80), "expected a trailing empty map");
+        legacy[0] = 0x9d;
+
+        let decoded: Metadata = rmp_serde::from_slice(&legacy).unwrap();
+
+        assert!(decoded.attributes.is_empty());
+        assert_eq!(decoded.name, metadata.name);
+    }
+
+    #[test]
+    fn metadata_without_attributes_still_deserializes() {
+        let mut json = serde_json::to_value(FakeMetadata::new().build()).unwrap();
+        json.as_object_mut().unwrap().remove("attributes");
+
+        let metadata: Metadata = serde_json::from_value(json).unwrap();
+
+        assert!(metadata.attributes.is_empty());
     }
 
     #[test]

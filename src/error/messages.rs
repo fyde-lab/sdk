@@ -189,6 +189,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "One of the document's subjects is not recognized.",
             "L'un des sujets du document n'est pas reconnu.",
         ),
+        ErrorCode::InvalidAttribute => (
+            "One of the document's attributes is not valid.",
+            "L'un des attributs du document n'est pas valide.",
+        ),
         ErrorCode::InvalidSearchQuery => (
             "This search isn't valid.",
             "Cette recherche n'est pas valide.",

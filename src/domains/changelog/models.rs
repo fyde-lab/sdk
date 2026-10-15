@@ -31,7 +31,7 @@ pub enum EventType {
 /// event type carries all of them: `content` is `None` for a metadata-only
 /// update, and both `content` and `metadata` are `None` for a deletion
 /// (only `subject_id` is meaningful then).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChangelogEvent {
     pub(super) id: Uuid,
     pub(super) event_type: EventType,

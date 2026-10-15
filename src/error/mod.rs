@@ -120,6 +120,9 @@ macro_rules! for_each_error_code {
             MismatchedSubcategory = 4011,
             /// A document's subject isn't a known `kind:value` tag.
             InvalidSubject = 4012,
+            /// A document's attribute has an unknown type, or a value that
+            /// doesn't match its type.
+            InvalidAttribute = 4013,
             /// No such script.
             ScriptNotFound = 5001,
             /// A script was run without one of its required parameters.
@@ -243,6 +246,8 @@ pub(crate) enum ErrorKind {
     MismatchedSubcategory(String),
     #[error("invalid subject: {0:?}")]
     InvalidSubject(String),
+    #[error("invalid document attribute: {0}")]
+    InvalidAttribute(String),
     #[error("invalid search query: {0}")]
     InvalidSearchQuery(String),
     #[error("invalid script type: {0:?}")]
@@ -302,6 +307,7 @@ impl ErrorKind {
             ErrorKind::InvalidDocumentType(_) => ErrorCode::InvalidDocumentType,
             ErrorKind::MismatchedSubcategory(_) => ErrorCode::MismatchedSubcategory,
             ErrorKind::InvalidSubject(_) => ErrorCode::InvalidSubject,
+            ErrorKind::InvalidAttribute(_) => ErrorCode::InvalidAttribute,
             ErrorKind::InvalidSearchQuery(_) => ErrorCode::InvalidSearchQuery,
             ErrorKind::InvalidScriptType(_) => ErrorCode::InvalidScriptType,
             ErrorKind::InvalidResponse(_) => ErrorCode::InvalidServerResponse,

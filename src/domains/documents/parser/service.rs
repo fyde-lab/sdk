@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -56,6 +57,7 @@ impl Service for ParserClient {
             subcategory: None,
             subjects: Vec::new(),
             purpose: None,
+            attributes: BTreeMap::new(),
         };
 
         let document = Document::new(id, content.to_vec(), metadata);

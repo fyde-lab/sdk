@@ -9,8 +9,8 @@ mod storage_sqlite;
 pub(crate) use crate::domains::changelog::FakeChangelogEvent;
 pub use crate::domains::changelog::{ChangelogEvent, EventType};
 pub use models::{
-    Category, Document, DocumentType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters,
-    SearchOrder, SearchQuery, Subcategory, SubjectKind, UploadRequest, UploadSource,
+    Attribute, Category, Document, DocumentType, FacetCount, Metadata, Purpose, SearchFacets,
+    SearchFilters, SearchOrder, SearchQuery, Subcategory, SubjectKind, UploadRequest, UploadSource,
 };
 #[cfg(test)]
 pub(crate) use models::{FakeDocument, FakeMetadata, FakeSearchFacets};
