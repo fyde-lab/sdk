@@ -12,10 +12,8 @@ use super::{Document, FacetCount, Metadata, SearchFilters, SearchOrder};
 pub(crate) enum FacetField {
     Category,
     Subcategory,
-    Purpose,
     Type,
     ContentType,
-    Subject,
 }
 
 /// Caches documents, unencrypted, locally. Implementations are injected
@@ -58,9 +56,7 @@ pub(crate) trait Storage: Send + Sync {
     /// Counts, per distinct non-empty value of `field`, how many documents
     /// [`Self::search_documents`] would match for `terms` and `filters`,
     /// most common first (ties by value). Each value is that field's
-    /// canonical string form (e.g. [`super::Category::as_str`]); for
-    /// [`FacetField::Subject`], each subject a matching document carries,
-    /// counted once per document.
+    /// canonical string form (e.g. [`super::Category::as_str`]).
     async fn count_documents_by(
         &self,
         terms: &[String],

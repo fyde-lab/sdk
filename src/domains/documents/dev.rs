@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{ErrorContext as _, Result};
 
 use super::{
-    Attribute, Category, Document, DocumentType, Metadata, Purpose, SearchFacets, SearchFilters,
+    Attribute, Category, Document, DocumentType, Metadata, SearchFacets, SearchFilters,
     SearchQuery, Service, Subcategory, UploadRequest, UploadSource,
 };
 
@@ -64,8 +64,6 @@ impl Service for DevDocumentsClient {
             r#type: request.r#type,
             category: request.category,
             subcategory: request.subcategory,
-            subjects: request.subjects.as_deref(),
-            purpose: request.purpose,
             attributes: &request.attributes,
         };
         let metadata = serde_json::to_vec_pretty(&metadata)
@@ -146,8 +144,6 @@ struct DevMetadata<'a> {
     r#type: Option<DocumentType>,
     category: Option<Category>,
     subcategory: Option<Subcategory>,
-    subjects: Option<&'a [String]>,
-    purpose: Option<Purpose>,
     attributes: &'a BTreeMap<String, Attribute>,
 }
 
@@ -222,7 +218,6 @@ mod tests {
         let mut request = UploadRequest::from_raw("payslip.pdf", b"the pdf content".to_vec());
         request.name = Some("Payslip January".to_string());
         request.category = Some(Category::Work);
-        request.subjects = Some(vec!["person:alice".to_string()]);
         request.attributes = BTreeMap::from([("net_pay".to_string(), Attribute::Float(2150.5))]);
         let id = client.upload(request).await.unwrap();
 
@@ -241,8 +236,6 @@ mod tests {
                 "type": null,
                 "category": "work",
                 "subcategory": null,
-                "subjects": ["person:alice"],
-                "purpose": null,
                 "attributes": {"net_pay": {"type": "float", "value": 2150.5}},
             })
         );

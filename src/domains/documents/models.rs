@@ -223,68 +223,6 @@ impl FromStr for Subcategory {
     }
 }
 
-/// The reason a document was produced, as filled in by a user's
-/// classification script.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Purpose {
-    Attestation,
-    Contract,
-    Invoice,
-    Report,
-    Description,
-    Evaluation,
-    Employment,
-}
-
-impl Purpose {
-    #[cfg(test)]
-    pub(crate) const ALL: &'static [Purpose] = &[
-        Self::Attestation,
-        Self::Contract,
-        Self::Invoice,
-        Self::Report,
-        Self::Description,
-        Self::Evaluation,
-        Self::Employment,
-    ];
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Attestation => "attestation",
-            Self::Contract => "contract",
-            Self::Invoice => "invoice",
-            Self::Report => "report",
-            Self::Description => "description",
-            Self::Evaluation => "evaluation",
-            Self::Employment => "employment",
-        }
-    }
-}
-
-impl fmt::Display for Purpose {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Purpose {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "attestation" => Ok(Self::Attestation),
-            "contract" => Ok(Self::Contract),
-            "invoice" => Ok(Self::Invoice),
-            "report" => Ok(Self::Report),
-            "description" => Ok(Self::Description),
-            "evaluation" => Ok(Self::Evaluation),
-            "employment" => Ok(Self::Employment),
-            other => Err(ErrorKind::InvalidPurpose(other.to_string()).into()),
-        }
-    }
-}
-
 /// What kind of paper a document is, independent of who issued it or which
 /// part of life it's about (an EDF bill and an Amazon order are both
 /// [`Self::Invoice`]).
@@ -403,73 +341,11 @@ impl FromStr for DocumentType {
     }
 }
 
-/// What a [`Metadata::subjects`] entry points at, written as its prefix
-/// (`person:lea-dupont`, `line:0612••••78`...). A subject only tells apart
-/// documents of one account that concern different people or things (each
-/// beneficiary of a health insurance, each phone line of a telecom
-/// account...), so there's no kind for the account holder themself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubjectKind {
-    /// A beneficiary, patient, employee or child the document is about.
-    Person,
-    /// A phone or internet line.
-    Line,
-    /// A bank, savings or betting account.
-    Account,
-    /// An insurance policy or utility contract.
-    Contract,
-    /// The address or property a housing document is about.
-    Place,
-    /// A licence plate or toll badge.
-    Vehicle,
-    /// A trip's origin and destination.
-    Trip,
-}
-
-impl SubjectKind {
-    pub(crate) const ALL: &'static [SubjectKind] = &[
-        Self::Person,
-        Self::Line,
-        Self::Account,
-        Self::Contract,
-        Self::Place,
-        Self::Vehicle,
-        Self::Trip,
-    ];
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Person => "person",
-            Self::Line => "line",
-            Self::Account => "account",
-            Self::Contract => "contract",
-            Self::Place => "place",
-            Self::Vehicle => "vehicle",
-            Self::Trip => "trip",
-        }
-    }
-
-    /// Splits `subject` into its kind and value, or `None` unless it's a
-    /// known kind followed by `:` and a non-blank value.
-    pub fn parse_subject(subject: &str) -> Option<(Self, &str)> {
-        let (kind, value) = subject.split_once(':')?;
-        let kind = Self::ALL
-            .iter()
-            .copied()
-            .find(|known| known.as_str() == kind)?;
-        (!value.trim().is_empty()).then_some((kind, value))
-    }
-}
-
-impl fmt::Display for SubjectKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// Cleartext metadata encrypted under a document's DEK before upload, and
-/// decrypted back out of it on download.
+/// decrypted back out of it on download. Serialized through
+/// [`MetadataWire`], which keeps the wire layout of fields since removed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "MetadataWire", into = "MetadataWire")]
 pub struct Metadata {
     pub id: Uuid,
     pub name: String,
@@ -490,19 +366,78 @@ pub struct Metadata {
     /// category yet.
     pub category: Option<Category>,
     pub subcategory: Option<Subcategory>,
-    /// Who or what the document concerns, each a `kind:value` tag (see
-    /// [`SubjectKind`]).
-    pub subjects: Vec<String>,
-    /// `None` until a classification script sets it — scripts never
-    /// persist anything themselves, so a freshly parsed document has no
-    /// purpose yet.
-    pub purpose: Option<Purpose>,
     /// Every unstructured piece of data a document carries beyond the
     /// fields above (e.g. `"price"` → `Attribute::Float(32.3)`), keyed by
-    /// name. Defaults to empty so metadata encrypted before this field
-    /// existed still decodes.
-    #[serde(default)]
+    /// name.
     pub attributes: BTreeMap<String, Attribute>,
+}
+
+/// [`Metadata`]'s serialized form. Changelog events are MessagePack-encoded
+/// positionally (a struct is an array of its fields), so a removed field
+/// keeps its slot: `subjects` and `purpose` are written empty and ignored
+/// on read, so events recorded before they were removed still decode, and
+/// devices still running a version that has them still decode new ones.
+#[derive(Serialize, Deserialize)]
+struct MetadataWire {
+    id: Uuid,
+    name: String,
+    original_name: String,
+    content_type: String,
+    created_at: i64,
+    size: u64,
+    checksum: String,
+    transcript: String,
+    r#type: Option<DocumentType>,
+    category: Option<Category>,
+    subcategory: Option<Subcategory>,
+    /// Removed: always written empty, ignored on read.
+    subjects: Vec<String>,
+    /// Removed: always written `None`, ignored on read.
+    purpose: Option<String>,
+    /// Defaults to empty so metadata encrypted before this field existed
+    /// still decodes.
+    #[serde(default)]
+    attributes: BTreeMap<String, Attribute>,
+}
+
+impl From<MetadataWire> for Metadata {
+    fn from(wire: MetadataWire) -> Self {
+        Self {
+            id: wire.id,
+            name: wire.name,
+            original_name: wire.original_name,
+            content_type: wire.content_type,
+            created_at: wire.created_at,
+            size: wire.size,
+            checksum: wire.checksum,
+            transcript: wire.transcript,
+            r#type: wire.r#type,
+            category: wire.category,
+            subcategory: wire.subcategory,
+            attributes: wire.attributes,
+        }
+    }
+}
+
+impl From<Metadata> for MetadataWire {
+    fn from(metadata: Metadata) -> Self {
+        Self {
+            id: metadata.id,
+            name: metadata.name,
+            original_name: metadata.original_name,
+            content_type: metadata.content_type,
+            created_at: metadata.created_at,
+            size: metadata.size,
+            checksum: metadata.checksum,
+            transcript: metadata.transcript,
+            r#type: metadata.r#type,
+            category: metadata.category,
+            subcategory: metadata.subcategory,
+            subjects: Vec::new(),
+            purpose: None,
+            attributes: metadata.attributes,
+        }
+    }
 }
 
 impl Metadata {
@@ -548,14 +483,6 @@ impl Metadata {
 
     pub fn subcategory(&self) -> Option<Subcategory> {
         self.subcategory
-    }
-
-    pub fn subjects(&self) -> &[String] {
-        &self.subjects
-    }
-
-    pub fn purpose(&self) -> Option<Purpose> {
-        self.purpose
     }
 
     pub fn attributes(&self) -> &BTreeMap<String, Attribute> {
@@ -628,8 +555,6 @@ pub struct UploadRequest {
     pub r#type: Option<DocumentType>,
     pub category: Option<Category>,
     pub subcategory: Option<Subcategory>,
-    pub subjects: Option<Vec<String>>,
-    pub purpose: Option<Purpose>,
     pub attributes: BTreeMap<String, Attribute>,
 }
 
@@ -643,8 +568,6 @@ impl UploadRequest {
             r#type: None,
             category: None,
             subcategory: None,
-            subjects: None,
-            purpose: None,
             attributes: BTreeMap::new(),
         }
     }
@@ -661,8 +584,6 @@ impl UploadRequest {
             r#type: None,
             category: None,
             subcategory: None,
-            subjects: None,
-            purpose: None,
             attributes: BTreeMap::new(),
         }
     }
@@ -678,11 +599,7 @@ impl UploadRequest {
 pub struct SearchFilters {
     pub categories: Vec<Category>,
     pub subcategories: Vec<Subcategory>,
-    pub purposes: Vec<Purpose>,
     pub types: Vec<DocumentType>,
-    /// Matches a document carrying at least one of these subjects, compared
-    /// exactly.
-    pub subjects: Vec<String>,
     /// Matched exactly against [`Metadata::content_type`].
     pub content_types: Vec<String>,
     /// Inclusive lower bound on [`Metadata::created_at`].
@@ -703,21 +620,19 @@ pub struct FacetCount<T> {
 /// [`super::Service::search_facets`]: for each field [`SearchFilters`] can
 /// filter on, every value carried by at least one document the search would
 /// match, most common first — so a UI only ever proposes choices that lead
-/// somewhere. Unclassified documents (no category, purpose...) and empty
+/// somewhere. Unclassified documents (no category, type...) and empty
 /// values are left out.
 ///
 /// Each field's values ignore that field's *own* filter (but honor every
-/// other one), so picking a category narrows the subcategories, purposes...
+/// other one), so picking a category narrows the subcategories, types...
 /// on offer to that category's, while every category still compatible with
 /// the rest of the search stays available to switch to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchFacets {
     pub categories: Vec<FacetCount<Category>>,
     pub subcategories: Vec<FacetCount<Subcategory>>,
-    pub purposes: Vec<FacetCount<Purpose>>,
     pub types: Vec<FacetCount<DocumentType>>,
     pub content_types: Vec<FacetCount<String>>,
-    pub subjects: Vec<FacetCount<String>>,
     /// The oldest matching [`Metadata::created_at`], ignoring the
     /// `created_from`/`created_until` filters; `None` when nothing matches.
     pub earliest_created_at: Option<i64>,
@@ -741,8 +656,7 @@ pub enum SearchOrder {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchQuery {
     /// Free text matched against a document's name, original name,
-    /// transcript, type, category/subcategory, subjects and
-    /// purpose. Every word must match one of those fields, as a
+    /// transcript, type and category/subcategory. Every word must match one of those fields, as a
     /// case- and accent-insensitive prefix ("fact" matches "Facturé").
     /// Blank matches every document, leaving only `filters` to narrow it.
     pub text: String,
@@ -801,14 +715,6 @@ impl FakeMetadata {
                 ),
                 category: Some(subcategory.category()),
                 subcategory: Some(subcategory),
-                subjects: vec![
-                    format!("person:{}", crate::tools::testing::random_word()),
-                    format!("place:{}", crate::tools::testing::random_word()),
-                ],
-                purpose: Some(
-                    Purpose::ALL
-                        [crate::tools::testing::random_u64(Purpose::ALL.len() as u64) as usize],
-                ),
                 attributes: BTreeMap::from([(
                     crate::tools::testing::random_word().to_string(),
                     Attribute::Integer(crate::tools::testing::random_u64(1000) as i64),
@@ -869,16 +775,6 @@ impl FakeMetadata {
 
     pub(crate) fn with_subcategory(mut self, subcategory: impl Into<Option<Subcategory>>) -> Self {
         self.metadata.subcategory = subcategory.into();
-        self
-    }
-
-    pub(crate) fn with_subjects(mut self, subjects: impl Into<Vec<String>>) -> Self {
-        self.metadata.subjects = subjects.into();
-        self
-    }
-
-    pub(crate) fn with_purpose(mut self, purpose: impl Into<Option<Purpose>>) -> Self {
-        self.metadata.purpose = purpose.into();
         self
     }
 
@@ -947,10 +843,6 @@ pub(crate) struct FakeSearchFacets {
 impl FakeSearchFacets {
     pub(crate) fn new() -> Self {
         let count = || 1 + crate::tools::testing::random_u64(20);
-        let word = || FacetCount {
-            value: crate::tools::testing::random_word().to_string(),
-            count: count(),
-        };
         let earliest = crate::tools::testing::random_past_timestamp();
         Self {
             facets: SearchFacets {
@@ -964,11 +856,6 @@ impl FakeSearchFacets {
                         [crate::tools::testing::random_u64(Subcategory::ALL.len() as u64) as usize],
                     count: count(),
                 }],
-                purposes: vec![FacetCount {
-                    value: Purpose::ALL
-                        [crate::tools::testing::random_u64(Purpose::ALL.len() as u64) as usize],
-                    count: count(),
-                }],
                 types: vec![FacetCount {
                     value: DocumentType::ALL[crate::tools::testing::random_u64(
                         DocumentType::ALL.len() as u64,
@@ -979,7 +866,6 @@ impl FakeSearchFacets {
                     value: "application/pdf".to_string(),
                     count: count(),
                 }],
-                subjects: vec![word(), word()],
                 earliest_created_at: Some(earliest),
                 latest_created_at: Some(
                     earliest + crate::tools::testing::random_u64(86_400) as i64,
@@ -1001,11 +887,6 @@ impl FakeSearchFacets {
         self
     }
 
-    pub(crate) fn with_purposes(mut self, purposes: Vec<FacetCount<Purpose>>) -> Self {
-        self.facets.purposes = purposes;
-        self
-    }
-
     pub(crate) fn with_types(mut self, types: Vec<FacetCount<DocumentType>>) -> Self {
         self.facets.types = types;
         self
@@ -1013,11 +894,6 @@ impl FakeSearchFacets {
 
     pub(crate) fn with_content_types(mut self, content_types: Vec<FacetCount<String>>) -> Self {
         self.facets.content_types = content_types;
-        self
-    }
-
-    pub(crate) fn with_subjects(mut self, subjects: Vec<FacetCount<String>>) -> Self {
-        self.facets.subjects = subjects;
         self
     }
 
@@ -1062,8 +938,6 @@ mod tests {
             .with_type(DocumentType::Invoice)
             .with_category(Category::Money)
             .with_subcategory(Subcategory::Banking)
-            .with_subjects(vec!["Q1 report".to_string()])
-            .with_purpose(Purpose::Invoice)
             .with_attributes([("price".to_string(), Attribute::Float(32.3))])
             .build();
 
@@ -1078,8 +952,6 @@ mod tests {
         assert_eq!(metadata.r#type, Some(DocumentType::Invoice));
         assert_eq!(metadata.category, Some(Category::Money));
         assert_eq!(metadata.subcategory, Some(Subcategory::Banking));
-        assert_eq!(metadata.subjects, vec!["Q1 report".to_string()]);
-        assert_eq!(metadata.purpose, Some(Purpose::Invoice));
         assert_eq!(
             metadata.attributes,
             BTreeMap::from([("price".to_string(), Attribute::Float(32.3))])
@@ -1127,6 +999,51 @@ mod tests {
     }
 
     #[test]
+    fn metadata_encoded_with_subjects_and_purpose_still_decodes() {
+        // The layout `Metadata` had before `subjects`/`purpose` were
+        // removed, with both set.
+        #[derive(Serialize)]
+        struct Legacy {
+            id: Uuid,
+            name: String,
+            original_name: String,
+            content_type: String,
+            created_at: i64,
+            size: u64,
+            checksum: String,
+            transcript: String,
+            r#type: Option<DocumentType>,
+            category: Option<Category>,
+            subcategory: Option<Subcategory>,
+            subjects: Vec<String>,
+            purpose: Option<String>,
+            attributes: BTreeMap<String, Attribute>,
+        }
+        let metadata = FakeMetadata::new().build();
+        let legacy = rmp_serde::to_vec(&Legacy {
+            id: metadata.id,
+            name: metadata.name.clone(),
+            original_name: metadata.original_name.clone(),
+            content_type: metadata.content_type.clone(),
+            created_at: metadata.created_at,
+            size: metadata.size,
+            checksum: metadata.checksum.clone(),
+            transcript: metadata.transcript.clone(),
+            r#type: metadata.r#type,
+            category: metadata.category,
+            subcategory: metadata.subcategory,
+            subjects: vec!["person:alice".to_string()],
+            purpose: Some("invoice".to_string()),
+            attributes: metadata.attributes.clone(),
+        })
+        .unwrap();
+
+        let decoded: Metadata = rmp_serde::from_slice(&legacy).unwrap();
+
+        assert_eq!(decoded, metadata);
+    }
+
+    #[test]
     fn metadata_without_attributes_still_deserializes() {
         let mut json = serde_json::to_value(FakeMetadata::new().build()).unwrap();
         json.as_object_mut().unwrap().remove("attributes");
@@ -1164,21 +1081,6 @@ mod tests {
                 *category != Category::Donations,
                 "{category}"
             );
-        }
-    }
-
-    #[test]
-    fn parse_subject_splits_a_known_kind_from_its_value() {
-        assert_eq!(
-            SubjectKind::parse_subject("person:lea-dupont"),
-            Some((SubjectKind::Person, "lea-dupont"))
-        );
-        assert_eq!(
-            SubjectKind::parse_subject("trip:paris:lyon"),
-            Some((SubjectKind::Trip, "paris:lyon"))
-        );
-        for invalid in ["lea-dupont", "pet:rex", "person:", "person: ", ":x", ""] {
-            assert_eq!(SubjectKind::parse_subject(invalid), None, "{invalid:?}");
         }
     }
 
@@ -1227,16 +1129,11 @@ mod tests {
                 count: 2,
             }])
             .with_subcategories(Vec::new())
-            .with_purposes(vec![FacetCount {
-                value: Purpose::Invoice,
-                count: 3,
-            }])
             .with_types(vec![FacetCount {
                 value: DocumentType::Payslip,
                 count: 1,
             }])
             .with_content_types(vec![count("application/pdf")])
-            .with_subjects(vec![count("rent")])
             .with_created_at_range(Some((10, 20)))
             .build();
 
@@ -1248,16 +1145,11 @@ mod tests {
                     count: 2
                 }],
                 subcategories: Vec::new(),
-                purposes: vec![FacetCount {
-                    value: Purpose::Invoice,
-                    count: 3
-                }],
                 types: vec![FacetCount {
                     value: DocumentType::Payslip,
                     count: 1
                 }],
                 content_types: vec![count("application/pdf")],
-                subjects: vec![count("rent")],
                 earliest_created_at: Some(10),
                 latest_created_at: Some(20),
             }

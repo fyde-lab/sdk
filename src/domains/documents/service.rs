@@ -11,8 +11,8 @@ use crate::domains::changelog::{ChangelogEvent, EventType, Service as ChangelogS
 use super::parser::Service as ParserService;
 use super::storage::{FacetField, Storage};
 use super::{
-    Attribute, Category, Document, DocumentType, FacetCount, Metadata, Purpose, SearchFacets,
-    SearchFilters, SearchQuery, Service, Subcategory, SubjectKind, UploadRequest, UploadSource,
+    Attribute, Category, Document, FacetCount, Metadata, SearchFacets, SearchFilters, SearchQuery,
+    Service, Subcategory, UploadRequest, UploadSource,
 };
 
 /// The default [`Service`] implementation: publishes new documents as
@@ -62,10 +62,8 @@ impl<S: Storage> DocumentsClient<S> {
         match field {
             FacetField::Category => filters.categories.clear(),
             FacetField::Subcategory => filters.subcategories.clear(),
-            FacetField::Purpose => filters.purposes.clear(),
             FacetField::Type => filters.types.clear(),
             FacetField::ContentType => filters.content_types.clear(),
-            FacetField::Subject => filters.subjects.clear(),
         }
 
         self.storage
@@ -150,19 +148,10 @@ impl<S: Storage> Service for DocumentsClient<S> {
             metadata.category = Some(category);
             metadata.subcategory = request.subcategory;
         }
-        if let Some(subjects) = request.subjects {
-            metadata.subjects = subjects;
-        }
-        if let Some(purpose) = request.purpose {
-            metadata.purpose = Some(purpose);
-        }
         metadata.attributes.extend(request.attributes);
-        if metadata.purpose.is_none() {
-            metadata.purpose = metadata.r#type.and_then(purpose_of);
-        }
 
         // Checked again after parsing: the user's classification scripts may
-        // have set subjects of their own.
+        // have set attributes of their own.
         check_metadata(&metadata)
             .with_context(|| format!("invalid metadata for document {original_name:?}"))?;
 
@@ -230,9 +219,6 @@ impl<S: Storage> Service for DocumentsClient<S> {
         let subcategories = self
             .count_documents_by(&terms, filters, FacetField::Subcategory)
             .await?;
-        let purposes = self
-            .count_documents_by(&terms, filters, FacetField::Purpose)
-            .await?;
         let created_at_range = self
             .storage
             .created_at_range(
@@ -249,7 +235,6 @@ impl<S: Storage> Service for DocumentsClient<S> {
         Ok(SearchFacets {
             categories: parse_facet(categories, "category")?,
             subcategories: parse_facet(subcategories, "subcategory")?,
-            purposes: parse_facet(purposes, "purpose")?,
             types: parse_facet(
                 self.count_documents_by(&terms, filters, FacetField::Type)
                     .await?,
@@ -257,9 +242,6 @@ impl<S: Storage> Service for DocumentsClient<S> {
             )?,
             content_types: self
                 .count_documents_by(&terms, filters, FacetField::ContentType)
-                .await?,
-            subjects: self
-                .count_documents_by(&terms, filters, FacetField::Subject)
                 .await?,
             earliest_created_at: created_at_range.map(|(earliest, _)| earliest),
             latest_created_at: created_at_range.map(|(_, latest)| latest),
@@ -309,16 +291,13 @@ pub(super) fn resolve_upload_request(request: &mut UploadRequest) -> Result<()> 
             .map(|subcategory| subcategory.category());
     }
     check_categories(request.category, request.subcategory)?;
-    check_subjects(request.subjects.as_deref().unwrap_or_default())?;
     check_attributes(&request.attributes)
 }
 
-/// Rejects metadata whose fields contradict each other, whose subjects
-/// aren't `kind:value` tags (see [`check_subjects`]), or whose attributes
+/// Rejects metadata whose fields contradict each other, or whose attributes
 /// aren't valid (see [`check_attributes`]).
 fn check_metadata(metadata: &Metadata) -> Result<()> {
     check_categories(metadata.category, metadata.subcategory)?;
-    check_subjects(&metadata.subjects)?;
     check_attributes(&metadata.attributes)
 }
 
@@ -342,18 +321,6 @@ fn check_attributes(attributes: &BTreeMap<String, Attribute>) -> Result<()> {
     Ok(())
 }
 
-/// Rejects any subject that isn't a known [`SubjectKind`] followed by `:`
-/// and a non-blank value (`person:lea-dupont`).
-fn check_subjects(subjects: &[String]) -> Result<()> {
-    match subjects
-        .iter()
-        .find(|subject| SubjectKind::parse_subject(subject).is_none())
-    {
-        Some(subject) => Err(ErrorKind::InvalidSubject(subject.clone()).into()),
-        None => Ok(()),
-    }
-}
-
 /// Rejects a subcategory that doesn't narrow down `category` (or that's
 /// set without any category).
 pub(super) fn check_categories(
@@ -371,32 +338,6 @@ pub(super) fn check_categories(
         .into());
     }
     Ok(())
-}
-
-/// The purpose a document of type `r#type` serves, given to an uploaded
-/// document nothing else gave a purpose to; `None` for
-/// [`DocumentType::Other`], which says nothing about it.
-fn purpose_of(r#type: DocumentType) -> Option<Purpose> {
-    match r#type {
-        DocumentType::Invoice | DocumentType::Receipt | DocumentType::Booking => {
-            Some(Purpose::Invoice)
-        }
-        DocumentType::Statement
-        | DocumentType::ReimbursementStatement
-        | DocumentType::FeeSummary
-        | DocumentType::TaxReturn
-        | DocumentType::MedicalDocument => Some(Purpose::Report),
-        DocumentType::InsuranceCertificate
-        | DocumentType::InsuranceCard
-        | DocumentType::RightsCertificate
-        | DocumentType::ProofOfResidence
-        | DocumentType::Rib
-        | DocumentType::TaxNotice
-        | DocumentType::TaxCertificate => Some(Purpose::Attestation),
-        DocumentType::Contract => Some(Purpose::Contract),
-        DocumentType::Payslip | DocumentType::EmploymentCertificate => Some(Purpose::Employment),
-        DocumentType::Other => None,
-    }
 }
 
 /// Rejects a `created_from` later than `created_until`, a range no
@@ -465,6 +406,7 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
+    use super::super::DocumentType;
     use super::super::parser::MockService as MockParserService;
     use super::super::storage::MockStorage;
     use super::*;
@@ -734,8 +676,6 @@ mod tests {
             r#type: Some(DocumentType::Payslip),
             category: Some(super::super::Category::Work),
             subcategory: None,
-            subjects: Some(vec!["person:alice".to_string()]),
-            purpose: Some(super::super::Purpose::Employment),
             attributes: BTreeMap::new(),
         };
 
@@ -748,11 +688,6 @@ mod tests {
         assert_eq!(sent_metadata.name, "overridden.pdf");
         assert_eq!(sent_metadata.r#type, Some(DocumentType::Payslip));
         assert_eq!(sent_metadata.category, Some(super::super::Category::Work));
-        assert_eq!(sent_metadata.subjects, vec!["person:alice".to_string()]);
-        assert_eq!(
-            sent_metadata.purpose,
-            Some(super::super::Purpose::Employment)
-        );
     }
 
     /// Uploads a document whose parsed metadata is `parsed` with `request`'s
@@ -779,47 +714,6 @@ mod tests {
 
         let sent = changelog.sent.lock().unwrap();
         sent[0].3.clone().unwrap()
-    }
-
-    #[tokio::test]
-    async fn upload_derives_a_missing_purpose_from_the_type() {
-        let parsed = super::super::FakeMetadata::new()
-            .with_type(None)
-            .with_purpose(None)
-            .build();
-        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
-        request.r#type = Some(DocumentType::Payslip);
-
-        let metadata = upload_with(parsed, request).await;
-
-        assert_eq!(metadata.purpose, Some(Purpose::Employment));
-    }
-
-    #[tokio::test]
-    async fn upload_keeps_a_purpose_already_set() {
-        let parsed = super::super::FakeMetadata::new()
-            .with_purpose(Purpose::Report)
-            .build();
-        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
-        request.r#type = Some(DocumentType::Invoice);
-
-        let metadata = upload_with(parsed, request).await;
-
-        assert_eq!(metadata.purpose, Some(Purpose::Report));
-    }
-
-    #[tokio::test]
-    async fn upload_leaves_the_purpose_empty_for_an_other_type() {
-        let parsed = super::super::FakeMetadata::new()
-            .with_type(None)
-            .with_purpose(None)
-            .build();
-        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
-        request.r#type = Some(DocumentType::Other);
-
-        let metadata = upload_with(parsed, request).await;
-
-        assert_eq!(metadata.purpose, None);
     }
 
     #[tokio::test]
@@ -868,26 +762,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_rejects_a_requested_subject_without_a_known_kind() {
-        // No `expect_parse_content()`: the parser must never be reached.
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            Arc::new(RecordingChangelog::default()),
-            Arc::new(MockParserService::new()),
-            None,
-        );
-        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
-        request.subjects = Some(vec!["person:alice".to_string(), "alice".to_string()]);
-
-        let err = client.upload(request).await.unwrap_err();
-
-        assert_eq!(err.code(), crate::ErrorCode::InvalidSubject);
-    }
-
-    #[tokio::test]
-    async fn upload_rejects_a_subject_a_classification_script_set_without_a_known_kind() {
+    async fn upload_rejects_an_attribute_a_classification_script_set_with_a_blank_name() {
         let parsed = super::super::FakeMetadata::new()
-            .with_subjects(vec!["pet:rex".to_string()])
+            .with_attributes([(" ".to_string(), Attribute::Integer(1))])
             .build();
         let mut parser = MockParserService::new();
         parser
@@ -905,7 +782,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(err.code(), crate::ErrorCode::InvalidSubject);
+        assert_eq!(err.code(), crate::ErrorCode::InvalidAttribute);
         assert!(changelog.sent.lock().unwrap().is_empty());
     }
 
@@ -990,21 +867,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_metadata_rejects_a_subject_without_a_known_kind() {
-        let changelog = Arc::new(RecordingChangelog::default());
-        let client =
-            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_parser(), None);
-        let metadata = super::super::FakeMetadata::new()
-            .with_subjects(vec!["Loyer Paris".to_string()])
-            .build();
-
-        let err = client.update_metadata(metadata).await.unwrap_err();
-
-        assert_eq!(err.code(), crate::ErrorCode::InvalidSubject);
-        assert!(changelog.sent.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
     async fn update_metadata_rejects_a_subcategory_of_another_category() {
         let changelog = Arc::new(RecordingChangelog::default());
         let client =
@@ -1038,8 +900,6 @@ mod tests {
                 r#type: None,
                 category: None,
                 subcategory: None,
-                subjects: Vec::new(),
-                purpose: None,
                 attributes: BTreeMap::new(),
             },
         };
@@ -1081,8 +941,6 @@ mod tests {
                     r#type: None,
                     category: None,
                     subcategory: None,
-                    subjects: Vec::new(),
-                    purpose: None,
                     attributes: BTreeMap::new(),
                 },
             },
@@ -1101,8 +959,6 @@ mod tests {
                     r#type: None,
                     category: None,
                     subcategory: None,
-                    subjects: Vec::new(),
-                    purpose: None,
                     attributes: BTreeMap::new(),
                 },
             },
@@ -1237,24 +1093,20 @@ mod tests {
         match field {
             FacetField::Category => filters.categories.clear(),
             FacetField::Subcategory => filters.subcategories.clear(),
-            FacetField::Purpose => filters.purposes.clear(),
             FacetField::Type => filters.types.clear(),
             FacetField::ContentType => filters.content_types.clear(),
-            FacetField::Subject => filters.subjects.clear(),
         }
         filters
     }
 
     #[tokio::test]
     async fn search_facets_counts_each_field_without_its_own_filter_but_with_every_other() {
-        use super::super::{Category, Purpose, SearchFilters, Subcategory};
+        use super::super::{Category, SearchFilters, Subcategory};
 
         let filters = SearchFilters {
             categories: vec![Category::Money],
             subcategories: vec![Subcategory::Banking],
-            purposes: vec![Purpose::Invoice],
             types: vec![DocumentType::Statement],
-            subjects: vec!["rent".to_string()],
             content_types: vec!["application/pdf".to_string()],
             created_from: Some(1),
             created_until: Some(2),
@@ -1293,17 +1145,6 @@ mod tests {
                 ),
             ),
             (
-                FacetField::Purpose,
-                as_strings(
-                    expected
-                        .purposes
-                        .iter()
-                        .map(|f| f.value.as_str().to_string())
-                        .collect(),
-                    expected.purposes.iter().map(|f| f.count).collect(),
-                ),
-            ),
-            (
                 FacetField::Type,
                 as_strings(
                     expected
@@ -1315,7 +1156,6 @@ mod tests {
                 ),
             ),
             (FacetField::ContentType, expected.content_types.clone()),
-            (FacetField::Subject, expected.subjects.clone()),
         ];
 
         let mut storage = MockStorage::new();
@@ -1412,7 +1252,6 @@ mod tests {
     async fn update_metadata_publishes_an_update_metadata_event_with_the_given_metadata() {
         let metadata = super::super::FakeMetadata::new()
             .with_name("new.pdf")
-            .with_subjects(vec!["line:0612".to_string()])
             .build();
         let id = metadata.id;
 
@@ -1430,7 +1269,6 @@ mod tests {
         assert_eq!(*content, None);
         let metadata = metadata.as_ref().unwrap();
         assert_eq!(metadata.name, "new.pdf");
-        assert_eq!(metadata.subjects, vec!["line:0612".to_string()]);
     }
 
     #[tokio::test]

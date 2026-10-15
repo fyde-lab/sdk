@@ -9,8 +9,8 @@ use crate::{ErrorContext as _, Result};
 
 use super::storage::{FacetField, Storage};
 use super::{
-    Attribute, Category, Document, DocumentType, FacetCount, Metadata, Purpose, SearchFilters,
-    SearchOrder, Subcategory,
+    Attribute, Category, Document, DocumentType, FacetCount, Metadata, SearchFilters, SearchOrder,
+    Subcategory,
 };
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
@@ -29,8 +29,8 @@ impl SqliteStorage {
 impl Storage for SqliteStorage {
     async fn save_document(&self, document: &Document) -> Result<()> {
         sqlx::query(
-            "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, subjects, purpose, attributes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, attributes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(document.id.to_string())
         .bind(&document.metadata.name)
@@ -45,8 +45,6 @@ impl Storage for SqliteStorage {
         .bind(subcategory_to_column(
             document.metadata.subcategory,
         ))
-        .bind(subjects_to_column(&document.metadata.subjects))
-        .bind(purpose_to_column(document.metadata.purpose))
         .bind(attributes_to_column(&document.metadata.attributes)?)
         .execute(&self.pool)
         .await
@@ -57,7 +55,7 @@ impl Storage for SqliteStorage {
 
     async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
         let row = sqlx::query(
-            "SELECT name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, subjects, purpose, attributes FROM documents WHERE id = ?1",
+            "SELECT name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, attributes FROM documents WHERE id = ?1",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -84,8 +82,6 @@ impl Storage for SqliteStorage {
                 r#type: type_from_column(row.get("type"))?,
                 category: category_from_column(row.get("category"))?,
                 subcategory: subcategory_from_column(row.get("subcategory"))?,
-                subjects: subjects_from_column(row.get("subjects"))?,
-                purpose: purpose_from_column(row.get("purpose"))?,
                 attributes: attributes_from_column(row.get("attributes"))?,
             },
             content,
@@ -113,7 +109,7 @@ impl Storage for SqliteStorage {
 
     async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
         let rows = sqlx::query(
-            "SELECT id, name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, subjects, purpose, attributes FROM documents
+            "SELECT id, name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, attributes FROM documents
              ORDER BY created_at ASC, id ASC
              LIMIT ?1 OFFSET ?2",
         )
@@ -135,7 +131,7 @@ impl Storage for SqliteStorage {
         limit: i64,
     ) -> Result<Vec<Document>> {
         let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT d.id, d.name, d.original_name, d.content_type, d.content, d.checksum, d.created_at, d.transcript, d.type, d.category, d.subcategory, d.subjects, d.purpose, d.attributes",
+            "SELECT d.id, d.name, d.original_name, d.content_type, d.content, d.checksum, d.created_at, d.transcript, d.type, d.category, d.subcategory, d.attributes",
         );
         push_matching(&mut query, terms, filters);
 
@@ -182,28 +178,17 @@ impl Storage for SqliteStorage {
         let column = match field {
             FacetField::Category => "d.category",
             FacetField::Subcategory => "d.subcategory",
-            FacetField::Purpose => "d.purpose",
             FacetField::Type => "d.type",
             FacetField::ContentType => "d.content_type",
-            FacetField::Subject => "d.subjects",
         };
 
         // `''` and `NULL` both mean "unset" here: see the `*_to_column`
         // helpers above.
-        let mut query = QueryBuilder::<Sqlite>::new("");
-        if field == FacetField::Subject {
-            query.push(format_args!(
-                "SELECT j.value AS value, COUNT(DISTINCT m.id) AS count FROM (SELECT d.id AS id, {column} AS subjects"
-            ));
-            push_matching(&mut query, terms, filters);
-            query.push(") m, json_each(m.subjects) j WHERE j.value != '' GROUP BY j.value");
-        } else {
-            query.push(format_args!(
-                "SELECT value, COUNT(*) AS count FROM (SELECT {column} AS value"
-            ));
-            push_matching(&mut query, terms, filters);
-            query.push(") WHERE value IS NOT NULL AND value != '' GROUP BY value");
-        }
+        let mut query = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT value, COUNT(*) AS count FROM (SELECT {column} AS value"
+        ));
+        push_matching(&mut query, terms, filters);
+        query.push(") WHERE value IS NOT NULL AND value != '' GROUP BY value");
         query.push(" ORDER BY count DESC, value ASC");
 
         let rows = query
@@ -245,8 +230,8 @@ impl Storage for SqliteStorage {
     async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()> {
         sqlx::query(
             "UPDATE documents
-             SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6, type = ?7, category = ?8, subcategory = ?9, subjects = ?10, purpose = ?11, attributes = ?12
-             WHERE id = ?13",
+             SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6, type = ?7, category = ?8, subcategory = ?9, attributes = ?10
+             WHERE id = ?11",
         )
         .bind(&metadata.name)
         .bind(&metadata.original_name)
@@ -259,8 +244,6 @@ impl Storage for SqliteStorage {
         .bind(subcategory_to_column(
             metadata.subcategory,
         ))
-        .bind(subjects_to_column(&metadata.subjects))
-        .bind(purpose_to_column(metadata.purpose))
         .bind(attributes_to_column(&metadata.attributes)?)
         .bind(id.to_string())
         .execute(&self.pool)
@@ -319,34 +302,6 @@ fn type_from_column(column: String) -> Result<Option<DocumentType>> {
         .with_context(|| format!("invalid document type in local database: {column}"))
 }
 
-/// The `subjects` column stores a JSON-encoded array, since SQLite has no
-/// native array type.
-fn subjects_to_column(subjects: &[String]) -> String {
-    serde_json::to_string(subjects).expect("serializing a Vec<String> to JSON cannot fail")
-}
-
-fn subjects_from_column(column: String) -> Result<Vec<String>> {
-    serde_json::from_str(&column)
-        .with_context(|| format!("invalid subjects json in local database: {column}"))
-}
-
-/// The `purpose` column has no NULL state (`NOT NULL DEFAULT ''`), so an
-/// unclassified document is stored as an empty string.
-fn purpose_to_column(purpose: Option<Purpose>) -> String {
-    purpose.map_or_else(String::new, |purpose| purpose.as_str().to_string())
-}
-
-fn purpose_from_column(column: String) -> Result<Option<Purpose>> {
-    if column.is_empty() {
-        return Ok(None);
-    }
-
-    column
-        .parse()
-        .map(Some)
-        .with_context(|| format!("invalid purpose in local database: {column}"))
-}
-
 /// The `attributes` column stores a JSON-encoded map, since SQLite has no
 /// native map type.
 /// Fails on a non-finite float, which JSON can't represent: the service
@@ -383,8 +338,6 @@ fn document_from_row(row: &SqliteRow) -> Result<Document> {
             r#type: type_from_column(row.get("type"))?,
             category: category_from_column(row.get("category"))?,
             subcategory: subcategory_from_column(row.get("subcategory"))?,
-            subjects: subjects_from_column(row.get("subjects"))?,
-            purpose: purpose_from_column(row.get("purpose"))?,
             attributes: attributes_from_column(row.get("attributes"))?,
         },
         content,
@@ -393,17 +346,15 @@ fn document_from_row(row: &SqliteRow) -> Result<Document> {
 
 /// Orders `documents_fts` matches best first (`bm25` scores lower for a
 /// better match), weighting each column in its declaration order in the
-/// `0014_create_documents_fts` migration: a hit in the name counts the
-/// most, one in the (long, noisy) transcript the least.
+/// `0018_drop_subjects_and_purpose_from_documents` migration: a hit in the
+/// name counts the most, one in the (long, noisy) transcript the least.
 const FTS_RANK: &str = "bm25(documents_fts,
     10.0, -- name
     5.0,  -- original_name
     1.0,  -- transcript
     4.0,  -- type
     4.0,  -- category
-    4.0,  -- subcategory
-    6.0,  -- subjects
-    4.0   -- purpose
+    4.0   -- subcategory
 )";
 
 /// Builds an FTS5 query matching documents containing every one of `terms`
@@ -465,11 +416,6 @@ fn push_matching(query: &mut QueryBuilder<Sqlite>, terms: &[String], filters: &S
     );
     push_any_of(
         query,
-        "d.purpose",
-        filters.purposes.iter().map(Purpose::as_str),
-    );
-    push_any_of(
-        query,
         "d.type",
         filters.types.iter().map(DocumentType::as_str),
     );
@@ -478,14 +424,6 @@ fn push_matching(query: &mut QueryBuilder<Sqlite>, terms: &[String], filters: &S
         "d.content_type",
         filters.content_types.iter().map(String::as_str),
     );
-    if !filters.subjects.is_empty() {
-        query.push(" AND EXISTS (SELECT 1 FROM json_each(d.subjects) WHERE json_each.value IN (");
-        let mut subjects = query.separated(", ");
-        for subject in &filters.subjects {
-            subjects.push_bind(subject.clone());
-        }
-        query.push("))");
-    }
     if let Some(created_from) = filters.created_from {
         query.push(" AND d.created_at >= ").push_bind(created_from);
     }
@@ -571,8 +509,6 @@ mod tests {
                     r#type: None,
                     category: None,
                     subcategory: None,
-                    subjects: Vec::new(),
-                    purpose: None,
                     attributes: BTreeMap::new(),
                 },
             })
@@ -598,8 +534,6 @@ mod tests {
                     r#type: None,
                     category: None,
                     subcategory: None,
-                    subjects: Vec::new(),
-                    purpose: None,
                     attributes: BTreeMap::new(),
                 },
             }
@@ -650,8 +584,6 @@ mod tests {
                     r#type: None,
                     category: None,
                     subcategory: None,
-                    subjects: Vec::new(),
-                    purpose: None,
                     attributes: BTreeMap::new(),
                 },
             })
@@ -673,8 +605,6 @@ mod tests {
                     r#type: None,
                     category: None,
                     subcategory: None,
-                    subjects: Vec::new(),
-                    purpose: None,
                     attributes: BTreeMap::new(),
                 },
             })
@@ -706,8 +636,6 @@ mod tests {
                         r#type: None,
                         category: None,
                         subcategory: None,
-                        subjects: Vec::new(),
-                        purpose: None,
                         attributes: BTreeMap::new(),
                     },
                 })
@@ -776,8 +704,6 @@ mod tests {
                     r#type: None,
                     category: None,
                     subcategory: None,
-                    subjects: Vec::new(),
-                    purpose: None,
                     attributes: BTreeMap::new(),
                 },
             })
@@ -799,8 +725,6 @@ mod tests {
                     r#type: None,
                     category: None,
                     subcategory: None,
-                    subjects: Vec::new(),
-                    purpose: None,
                     attributes: BTreeMap::new(),
                 },
             )
@@ -831,8 +755,6 @@ mod tests {
                     r#type: None,
                     category: None,
                     subcategory: None,
-                    subjects: Vec::new(),
-                    purpose: None,
                     attributes: BTreeMap::new(),
                 },
             )
@@ -855,8 +777,6 @@ mod tests {
             .with_type(None)
             .with_category(None)
             .with_subcategory(None)
-            .with_subjects(Vec::<String>::new())
-            .with_purpose(None)
     }
 
     async fn save(storage: &SqliteStorage, metadata: FakeMetadata) {
@@ -968,16 +888,6 @@ mod tests {
             searchable("by-subcategory", 5).with_subcategory(Subcategory::Mobile),
         )
         .await;
-        save(
-            &storage,
-            searchable("by-subjects", 6).with_subjects(vec!["Loyer Paris".to_string()]),
-        )
-        .await;
-        save(
-            &storage,
-            searchable("by-purpose", 7).with_purpose(Purpose::Attestation),
-        )
-        .await;
 
         for (term, expected) in [
             ("originalname", "by-original"),
@@ -985,8 +895,6 @@ mod tests {
             ("payslip", "by-type"),
             ("housing", "by-category"),
             ("mobile", "by-subcategory"),
-            ("loyer", "by-subjects"),
-            ("attestation", "by-purpose"),
         ] {
             let names = search_names(
                 &storage,
@@ -1074,9 +982,7 @@ mod tests {
             searchable("match", 10)
                 .with_category(Category::Health)
                 .with_subcategory(Subcategory::Banking)
-                .with_purpose(Purpose::Invoice)
-                .with_type(DocumentType::Receipt)
-                .with_subjects(vec!["alice".to_string(), "bob".to_string()]),
+                .with_type(DocumentType::Receipt),
         )
         .await;
         // Each differs from "match" in exactly one filtered field.
@@ -1085,28 +991,14 @@ mod tests {
             searchable("wrong-category", 10)
                 .with_category(Category::Money)
                 .with_subcategory(Subcategory::Banking)
-                .with_purpose(Purpose::Invoice)
-                .with_type(DocumentType::Receipt)
-                .with_subjects(vec!["bob".to_string()]),
+                .with_type(DocumentType::Receipt),
         )
         .await;
         save(
             &storage,
             searchable("wrong-subcategory", 10)
                 .with_category(Category::Health)
-                .with_purpose(Purpose::Invoice)
-                .with_type(DocumentType::Receipt)
-                .with_subjects(vec!["bob".to_string()]),
-        )
-        .await;
-        save(
-            &storage,
-            searchable("wrong-purpose", 10)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
-                .with_purpose(Purpose::Contract)
-                .with_type(DocumentType::Receipt)
-                .with_subjects(vec!["bob".to_string()]),
+                .with_type(DocumentType::Receipt),
         )
         .await;
         save(
@@ -1114,19 +1006,7 @@ mod tests {
             searchable("wrong-type", 10)
                 .with_category(Category::Health)
                 .with_subcategory(Subcategory::Banking)
-                .with_purpose(Purpose::Invoice)
-                .with_type(DocumentType::Statement)
-                .with_subjects(vec!["bob".to_string()]),
-        )
-        .await;
-        save(
-            &storage,
-            searchable("wrong-subjects", 10)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
-                .with_purpose(Purpose::Invoice)
-                .with_type(DocumentType::Receipt)
-                .with_subjects(vec!["carol".to_string()]),
+                .with_type(DocumentType::Statement),
         )
         .await;
         save(
@@ -1135,9 +1015,7 @@ mod tests {
                 .with_content_type("text/plain")
                 .with_category(Category::Health)
                 .with_subcategory(Subcategory::Banking)
-                .with_purpose(Purpose::Invoice)
-                .with_type(DocumentType::Receipt)
-                .with_subjects(vec!["bob".to_string()]),
+                .with_type(DocumentType::Receipt),
         )
         .await;
         save(
@@ -1145,9 +1023,7 @@ mod tests {
             searchable("too-old", 1)
                 .with_category(Category::Health)
                 .with_subcategory(Subcategory::Banking)
-                .with_purpose(Purpose::Invoice)
-                .with_type(DocumentType::Receipt)
-                .with_subjects(vec!["bob".to_string()]),
+                .with_type(DocumentType::Receipt),
         )
         .await;
         save(
@@ -1155,9 +1031,7 @@ mod tests {
             searchable("too-new", 100)
                 .with_category(Category::Health)
                 .with_subcategory(Subcategory::Banking)
-                .with_purpose(Purpose::Invoice)
-                .with_type(DocumentType::Receipt)
-                .with_subjects(vec!["bob".to_string()]),
+                .with_type(DocumentType::Receipt),
         )
         .await;
 
@@ -1167,9 +1041,7 @@ mod tests {
             &SearchFilters {
                 categories: vec![Category::Health],
                 subcategories: vec![Subcategory::Banking],
-                purposes: vec![Purpose::Invoice],
                 types: vec![DocumentType::Receipt],
-                subjects: vec!["bob".to_string(), "dave".to_string()],
                 content_types: vec!["application/pdf".to_string()],
                 created_from: Some(10),
                 created_until: Some(10),
@@ -1352,7 +1224,6 @@ mod tests {
             searchable("a", 1)
                 .with_category(Category::Housing)
                 .with_subcategory(Subcategory::Banking)
-                .with_purpose(Purpose::Invoice)
                 .with_type(DocumentType::Invoice),
         )
         .await;
@@ -1360,7 +1231,6 @@ mod tests {
             &storage,
             searchable("b", 2)
                 .with_category(Category::Money)
-                .with_purpose(Purpose::Invoice)
                 .with_content_type("image/png"),
         )
         .await;
@@ -1375,10 +1245,6 @@ mod tests {
         assert_eq!(
             facet(&storage, &[], &filters, FacetField::Subcategory).await,
             counts(&[("banking", 1)])
-        );
-        assert_eq!(
-            facet(&storage, &[], &filters, FacetField::Purpose).await,
-            counts(&[("invoice", 2)])
         );
         assert_eq!(
             facet(&storage, &[], &filters, FacetField::Type).await,
@@ -1397,21 +1263,21 @@ mod tests {
             &storage,
             searchable("facture edf", 1)
                 .with_category(Category::Housing)
-                .with_purpose(Purpose::Invoice),
+                .with_type(DocumentType::Invoice),
         )
         .await;
         save(
             &storage,
             searchable("facture orange", 2)
                 .with_category(Category::Telecom)
-                .with_purpose(Purpose::Contract),
+                .with_type(DocumentType::Contract),
         )
         .await;
         save(
             &storage,
             searchable("releve", 3)
                 .with_category(Category::Money)
-                .with_purpose(Purpose::Invoice),
+                .with_type(DocumentType::Invoice),
         )
         .await;
 
@@ -1420,43 +1286,13 @@ mod tests {
                 &storage,
                 &["facture"],
                 &SearchFilters {
-                    purposes: vec![Purpose::Invoice],
+                    types: vec![DocumentType::Invoice],
                     ..Default::default()
                 },
                 FacetField::Category,
             )
             .await,
             counts(&[("housing", 1)])
-        );
-    }
-
-    #[tokio::test]
-    async fn count_documents_by_subject_counts_each_document_once_per_subject() {
-        let storage = setup().await;
-        save(
-            &storage,
-            searchable("a", 1).with_subjects(vec![
-                "rent".to_string(),
-                "rent".to_string(),
-                "paris".to_string(),
-            ]),
-        )
-        .await;
-        save(
-            &storage,
-            searchable("b", 2).with_subjects(vec!["rent".to_string(), String::new()]),
-        )
-        .await;
-
-        assert_eq!(
-            facet(
-                &storage,
-                &[],
-                &SearchFilters::default(),
-                FacetField::Subject
-            )
-            .await,
-            counts(&[("rent", 2), ("paris", 1)])
         );
     }
 

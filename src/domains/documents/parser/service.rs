@@ -55,8 +55,6 @@ impl Service for ParserClient {
             r#type: None,
             category: None,
             subcategory: None,
-            subjects: Vec::new(),
-            purpose: None,
             attributes: BTreeMap::new(),
         };
 
@@ -93,7 +91,6 @@ fn run_scripts_blocking(scripts: &[Script], document: &Document) -> Result<Metad
         let source_metadata = vm::expose_document(&lua, &working_document)?;
         vm::expose_pdf_conversions(&lua, document.content())?;
         vm::expose_set_category(&lua, source_metadata.clone())?;
-        vm::expose_set_purpose(&lua, source_metadata.clone())?;
         crate::tools::sandbox::load_source(&lua, script.script())
             .exec()
             .with_context(|| {
@@ -240,9 +237,7 @@ mod tests {
                 .with_script(r#"document.metadata.name = "first.pdf""#)
                 .build(),
             FakeScript::new()
-                .with_script(
-                    r#"document.metadata.subjects = { document.metadata.name .. "-subject" }"#,
-                )
+                .with_script(r#"document.metadata.name = document.metadata.name .. "-second""#)
                 .build(),
         ];
         let mut mock_scripts = MockScriptsService::new();
@@ -256,7 +251,6 @@ mod tests {
 
         let metadata = client.run_scripts(&document).await.unwrap();
 
-        assert_eq!(metadata.name, "first.pdf");
-        assert_eq!(metadata.subjects, vec!["first.pdf-subject".to_string()]);
+        assert_eq!(metadata.name, "first.pdf-second");
     }
 }

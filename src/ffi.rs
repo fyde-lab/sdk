@@ -13,7 +13,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::domains::documents::{
-    Attribute, Category, DocumentType, EventType, FacetCount, Metadata, Purpose, SearchFacets,
+    Attribute, Category, DocumentType, EventType, FacetCount, Metadata, SearchFacets,
     SearchFilters, SearchOrder, SearchQuery, Subcategory, UploadRequest,
 };
 use crate::domains::scripts::{
@@ -239,47 +239,6 @@ impl From<FfiSubcategory> for Subcategory {
     }
 }
 
-/// The reason a document was produced, mirroring [`Purpose`] across the FFI
-/// boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum FfiPurpose {
-    Attestation,
-    Contract,
-    Invoice,
-    Report,
-    Description,
-    Evaluation,
-    Employment,
-}
-
-impl From<Purpose> for FfiPurpose {
-    fn from(purpose: Purpose) -> Self {
-        match purpose {
-            Purpose::Attestation => Self::Attestation,
-            Purpose::Contract => Self::Contract,
-            Purpose::Invoice => Self::Invoice,
-            Purpose::Report => Self::Report,
-            Purpose::Description => Self::Description,
-            Purpose::Evaluation => Self::Evaluation,
-            Purpose::Employment => Self::Employment,
-        }
-    }
-}
-
-impl From<FfiPurpose> for Purpose {
-    fn from(purpose: FfiPurpose) -> Self {
-        match purpose {
-            FfiPurpose::Attestation => Self::Attestation,
-            FfiPurpose::Contract => Self::Contract,
-            FfiPurpose::Invoice => Self::Invoice,
-            FfiPurpose::Report => Self::Report,
-            FfiPurpose::Description => Self::Description,
-            FfiPurpose::Evaluation => Self::Evaluation,
-            FfiPurpose::Employment => Self::Employment,
-        }
-    }
-}
-
 /// What kind of paper a document is, mirroring [`DocumentType`] across the
 /// FFI boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -372,8 +331,6 @@ pub struct FfiMetadata {
     pub r#type: Option<FfiDocumentType>,
     pub category: Option<FfiCategory>,
     pub subcategory: Option<FfiSubcategory>,
-    pub subjects: Vec<String>,
-    pub purpose: Option<FfiPurpose>,
     pub attributes: HashMap<String, FfiAttribute>,
 }
 
@@ -423,8 +380,6 @@ impl From<Metadata> for FfiMetadata {
             r#type: metadata.r#type().map(FfiDocumentType::from),
             category: metadata.category().map(FfiCategory::from),
             subcategory: metadata.subcategory().map(FfiSubcategory::from),
-            subjects: metadata.subjects().to_vec(),
-            purpose: metadata.purpose().map(FfiPurpose::from),
             attributes: metadata
                 .attributes()
                 .iter()
@@ -450,8 +405,6 @@ impl TryFrom<FfiMetadata> for Metadata {
             r#type: metadata.r#type.map(DocumentType::from),
             category: metadata.category.map(Category::from),
             subcategory: metadata.subcategory.map(Subcategory::from),
-            subjects: metadata.subjects,
-            purpose: metadata.purpose.map(Purpose::from),
             attributes: metadata
                 .attributes
                 .into_iter()
@@ -487,9 +440,7 @@ impl From<Document> for FfiDocument {
 pub struct FfiSearchFilters {
     pub categories: Vec<FfiCategory>,
     pub subcategories: Vec<FfiSubcategory>,
-    pub purposes: Vec<FfiPurpose>,
     pub types: Vec<FfiDocumentType>,
-    pub subjects: Vec<String>,
     pub content_types: Vec<String>,
     pub created_from: Option<i64>,
     pub created_until: Option<i64>,
@@ -504,9 +455,7 @@ impl From<FfiSearchFilters> for SearchFilters {
                 .into_iter()
                 .map(Subcategory::from)
                 .collect(),
-            purposes: filters.purposes.into_iter().map(Purpose::from).collect(),
             types: filters.types.into_iter().map(DocumentType::from).collect(),
-            subjects: filters.subjects,
             content_types: filters.content_types,
             created_from: filters.created_from,
             created_until: filters.created_until,
@@ -548,13 +497,6 @@ pub struct FfiSubcategoryCount {
     pub count: u64,
 }
 
-/// How many documents carry one purpose, mirroring `FacetCount<Purpose>`.
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct FfiPurposeCount {
-    pub value: FfiPurpose,
-    pub count: u64,
-}
-
 /// How many documents carry one type, mirroring `FacetCount<DocumentType>`.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiDocumentTypeCount {
@@ -562,8 +504,8 @@ pub struct FfiDocumentTypeCount {
     pub count: u64,
 }
 
-/// How many documents carry one free-form value (a content type or
-/// subject), mirroring `FacetCount<String>`.
+/// How many documents carry one free-form value (a content type),
+/// mirroring `FacetCount<String>`.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiStringCount {
     pub value: String,
@@ -576,10 +518,8 @@ pub struct FfiStringCount {
 pub struct FfiSearchFacets {
     pub categories: Vec<FfiCategoryCount>,
     pub subcategories: Vec<FfiSubcategoryCount>,
-    pub purposes: Vec<FfiPurposeCount>,
     pub types: Vec<FfiDocumentTypeCount>,
     pub content_types: Vec<FfiStringCount>,
-    pub subjects: Vec<FfiStringCount>,
     pub earliest_created_at: Option<i64>,
     pub latest_created_at: Option<i64>,
 }
@@ -613,14 +553,6 @@ impl From<SearchFacets> for FfiSearchFacets {
                     count: facet.count,
                 })
                 .collect(),
-            purposes: facets
-                .purposes
-                .into_iter()
-                .map(|facet| FfiPurposeCount {
-                    value: facet.value.into(),
-                    count: facet.count,
-                })
-                .collect(),
             types: facets
                 .types
                 .into_iter()
@@ -630,7 +562,6 @@ impl From<SearchFacets> for FfiSearchFacets {
                 })
                 .collect(),
             content_types: strings(facets.content_types),
-            subjects: strings(facets.subjects),
             earliest_created_at: facets.earliest_created_at,
             latest_created_at: facets.latest_created_at,
         }
@@ -1583,8 +1514,6 @@ mod tests {
             ffi.subcategory,
             metadata.subcategory().map(FfiSubcategory::from)
         );
-        assert_eq!(ffi.subjects, metadata.subjects());
-        assert_eq!(ffi.purpose, metadata.purpose().map(FfiPurpose::from));
     }
 
     #[test]

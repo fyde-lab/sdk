@@ -173,10 +173,6 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "The document's subcategory is not recognized.",
             "La sous-catégorie du document n'est pas reconnue.",
         ),
-        ErrorCode::InvalidPurpose => (
-            "The document's purpose is not recognized.",
-            "L'usage du document n'est pas reconnu.",
-        ),
         ErrorCode::InvalidDocumentType => (
             "The document's type is not recognized.",
             "Le type du document n'est pas reconnu.",
@@ -184,10 +180,6 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
         ErrorCode::MismatchedSubcategory => (
             "The document's subcategory doesn't belong to its category.",
             "La sous-catégorie du document n'appartient pas à sa catégorie.",
-        ),
-        ErrorCode::InvalidSubject => (
-            "One of the document's subjects is not recognized.",
-            "L'un des sujets du document n'est pas reconnu.",
         ),
         ErrorCode::InvalidAttribute => (
             "One of the document's attributes is not valid.",

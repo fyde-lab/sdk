@@ -108,8 +108,7 @@ macro_rules! for_each_error_code {
             InvalidCategory = 4005,
             /// A document's subcategory is unknown.
             InvalidSubcategory = 4006,
-            /// A document's purpose is unknown.
-            InvalidPurpose = 4007,
+            // 4007 (InvalidPurpose) is retired: never reuse it.
             /// A document search's parameters were invalid.
             InvalidSearchQuery = 4008,
             /// A document with the same content is already saved locally.
@@ -118,8 +117,7 @@ macro_rules! for_each_error_code {
             InvalidDocumentType = 4010,
             /// A document's subcategory doesn't belong to its category.
             MismatchedSubcategory = 4011,
-            /// A document's subject isn't a known `kind:value` tag.
-            InvalidSubject = 4012,
+            // 4012 (InvalidSubject) is retired: never reuse it.
             /// A document's attribute has an unknown type, or a value that
             /// doesn't match its type.
             InvalidAttribute = 4013,
@@ -238,14 +236,10 @@ pub(crate) enum ErrorKind {
     InvalidCategory(String),
     #[error("invalid subcategory: {0:?}")]
     InvalidSubcategory(String),
-    #[error("invalid purpose: {0:?}")]
-    InvalidPurpose(String),
     #[error("invalid document type: {0:?}")]
     InvalidDocumentType(String),
     #[error("mismatched subcategory: {0}")]
     MismatchedSubcategory(String),
-    #[error("invalid subject: {0:?}")]
-    InvalidSubject(String),
     #[error("invalid document attribute: {0}")]
     InvalidAttribute(String),
     #[error("invalid search query: {0}")]
@@ -303,10 +297,8 @@ impl ErrorKind {
             ErrorKind::InvalidChangelogEvent(_) => ErrorCode::InvalidChangelogEvent,
             ErrorKind::InvalidCategory(_) => ErrorCode::InvalidCategory,
             ErrorKind::InvalidSubcategory(_) => ErrorCode::InvalidSubcategory,
-            ErrorKind::InvalidPurpose(_) => ErrorCode::InvalidPurpose,
             ErrorKind::InvalidDocumentType(_) => ErrorCode::InvalidDocumentType,
             ErrorKind::MismatchedSubcategory(_) => ErrorCode::MismatchedSubcategory,
-            ErrorKind::InvalidSubject(_) => ErrorCode::InvalidSubject,
             ErrorKind::InvalidAttribute(_) => ErrorCode::InvalidAttribute,
             ErrorKind::InvalidSearchQuery(_) => ErrorCode::InvalidSearchQuery,
             ErrorKind::InvalidScriptType(_) => ErrorCode::InvalidScriptType,

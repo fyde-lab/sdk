@@ -43,8 +43,7 @@ pub trait Service: Send + Sync {
     /// transcript, then runs every script currently enabled for the
     /// authenticated user against it (see [`Self::run_scripts`]) to fill in
     /// its classification fields (`type`, `category`,
-    /// `subcategory`, `subjects`, `purpose`) — left
-    /// empty otherwise, since scripts never persist anything themselves.
+    /// `subcategory`) — left empty otherwise, since scripts never persist anything themselves.
     async fn parse_content(&self, content: &[u8], original_name: &str) -> Result<Metadata>;
 
     /// Fetches the scripts currently enabled for the authenticated user and

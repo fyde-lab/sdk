@@ -9,8 +9,8 @@ mod storage_sqlite;
 pub(crate) use crate::domains::changelog::FakeChangelogEvent;
 pub use crate::domains::changelog::{ChangelogEvent, EventType};
 pub use models::{
-    Attribute, Category, Document, DocumentType, FacetCount, Metadata, Purpose, SearchFacets,
-    SearchFilters, SearchOrder, SearchQuery, Subcategory, SubjectKind, UploadRequest, UploadSource,
+    Attribute, Category, Document, DocumentType, FacetCount, Metadata, SearchFacets, SearchFilters,
+    SearchOrder, SearchQuery, Subcategory, UploadRequest, UploadSource,
 };
 #[cfg(test)]
 pub(crate) use models::{FakeDocument, FakeMetadata, FakeSearchFacets};
@@ -42,14 +42,12 @@ pub trait Service: Send + Sync {
     /// disk or already-in-memory bytes), encrypts it and its metadata, then
     /// publishes it as a "created" changelog event, returning its
     /// generated id. Metadata fields set on `request` (`name`, `type`,
-    /// `category`, `subcategory`, `subjects`, `purpose`)
+    /// `category`, `subcategory`)
     /// override whatever would otherwise be derived from the document
     /// itself and any scripts run against it; `request.attributes` are
     /// merged over the scripts' attributes, replacing those of the same
     /// name. An attribute with a blank name or a non-finite float value is
-    /// rejected with [`crate::ErrorCode::InvalidAttribute`]. A document left without a
-    /// purpose gets the one its type implies (an invoice is for `invoice`,
-    /// a payslip for `employment`...).
+    /// rejected with [`crate::ErrorCode::InvalidAttribute`].
     ///
     /// The file type is determined from the source's name's extension;
     /// only `.pdf` is currently accepted, anything else is rejected with

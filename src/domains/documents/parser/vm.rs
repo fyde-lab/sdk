@@ -8,7 +8,7 @@ use pdf_oxide::converters::ConversionOptions;
 use uuid::Uuid;
 
 use crate::domains::documents::{
-    Attribute, Category, Document, DocumentType, Metadata, Purpose, Subcategory,
+    Attribute, Category, Document, DocumentType, Metadata, Subcategory,
 };
 use crate::{ErrorContext as _, ErrorKind, Result};
 
@@ -175,38 +175,6 @@ pub(super) fn expose_set_category(lua: &Lua, metadata: Rc<RefCell<Metadata>>) ->
     Ok(())
 }
 
-/// Exposes `set_purpose(purpose)` as a global function in `lua`, letting a
-/// script set `document.metadata.purpose` with immediate validation: an
-/// unknown purpose name raises a Lua error right away, rather than leaving
-/// an invalid value sitting in `document.metadata` to only be caught later
-/// by [`read_metadata`], after the script has already finished running.
-///
-/// `metadata` is the same handle [`expose_document`] returned for this
-/// document: a call writes the parsed purpose into it directly, alongside
-/// the `document.metadata` table, so the original [`Metadata`] is updated
-/// immediately rather than only once [`read_metadata`] re-parses the table
-/// at the end of the script.
-pub(super) fn expose_set_purpose(lua: &Lua, metadata: Rc<RefCell<Metadata>>) -> Result<()> {
-    let set_purpose = lua
-        .create_function(move |lua, purpose: String| {
-            let purpose = purpose.parse::<Purpose>().map_err(mlua::Error::external)?;
-
-            metadata.borrow_mut().purpose = Some(purpose);
-
-            let document_table: mlua::Table = lua.globals().get("document")?;
-            let metadata_table: mlua::Table = document_table.get("metadata")?;
-            metadata_table.set("purpose", purpose.as_str())?;
-
-            Ok(())
-        })
-        .context("failed to create the set_purpose lua function")?;
-    lua.globals()
-        .set("set_purpose", set_purpose)
-        .context("failed to expose set_purpose to the sandboxed lua vm")?;
-
-    Ok(())
-}
-
 fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
     let metadata_table = lua
         .create_table()
@@ -253,15 +221,6 @@ fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
             metadata.subcategory().map(|category| category.as_str()),
         )
         .context("failed to set document.metadata.subcategory")?;
-    metadata_table
-        .set("subjects", metadata.subjects().to_vec())
-        .context("failed to set document.metadata.subjects")?;
-    metadata_table
-        .set(
-            "purpose",
-            metadata.purpose().map_or("", |purpose| purpose.as_str()),
-        )
-        .context("failed to set document.metadata.purpose")?;
     metadata_table
         .set(
             "attributes",
@@ -361,10 +320,9 @@ pub(crate) fn attributes_from_table(
 /// `content_type`, `size`, `checksum`, and `transcript` — those describe the
 /// underlying file rather than user-editable metadata, so a script can't
 /// change them: they're always taken from `original` regardless of what a
-/// script assigned into the table. `category`/`subcategory`
-/// and `purpose` are likewise taken from `source` (the
-/// [`expose_document`]-returned handle [`expose_set_category`]/
-/// [`expose_set_purpose`] write into) rather than re-parsed out of the
+/// script assigned into the table. `category`/`subcategory` are likewise
+/// taken from `source` (the [`expose_document`]-returned handle
+/// [`expose_set_category`] writes into) rather than re-parsed out of the
 /// table, since that handle is already validated and is the only way those
 /// fields can change. Called once a script has finished running, so the
 /// caller can compare the result against `original` to see which fields, if
@@ -412,10 +370,6 @@ pub(super) fn read_metadata(lua: &Lua, original: &Metadata, source: &Metadata) -
         r#type,
         category: source.category(),
         subcategory: source.subcategory(),
-        subjects: metadata_table
-            .get("subjects")
-            .context("failed to read document.metadata.subjects back")?,
-        purpose: source.purpose(),
         attributes: attributes_from_table(
             metadata_table
                 .get("attributes")
@@ -744,35 +698,6 @@ mod tests {
         expose_set_category(&lua, source_metadata).unwrap();
 
         let result = lua.load(r#"set_category("money", "energy")"#).exec();
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn set_purpose_sets_the_purpose() {
-        let lua = sandboxed(0).unwrap();
-        let document = FakeDocument::new().build();
-
-        let source_metadata = expose_document(&lua, &document).unwrap();
-        expose_set_purpose(&lua, source_metadata.clone()).unwrap();
-        lua.load(r#"set_purpose("invoice")"#).exec().unwrap();
-
-        assert_eq!(source_metadata.borrow().purpose, Some(Purpose::Invoice));
-
-        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
-
-        assert_eq!(metadata.purpose, Some(Purpose::Invoice));
-    }
-
-    #[test]
-    fn set_purpose_errors_on_an_unknown_purpose() {
-        let lua = sandboxed(0).unwrap();
-        let document = FakeDocument::new().build();
-
-        let source_metadata = expose_document(&lua, &document).unwrap();
-        expose_set_purpose(&lua, source_metadata).unwrap();
-
-        let result = lua.load(r#"set_purpose("not-a-purpose")"#).exec();
 
         assert!(result.is_err());
     }
