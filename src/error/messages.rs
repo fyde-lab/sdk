@@ -185,6 +185,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "The document's subcategory doesn't belong to its category.",
             "La sous-catégorie du document n'appartient pas à sa catégorie.",
         ),
+        ErrorCode::InvalidSubject => (
+            "One of the document's subjects is not recognized.",
+            "L'un des sujets du document n'est pas reconnu.",
+        ),
         ErrorCode::InvalidSearchQuery => (
             "This search isn't valid.",
             "Cette recherche n'est pas valide.",

@@ -377,6 +377,70 @@ impl FromStr for DocumentType {
     }
 }
 
+/// What a [`Metadata::subjects`] entry points at, written as its prefix
+/// (`person:lea-dupont`, `line:0612••••78`...). A subject only tells apart
+/// documents of one account that concern different people or things (each
+/// beneficiary of a health insurance, each phone line of a telecom
+/// account...), so there's no kind for the account holder themself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectKind {
+    /// A beneficiary, patient, employee or child the document is about.
+    Person,
+    /// A phone or internet line.
+    Line,
+    /// A bank, savings or betting account.
+    Account,
+    /// An insurance policy or utility contract.
+    Contract,
+    /// The address or property a housing document is about.
+    Place,
+    /// A licence plate or toll badge.
+    Vehicle,
+    /// A trip's origin and destination.
+    Trip,
+}
+
+impl SubjectKind {
+    pub(crate) const ALL: &'static [SubjectKind] = &[
+        Self::Person,
+        Self::Line,
+        Self::Account,
+        Self::Contract,
+        Self::Place,
+        Self::Vehicle,
+        Self::Trip,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Line => "line",
+            Self::Account => "account",
+            Self::Contract => "contract",
+            Self::Place => "place",
+            Self::Vehicle => "vehicle",
+            Self::Trip => "trip",
+        }
+    }
+
+    /// Splits `subject` into its kind and value, or `None` unless it's a
+    /// known kind followed by `:` and a non-blank value.
+    pub fn parse_subject(subject: &str) -> Option<(Self, &str)> {
+        let (kind, value) = subject.split_once(':')?;
+        let kind = Self::ALL
+            .iter()
+            .copied()
+            .find(|known| known.as_str() == kind)?;
+        (!value.trim().is_empty()).then_some((kind, value))
+    }
+}
+
+impl fmt::Display for SubjectKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Cleartext metadata encrypted under a document's DEK before upload, and
 /// decrypted back out of it on download.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +464,8 @@ pub struct Metadata {
     /// category yet.
     pub category: Option<Category>,
     pub subcategory: Option<Subcategory>,
+    /// Who or what the document concerns, each a `kind:value` tag (see
+    /// [`SubjectKind`]).
     pub subjects: Vec<String>,
     /// `None` until a classification script sets it — scripts never
     /// persist anything themselves, so a freshly parsed document has no
@@ -695,8 +761,8 @@ impl FakeMetadata {
                 category: Some(subcategory.category()),
                 subcategory: Some(subcategory),
                 subjects: vec![
-                    crate::tools::testing::random_word().to_string(),
-                    crate::tools::testing::random_word().to_string(),
+                    format!("person:{}", crate::tools::testing::random_word()),
+                    format!("place:{}", crate::tools::testing::random_word()),
                 ],
                 purpose: Some(
                     Purpose::ALL
@@ -990,6 +1056,21 @@ mod tests {
                 *category != Category::Donations,
                 "{category}"
             );
+        }
+    }
+
+    #[test]
+    fn parse_subject_splits_a_known_kind_from_its_value() {
+        assert_eq!(
+            SubjectKind::parse_subject("person:lea-dupont"),
+            Some((SubjectKind::Person, "lea-dupont"))
+        );
+        assert_eq!(
+            SubjectKind::parse_subject("trip:paris:lyon"),
+            Some((SubjectKind::Trip, "paris:lyon"))
+        );
+        for invalid in ["lea-dupont", "pet:rex", "person:", "person: ", ":x", ""] {
+            assert_eq!(SubjectKind::parse_subject(invalid), None, "{invalid:?}");
         }
     }
 

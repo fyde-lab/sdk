@@ -190,7 +190,7 @@ mod tests {
                     && request.r#type == Some(crate::domains::documents::DocumentType::Payslip)
                     && request.category == Some(crate::domains::documents::Category::Work)
                     && request.subcategory == Some(crate::domains::documents::Subcategory::Payslips)
-                    && request.subjects.as_deref() == Some(["Alice".to_string()].as_slice())
+                    && request.subjects.as_deref() == Some(["person:alice".to_string()].as_slice())
                     && request.purpose == Some(crate::domains::documents::Purpose::Employment)
             })
             .times(1)
@@ -213,7 +213,7 @@ mod tests {
                 type = "payslip",
                 category = "work",
                 subcategory = "payslips",
-                subjects = {"Alice"},
+                subjects = {"person:alice"},
                 purpose = "employment",
             })"#,
         )
