@@ -24,7 +24,7 @@ use crate::domains::sessions::Service as SessionsService;
 use crate::domains::users::system_language;
 use crate::{
     ChangelogEvent, Client, ClientConfig, Document, Error, ErrorCode, ErrorContext as _, ErrorKind,
-    LogLevel, LoginOutcome, OpenSession, ProgressEvent, Storage,
+    LogLevel, LoginOutcome, OpenSession, ProgressEvent, Storage, Usage,
 };
 
 macro_rules! define_ffi_error {
@@ -517,6 +517,33 @@ impl From<FfiSearchOrder> for SearchOrder {
             FfiSearchOrder::Relevance => Self::Relevance,
             FfiSearchOrder::Newest => Self::Newest,
             FfiSearchOrder::Oldest => Self::Oldest,
+        }
+    }
+}
+
+/// The signed-in account's plan and current usage, mirroring [`Usage`]
+/// across the FFI boundary.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiUsage {
+    pub plan_id: String,
+    pub max_scripts: u32,
+    pub max_sessions: u32,
+    pub max_size: u64,
+    pub enabled_scripts: u32,
+    pub open_sessions: u32,
+    pub total_size: u64,
+}
+
+impl From<Usage> for FfiUsage {
+    fn from(usage: Usage) -> Self {
+        Self {
+            plan_id: usage.plan_id().to_string(),
+            max_scripts: usage.max_scripts(),
+            max_sessions: usage.max_sessions(),
+            max_size: usage.max_size(),
+            enabled_scripts: usage.enabled_scripts(),
+            open_sessions: usage.open_sessions(),
+            total_size: usage.total_size(),
         }
     }
 }
@@ -1150,6 +1177,13 @@ impl FydeClient {
     /// hasn't been called since. Mirrors `sessions::Service::is_connected`.
     pub async fn is_connected(&self) -> Result<bool, FfiError> {
         self.localized(self.inner.sessions().is_connected()).await
+    }
+
+    /// Fetches the signed-in account's plan, limits and current usage.
+    /// Mirrors [`crate::UsageService::get_usage`].
+    pub async fn get_usage(&self) -> Result<FfiUsage, FfiError> {
+        self.localized(async { Ok(FfiUsage::from(self.inner.usage().get_usage().await?)) })
+            .await
     }
 
     /// Returns whether the fyde server currently responds as reachable.

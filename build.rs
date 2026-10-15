@@ -24,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::compile_protos(proto_dir.join("changelog/v1/changelog.proto"))?;
     tonic_prost_build::compile_protos(proto_dir.join("users/v1/users.proto"))?;
     tonic_prost_build::compile_protos(proto_dir.join("scripts/v1/scripts.proto"))?;
+    tonic_prost_build::compile_protos(proto_dir.join("usage/v1/usage.proto"))?;
 
     Ok(())
 }

@@ -25,6 +25,7 @@ pub use domains::scripts::{
 };
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
+pub use domains::usage::{Service as UsageService, Usage};
 pub use domains::users::{LoginOutcome, OpenSession, Service as UsersService};
 pub use tools::log::LogLevel;
 
@@ -90,6 +91,7 @@ pub struct Client {
     server_state: Arc<dyn ServerStateService>,
     sessions: Arc<SessionsClient>,
     settings: Arc<dyn SettingsService>,
+    usage: Arc<dyn UsageService>,
     users: Arc<dyn UsersService>,
 }
 
@@ -124,6 +126,7 @@ impl Client {
             sqlite.pool().clone(),
             changelog.clone(),
         );
+        let usage = domains::usage::init(channel.clone(), sessions.clone());
         let documents = domains::documents::init(
             sqlite.pool().clone(),
             changelog,
@@ -165,6 +168,7 @@ impl Client {
             server_state,
             sessions,
             settings,
+            usage,
             users,
         })
     }
@@ -192,6 +196,11 @@ impl Client {
     /// Returns a reference to the client's scripts service.
     pub fn scripts(&self) -> &dyn ScriptsService {
         self.scripts.as_ref()
+    }
+
+    /// Returns a reference to the client's usage service.
+    pub fn usage(&self) -> &dyn UsageService {
+        self.usage.as_ref()
     }
 
     /// Returns a reference to the client's scrapers service.

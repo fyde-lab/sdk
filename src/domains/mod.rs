@@ -6,4 +6,5 @@ pub(crate) mod secrets;
 pub(crate) mod server_state;
 pub(crate) mod sessions;
 pub(crate) mod settings;
+pub(crate) mod usage;
 pub(crate) mod users;
