@@ -338,10 +338,32 @@ pub struct FfiMetadata {
 /// across the FFI boundary.
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum FfiAttribute {
-    String { value: String },
-    Integer { value: i64 },
-    Float { value: f64 },
-    Boolean { value: bool },
+    String {
+        value: String,
+    },
+    Integer {
+        value: i64,
+    },
+    Float {
+        value: f64,
+    },
+    Boolean {
+        value: bool,
+    },
+    /// An ISO 8601 `YYYY-MM-DD` calendar date.
+    Date {
+        value: String,
+    },
+    /// `minor_units` of `currency`'s ISO 4217 minor unit (cents for `"EUR"`).
+    Amount {
+        minor_units: i64,
+        currency: String,
+    },
+    /// `selected`, always one of `options`.
+    Select {
+        selected: String,
+        options: Vec<String>,
+    },
 }
 
 impl From<Attribute> for FfiAttribute {
@@ -351,6 +373,15 @@ impl From<Attribute> for FfiAttribute {
             Attribute::Integer(value) => Self::Integer { value },
             Attribute::Float(value) => Self::Float { value },
             Attribute::Boolean(value) => Self::Boolean { value },
+            Attribute::Date(value) => Self::Date { value },
+            Attribute::Amount {
+                minor_units,
+                currency,
+            } => Self::Amount {
+                minor_units,
+                currency,
+            },
+            Attribute::Select { selected, options } => Self::Select { selected, options },
         }
     }
 }
@@ -362,6 +393,15 @@ impl From<FfiAttribute> for Attribute {
             FfiAttribute::Integer { value } => Self::Integer(value),
             FfiAttribute::Float { value } => Self::Float(value),
             FfiAttribute::Boolean { value } => Self::Boolean(value),
+            FfiAttribute::Date { value } => Self::Date(value),
+            FfiAttribute::Amount {
+                minor_units,
+                currency,
+            } => Self::Amount {
+                minor_units,
+                currency,
+            },
+            FfiAttribute::Select { selected, options } => Self::Select { selected, options },
         }
     }
 }

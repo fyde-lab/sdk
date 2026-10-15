@@ -235,6 +235,9 @@ fn metadata_to_table(lua: &Lua, metadata: &Metadata) -> Result<mlua::Table> {
 /// entries keyed by name — the same shape [`Attribute`] serializes to — so
 /// a script adds one with e.g.
 /// `document.metadata.attributes.price = { type = "float", value = 32.3 }`.
+/// A date's value is its `"YYYY-MM-DD"` string, an amount's a
+/// `{ minor_units = 215050, currency = "EUR" }` table, and a select's a
+/// `{ selected = "paid", options = { "paid", "unpaid" } }` table.
 fn attributes_to_table(lua: &Lua, attributes: &BTreeMap<String, Attribute>) -> Result<mlua::Table> {
     let attributes_table = lua
         .create_table()
@@ -247,10 +250,36 @@ fn attributes_to_table(lua: &Lua, attributes: &BTreeMap<String, Attribute>) -> R
             .set("type", attribute.type_name())
             .with_context(|| format!("failed to set the type of attribute {name:?}"))?;
         let value = match attribute {
-            Attribute::String(value) => attribute_table.set("value", value.as_str()),
+            Attribute::String(value) | Attribute::Date(value) => {
+                attribute_table.set("value", value.as_str())
+            }
             Attribute::Integer(value) => attribute_table.set("value", *value),
             Attribute::Float(value) => attribute_table.set("value", *value),
             Attribute::Boolean(value) => attribute_table.set("value", *value),
+            Attribute::Amount {
+                minor_units,
+                currency,
+            } => lua
+                .create_table_from([
+                    ("minor_units", mlua::Value::Integer(*minor_units)),
+                    (
+                        "currency",
+                        mlua::Value::String(lua.create_string(currency)?),
+                    ),
+                ])
+                .and_then(|value| attribute_table.set("value", value)),
+            Attribute::Select { selected, options } => lua
+                .create_sequence_from(options.iter().map(String::as_str))
+                .and_then(|options| {
+                    lua.create_table_from([
+                        (
+                            "selected",
+                            mlua::Value::String(lua.create_string(selected)?),
+                        ),
+                        ("options", mlua::Value::Table(options)),
+                    ])
+                })
+                .and_then(|value| attribute_table.set("value", value)),
         };
         value.with_context(|| format!("failed to set the value of attribute {name:?}"))?;
         attributes_table
@@ -285,17 +314,19 @@ pub(crate) fn attributes_from_table(
             .get("value")
             .with_context(|| format!("failed to read the value of attribute {name:?} back"))?;
         let attribute = match (r#type.as_str(), value) {
-            ("string", mlua::Value::String(value)) => Attribute::String(
-                value
-                    .to_str()
-                    .with_context(|| format!("attribute {name:?} has a non-UTF-8 value"))?
-                    .to_string(),
-            ),
+            ("string", mlua::Value::String(value)) => {
+                Attribute::String(lua_to_string(&value, &name, "value")?)
+            }
+            ("date", mlua::Value::String(value)) => {
+                Attribute::Date(lua_to_string(&value, &name, "value")?)
+            }
             ("integer", mlua::Value::Integer(value)) => Attribute::Integer(value),
             ("float", mlua::Value::Number(value)) => Attribute::Float(value),
             ("float", mlua::Value::Integer(value)) => Attribute::Float(value as f64),
             ("boolean", mlua::Value::Boolean(value)) => Attribute::Boolean(value),
-            ("string" | "integer" | "float" | "boolean", value) => {
+            ("amount", mlua::Value::Table(value)) => amount_from_table(&value, &name)?,
+            ("select", mlua::Value::Table(value)) => select_from_table(&value, &name)?,
+            ("string" | "date" | "integer" | "float" | "boolean" | "amount" | "select", value) => {
                 return Err(ErrorKind::InvalidAttribute(format!(
                     "attribute {name:?} has a {} value, not a valid {type}",
                     value.type_name()
@@ -313,6 +344,100 @@ pub(crate) fn attributes_from_table(
     }
 
     Ok(attributes)
+}
+
+/// Reads an amount attribute's `{ minor_units = ..., currency = ... }`
+/// value: `minor_units` must be a Lua integer (`math.tointeger` turns a
+/// computed float like `21.5 * 100` into one), never a fractional number.
+fn amount_from_table(value: &mlua::Table, name: &str) -> Result<Attribute> {
+    let minor_units = match value
+        .get::<mlua::Value>("minor_units")
+        .with_context(|| format!("failed to read the minor_units of attribute {name:?} back"))?
+    {
+        mlua::Value::Integer(minor_units) => minor_units,
+        other => {
+            return Err(ErrorKind::InvalidAttribute(format!(
+                "attribute {name:?} has a {} minor_units, not an integer",
+                other.type_name()
+            ))
+            .into());
+        }
+    };
+    let currency = match value
+        .get::<mlua::Value>("currency")
+        .with_context(|| format!("failed to read the currency of attribute {name:?} back"))?
+    {
+        mlua::Value::String(currency) => lua_to_string(&currency, name, "currency")?,
+        other => {
+            return Err(ErrorKind::InvalidAttribute(format!(
+                "attribute {name:?} has a {} currency, not a string",
+                other.type_name()
+            ))
+            .into());
+        }
+    };
+
+    Ok(Attribute::Amount {
+        minor_units,
+        currency,
+    })
+}
+
+/// Reads a select attribute's `{ selected = ..., options = { ... } }` value:
+/// `selected` must be a string, and `options` a sequence of strings.
+fn select_from_table(value: &mlua::Table, name: &str) -> Result<Attribute> {
+    let selected = match value
+        .get::<mlua::Value>("selected")
+        .with_context(|| format!("failed to read the selected value of attribute {name:?} back"))?
+    {
+        mlua::Value::String(selected) => lua_to_string(&selected, name, "selected value")?,
+        other => {
+            return Err(ErrorKind::InvalidAttribute(format!(
+                "attribute {name:?} has a {} selected value, not a string",
+                other.type_name()
+            ))
+            .into());
+        }
+    };
+    let options_table = match value
+        .get::<mlua::Value>("options")
+        .with_context(|| format!("failed to read the options of attribute {name:?} back"))?
+    {
+        mlua::Value::Table(options) => options,
+        other => {
+            return Err(ErrorKind::InvalidAttribute(format!(
+                "attribute {name:?} has {} options, not a list of strings",
+                other.type_name()
+            ))
+            .into());
+        }
+    };
+    let mut options = Vec::new();
+    for option in options_table.sequence_values::<mlua::Value>() {
+        match option
+            .with_context(|| format!("failed to read an option of attribute {name:?} back"))?
+        {
+            mlua::Value::String(option) => options.push(lua_to_string(&option, name, "option")?),
+            other => {
+                return Err(ErrorKind::InvalidAttribute(format!(
+                    "attribute {name:?} has a {} option, not a string",
+                    other.type_name()
+                ))
+                .into());
+            }
+        }
+    }
+
+    Ok(Attribute::Select { selected, options })
+}
+
+/// Converts `value`, the `what` of attribute `name`, to a Rust string,
+/// failing if it isn't valid UTF-8.
+fn lua_to_string(value: &mlua::LuaString, name: &str, what: &str) -> Result<String> {
+    Ok(value
+        .to_str()
+        .with_context(|| format!("attribute {name:?} has a non-UTF-8 {what}"))?
+        .to_string())
 }
 
 /// Reads `document.metadata` back out of `lua` into a [`Metadata`], mirroring
@@ -563,6 +688,126 @@ mod tests {
                 ),
             ])
         );
+    }
+
+    #[test]
+    fn date_amount_and_select_attributes_round_trip_through_lua() {
+        let lua = sandboxed(0).unwrap();
+        let attributes = BTreeMap::from([
+            (
+                "issued_on".to_string(),
+                Attribute::Date("2026-10-15".to_string()),
+            ),
+            (
+                "net_pay".to_string(),
+                Attribute::Amount {
+                    minor_units: 215050,
+                    currency: "EUR".to_string(),
+                },
+            ),
+            (
+                "status".to_string(),
+                Attribute::Select {
+                    selected: "paid".to_string(),
+                    options: vec!["paid".to_string(), "unpaid".to_string()],
+                },
+            ),
+        ]);
+        let metadata = crate::domains::documents::FakeMetadata::new()
+            .with_attributes(attributes.clone())
+            .build();
+        let document = FakeDocument::new().with_metadata(metadata).build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        let (currency, second_option): (String, String) = lua
+            .load(
+                "return document.metadata.attributes.net_pay.value.currency, document.metadata.attributes.status.value.options[2]",
+            )
+            .eval()
+            .unwrap();
+        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
+
+        assert_eq!(currency, "EUR");
+        assert_eq!(second_option, "unpaid");
+        assert_eq!(metadata.attributes, attributes);
+    }
+
+    #[test]
+    fn read_metadata_reflects_date_amount_and_select_attributes_a_script_assigned() {
+        let lua = sandboxed(0).unwrap();
+        let metadata = crate::domains::documents::FakeMetadata::new()
+            .with_attributes(BTreeMap::new())
+            .build();
+        let document = FakeDocument::new().with_metadata(metadata).build();
+
+        let source_metadata = expose_document(&lua, &document).unwrap();
+        lua.load(
+            r#"
+            document.metadata.attributes.due_on = { type = "date", value = "2026-11-01" }
+            document.metadata.attributes.total_amount = {
+                type = "amount",
+                value = { minor_units = math.floor(32.3 * 100 + 0.5), currency = "EUR" },
+            }
+            document.metadata.attributes.status = {
+                type = "select",
+                value = { selected = "unpaid", options = { "paid", "unpaid" } },
+            }
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        let metadata = read_metadata(&lua, document.metadata(), &source_metadata.borrow()).unwrap();
+
+        assert_eq!(
+            metadata.attributes,
+            BTreeMap::from([
+                (
+                    "due_on".to_string(),
+                    Attribute::Date("2026-11-01".to_string())
+                ),
+                (
+                    "status".to_string(),
+                    Attribute::Select {
+                        selected: "unpaid".to_string(),
+                        options: vec!["paid".to_string(), "unpaid".to_string()],
+                    }
+                ),
+                (
+                    "total_amount".to_string(),
+                    Attribute::Amount {
+                        minor_units: 3230,
+                        currency: "EUR".to_string(),
+                    }
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn read_metadata_errors_on_a_malformed_amount_or_select() {
+        for script in [
+            r#"document.metadata.attributes.price = { type = "amount", value = 32.3 }"#,
+            r#"document.metadata.attributes.price = { type = "amount", value = { minor_units = 32.3, currency = "EUR" } }"#,
+            r#"document.metadata.attributes.price = { type = "amount", value = { minor_units = 3230 } }"#,
+            r#"document.metadata.attributes.status = { type = "select", value = { selected = 1, options = { "1" } } }"#,
+            r#"document.metadata.attributes.status = { type = "select", value = { selected = "1", options = { 1 } } }"#,
+            r#"document.metadata.attributes.status = { type = "select", value = { selected = "1", options = "1" } }"#,
+            r#"document.metadata.attributes.on = { type = "date", value = 20261015 }"#,
+        ] {
+            let lua = sandboxed(0).unwrap();
+            let document = FakeDocument::new().build();
+            let source_metadata = expose_document(&lua, &document).unwrap();
+            lua.load(script).exec().unwrap();
+
+            let result = read_metadata(&lua, document.metadata(), &source_metadata.borrow());
+
+            assert_eq!(
+                result.unwrap_err().code(),
+                crate::ErrorCode::InvalidAttribute,
+                "{script}"
+            );
+        }
     }
 
     #[test]

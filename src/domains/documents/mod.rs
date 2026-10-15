@@ -9,8 +9,8 @@ mod storage_sqlite;
 pub(crate) use crate::domains::changelog::FakeChangelogEvent;
 pub use crate::domains::changelog::{ChangelogEvent, EventType};
 pub use models::{
-    Attribute, Category, Document, DocumentType, FacetCount, Metadata, SearchFacets, SearchFilters,
-    SearchOrder, SearchQuery, Subcategory, UploadRequest, UploadSource,
+    Attribute, AttributeType, Category, Document, DocumentType, FacetCount, Metadata, SearchFacets,
+    SearchFilters, SearchOrder, SearchQuery, Subcategory, UploadRequest, UploadSource,
 };
 #[cfg(test)]
 pub(crate) use models::{FakeDocument, FakeMetadata, FakeSearchFacets};
@@ -46,8 +46,8 @@ pub trait Service: Send + Sync {
     /// override whatever would otherwise be derived from the document
     /// itself and any scripts run against it; `request.attributes` are
     /// merged over the scripts' attributes, replacing those of the same
-    /// name. An attribute with a blank name or a non-finite float value is
-    /// rejected with [`crate::ErrorCode::InvalidAttribute`].
+    /// name. An attribute with a blank name, or a value that doesn't fit
+    /// its type, is rejected with [`crate::ErrorCode::InvalidAttribute`].
     ///
     /// The file type is determined from the source's name's extension;
     /// only `.pdf` is currently accepted, anything else is rejected with
