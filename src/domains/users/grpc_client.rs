@@ -12,7 +12,7 @@ use super::{OpenSession, Role};
 
 /// Generated protobuf/gRPC bindings for the `users` service, compiled by
 /// `build.rs` from `users/v1/users.proto` in the `buf.build/fyde-lab/api`
-/// BSR module (sourced from `../api-protos`).
+/// BSR module (sourced from `../server/protos`).
 mod proto {
     tonic::include_proto!("users.v1");
 }

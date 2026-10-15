@@ -3,7 +3,7 @@ use std::process::Command;
 
 const BUF_MODULE: &str = "buf.build/fyde-lab/api";
 
-/// Points the build at a local checkout of the protos (e.g. `../api-protos`)
+/// Points the build at a local checkout of the protos (e.g. `../server/protos`)
 /// instead of fetching [`BUF_MODULE`] from the BSR — for offline builds, and
 /// for CI or contributors without `buf` or network access to `buf.build`.
 const PROTO_DIR_ENV: &str = "FYDE_PROTO_DIR";

@@ -33,11 +33,11 @@ Requirements:
 The gRPC protos come from the Buf Schema Registry module `buf.build/fyde-lab/api`, so a build needs either:
 
 - `buf` on `PATH` with network access to `buf.build`, or
-- a local checkout of [`api-protos`](https://github.com/fyde-lab/api-protos), pointed to by `FYDE_PROTO_DIR`.
+- a local checkout of the protos (`protos/` in [`server`](https://github.com/fyde-lab/server)), pointed to by `FYDE_PROTO_DIR`.
 
 ```sh
 cargo build                                  # protos from the BSR
-FYDE_PROTO_DIR=../api-protos cargo build     # protos from a local checkout
+FYDE_PROTO_DIR=../server/protos cargo build  # protos from a local checkout
 ```
 
 ## Testing

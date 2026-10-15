@@ -17,7 +17,7 @@ pkgs.mkShell {
     rustToolchain
     sccache
 
-    # required by build.rs to compile ../api-protos/*.proto via tonic-prost-build
+    # required by build.rs to compile the BSR's (or ../server/protos') *.proto via tonic-prost-build
     protobuf
 
     # required to build wreq's vendored, patched BoringSSL (btls-sys), used by the

@@ -13,7 +13,7 @@ use crate::{ErrorContext as _, Result};
 /// Abstracted as a trait so callers can be tested against
 /// [`MockFydeClient`] instead of a live server. Generated bindings come
 /// from the `tonic-health` crate (the standard, cross-language health
-/// checking protocol), not from `build.rs`/`../api-protos`.
+/// checking protocol), not from `build.rs`/`../server/protos`.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(super) trait FydeClient: Send + Sync {

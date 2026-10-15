@@ -11,7 +11,7 @@ use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::{ErrorContext as _, Result};
 
 /// Generated protobuf/gRPC bindings for the `changelog` service, compiled
-/// from `../api-protos/changelog/v1/changelog.proto` by `build.rs`.
+/// from `../server/protos/changelog/v1/changelog.proto` by `build.rs`.
 mod proto {
     tonic::include_proto!("changelog.v1");
 }

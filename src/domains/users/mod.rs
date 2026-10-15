@@ -33,7 +33,7 @@ pub(crate) const LANGUAGE_SETTING: &str = "language";
 pub(crate) const ROLE_SETTING: &str = "role";
 
 /// A user account's privilege level, mirroring `users.v1.Role` in
-/// `../api-protos`.
+/// `../server/protos`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Admin,
@@ -191,7 +191,7 @@ pub trait Service: Send + Sync {
     /// [`crate::ErrorCode::SecureStorageUnavailable`], before contacting the
     /// server, if it isn't; the flag is ignored whenever a credential store
     /// is usable. The server's response carries only the new session's
-    /// token (see `../api-protos/users.proto`), so there is no user payload
+    /// token (see `../server/protos/users.proto`), so there is no user payload
     /// to return here. Fails with [`crate::ErrorCode::AlreadyExists`]
     /// if the username is already taken, and with
     /// [`crate::ErrorCode::AlreadyLoggedIn`] — before contacting the server — if a

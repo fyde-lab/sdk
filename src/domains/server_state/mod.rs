@@ -15,7 +15,7 @@ pub use service::ServerStateClient;
 /// Reachability checking against the fyde server, over the standard gRPC
 /// health checking protocol (`grpc.health.v1.Health`,
 /// https://github.com/grpc/grpc/blob/master/doc/health-checking.md) rather
-/// than anything defined in `../api-protos`.
+/// than anything defined in `../server/protos`.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Service: Send + Sync {

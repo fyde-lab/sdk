@@ -10,7 +10,7 @@ use crate::{Error, ErrorKind};
 
 /// What kind of script this is, opaque to the server beyond storage and
 /// filtering (see `Script`/`CreateScriptRequest`/`UpdateScriptRequest`'s
-/// `type` field in `../../../../api-protos/scripts/v1/scripts.proto`).
+/// `type` field in `../../../../server/protos/scripts/v1/scripts.proto`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScriptType {

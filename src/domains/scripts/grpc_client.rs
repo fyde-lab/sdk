@@ -17,7 +17,7 @@ use super::ScriptType;
 
 /// Generated protobuf/gRPC bindings for the `scripts` service, compiled by
 /// `build.rs` from `scripts/v1/scripts.proto` in the `buf.build/fyde-lab/api`
-/// BSR module (sourced from `../api-protos`).
+/// BSR module (sourced from `../server/protos`).
 mod proto {
     tonic::include_proto!("scripts.v1");
 }

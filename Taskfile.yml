@@ -2,7 +2,7 @@ version: '3'
 
 tasks:
   build:
-    desc: Build fyde-sdk (also regenerates gRPC code from ../api-protos)
+    desc: Build fyde-sdk (also regenerates gRPC code from buf.build/fyde-lab/api)
     cmd: cargo build
 
   test:
