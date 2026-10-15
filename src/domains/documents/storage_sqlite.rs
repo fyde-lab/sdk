@@ -47,7 +47,7 @@ impl Storage for SqliteStorage {
         ))
         .bind(subjects_to_column(&document.metadata.subjects))
         .bind(purpose_to_column(document.metadata.purpose))
-        .bind(attributes_to_column(&document.metadata.attributes))
+        .bind(attributes_to_column(&document.metadata.attributes)?)
         .execute(&self.pool)
         .await
         .with_context(|| format!("failed to save document {} to local database", document.id))?;
@@ -261,7 +261,7 @@ impl Storage for SqliteStorage {
         ))
         .bind(subjects_to_column(&metadata.subjects))
         .bind(purpose_to_column(metadata.purpose))
-        .bind(attributes_to_column(&metadata.attributes))
+        .bind(attributes_to_column(&metadata.attributes)?)
         .bind(id.to_string())
         .execute(&self.pool)
         .await
@@ -349,8 +349,11 @@ fn purpose_from_column(column: String) -> Result<Option<Purpose>> {
 
 /// The `attributes` column stores a JSON-encoded map, since SQLite has no
 /// native map type.
-fn attributes_to_column(attributes: &BTreeMap<String, Attribute>) -> String {
-    serde_json::to_string(attributes).expect("serializing attributes to JSON cannot fail")
+/// Fails on a non-finite float, which JSON can't represent: the service
+/// rejects those, but a document synced from another device isn't checked
+/// before it's cached.
+fn attributes_to_column(attributes: &BTreeMap<String, Attribute>) -> Result<String> {
+    serde_json::to_string(attributes).context("failed to encode attributes as json")
 }
 
 fn attributes_from_column(column: String) -> Result<BTreeMap<String, Attribute>> {

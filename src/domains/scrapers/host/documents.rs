@@ -5,6 +5,7 @@ use mlua::{Function, Lua, Table, Value};
 use tokio::runtime::Handle;
 
 use crate::ErrorCode;
+use crate::domains::documents::parser::attributes_from_table;
 use crate::domains::documents::{
     Category, DocumentType, Purpose, Service as DocumentsService, Subcategory, UploadRequest,
 };
@@ -19,7 +20,9 @@ use crate::domains::documents::{
 /// not the uploaded document's real identity (that's the id `upload`
 /// returns). The optional `fields` table lets a script set any of
 /// [`UploadRequest`]'s other metadata overrides up front (`name`, `type`,
-/// `category`, `subcategory`, `subjects`, `purpose`) instead
+/// `category`, `subcategory`, `subjects`, `purpose`, and `attributes` —
+/// `{ price = { type = "float", value = 32.3 } }`, the same shape as a
+/// classification script's `document.metadata.attributes`) instead
 /// of leaving them to be derived later by a classification script. A
 /// document whose content is already saved locally is silently skipped,
 /// not an error, so re-running a scraper doesn't fail on what it already
@@ -102,6 +105,10 @@ fn apply_upload_fields(request: &mut UploadRequest, fields: &Table) -> mlua::Res
     }
     if let Some(purpose) = fields.get::<Option<String>>("purpose")? {
         request.purpose = Some(Purpose::from_str(&purpose).map_err(mlua::Error::external)?);
+    }
+    if let Some(attributes) = fields.get::<Option<Table>>("attributes")? {
+        request.attributes =
+            attributes_from_table(Some(attributes)).map_err(mlua::Error::external)?;
     }
 
     Ok(())
@@ -192,6 +199,11 @@ mod tests {
                     && request.subcategory == Some(crate::domains::documents::Subcategory::Payslips)
                     && request.subjects.as_deref() == Some(["person:alice".to_string()].as_slice())
                     && request.purpose == Some(crate::domains::documents::Purpose::Employment)
+                    && request.attributes
+                        == std::collections::BTreeMap::from([(
+                            "net_pay".to_string(),
+                            crate::domains::documents::Attribute::Float(2150.5),
+                        )])
             })
             .times(1)
             .returning(move |_| Ok(id));
@@ -215,6 +227,7 @@ mod tests {
                 subcategory = "payslips",
                 subjects = {"person:alice"},
                 purpose = "employment",
+                attributes = { net_pay = { type = "float", value = 2150.5 } },
             })"#,
         )
         .exec()

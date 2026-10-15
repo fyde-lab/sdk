@@ -44,7 +44,10 @@ pub trait Service: Send + Sync {
     /// generated id. Metadata fields set on `request` (`name`, `type`,
     /// `category`, `subcategory`, `subjects`, `purpose`)
     /// override whatever would otherwise be derived from the document
-    /// itself and any scripts run against it. A document left without a
+    /// itself and any scripts run against it; `request.attributes` are
+    /// merged over the scripts' attributes, replacing those of the same
+    /// name. An attribute with a blank name or a non-finite float value is
+    /// rejected with [`crate::ErrorCode::InvalidAttribute`]. A document left without a
     /// purpose gets the one its type implies (an invoice is for `invoice`,
     /// a payslip for `employment`...).
     ///
@@ -90,7 +93,8 @@ pub trait Service: Send + Sync {
     /// changelog event, replacing whatever metadata was previously
     /// associated with `metadata.id`. The caller is responsible for
     /// constructing the full replacement `Metadata` (its fields are public
-    /// for this purpose).
+    /// for this purpose), `attributes` included: an attribute left out of
+    /// it is removed. Rejects invalid attributes like [`Self::upload`].
     async fn update_metadata(&self, metadata: Metadata) -> Result<()>;
 
     /// Fetches the scripts currently enabled for the authenticated user and

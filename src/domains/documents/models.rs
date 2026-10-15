@@ -618,8 +618,10 @@ pub enum UploadSource {
 /// content from, plus any of the modifiable [`Metadata`] fields to set
 /// up front. Every field besides `source` is optional — left `None`, it's
 /// derived from the document itself and whatever scripts run against it;
-/// set, it overrides that derived value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// set, it overrides that derived value. `attributes` is merged over the
+/// ones derived instead, name by name: an attribute set here replaces a
+/// script's attribute of the same name, and leaves the others in place.
+#[derive(Debug, Clone, PartialEq)]
 pub struct UploadRequest {
     pub source: UploadSource,
     pub name: Option<String>,
@@ -628,6 +630,7 @@ pub struct UploadRequest {
     pub subcategory: Option<Subcategory>,
     pub subjects: Option<Vec<String>>,
     pub purpose: Option<Purpose>,
+    pub attributes: BTreeMap<String, Attribute>,
 }
 
 impl UploadRequest {
@@ -642,6 +645,7 @@ impl UploadRequest {
             subcategory: None,
             subjects: None,
             purpose: None,
+            attributes: BTreeMap::new(),
         }
     }
 
@@ -659,6 +663,7 @@ impl UploadRequest {
             subcategory: None,
             subjects: None,
             purpose: None,
+            attributes: BTreeMap::new(),
         }
     }
 }

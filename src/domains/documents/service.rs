@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,8 +11,8 @@ use crate::domains::changelog::{ChangelogEvent, EventType, Service as ChangelogS
 use super::parser::Service as ParserService;
 use super::storage::{FacetField, Storage};
 use super::{
-    Category, Document, DocumentType, FacetCount, Metadata, Purpose, SearchFacets, SearchFilters,
-    SearchQuery, Service, Subcategory, SubjectKind, UploadRequest, UploadSource,
+    Attribute, Category, Document, DocumentType, FacetCount, Metadata, Purpose, SearchFacets,
+    SearchFilters, SearchQuery, Service, Subcategory, SubjectKind, UploadRequest, UploadSource,
 };
 
 /// The default [`Service`] implementation: publishes new documents as
@@ -155,6 +156,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
         if let Some(purpose) = request.purpose {
             metadata.purpose = Some(purpose);
         }
+        metadata.attributes.extend(request.attributes);
         if metadata.purpose.is_none() {
             metadata.purpose = metadata.r#type.and_then(purpose_of);
         }
@@ -307,14 +309,37 @@ pub(super) fn resolve_upload_request(request: &mut UploadRequest) -> Result<()> 
             .map(|subcategory| subcategory.category());
     }
     check_categories(request.category, request.subcategory)?;
-    check_subjects(request.subjects.as_deref().unwrap_or_default())
+    check_subjects(request.subjects.as_deref().unwrap_or_default())?;
+    check_attributes(&request.attributes)
 }
 
-/// Rejects metadata whose fields contradict each other, or whose subjects
-/// aren't `kind:value` tags (see [`check_subjects`]).
+/// Rejects metadata whose fields contradict each other, whose subjects
+/// aren't `kind:value` tags (see [`check_subjects`]), or whose attributes
+/// aren't valid (see [`check_attributes`]).
 fn check_metadata(metadata: &Metadata) -> Result<()> {
     check_categories(metadata.category, metadata.subcategory)?;
-    check_subjects(&metadata.subjects)
+    check_subjects(&metadata.subjects)?;
+    check_attributes(&metadata.attributes)
+}
+
+/// Rejects an attribute with a blank name, or a float that isn't finite
+/// (`NaN`/infinity have no JSON representation, so couldn't be cached).
+fn check_attributes(attributes: &BTreeMap<String, Attribute>) -> Result<()> {
+    for (name, attribute) in attributes {
+        if name.trim().is_empty() {
+            return Err(ErrorKind::InvalidAttribute("attribute name is blank".to_string()).into());
+        }
+        if let Attribute::Float(value) = attribute
+            && !value.is_finite()
+        {
+            return Err(ErrorKind::InvalidAttribute(format!(
+                "attribute {name:?} has a non-finite value {value}"
+            ))
+            .into());
+        }
+    }
+
+    Ok(())
 }
 
 /// Rejects any subject that isn't a known [`SubjectKind`] followed by `:`
@@ -435,7 +460,6 @@ fn check_extension(name: &std::path::Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::io::Write as _;
     use std::sync::Mutex;
 
@@ -712,6 +736,7 @@ mod tests {
             subcategory: None,
             subjects: Some(vec!["person:alice".to_string()]),
             purpose: Some(super::super::Purpose::Employment),
+            attributes: BTreeMap::new(),
         };
 
         client.upload(request).await.unwrap();
@@ -882,6 +907,86 @@ mod tests {
 
         assert_eq!(err.code(), crate::ErrorCode::InvalidSubject);
         assert!(changelog.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_merges_requested_attributes_over_the_scripts_ones() {
+        let parsed = super::super::FakeMetadata::new()
+            .with_attributes([
+                ("price".to_string(), Attribute::Float(10.0)),
+                (
+                    "reference".to_string(),
+                    Attribute::String("F-42".to_string()),
+                ),
+            ])
+            .build();
+        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
+        request.attributes = BTreeMap::from([
+            ("price".to_string(), Attribute::Float(32.3)),
+            ("paid".to_string(), Attribute::Boolean(true)),
+        ]);
+
+        let metadata = upload_with(parsed, request).await;
+
+        assert_eq!(
+            metadata.attributes,
+            BTreeMap::from([
+                ("paid".to_string(), Attribute::Boolean(true)),
+                ("price".to_string(), Attribute::Float(32.3)),
+                (
+                    "reference".to_string(),
+                    Attribute::String("F-42".to_string())
+                ),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_a_requested_non_finite_attribute_before_parsing() {
+        // No `expect_parse_content()`: the parser must never be reached.
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            Arc::new(RecordingChangelog::default()),
+            Arc::new(MockParserService::new()),
+            None,
+        );
+        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
+        request.attributes = BTreeMap::from([("price".to_string(), Attribute::Float(f64::NAN))]);
+
+        let err = client.upload(request).await.unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::InvalidAttribute);
+    }
+
+    #[tokio::test]
+    async fn update_metadata_rejects_an_attribute_with_a_blank_name() {
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client =
+            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_parser(), None);
+        let metadata = super::super::FakeMetadata::new()
+            .with_attributes([(" ".to_string(), Attribute::Integer(1))])
+            .build();
+
+        let err = client.update_metadata(metadata).await.unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::InvalidAttribute);
+        assert!(changelog.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_metadata_publishes_the_given_attributes() {
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client =
+            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_parser(), None);
+        let attributes = BTreeMap::from([("price".to_string(), Attribute::Float(32.3))]);
+        let metadata = super::super::FakeMetadata::new()
+            .with_attributes(attributes.clone())
+            .build();
+
+        client.update_metadata(metadata).await.unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(sent[0].3.as_ref().unwrap().attributes, attributes);
     }
 
     #[tokio::test]

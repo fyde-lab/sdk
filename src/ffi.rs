@@ -1203,6 +1203,27 @@ impl FydeClient {
         .await
     }
 
+    /// Like [`Self::upload_document`], also setting `attributes` on the
+    /// document, over any its classification scripts set. Mirrors
+    /// [`crate::DocumentsService::upload`] with
+    /// [`UploadRequest::attributes`].
+    pub async fn upload_document_with_attributes(
+        &self,
+        path: String,
+        attributes: HashMap<String, FfiAttribute>,
+    ) -> Result<String, FfiError> {
+        self.localized(async {
+            let mut request = UploadRequest::from_path(Path::new(&path));
+            request.attributes = attributes
+                .into_iter()
+                .map(|(name, attribute)| (name, attribute.into()))
+                .collect();
+            let id = self.inner.documents().upload(request).await?;
+            Ok(id.to_string())
+        })
+        .await
+    }
+
     /// Fetches a document previously cached locally by the SDK's automatic
     /// changelog sync (see [`FydeClient::init`]'s `on_document_change`), or
     /// `None` if it doesn't exist. Mirrors [`crate::DocumentsService::get`].

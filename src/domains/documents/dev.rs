@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -7,8 +8,8 @@ use uuid::Uuid;
 use crate::{ErrorContext as _, Result};
 
 use super::{
-    Category, Document, DocumentType, Metadata, Purpose, SearchFacets, SearchFilters, SearchQuery,
-    Service, Subcategory, UploadRequest, UploadSource,
+    Attribute, Category, Document, DocumentType, Metadata, Purpose, SearchFacets, SearchFilters,
+    SearchQuery, Service, Subcategory, UploadRequest, UploadSource,
 };
 
 /// A [`Service`] implementation for standalone/dev use (see
@@ -65,6 +66,7 @@ impl Service for DevDocumentsClient {
             subcategory: request.subcategory,
             subjects: request.subjects.as_deref(),
             purpose: request.purpose,
+            attributes: &request.attributes,
         };
         let metadata = serde_json::to_vec_pretty(&metadata)
             .with_context(|| format!("serializing metadata for scraped document {name}"))?;
@@ -146,6 +148,7 @@ struct DevMetadata<'a> {
     subcategory: Option<Subcategory>,
     subjects: Option<&'a [String]>,
     purpose: Option<Purpose>,
+    attributes: &'a BTreeMap<String, Attribute>,
 }
 
 #[cfg(test)]
@@ -220,6 +223,7 @@ mod tests {
         request.name = Some("Payslip January".to_string());
         request.category = Some(Category::Work);
         request.subjects = Some(vec!["person:alice".to_string()]);
+        request.attributes = BTreeMap::from([("net_pay".to_string(), Attribute::Float(2150.5))]);
         let id = client.upload(request).await.unwrap();
 
         let json: serde_json::Value = serde_json::from_slice(
@@ -239,6 +243,7 @@ mod tests {
                 "subcategory": null,
                 "subjects": ["person:alice"],
                 "purpose": null,
+                "attributes": {"net_pay": {"type": "float", "value": 2150.5}},
             })
         );
     }

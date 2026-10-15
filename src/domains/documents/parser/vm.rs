@@ -306,8 +306,9 @@ fn attributes_to_table(lua: &Lua, attributes: &BTreeMap<String, Attribute>) -> R
 /// [`attributes_to_table`] wrote, validating every entry a script added or
 /// changed: an unknown `type`, or a `value` that doesn't fit it, fails with
 /// [`ErrorKind::InvalidAttribute`]. A script that set the whole table to
-/// `nil` cleared every attribute.
-fn attributes_from_table(
+/// `nil` cleared every attribute. Also parses `fyde.save_document`'s
+/// `attributes` field, which takes the same shape.
+pub(crate) fn attributes_from_table(
     attributes_table: Option<mlua::Table>,
 ) -> Result<BTreeMap<String, Attribute>> {
     let Some(attributes_table) = attributes_table else {
