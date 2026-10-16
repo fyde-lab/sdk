@@ -5,7 +5,7 @@ use mlua::{Function, Lua, Table, Value};
 use tokio::runtime::Handle;
 
 use crate::ErrorCode;
-use crate::domains::documents::parser::attributes_from_table;
+use crate::domains::documents::attributes::lua::attributes_from_table;
 use crate::domains::documents::{
     Category, DocumentType, Service as DocumentsService, Subcategory, UploadRequest,
 };

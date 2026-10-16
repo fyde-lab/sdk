@@ -13,8 +13,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::domains::documents::{
-    Attribute, Category, DocumentType, EventType, FacetCount, Metadata, SearchFacets,
-    SearchFilters, SearchOrder, SearchQuery, Subcategory, UploadRequest,
+    Attribute, AttributeDefinition, AttributeType, Category, DocumentType, EventType, FacetCount,
+    Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery, SetAttributeRequest,
+    Subcategory, UploadRequest,
 };
 use crate::domains::scripts::{
     InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptParameterType, ScriptType,
@@ -402,6 +403,71 @@ impl From<FfiAttribute> for Attribute {
                 currency,
             },
             FfiAttribute::Select { selected, options } => Self::Select { selected, options },
+        }
+    }
+}
+
+/// The type an attribute's values must have, mirroring [`AttributeType`]
+/// across the FFI boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiAttributeType {
+    String,
+    Integer,
+    Float,
+    Boolean,
+    Date,
+    Amount,
+    Select,
+}
+
+impl From<AttributeType> for FfiAttributeType {
+    fn from(r#type: AttributeType) -> Self {
+        match r#type {
+            AttributeType::String => Self::String,
+            AttributeType::Integer => Self::Integer,
+            AttributeType::Float => Self::Float,
+            AttributeType::Boolean => Self::Boolean,
+            AttributeType::Date => Self::Date,
+            AttributeType::Amount => Self::Amount,
+            AttributeType::Select => Self::Select,
+        }
+    }
+}
+
+impl From<FfiAttributeType> for AttributeType {
+    fn from(r#type: FfiAttributeType) -> Self {
+        match r#type {
+            FfiAttributeType::String => Self::String,
+            FfiAttributeType::Integer => Self::Integer,
+            FfiAttributeType::Float => Self::Float,
+            FfiAttributeType::Boolean => Self::Boolean,
+            FfiAttributeType::Date => Self::Date,
+            FfiAttributeType::Amount => Self::Amount,
+            FfiAttributeType::Select => Self::Select,
+        }
+    }
+}
+
+/// An attribute definition, mirroring [`AttributeDefinition`] across the
+/// FFI boundary. `id` crosses as a string since UniFFI has no native UUID
+/// type.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiAttributeDefinition {
+    pub id: String,
+    pub name: String,
+    pub r#type: FfiAttributeType,
+    pub description: String,
+    pub is_default: bool,
+}
+
+impl From<AttributeDefinition> for FfiAttributeDefinition {
+    fn from(definition: AttributeDefinition) -> Self {
+        Self {
+            id: definition.id().to_string(),
+            name: definition.name().to_string(),
+            r#type: definition.r#type().into(),
+            description: definition.description().to_string(),
+            is_default: definition.is_default(),
         }
     }
 }
@@ -1225,6 +1291,39 @@ impl FydeClient {
                 .collect();
             let id = self.inner.documents().upload(request).await?;
             Ok(id.to_string())
+        })
+        .await
+    }
+
+    /// Lists every attribute definition the signed-in user can use: the
+    /// default ones, then its own. Mirrors [`crate::AttributesService::list`].
+    pub async fn list_attributes(&self) -> Result<Vec<FfiAttributeDefinition>, FfiError> {
+        self.localized(async {
+            let definitions = self.inner.attributes().list().await?;
+            Ok(definitions.into_iter().map(Into::into).collect())
+        })
+        .await
+    }
+
+    /// Defines (or redefines) an attribute for the signed-in user. Mirrors
+    /// [`crate::AttributesService::set`].
+    pub async fn set_attribute(
+        &self,
+        name: String,
+        r#type: FfiAttributeType,
+        description: String,
+    ) -> Result<FfiAttributeDefinition, FfiError> {
+        self.localized(async {
+            let definition = self
+                .inner
+                .attributes()
+                .set(SetAttributeRequest {
+                    name,
+                    r#type: r#type.into(),
+                    description,
+                })
+                .await?;
+            Ok(definition.into())
         })
         .await
     }

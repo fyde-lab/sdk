@@ -1,17 +1,21 @@
+pub(crate) mod attributes;
 mod dev;
 mod models;
 pub(crate) mod parser;
 mod service;
 mod storage;
 mod storage_sqlite;
-pub mod well_known;
 
 #[cfg(test)]
 pub(crate) use crate::domains::changelog::FakeChangelogEvent;
 pub use crate::domains::changelog::{ChangelogEvent, EventType};
+pub use attributes::{
+    Attribute, AttributeDefinition, AttributeType, Service as AttributesService,
+    SetAttributeRequest,
+};
 pub use models::{
-    Attribute, AttributeType, Category, Document, DocumentType, FacetCount, Metadata, SearchFacets,
-    SearchFilters, SearchOrder, SearchQuery, Subcategory, UploadRequest, UploadSource,
+    Category, Document, DocumentType, FacetCount, Metadata, SearchFacets, SearchFilters,
+    SearchOrder, SearchQuery, Subcategory, UploadRequest, UploadSource,
 };
 #[cfg(test)]
 pub(crate) use models::{FakeDocument, FakeMetadata, FakeSearchFacets};
@@ -47,10 +51,8 @@ pub trait Service: Send + Sync {
     /// override whatever would otherwise be derived from the document
     /// itself and any scripts run against it; `request.attributes` are
     /// merged over the scripts' attributes, replacing those of the same
-    /// name. Attributes that aren't valid — a name that isn't `snake_case`,
-    /// a value that doesn't fit its type, a [`well_known`] name with a value
-    /// of another type, or more of them than a document can carry — are
-    /// rejected with [`crate::ErrorCode::InvalidAttribute`].
+    /// name. Attributes that aren't valid — see [`AttributesService::check`]
+    /// — are rejected with [`crate::ErrorCode::InvalidAttribute`].
     ///
     /// The file type is determined from the source's name's extension;
     /// only `.pdf` is currently accepted, anything else is rejected with
@@ -154,6 +156,7 @@ pub(crate) fn init(
     pool: SqlitePool,
     changelog: Arc<dyn changelog::Service>,
     scripts: Arc<dyn ScriptsService>,
+    attributes: Arc<dyn AttributesService>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Arc<dyn Service> {
     let storage = storage_sqlite::SqliteStorage::new(pool);
@@ -164,6 +167,7 @@ pub(crate) fn init(
         changelog,
         parser,
         on_document_change,
+        attributes,
     ))
 }
 

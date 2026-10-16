@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,12 +7,12 @@ use crate::{ErrorContext as _, ErrorKind, Result};
 
 use crate::domains::changelog::{ChangelogEvent, EventType, Service as ChangelogService};
 
+use super::attributes::{self, Service as AttributesService};
 use super::parser::Service as ParserService;
 use super::storage::{FacetField, Storage};
-use super::well_known;
 use super::{
-    Attribute, Category, Document, FacetCount, Metadata, SearchFacets, SearchFilters, SearchQuery,
-    Service, Subcategory, UploadRequest, UploadSource,
+    Category, Document, FacetCount, Metadata, SearchFacets, SearchFilters, SearchQuery, Service,
+    Subcategory, UploadRequest, UploadSource,
 };
 
 /// The default [`Service`] implementation: publishes new documents as
@@ -26,6 +25,7 @@ pub(super) struct DocumentsClient<S: Storage> {
     /// Invoked once per event by [`Service::start_sync`]'s consume job, when
     /// set — see [`crate::ClientConfig::on_document_change`].
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
+    attributes: Arc<dyn AttributesService>,
 }
 
 impl<S: Storage> DocumentsClient<S> {
@@ -34,23 +34,36 @@ impl<S: Storage> DocumentsClient<S> {
     /// [`Service::start_sync`], `parser` to derive a newly uploaded
     /// document's metadata and to fill in its classification metadata (see
     /// [`Service::run_scripts`]), and `on_document_change` as the callback
-    /// [`Service::start_sync`] invokes per consumed event.
+    /// [`Service::start_sync`] invokes per consumed event, and `attributes`
+    /// to check the attributes of every document before it's published.
     pub(super) fn new(
         storage: S,
         changelog: Arc<dyn ChangelogService>,
         parser: Arc<dyn ParserService>,
         on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
+        attributes: Arc<dyn AttributesService>,
     ) -> Self {
         Self {
             storage,
             changelog,
             parser,
             on_document_change,
+            attributes,
         }
     }
 }
 
 impl<S: Storage> DocumentsClient<S> {
+    /// Rejects metadata whose fields contradict each other, or whose
+    /// attributes aren't valid (see [`AttributesService::check`]).
+    async fn check_metadata(&self, metadata: &Metadata) -> Result<()> {
+        check_categories(metadata.category, metadata.subcategory)?;
+        self.attributes
+            .check(&metadata.attributes)
+            .await
+            .context("invalid document attributes")
+    }
+
     /// Counts the documents matching `terms` and `filters` — minus
     /// `field`'s own filter — per value of `field`.
     async fn count_documents_by(
@@ -153,7 +166,8 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
         // Checked again after parsing: the user's classification scripts may
         // have set attributes of their own.
-        check_metadata(&metadata)
+        self.check_metadata(&metadata)
+            .await
             .with_context(|| format!("invalid metadata for document {original_name:?}"))?;
 
         let id = metadata.id;
@@ -255,7 +269,9 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
     async fn update_metadata(&self, metadata: Metadata) -> Result<()> {
         let id = metadata.id;
-        check_metadata(&metadata).with_context(|| format!("invalid metadata for document {id}"))?;
+        self.check_metadata(&metadata)
+            .await
+            .with_context(|| format!("invalid metadata for document {id}"))?;
 
         self.changelog
             .send(EventType::UpdateMetadata, id, None, Some(&metadata))
@@ -292,181 +308,10 @@ pub(super) fn resolve_upload_request(request: &mut UploadRequest) -> Result<()> 
             .map(|subcategory| subcategory.category());
     }
     check_categories(request.category, request.subcategory)?;
-    check_attributes(&request.attributes)
-}
-
-/// Rejects metadata whose fields contradict each other, or whose attributes
-/// aren't valid (see [`check_attributes`]).
-fn check_metadata(metadata: &Metadata) -> Result<()> {
-    check_categories(metadata.category, metadata.subcategory)?;
-    check_attributes(&metadata.attributes)
-}
-
-/// The most attributes a single document can carry: every one of them is
-/// re-encrypted into each of the document's changelog events, and cached on
-/// every device of the account.
-const MAX_ATTRIBUTES: usize = 64;
-/// The longest an attribute name can be, in bytes.
-const MAX_ATTRIBUTE_NAME_LEN: usize = 64;
-/// The longest a string, or select option, attribute value can be, in bytes.
-const MAX_ATTRIBUTE_TEXT_LEN: usize = 1024;
-/// The most options a select attribute can offer.
-const MAX_SELECT_OPTIONS: usize = 64;
-
-/// Rejects attributes that are too many, or one that isn't valid: see
-/// [`check_attribute_name`] and [`check_attribute_value`].
-fn check_attributes(attributes: &BTreeMap<String, Attribute>) -> Result<()> {
-    if attributes.len() > MAX_ATTRIBUTES {
-        return Err(ErrorKind::InvalidAttribute(format!(
-            "a document can't have more than {MAX_ATTRIBUTES} attributes, got {}",
-            attributes.len()
-        ))
-        .into());
-    }
-    for (name, attribute) in attributes {
-        check_attribute_name(name)?;
-        check_attribute_value(name, attribute)?;
-    }
-
-    Ok(())
-}
-
-/// Rejects a name that isn't `snake_case` ASCII (a lowercase letter, then
-/// lowercase letters, digits or underscores), or is longer than
-/// [`MAX_ATTRIBUTE_NAME_LEN`].
-fn check_attribute_name(name: &str) -> Result<()> {
-    let mut chars = name.chars();
-    let is_snake_case = chars.next().is_some_and(|c| c.is_ascii_lowercase())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    if !is_snake_case {
-        return Err(ErrorKind::InvalidAttribute(format!(
-            "attribute name {name:?} isn't snake_case (a lowercase letter, then lowercase letters, digits or underscores)"
-        ))
-        .into());
-    }
-    if name.len() > MAX_ATTRIBUTE_NAME_LEN {
-        return Err(ErrorKind::InvalidAttribute(format!(
-            "attribute name {name:?} is longer than {MAX_ATTRIBUTE_NAME_LEN} bytes"
-        ))
-        .into());
-    }
-
-    Ok(())
-}
-
-/// Rejects an attribute of another type than the [`well_known`] attribute
-/// of the same name, or whose value doesn't fit its type:
-/// - a float that isn't finite (`NaN`/infinity have no JSON representation,
-///   so couldn't be cached),
-/// - a string, or select option, longer than [`MAX_ATTRIBUTE_TEXT_LEN`],
-/// - a date that isn't a real `YYYY-MM-DD` calendar date,
-/// - an amount whose currency isn't an ISO 4217 code (three uppercase
-///   letters),
-/// - a select with no options, more than [`MAX_SELECT_OPTIONS`], a blank or
-///   duplicate one, or a `selected` value that isn't one of them.
-fn check_attribute_value(name: &str, attribute: &Attribute) -> Result<()> {
-    let invalid = |reason: String| -> Result<()> {
-        Err(ErrorKind::InvalidAttribute(format!("attribute {name:?} {reason}")).into())
-    };
-
-    if let Some(well_known) = well_known::get(name)
-        && well_known.r#type != attribute.r#type()
-    {
-        return invalid(format!(
-            "is a {}, but must be a {}",
-            attribute.r#type(),
-            well_known.r#type
-        ));
-    }
-
-    match attribute {
-        Attribute::Integer(_) | Attribute::Boolean(_) => {}
-        Attribute::Float(value) => {
-            if !value.is_finite() {
-                return invalid(format!("has a non-finite value {value}"));
-            }
-        }
-        Attribute::String(value) => {
-            if value.len() > MAX_ATTRIBUTE_TEXT_LEN {
-                return invalid(format!("is longer than {MAX_ATTRIBUTE_TEXT_LEN} bytes"));
-            }
-        }
-        Attribute::Date(value) => {
-            if !is_calendar_date(value) {
-                return invalid(format!("has {value:?}, not a YYYY-MM-DD calendar date"));
-            }
-        }
-        Attribute::Amount { currency, .. } => {
-            if currency.len() != 3 || !currency.chars().all(|c| c.is_ascii_uppercase()) {
-                return invalid(format!(
-                    "has currency {currency:?}, not an ISO 4217 code like \"EUR\""
-                ));
-            }
-        }
-        Attribute::Select { selected, options } => {
-            if options.is_empty() {
-                return invalid("is a select without any option".to_string());
-            }
-            if options.len() > MAX_SELECT_OPTIONS {
-                return invalid(format!(
-                    "has more than {MAX_SELECT_OPTIONS} options, got {}",
-                    options.len()
-                ));
-            }
-            for (i, option) in options.iter().enumerate() {
-                if option.trim().is_empty() {
-                    return invalid("has a blank option".to_string());
-                }
-                if option.len() > MAX_ATTRIBUTE_TEXT_LEN {
-                    return invalid(format!(
-                        "has an option longer than {MAX_ATTRIBUTE_TEXT_LEN} bytes"
-                    ));
-                }
-                if options[..i].contains(option) {
-                    return invalid(format!("has option {option:?} more than once"));
-                }
-            }
-            if !options.contains(selected) {
-                return invalid(format!(
-                    "has {selected:?} selected, which isn't one of its options"
-                ));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Whether `value` is an ISO 8601 calendar date, `YYYY-MM-DD`, of a year
-/// from 1 to 9999 — a day that actually exists, leap years included.
-fn is_calendar_date(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    let digits_at = |range: std::ops::Range<usize>| bytes[range].iter().all(u8::is_ascii_digit);
-    if bytes.len() != 10
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || !digits_at(0..4)
-        || !digits_at(5..7)
-        || !digits_at(8..10)
-    {
-        return false;
-    }
-    // Only ASCII digits from here on, so these can't fail.
-    let year: u32 = value[0..4].parse().unwrap_or_default();
-    let month: u32 = value[5..7].parse().unwrap_or_default();
-    let day: u32 = value[8..10].parse().unwrap_or_default();
-
-    let is_leap_year =
-        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
-    let days_in_month = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year => 29,
-        2 => 28,
-        _ => return false,
-    };
-
-    year >= 1 && (1..=days_in_month).contains(&day)
+    // Only what can be checked without a server: the dev `Service` has none
+    // to fetch attribute definitions from. `upload` checks them in full once
+    // the document is parsed.
+    attributes::check_values(&request.attributes)
 }
 
 /// Rejects a subcategory that doesn't narrow down `category` (or that's
@@ -554,15 +399,36 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
-    use super::super::DocumentType;
+    use std::collections::BTreeMap;
+
+    use super::super::attributes::MockService as MockAttributesService;
     use super::super::parser::MockService as MockParserService;
     use super::super::storage::MockStorage;
+    use super::super::{Attribute, DocumentType};
     use super::*;
 
     /// A [`ParserService`] fake that's never expected to be called, for
     /// tests that don't exercise document parsing/script running.
     fn no_op_parser() -> Arc<dyn ParserService> {
         Arc::new(MockParserService::new())
+    }
+
+    /// An [`AttributesService`] fake accepting any attributes, for tests
+    /// that don't exercise attribute checks.
+    fn accepting_attributes() -> Arc<dyn AttributesService> {
+        let mut attributes = MockAttributesService::new();
+        attributes.expect_check().returning(|_| Ok(()));
+        Arc::new(attributes)
+    }
+
+    /// An [`AttributesService`] fake rejecting any attributes, as it would
+    /// an invalid one.
+    fn rejecting_attributes() -> Arc<dyn AttributesService> {
+        let mut attributes = MockAttributesService::new();
+        attributes
+            .expect_check()
+            .returning(|_| Err(crate::ErrorKind::InvalidAttribute("rejected".to_string()).into()));
+        Arc::new(attributes)
     }
 
     #[tokio::test]
@@ -575,7 +441,13 @@ mod tests {
         });
         // `no_op_parser` panics on any call, proving `upload` never reaches
         // parsing (and so never lists/runs scripts) once this check fails.
-        let client = DocumentsClient::new(MockStorage::new(), changelog, no_op_parser(), None);
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            changelog,
+            no_op_parser(),
+            None,
+            accepting_attributes(),
+        );
 
         let err = client
             .upload(UploadRequest::from_path(file.path()))
@@ -609,6 +481,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             Arc::new(parser),
             None,
+            accepting_attributes(),
         );
 
         let metadata = client.run_scripts(&document).await.unwrap();
@@ -724,7 +597,13 @@ mod tests {
             .returning(|_| Ok(None));
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(storage, changelog.clone(), Arc::new(parser), None);
+        let client = DocumentsClient::new(
+            storage,
+            changelog.clone(),
+            Arc::new(parser),
+            None,
+            accepting_attributes(),
+        );
 
         let id = client
             .upload(UploadRequest::from_path(file.path()))
@@ -758,7 +637,13 @@ mod tests {
         // `no_op_parser` panics on any call, proving the duplicate is
         // rejected before parsing (and so before running any script).
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(storage, changelog.clone(), no_op_parser(), None);
+        let client = DocumentsClient::new(
+            storage,
+            changelog.clone(),
+            no_op_parser(),
+            None,
+            accepting_attributes(),
+        );
 
         let err = client
             .upload(UploadRequest::from_path(file.path()))
@@ -781,6 +666,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             no_op_parser(),
             None,
+            accepting_attributes(),
         );
 
         let result = client.upload(UploadRequest::from_path(file.path())).await;
@@ -813,7 +699,13 @@ mod tests {
             .returning(|_| Ok(None));
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(storage, changelog.clone(), Arc::new(parser), None);
+        let client = DocumentsClient::new(
+            storage,
+            changelog.clone(),
+            Arc::new(parser),
+            None,
+            accepting_attributes(),
+        );
 
         let request = UploadRequest {
             source: super::super::UploadSource::Raw {
@@ -852,7 +744,13 @@ mod tests {
             .times(1)
             .returning(|_| Ok(None));
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(storage, changelog.clone(), Arc::new(parser), None);
+        let client = DocumentsClient::new(
+            storage,
+            changelog.clone(),
+            Arc::new(parser),
+            None,
+            accepting_attributes(),
+        );
 
         request.source = super::super::UploadSource::Raw {
             name: "raw.pdf".to_string(),
@@ -899,6 +797,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             Arc::new(MockParserService::new()),
             None,
+            accepting_attributes(),
         );
         let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
         request.category = Some(Category::Money);
@@ -910,9 +809,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_rejects_an_attribute_a_classification_script_set_with_a_blank_name() {
+    async fn upload_rejects_attributes_the_attributes_service_rejects_once_parsed() {
         let parsed = super::super::FakeMetadata::new()
-            .with_attributes([(" ".to_string(), Attribute::Integer(1))])
+            .with_attributes([("price".to_string(), Attribute::Integer(1))])
             .build();
         let mut parser = MockParserService::new();
         parser
@@ -923,7 +822,13 @@ mod tests {
             .expect_find_document_by_checksum()
             .returning(|_| Ok(None));
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(storage, changelog.clone(), Arc::new(parser), None);
+        let client = DocumentsClient::new(
+            storage,
+            changelog.clone(),
+            Arc::new(parser),
+            None,
+            rejecting_attributes(),
+        );
 
         let err = client
             .upload(UploadRequest::from_raw("raw.pdf", Vec::new()))
@@ -974,6 +879,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             Arc::new(MockParserService::new()),
             None,
+            accepting_attributes(),
         );
         let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
         request.attributes = BTreeMap::from([("price".to_string(), Attribute::Float(f64::NAN))]);
@@ -983,139 +889,18 @@ mod tests {
         assert_eq!(err.code(), crate::ErrorCode::InvalidAttribute);
     }
 
-    fn check_one(name: &str, attribute: Attribute) -> Result<()> {
-        check_attributes(&BTreeMap::from([(name.to_string(), attribute)]))
-    }
-
-    fn select(selected: &str, options: &[&str]) -> Attribute {
-        Attribute::Select {
-            selected: selected.to_string(),
-            options: options.iter().map(|option| option.to_string()).collect(),
-        }
-    }
-
-    fn assert_invalid(result: Result<()>) {
-        assert_eq!(
-            result.unwrap_err().code(),
-            crate::ErrorCode::InvalidAttribute
-        );
-    }
-
-    #[test]
-    fn check_attributes_accepts_one_valid_attribute_of_every_type() {
-        let attributes = BTreeMap::from([
-            (
-                "reference".to_string(),
-                Attribute::String("F-42".to_string()),
-            ),
-            ("tax_year".to_string(), Attribute::Integer(2025)),
-            ("ratio_2".to_string(), Attribute::Float(0.5)),
-            ("paid".to_string(), Attribute::Boolean(true)),
-            (
-                "issued_on".to_string(),
-                Attribute::Date("2024-02-29".to_string()),
-            ),
-            (
-                "net_pay".to_string(),
-                Attribute::Amount {
-                    minor_units: 215050,
-                    currency: "EUR".to_string(),
-                },
-            ),
-            ("status".to_string(), select("paid", &["paid", "unpaid"])),
-        ]);
-
-        check_attributes(&attributes).unwrap();
-    }
-
-    #[test]
-    fn check_attributes_rejects_a_name_that_isnt_snake_case() {
-        for name in ["", " ", "Price", "net-pay", "2nd", "_price", "prix_été"] {
-            assert_invalid(check_one(name, Attribute::Integer(1)));
-        }
-    }
-
-    #[test]
-    fn check_attributes_rejects_a_name_longer_than_the_limit() {
-        assert_invalid(check_one(
-            &"a".repeat(MAX_ATTRIBUTE_NAME_LEN + 1),
-            Attribute::Integer(1),
-        ));
-    }
-
-    #[test]
-    fn check_attributes_rejects_more_attributes_than_the_limit() {
-        let attributes = (0..=MAX_ATTRIBUTES)
-            .map(|i| (format!("attribute_{i}"), Attribute::Integer(1)))
-            .collect();
-
-        assert_invalid(check_attributes(&attributes));
-    }
-
-    #[test]
-    fn check_attributes_rejects_a_well_known_attribute_of_another_type() {
-        assert_invalid(check_one("net_pay", Attribute::Float(2150.5)));
-        assert_invalid(check_one(
-            "issued_on",
-            Attribute::String("2026-10-15".to_string()),
-        ));
-    }
-
-    #[test]
-    fn check_attributes_rejects_a_string_longer_than_the_limit() {
-        assert_invalid(check_one(
-            "note",
-            Attribute::String("a".repeat(MAX_ATTRIBUTE_TEXT_LEN + 1)),
-        ));
-    }
-
-    #[test]
-    fn check_attributes_rejects_a_date_that_isnt_a_calendar_day() {
-        for date in [
-            "2026-02-29",
-            "2026-13-01",
-            "2026-04-31",
-            "2026-00-10",
-            "0000-01-01",
-            "2026-1-15",
-            "15/10/2026",
-            "2026-10-15T00:00:00Z",
-        ] {
-            assert_invalid(check_one("on", Attribute::Date(date.to_string())));
-        }
-    }
-
-    #[test]
-    fn check_attributes_rejects_an_amount_whose_currency_isnt_an_iso_4217_code() {
-        for currency in ["", "eur", "EURO", "€", "E1R"] {
-            assert_invalid(check_one(
-                "price",
-                Attribute::Amount {
-                    minor_units: 100,
-                    currency: currency.to_string(),
-                },
-            ));
-        }
-    }
-
-    #[test]
-    fn check_attributes_rejects_an_invalid_select() {
-        assert_invalid(check_one("status", select("paid", &[])));
-        assert_invalid(check_one("status", select("paid", &["unpaid"])));
-        assert_invalid(check_one("status", select("paid", &["paid", "paid"])));
-        assert_invalid(check_one("status", select("paid", &["paid", " "])));
-        let options: Vec<String> = (0..=MAX_SELECT_OPTIONS).map(|i| format!("o{i}")).collect();
-        let options: Vec<&str> = options.iter().map(String::as_str).collect();
-        assert_invalid(check_one("status", select("o0", &options)));
-    }
-
     #[tokio::test]
-    async fn update_metadata_rejects_an_attribute_with_a_blank_name() {
+    async fn update_metadata_rejects_attributes_the_attributes_service_rejects() {
         let changelog = Arc::new(RecordingChangelog::default());
-        let client =
-            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_parser(), None);
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            changelog.clone(),
+            no_op_parser(),
+            None,
+            rejecting_attributes(),
+        );
         let metadata = super::super::FakeMetadata::new()
-            .with_attributes([(" ".to_string(), Attribute::Integer(1))])
+            .with_attributes([("price".to_string(), Attribute::Integer(1))])
             .build();
 
         let err = client.update_metadata(metadata).await.unwrap_err();
@@ -1127,8 +912,13 @@ mod tests {
     #[tokio::test]
     async fn update_metadata_publishes_the_given_attributes() {
         let changelog = Arc::new(RecordingChangelog::default());
-        let client =
-            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_parser(), None);
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            changelog.clone(),
+            no_op_parser(),
+            None,
+            accepting_attributes(),
+        );
         let attributes = BTreeMap::from([("price".to_string(), Attribute::Float(32.3))]);
         let metadata = super::super::FakeMetadata::new()
             .with_attributes(attributes.clone())
@@ -1143,8 +933,13 @@ mod tests {
     #[tokio::test]
     async fn update_metadata_rejects_a_subcategory_of_another_category() {
         let changelog = Arc::new(RecordingChangelog::default());
-        let client =
-            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_parser(), None);
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            changelog.clone(),
+            no_op_parser(),
+            None,
+            accepting_attributes(),
+        );
         let metadata = super::super::FakeMetadata::new()
             .with_category(Category::Money)
             .with_subcategory(Subcategory::Energy)
@@ -1191,6 +986,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             no_op_parser(),
             None,
+            accepting_attributes(),
         );
 
         assert_eq!(client.get(id).await.unwrap(), Some(document));
@@ -1251,6 +1047,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             no_op_parser(),
             None,
+            accepting_attributes(),
         );
 
         let page = client.list(1, 2).await.unwrap();
@@ -1293,6 +1090,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             no_op_parser(),
             None,
+            accepting_attributes(),
         );
 
         let documents = client
@@ -1323,6 +1121,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             no_op_parser(),
             None,
+            accepting_attributes(),
         );
 
         client.search(SearchQuery::new(" - ", 0, 10)).await.unwrap();
@@ -1345,6 +1144,7 @@ mod tests {
                 Arc::new(RecordingChangelog::default()),
                 no_op_parser(),
                 None,
+                accepting_attributes(),
             );
 
             let err = client.search(query.clone()).await.unwrap_err();
@@ -1459,6 +1259,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             no_op_parser(),
             None,
+            accepting_attributes(),
         );
 
         let facets = client.search_facets(" facture ", &filters).await.unwrap();
@@ -1488,6 +1289,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             no_op_parser(),
             None,
+            accepting_attributes(),
         );
 
         let err = client
@@ -1505,6 +1307,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             no_op_parser(),
             None,
+            accepting_attributes(),
         );
 
         let err = client
@@ -1530,8 +1333,13 @@ mod tests {
         let id = metadata.id;
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client =
-            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_parser(), None);
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            changelog.clone(),
+            no_op_parser(),
+            None,
+            accepting_attributes(),
+        );
 
         client.update_metadata(metadata).await.unwrap();
 
@@ -1563,6 +1371,7 @@ mod tests {
             changelog,
             no_op_parser(),
             Some(on_document_change),
+            accepting_attributes(),
         );
 
         client.start_sync().await.unwrap();
@@ -1578,7 +1387,13 @@ mod tests {
             to_consume: Mutex::new(vec![event]),
             ..Default::default()
         });
-        let client = DocumentsClient::new(MockStorage::new(), changelog, no_op_parser(), None);
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            changelog,
+            no_op_parser(),
+            None,
+            accepting_attributes(),
+        );
 
         client.start_sync().await.unwrap();
     }
@@ -1586,8 +1401,13 @@ mod tests {
     #[tokio::test]
     async fn stop_sync_delegates_to_the_changelog_services_stop_consume_job() {
         let changelog = Arc::new(RecordingChangelog::default());
-        let client =
-            DocumentsClient::new(MockStorage::new(), changelog.clone(), no_op_parser(), None);
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            changelog.clone(),
+            no_op_parser(),
+            None,
+            accepting_attributes(),
+        );
 
         client.stop_sync();
 

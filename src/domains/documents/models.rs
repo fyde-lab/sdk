@@ -5,6 +5,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::attributes::Attribute;
 use crate::{Error, ErrorKind};
 
 /// The part of life a document is about — where it would be filed — rather
@@ -298,168 +299,6 @@ impl DocumentType {
     }
 }
 
-/// One typed value of a document's [`Metadata::attributes`]. Serialized
-/// adjacently tagged, so `Float(32.3)` round-trips as
-/// `{"type": "float", "value": 32.3}`: the type always travels with the
-/// value, and can never disagree with it.
-///
-/// This set of variants, and the fields of each, is a wire format (see
-/// `AttributeWire`): it's
-/// encrypted into every changelog event, and a client that doesn't know a
-/// variant can't decode the metadata carrying it at all. Never remove or
-/// change one; add a new variant only knowing every older client fails on
-/// documents that use it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(from = "AttributeWire", into = "AttributeWire")]
-pub enum Attribute {
-    String(String),
-    Integer(i64),
-    Float(f64),
-    Boolean(bool),
-    /// A calendar date, as an ISO 8601 `YYYY-MM-DD` string — which sorts
-    /// chronologically as plain text.
-    Date(String),
-    /// A sum of money: `minor_units` of `currency`'s ISO 4217 minor unit
-    /// (cents for `"EUR"`, so 2150.50 € is `minor_units: 215050`), never a
-    /// float, so it adds up without rounding errors.
-    Amount {
-        minor_units: i64,
-        currency: String,
-    },
-    /// One value picked among a closed list: `selected` is always one of
-    /// `options`, which every value it could be changed to is offered from.
-    Select {
-        selected: String,
-        options: Vec<String>,
-    },
-}
-
-/// [`Attribute`]'s serialized form. A struct variant's fields can't sit
-/// directly in an adjacently tagged enum's `value`: MessagePack encodes them
-/// positionally (as an array), which serde can't decode back into a struct
-/// variant there. Wrapping them in a struct of their own, as each wire
-/// variant below does, decodes the same way any other struct field does.
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
-enum AttributeWire {
-    String(String),
-    Integer(i64),
-    Float(f64),
-    Boolean(bool),
-    Date(String),
-    Amount(AmountWire),
-    Select(SelectWire),
-}
-
-#[derive(Serialize, Deserialize)]
-struct AmountWire {
-    minor_units: i64,
-    currency: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct SelectWire {
-    selected: String,
-    options: Vec<String>,
-}
-
-impl From<AttributeWire> for Attribute {
-    fn from(wire: AttributeWire) -> Self {
-        match wire {
-            AttributeWire::String(value) => Self::String(value),
-            AttributeWire::Integer(value) => Self::Integer(value),
-            AttributeWire::Float(value) => Self::Float(value),
-            AttributeWire::Boolean(value) => Self::Boolean(value),
-            AttributeWire::Date(value) => Self::Date(value),
-            AttributeWire::Amount(AmountWire {
-                minor_units,
-                currency,
-            }) => Self::Amount {
-                minor_units,
-                currency,
-            },
-            AttributeWire::Select(SelectWire { selected, options }) => {
-                Self::Select { selected, options }
-            }
-        }
-    }
-}
-
-impl From<Attribute> for AttributeWire {
-    fn from(attribute: Attribute) -> Self {
-        match attribute {
-            Attribute::String(value) => Self::String(value),
-            Attribute::Integer(value) => Self::Integer(value),
-            Attribute::Float(value) => Self::Float(value),
-            Attribute::Boolean(value) => Self::Boolean(value),
-            Attribute::Date(value) => Self::Date(value),
-            Attribute::Amount {
-                minor_units,
-                currency,
-            } => Self::Amount(AmountWire {
-                minor_units,
-                currency,
-            }),
-            Attribute::Select { selected, options } => {
-                Self::Select(SelectWire { selected, options })
-            }
-        }
-    }
-}
-
-impl Attribute {
-    pub fn r#type(&self) -> AttributeType {
-        match self {
-            Self::String(_) => AttributeType::String,
-            Self::Integer(_) => AttributeType::Integer,
-            Self::Float(_) => AttributeType::Float,
-            Self::Boolean(_) => AttributeType::Boolean,
-            Self::Date(_) => AttributeType::Date,
-            Self::Amount { .. } => AttributeType::Amount,
-            Self::Select { .. } => AttributeType::Select,
-        }
-    }
-
-    /// The name this attribute's type is serialized under (`"float"`...).
-    pub fn type_name(&self) -> &'static str {
-        self.r#type().as_str()
-    }
-}
-
-/// The type of an [`Attribute`], without its value — what a
-/// [`super::well_known::WellKnownAttribute`] expects its values to be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AttributeType {
-    String,
-    Integer,
-    Float,
-    Boolean,
-    Date,
-    Amount,
-    Select,
-}
-
-impl AttributeType {
-    /// The name [`Attribute`]s of this type are serialized under.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::String => "string",
-            Self::Integer => "integer",
-            Self::Float => "float",
-            Self::Boolean => "boolean",
-            Self::Date => "date",
-            Self::Amount => "amount",
-            Self::Select => "select",
-        }
-    }
-}
-
-impl fmt::Display for AttributeType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 impl fmt::Display for DocumentType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -505,8 +344,9 @@ pub struct Metadata {
     pub subcategory: Option<Subcategory>,
     /// Every unstructured piece of data a document carries beyond the
     /// fields above (e.g. `"reference"` → `Attribute::String("F-42")`),
-    /// keyed by a `snake_case` name — one of [`super::well_known`]'s
-    /// whenever one fits. A piece of data that needs to be filtered,
+    /// keyed by a `snake_case` name — one of the user's attribute
+    /// definitions ([`super::attributes::Service::list`]) whenever one
+    /// fits. A piece of data that needs to be filtered,
     /// faceted or sorted on across documents belongs in a field of its
     /// own instead, the way `category` is.
     pub attributes: BTreeMap<String, Attribute>,
@@ -1095,67 +935,6 @@ mod tests {
         assert_eq!(
             metadata.attributes,
             BTreeMap::from([("price".to_string(), Attribute::Float(32.3))])
-        );
-    }
-
-    #[test]
-    fn attribute_serializes_its_type_alongside_its_value() {
-        let attributes = BTreeMap::from([
-            ("price".to_string(), Attribute::Float(32.3)),
-            ("paid".to_string(), Attribute::Boolean(true)),
-        ]);
-
-        let json = serde_json::to_value(&attributes).unwrap();
-
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "price": {"type": "float", "value": 32.3},
-                "paid": {"type": "boolean", "value": true},
-            })
-        );
-        assert_eq!(
-            serde_json::from_value::<BTreeMap<String, Attribute>>(json).unwrap(),
-            attributes
-        );
-    }
-
-    #[test]
-    fn date_amount_and_select_attributes_serialize_their_value_as_json() {
-        let attributes = BTreeMap::from([
-            (
-                "issued_on".to_string(),
-                Attribute::Date("2026-10-15".to_string()),
-            ),
-            (
-                "total_amount".to_string(),
-                Attribute::Amount {
-                    minor_units: 3230,
-                    currency: "EUR".to_string(),
-                },
-            ),
-            (
-                "status".to_string(),
-                Attribute::Select {
-                    selected: "paid".to_string(),
-                    options: vec!["paid".to_string(), "unpaid".to_string()],
-                },
-            ),
-        ]);
-
-        let json = serde_json::to_value(&attributes).unwrap();
-
-        assert_eq!(
-            json,
-            serde_json::json!({
-                "issued_on": {"type": "date", "value": "2026-10-15"},
-                "total_amount": {"type": "amount", "value": {"minor_units": 3230, "currency": "EUR"}},
-                "status": {"type": "select", "value": {"selected": "paid", "options": ["paid", "unpaid"]}},
-            })
-        );
-        assert_eq!(
-            serde_json::from_value::<BTreeMap<String, Attribute>>(json).unwrap(),
-            attributes
         );
     }
 

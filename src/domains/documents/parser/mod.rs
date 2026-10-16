@@ -2,8 +2,6 @@ mod service;
 mod transcript;
 mod vm;
 
-pub(crate) use vm::attributes_from_table;
-
 use std::sync::Arc;
 
 use async_trait::async_trait;

@@ -13,10 +13,10 @@ pub(crate) use error::{ErrorContext, ErrorKind};
 use std::sync::Arc;
 
 pub use domains::documents::parser::{Service as ParserService, init as init_parser};
-pub use domains::documents::well_known as well_known_attributes;
 pub use domains::documents::{
-    Attribute, AttributeType, ChangelogEvent, Document, FacetCount, Metadata, SearchFacets,
-    SearchFilters, SearchOrder, SearchQuery, Service as DocumentsService, UploadRequest,
+    Attribute, AttributeDefinition, AttributeType, AttributesService, ChangelogEvent, Document,
+    FacetCount, Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery,
+    Service as DocumentsService, SetAttributeRequest, UploadRequest,
 };
 pub use domains::scrapers::{ProgressEvent, Service as ScrapersService};
 pub use domains::scripts::{
@@ -85,6 +85,7 @@ pub struct ClientConfig {
 
 /// A connection to a fyde server.
 pub struct Client {
+    attributes: Arc<dyn AttributesService>,
     documents: Arc<dyn DocumentsService>,
     scrapers: Arc<dyn ScrapersService>,
     scripts: Arc<dyn ScriptsService>,
@@ -127,10 +128,12 @@ impl Client {
             changelog.clone(),
         );
         let usage = domains::usage::init(channel.clone(), sessions.clone());
+        let attributes = domains::documents::attributes::init(channel.clone(), sessions.clone());
         let documents = domains::documents::init(
             sqlite.pool().clone(),
             changelog,
             scripts.clone(),
+            attributes.clone(),
             config.on_document_change,
         );
         let users = domains::users::init(
@@ -162,6 +165,7 @@ impl Client {
         }
 
         Ok(Self {
+            attributes,
             documents,
             scrapers,
             scripts,
@@ -176,6 +180,12 @@ impl Client {
     /// Returns a reference to the client's documents service.
     pub fn documents(&self) -> &dyn DocumentsService {
         self.documents.as_ref()
+    }
+
+    /// Returns a reference to the client's attributes service: the
+    /// definitions document attributes are checked against.
+    pub fn attributes(&self) -> &dyn AttributesService {
+        self.attributes.as_ref()
     }
 
     /// Returns a reference to the client's users service.
