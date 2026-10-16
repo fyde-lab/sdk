@@ -84,17 +84,22 @@ pub enum LoginOutcome {
 }
 
 /// One of an account's open sessions (a device logged into it), as listed
-/// by [`LoginOutcome::SessionLimitReached`].
+/// by [`LoginOutcome::SessionLimitReached`] or [`Service::list_sessions`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenSession {
     pub(super) id: String,
     pub(super) device_name: String,
     /// Unix timestamp, in seconds, of when the session was opened.
     pub(super) created_at: i64,
+    /// Whether this is the session this device is signed in with. Always
+    /// `false` in [`LoginOutcome::SessionLimitReached`], since no session is
+    /// open on this device yet then.
+    pub(super) is_current: bool,
 }
 
 impl OpenSession {
-    /// The id to pass as [`Service::login`]'s `replace_session_id`.
+    /// The id to pass as [`Service::login`]'s `replace_session_id`, or to
+    /// [`Service::revoke_session`].
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -106,6 +111,10 @@ impl OpenSession {
 
     pub fn created_at(&self) -> i64 {
         self.created_at
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.is_current
     }
 }
 
@@ -124,8 +133,24 @@ impl FakeOpenSession {
                 id: uuid::Uuid::now_v7().to_string(),
                 device_name: crate::tools::testing::random_word().to_string(),
                 created_at: crate::tools::testing::random_past_timestamp(),
+                is_current: false,
             },
         }
+    }
+
+    pub(crate) fn with_id(mut self, id: &str) -> Self {
+        self.session.id = id.to_string();
+        self
+    }
+
+    pub(crate) fn with_created_at(mut self, created_at: i64) -> Self {
+        self.session.created_at = created_at;
+        self
+    }
+
+    pub(crate) fn with_is_current(mut self, is_current: bool) -> Self {
+        self.session.is_current = is_current;
+        self
     }
 
     pub(crate) fn with_device_name(mut self, device_name: &str) -> Self {
@@ -279,6 +304,23 @@ pub trait Service: Send + Sync {
         old_password: &str,
         new_password: &str,
     ) -> Result<()>;
+
+    /// Lists every session open on the signed-in account, across all of its
+    /// users, oldest first — the sessions its plan's `max_sessions` counts
+    /// (see [`crate::Usage`]). The one this device is signed in with is
+    /// flagged [`OpenSession::is_current`]. Never cached locally: other
+    /// devices open and close sessions, so it needs the server.
+    async fn list_sessions(&self) -> Result<Vec<OpenSession>>;
+
+    /// Closes `session_id`, one of the sessions [`Service::list_sessions`]
+    /// lists, logging its device out: it finds out on its next
+    /// authenticated call ([`crate::ErrorCode::SessionExpired`]). Fails with
+    /// [`crate::ErrorCode::NotFoundOnServer`] if it isn't one of the
+    /// account's open sessions. Naming this device's own session closes it
+    /// server-side like any other, so the SDK logs out locally on the next
+    /// authenticated call — prefer [`Service::logout`] for that, which
+    /// clears local state right away.
+    async fn revoke_session(&self, session_id: &str) -> Result<()>;
 
     /// Returns whether this device has a usable OS credential store
     /// (Keychain, Secret Service, ...) to keep the account's secrets in —

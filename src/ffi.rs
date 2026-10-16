@@ -910,11 +910,15 @@ impl From<ChangelogEvent> for FfiChangelogEvent {
 /// FFI boundary.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiOpenSession {
-    /// The id to pass back as `login`'s `replace_session_id`.
+    /// The id to pass back as `login`'s `replace_session_id`, or to
+    /// `revoke_session`.
     pub id: String,
     pub device_name: String,
     /// Unix timestamp, in seconds, of when the session was opened.
     pub created_at: i64,
+    /// Whether this device is signed in with this session. Always `false`
+    /// in a `SessionLimitReached` login outcome.
+    pub is_current: bool,
 }
 
 impl From<OpenSession> for FfiOpenSession {
@@ -923,6 +927,7 @@ impl From<OpenSession> for FfiOpenSession {
             id: session.id().to_string(),
             device_name: session.device_name().to_string(),
             created_at: session.created_at(),
+            is_current: session.is_current(),
         }
     }
 }
@@ -1221,6 +1226,24 @@ impl FydeClient {
     /// call. Mirrors [`crate::UsersService::logout`].
     pub async fn logout(&self) -> Result<(), FfiError> {
         self.localized(self.inner.users().logout()).await
+    }
+
+    /// Lists every session open on the signed-in account, oldest first,
+    /// flagging the one this device uses. Mirrors
+    /// [`crate::UsersService::list_sessions`].
+    pub async fn list_sessions(&self) -> Result<Vec<FfiOpenSession>, FfiError> {
+        self.localized(async {
+            let sessions = self.inner.users().list_sessions().await?;
+            Ok(sessions.into_iter().map(Into::into).collect())
+        })
+        .await
+    }
+
+    /// Closes one of the account's sessions, logging its device out.
+    /// Mirrors [`crate::UsersService::revoke_session`].
+    pub async fn revoke_session(&self, session_id: String) -> Result<(), FfiError> {
+        self.localized(self.inner.users().revoke_session(&session_id))
+            .await
     }
 
     /// Persists `token` as the session token attached to every subsequent

@@ -18,10 +18,22 @@ mod proto {
 }
 
 use proto::{
-    FinishChangePasswordRequest, FinishLoginRequest, FinishRegistrationRequest, LogoutRequest,
+    FinishChangePasswordRequest, FinishLoginRequest, FinishRegistrationRequest,
+    ListSessionsRequest, LogoutRequest, RevokeSessionRequest, SessionInfo,
     StartChangePasswordRequest, StartLoginRequest, StartRegistrationRequest, finish_login_response,
     users_service_client::UsersServiceClient as GeneratedUsersClient,
 };
+
+/// Converts a listed `SessionInfo` into an [`OpenSession`], not flagged as
+/// current: deciding which one is, is `service.rs`'s job.
+fn to_open_session(session: SessionInfo) -> OpenSession {
+    OpenSession {
+        id: session.id,
+        device_name: session.device_name,
+        created_at: session.created_at,
+        is_current: false,
+    }
+}
 
 /// Converts the raw `role` field of a `FinishRegistrationResponse`/
 /// `FinishLoginResponse` into [`Role`]. Defaults to [`Role::User`] for
@@ -106,6 +118,14 @@ pub(super) trait FydeClient: Send + Sync {
     /// Closes the session currently authenticating outgoing calls (see
     /// [`crate::domains::sessions::Service::authenticated_request`]).
     async fn logout(&self) -> Result<()>;
+
+    /// Lists every session open on the account behind the currently
+    /// authenticated session, oldest first, alongside that session's own id.
+    async fn list_sessions(&self) -> Result<(Vec<OpenSession>, String)>;
+
+    /// Closes `session_id`, one of the sessions of the account behind the
+    /// currently authenticated session.
+    async fn revoke_session(&self, session_id: &str) -> Result<()>;
 
     /// First step of changing the password of the account behind the
     /// currently authenticated session: forwards a serialized OPAQUE
@@ -272,15 +292,7 @@ impl FydeClient for GrpcClient {
             Some(finish_login_response::Result::SessionLimitReached(reached)) => {
                 Ok(FinishedLogin::SessionLimitReached {
                     max_sessions: reached.max_sessions,
-                    sessions: reached
-                        .sessions
-                        .into_iter()
-                        .map(|session| OpenSession {
-                            id: session.id,
-                            device_name: session.device_name,
-                            created_at: session.created_at,
-                        })
-                        .collect(),
+                    sessions: reached.sessions.into_iter().map(to_open_session).collect(),
                 })
             }
             None => Err(crate::ErrorKind::InvalidResponse(
@@ -300,6 +312,41 @@ impl FydeClient for GrpcClient {
             .logout(request)
             .await
             .context("failed to log out")?;
+
+        Ok(())
+    }
+
+    async fn list_sessions(&self) -> Result<(Vec<OpenSession>, String)> {
+        let request = self
+            .sessions
+            .authenticated_request(ListSessionsRequest {})
+            .await?;
+
+        let response = self
+            .sessions
+            .check_response(self.client().list_sessions(request).await)
+            .await
+            .context("failed to list sessions")?
+            .into_inner();
+
+        Ok((
+            response.sessions.into_iter().map(to_open_session).collect(),
+            response.current_session_id,
+        ))
+    }
+
+    async fn revoke_session(&self, session_id: &str) -> Result<()> {
+        let request = self
+            .sessions
+            .authenticated_request(RevokeSessionRequest {
+                session_id: session_id.to_string(),
+            })
+            .await?;
+
+        self.sessions
+            .check_response(self.client().revoke_session(request).await)
+            .await
+            .with_context(|| format!("failed to revoke session {session_id}"))?;
 
         Ok(())
     }

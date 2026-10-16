@@ -17,7 +17,7 @@ use super::crypto::{
 };
 use super::grpc_client::{FinishedLogin, FydeClient, GrpcClient};
 use super::{
-    LANGUAGE_SETTING, LoginOutcome, ROLE_SETTING, Role, Service, decode_master_key,
+    LANGUAGE_SETTING, LoginOutcome, OpenSession, ROLE_SETTING, Role, Service, decode_master_key,
     encode_master_key,
 };
 
@@ -400,6 +400,29 @@ impl Service for UsersClient {
             .context("failed to finish change password")?;
 
         Ok(())
+    }
+
+    async fn list_sessions(&self) -> Result<Vec<OpenSession>> {
+        let (sessions, current_session_id) = self
+            .grpc
+            .list_sessions()
+            .await
+            .context("failed to list the account's sessions")?;
+
+        Ok(sessions
+            .into_iter()
+            .map(|session| OpenSession {
+                is_current: session.id == current_session_id,
+                ..session
+            })
+            .collect())
+    }
+
+    async fn revoke_session(&self, session_id: &str) -> Result<()> {
+        self.grpc
+            .revoke_session(session_id)
+            .await
+            .with_context(|| format!("failed to close session {session_id}"))
     }
 
     async fn is_secure_storage_available(&self) -> bool {
@@ -1420,6 +1443,78 @@ mod tests {
             )
             .await
             .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn list_sessions_flags_the_current_session() {
+        let laptop = FakeOpenSession::new().with_device_name("laptop").build();
+        let phone = FakeOpenSession::new().with_device_name("phone").build();
+        let phone_id = phone.id().to_string();
+        let listed = vec![laptop.clone(), phone.clone()];
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_list_sessions()
+            .times(1)
+            .return_once(move || Ok((listed, phone_id)));
+
+        let client = client_with_deps(
+            mock_grpc,
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            MockSecretsService::new(),
+        );
+        let sessions = client.list_sessions().await.unwrap();
+
+        assert_eq!(
+            sessions,
+            vec![
+                laptop,
+                FakeOpenSession::new()
+                    .with_id(phone.id())
+                    .with_device_name("phone")
+                    .with_created_at(phone.created_at())
+                    .with_is_current(true)
+                    .build(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_session_closes_the_named_session() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_revoke_session()
+            .withf(|session_id| session_id == "the-session")
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let client = client_with_deps(
+            mock_grpc,
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            MockSecretsService::new(),
+        );
+
+        client.revoke_session("the-session").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoke_session_propagates_the_servers_refusal() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_revoke_session()
+            .times(1)
+            .returning(|_| Err(tonic::Status::not_found("session not found").into()));
+
+        let client = client_with_deps(
+            mock_grpc,
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            MockSecretsService::new(),
+        );
+        let err = client.revoke_session("the-session").await.unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::NotFoundOnServer);
     }
 
     #[tokio::test]
