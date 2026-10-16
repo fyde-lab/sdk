@@ -22,9 +22,10 @@ use tonic::transport::Channel;
 use uuid::Uuid;
 
 #[cfg(test)]
-pub(crate) use models::{FakeInstalledScript, FakeScript};
+pub(crate) use models::{FakeInstalledScript, FakeScript, FakeScriptMetadata};
 pub use models::{
-    InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptParameterType, ScriptType,
+    InstallScriptRequest, InstalledScript, Script, ScriptMetadata, ScriptParameter,
+    ScriptParameterType, ScriptType,
 };
 
 use crate::Result;
@@ -36,7 +37,8 @@ use crate::domains::sessions::SessionsClient;
 /// enabling/disabling them for the authenticated user, and listing the ones
 /// currently enabled or public. Running scripts against a document is done
 /// by the `documents` domain's `parser` submodule, using
-/// [`Service::list_user_scripts`] together with its own sandboxed Lua VM. Trait methods take `&self` (not `&mut self`) so
+/// [`Service::list_user_scripts`] and [`Service::fetch_script`] together
+/// with its own sandboxed Lua VM. Trait methods take `&self` (not `&mut self`) so
 /// implementations can be shared behind `Arc<dyn Service>`.
 #[cfg_attr(test, automock)]
 #[async_trait]
@@ -85,12 +87,18 @@ pub trait Service: Send + Sync {
     /// that isn't enabled is a no-op.
     async fn disable_script(&self, script_id: Uuid) -> Result<()>;
 
-    /// Lists the scripts currently enabled for the authenticated user.
-    async fn list_user_scripts(&self) -> Result<Vec<Script>>;
+    /// Lists the metadata of the scripts currently enabled for the
+    /// authenticated user, most recently enabled first, fetching every page
+    /// of the server's paginated listing. Fetch a script with
+    /// [`Self::fetch_script`] for its content.
+    async fn list_user_scripts(&self) -> Result<Vec<ScriptMetadata>>;
 
-    /// Lists every script marked public, regardless of who owns it or
-    /// whether the authenticated user has it enabled.
-    async fn list_public_scripts(&self) -> Result<Vec<Script>>;
+    /// Lists the metadata of every script marked public, regardless of who
+    /// owns it or whether the authenticated user has it enabled, most
+    /// recently updated first, fetching every page of the server's
+    /// paginated listing. Fetch a script with [`Self::fetch_script`] for its
+    /// content.
+    async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>>;
 
     /// Installs the script `request.script_id` for the authenticated user,
     /// to be run with `request.parameters`: fetches the script (see

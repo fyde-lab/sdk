@@ -18,7 +18,8 @@ use crate::domains::documents::{
     Subcategory, UploadRequest,
 };
 use crate::domains::scripts::{
-    InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptParameterType, ScriptType,
+    InstallScriptRequest, InstalledScript, Script, ScriptMetadata, ScriptParameter,
+    ScriptParameterType, ScriptType,
 };
 use crate::domains::secrets::SecretLocation;
 use crate::domains::sessions::Service as SessionsService;
@@ -831,6 +832,46 @@ impl From<Script> for FfiScript {
     }
 }
 
+/// A script's metadata — everything but its content — mirroring
+/// [`ScriptMetadata`] across the FFI boundary. `id` crosses as a string
+/// since UniFFI has no native UUID type.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FfiScriptMetadata {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub short_description: String,
+    pub is_public: bool,
+    pub icon: Vec<u8>,
+    pub allowed_domains: Vec<String>,
+    pub version: u64,
+    pub last_updated: i64,
+    pub script_type: FfiScriptType,
+    pub parameters: HashMap<String, FfiScriptParameter>,
+}
+
+impl From<ScriptMetadata> for FfiScriptMetadata {
+    fn from(metadata: ScriptMetadata) -> Self {
+        Self {
+            id: metadata.id().to_string(),
+            name: metadata.name().to_string(),
+            description: metadata.description().to_string(),
+            short_description: metadata.short_description().to_string(),
+            is_public: metadata.is_public(),
+            icon: metadata.icon().to_vec(),
+            allowed_domains: metadata.allowed_domains().to_vec(),
+            version: metadata.version(),
+            last_updated: metadata.last_updated(),
+            script_type: metadata.script_type().into(),
+            parameters: metadata
+                .parameters()
+                .iter()
+                .map(|(key, parameter)| (key.clone(), parameter.clone().into()))
+                .collect(),
+        }
+    }
+}
+
 /// A script installed for the authenticated user, mirroring
 /// [`InstalledScript`] across the FFI boundary. `parameters_json` is the
 /// JSON object of values the script was installed with (e.g.
@@ -1566,23 +1607,24 @@ impl FydeClient {
         .await
     }
 
-    /// Lists the scripts currently enabled for the authenticated user.
-    /// Mirrors [`crate::ScriptsService::list_user_scripts`].
-    pub async fn list_user_scripts(&self) -> Result<Vec<FfiScript>, FfiError> {
+    /// Lists the metadata of the scripts currently enabled for the
+    /// authenticated user, without their content. Mirrors
+    /// [`crate::ScriptsService::list_user_scripts`].
+    pub async fn list_user_scripts(&self) -> Result<Vec<FfiScriptMetadata>, FfiError> {
         self.localized(async {
             let scripts = self.inner.scripts().list_user_scripts().await?;
-            Ok(scripts.into_iter().map(FfiScript::from).collect())
+            Ok(scripts.into_iter().map(FfiScriptMetadata::from).collect())
         })
         .await
     }
 
-    /// Lists every script marked public, regardless of who owns it or
-    /// whether the authenticated user has it enabled. Mirrors
-    /// [`crate::ScriptsService::list_public_scripts`].
-    pub async fn list_public_scripts(&self) -> Result<Vec<FfiScript>, FfiError> {
+    /// Lists the metadata of every script marked public, regardless of who
+    /// owns it or whether the authenticated user has it enabled, without
+    /// their content. Mirrors [`crate::ScriptsService::list_public_scripts`].
+    pub async fn list_public_scripts(&self) -> Result<Vec<FfiScriptMetadata>, FfiError> {
         self.localized(async {
             let scripts = self.inner.scripts().list_public_scripts().await?;
-            Ok(scripts.into_iter().map(FfiScript::from).collect())
+            Ok(scripts.into_iter().map(FfiScriptMetadata::from).collect())
         })
         .await
     }

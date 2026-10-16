@@ -162,6 +162,95 @@ impl Script {
     }
 }
 
+/// Everything about a [`Script`] but its content ([`Script::script`]), as
+/// returned by [`super::Service::list_user_scripts`]/
+/// [`super::Service::list_public_scripts`]. Fetch the script itself with
+/// [`super::Service::fetch_script`] to run it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptMetadata {
+    pub(super) id: Uuid,
+    pub(super) name: String,
+    pub(super) description: String,
+    pub(super) short_description: String,
+    pub(super) is_public: bool,
+    pub(super) icon: Vec<u8>,
+    /// See [`Script::allowed_domains`].
+    pub(super) allowed_domains: Vec<String>,
+    pub(super) version: u64,
+    /// Unix timestamp, in seconds, of the last time this script was
+    /// updated.
+    pub(super) last_updated: i64,
+    pub(super) script_type: ScriptType,
+    /// See [`Script::parameters`].
+    pub(super) parameters: HashMap<String, ScriptParameter>,
+}
+
+impl ScriptMetadata {
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// See [`Script::description`].
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    /// See [`Script::short_description`].
+    pub fn short_description(&self) -> &str {
+        &self.short_description
+    }
+
+    pub fn is_public(&self) -> bool {
+        self.is_public
+    }
+
+    pub fn icon(&self) -> &[u8] {
+        &self.icon
+    }
+
+    pub fn allowed_domains(&self) -> &[String] {
+        &self.allowed_domains
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn last_updated(&self) -> i64 {
+        self.last_updated
+    }
+
+    pub fn script_type(&self) -> ScriptType {
+        self.script_type
+    }
+
+    pub fn parameters(&self) -> &HashMap<String, ScriptParameter> {
+        &self.parameters
+    }
+}
+
+impl From<Script> for ScriptMetadata {
+    fn from(script: Script) -> Self {
+        Self {
+            id: script.id,
+            name: script.name,
+            description: script.description,
+            short_description: script.short_description,
+            is_public: script.is_public,
+            icon: script.icon,
+            allowed_domains: script.allowed_domains,
+            version: script.version,
+            last_updated: script.last_updated,
+            script_type: script.script_type,
+            parameters: script.parameters,
+        }
+    }
+}
+
 /// What [`super::Service::install_script`] takes: the id of the script to
 /// install, plus the values to run it with, keyed by the same machine names
 /// as [`Script::parameters`] (e.g. `{"username": "alice"}`).
@@ -235,6 +324,26 @@ impl FakeScript {
 
     pub(crate) fn build(self) -> Script {
         self.script
+    }
+}
+
+/// Builds a [`ScriptMetadata`] filled with random-but-plausible data, for
+/// use in tests.
+#[cfg(test)]
+pub(crate) struct FakeScriptMetadata {
+    metadata: ScriptMetadata,
+}
+
+#[cfg(test)]
+impl FakeScriptMetadata {
+    pub(crate) fn new() -> Self {
+        Self {
+            metadata: FakeScript::new().build().into(),
+        }
+    }
+
+    pub(crate) fn build(self) -> ScriptMetadata {
+        self.metadata
     }
 }
 

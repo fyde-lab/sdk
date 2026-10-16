@@ -63,11 +63,29 @@ impl Service for ParserClient {
     }
 
     async fn run_scripts(&self, document: &Document) -> Result<Metadata> {
-        let scripts = self
+        let enabled = self
             .scripts
             .list_user_scripts()
             .await
             .context("failed to list the scripts enabled for the authenticated user")?;
+
+        // Listings only carry each script's metadata: fetch the content of
+        // every one to run.
+        let mut scripts = Vec::with_capacity(enabled.len());
+        for metadata in enabled {
+            let script = self
+                .scripts
+                .fetch_script(metadata.id())
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to fetch enabled script {:?} ({})",
+                        metadata.name(),
+                        metadata.id()
+                    )
+                })?;
+            scripts.push(script);
+        }
 
         // Lua runs synchronously and `mlua::Lua` isn't `Send`, so the whole
         // loop — every VM built and dropped inside it — runs on a blocking
@@ -107,7 +125,7 @@ fn run_scripts_blocking(scripts: &[Script], document: &Document) -> Result<Metad
 mod tests {
     use super::*;
     use crate::domains::documents::FakeDocument;
-    use crate::domains::scripts::{FakeScript, MockService as MockScriptsService};
+    use crate::domains::scripts::{FakeScript, MockService as MockScriptsService, ScriptMetadata};
 
     /// A [`ScriptsService`] fake with no scripts enabled, so
     /// [`Service::run_scripts`] returns a document's metadata back
@@ -118,6 +136,26 @@ mod tests {
             .expect_list_user_scripts()
             .returning(|| Ok(Vec::new()));
         Arc::new(scripts)
+    }
+
+    /// A [`ScriptsService`] fake with `scripts` enabled, in that order:
+    /// listing them once returns their metadata, and fetching each by id
+    /// returns it whole.
+    fn enabled_scripts(scripts: Vec<Script>) -> Arc<dyn ScriptsService> {
+        let mut mock_scripts = MockScriptsService::new();
+        let metadata: Vec<_> = scripts.iter().cloned().map(ScriptMetadata::from).collect();
+        mock_scripts
+            .expect_list_user_scripts()
+            .times(1)
+            .return_once(move || Ok(metadata));
+        mock_scripts.expect_fetch_script().returning(move |id| {
+            Ok(scripts
+                .iter()
+                .find(|script| script.id() == id)
+                .cloned()
+                .expect("only enabled scripts are fetched"))
+        });
+        Arc::new(mock_scripts)
     }
 
     #[tokio::test]
@@ -140,13 +178,7 @@ mod tests {
             FakeScript::new().with_script("return 1 + 1").build(),
             FakeScript::new().with_script("return 2 + 2").build(),
         ];
-        let mut mock_scripts = MockScriptsService::new();
-        mock_scripts
-            .expect_list_user_scripts()
-            .times(1)
-            .returning(move || Ok(scripts.clone()));
-
-        let client = ParserClient::new(Arc::new(mock_scripts));
+        let client = ParserClient::new(enabled_scripts(scripts));
         let document = FakeDocument::new().build();
 
         client.run_scripts(&document).await.unwrap();
@@ -159,13 +191,7 @@ mod tests {
                 .with_script("this is not valid lua")
                 .build(),
         ];
-        let mut mock_scripts = MockScriptsService::new();
-        mock_scripts
-            .expect_list_user_scripts()
-            .times(1)
-            .returning(move || Ok(scripts.clone()));
-
-        let client = ParserClient::new(Arc::new(mock_scripts));
+        let client = ParserClient::new(enabled_scripts(scripts));
         let document = FakeDocument::new().build();
 
         client.run_scripts(&document).await.unwrap_err();
@@ -174,13 +200,7 @@ mod tests {
     #[tokio::test]
     async fn run_scripts_fails_instead_of_hanging_on_a_script_that_never_terminates() {
         let scripts = vec![FakeScript::new().with_script("while true do end").build()];
-        let mut mock_scripts = MockScriptsService::new();
-        mock_scripts
-            .expect_list_user_scripts()
-            .times(1)
-            .returning(move || Ok(scripts.clone()));
-
-        let client = ParserClient::new(Arc::new(mock_scripts));
+        let client = ParserClient::new(enabled_scripts(scripts));
         let document = FakeDocument::new().build();
 
         client.run_scripts(&document).await.unwrap_err();
@@ -193,13 +213,7 @@ mod tests {
                 .with_script(r#"document.metadata.name = "renamed.pdf""#)
                 .build(),
         ];
-        let mut mock_scripts = MockScriptsService::new();
-        mock_scripts
-            .expect_list_user_scripts()
-            .times(1)
-            .returning(move || Ok(scripts.clone()));
-
-        let client = ParserClient::new(Arc::new(mock_scripts));
+        let client = ParserClient::new(enabled_scripts(scripts));
         let document = FakeDocument::new().build();
 
         let metadata = client.run_scripts(&document).await.unwrap();
@@ -216,18 +230,32 @@ mod tests {
     #[tokio::test]
     async fn run_scripts_keeps_the_original_metadata_when_no_script_changes_it() {
         let scripts = vec![FakeScript::new().with_script("return 1 + 1").build()];
-        let mut mock_scripts = MockScriptsService::new();
-        mock_scripts
-            .expect_list_user_scripts()
-            .times(1)
-            .returning(move || Ok(scripts.clone()));
-
-        let client = ParserClient::new(Arc::new(mock_scripts));
+        let client = ParserClient::new(enabled_scripts(scripts));
         let document = FakeDocument::new().build();
 
         let metadata = client.run_scripts(&document).await.unwrap();
 
         assert_eq!(metadata, *document.metadata());
+    }
+
+    #[tokio::test]
+    async fn run_scripts_fails_if_an_enabled_script_cant_be_fetched() {
+        let script = FakeScript::new().build();
+        let mut mock_scripts = MockScriptsService::new();
+        let metadata = vec![ScriptMetadata::from(script)];
+        mock_scripts
+            .expect_list_user_scripts()
+            .times(1)
+            .return_once(move || Ok(metadata));
+        mock_scripts
+            .expect_fetch_script()
+            .times(1)
+            .returning(|id| Err(crate::ErrorKind::ScriptNotInstalled(id).into()));
+
+        let client = ParserClient::new(Arc::new(mock_scripts));
+        let document = FakeDocument::new().build();
+
+        client.run_scripts(&document).await.unwrap_err();
     }
 
     #[tokio::test]
@@ -240,13 +268,7 @@ mod tests {
                 .with_script(r#"document.metadata.name = document.metadata.name .. "-second""#)
                 .build(),
         ];
-        let mut mock_scripts = MockScriptsService::new();
-        mock_scripts
-            .expect_list_user_scripts()
-            .times(1)
-            .returning(move || Ok(scripts.clone()));
-
-        let client = ParserClient::new(Arc::new(mock_scripts));
+        let client = ParserClient::new(enabled_scripts(scripts));
         let document = FakeDocument::new().build();
 
         let metadata = client.run_scripts(&document).await.unwrap();

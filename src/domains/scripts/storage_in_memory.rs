@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::{ErrorKind, Result};
 
 use super::Script;
+use super::ScriptMetadata;
 use super::ScriptParameter;
 use super::ScriptType;
 use super::Service;
@@ -131,17 +132,17 @@ impl Service for InMemoryScriptStorage {
         Ok(())
     }
 
-    async fn list_user_scripts(&self) -> Result<Vec<Script>> {
+    async fn list_user_scripts(&self) -> Result<Vec<ScriptMetadata>> {
         let scripts = self.scripts.lock().unwrap_or_else(PoisonError::into_inner);
         let enabled = self.enabled.lock().unwrap_or_else(PoisonError::into_inner);
 
         Ok(enabled
             .iter()
-            .filter_map(|id| scripts.get(id).cloned())
+            .filter_map(|id| scripts.get(id).cloned().map(ScriptMetadata::from))
             .collect())
     }
 
-    async fn list_public_scripts(&self) -> Result<Vec<Script>> {
+    async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>> {
         Ok(self
             .scripts
             .lock()
@@ -149,6 +150,7 @@ impl Service for InMemoryScriptStorage {
             .values()
             .filter(|script| script.is_public)
             .cloned()
+            .map(ScriptMetadata::from)
             .collect())
     }
 
@@ -352,8 +354,8 @@ mod tests {
 
         let listed = storage.list_user_scripts().await.unwrap();
 
-        assert_eq!(listed, vec![enabled]);
-        assert!(!listed.contains(&disabled));
+        assert_eq!(listed, vec![ScriptMetadata::from(enabled)]);
+        assert!(!listed.contains(&ScriptMetadata::from(disabled)));
     }
 
     #[tokio::test]
@@ -390,8 +392,8 @@ mod tests {
 
         let listed = storage.list_public_scripts().await.unwrap();
 
-        assert_eq!(listed, vec![public]);
-        assert!(!listed.contains(&private));
+        assert_eq!(listed, vec![ScriptMetadata::from(public)]);
+        assert!(!listed.contains(&ScriptMetadata::from(private)));
     }
 
     #[tokio::test]

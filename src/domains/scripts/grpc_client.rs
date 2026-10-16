@@ -11,6 +11,7 @@ use crate::domains::sessions::{Service as SessionsService, SessionsClient};
 use crate::{ErrorContext as _, Result};
 
 use super::Script;
+use super::ScriptMetadata;
 use super::ScriptParameter;
 use super::ScriptParameterType;
 use super::ScriptType;
@@ -45,6 +46,15 @@ pub(super) struct ScriptDraft {
     pub(super) parameters: HashMap<String, ScriptParameter>,
 }
 
+/// One page of one of the server's paginated script listings.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ScriptMetadataPage {
+    pub(super) scripts: Vec<ScriptMetadata>,
+    /// The token listing the page after this one, or `None` when this is
+    /// the last page.
+    pub(super) next_page_token: Option<String>,
+}
+
 /// A gRPC transport for talking to the fyde server's scripts service. Knows
 /// nothing about scripts business logic beyond translating between raw
 /// proto messages and the domain [`Script`] type. Abstracted as a trait so
@@ -69,12 +79,16 @@ pub(super) trait FydeClient: Send + Sync {
     /// Disables `script_id` for the authenticated user.
     async fn disable_script(&self, script_id: Uuid) -> Result<()>;
 
-    /// Lists the scripts currently enabled for the authenticated user.
-    async fn list_user_scripts(&self) -> Result<Vec<Script>>;
+    /// Lists one page of the metadata of the scripts currently enabled for
+    /// the authenticated user: the first one for a `None` `page_token`,
+    /// otherwise the one after the page that returned it. The page size is
+    /// left to the server's default.
+    async fn list_user_scripts(&self, page_token: Option<String>) -> Result<ScriptMetadataPage>;
 
-    /// Lists every script marked public, regardless of who owns it or
-    /// whether the authenticated user has it enabled.
-    async fn list_public_scripts(&self) -> Result<Vec<Script>>;
+    /// Lists one page of the metadata of every script marked public,
+    /// regardless of who owns it or whether the authenticated user has it
+    /// enabled — see [`Self::list_user_scripts`] for `page_token`.
+    async fn list_public_scripts(&self, page_token: Option<String>) -> Result<ScriptMetadataPage>;
 }
 
 /// The production [`FydeClient`] implementation, backed by a tonic
@@ -215,10 +229,13 @@ impl FydeClient for GrpcClient {
         Ok(())
     }
 
-    async fn list_user_scripts(&self) -> Result<Vec<Script>> {
+    async fn list_user_scripts(&self, page_token: Option<String>) -> Result<ScriptMetadataPage> {
         let request = self
             .sessions
-            .authenticated_request(ListUserScriptsRequest {})
+            .authenticated_request(ListUserScriptsRequest {
+                page_size: 0,
+                page_token: page_token.unwrap_or_default(),
+            })
             .await?;
 
         let response = self
@@ -228,13 +245,16 @@ impl FydeClient for GrpcClient {
             .context("failed to list user scripts")?
             .into_inner();
 
-        response.scripts.into_iter().map(into_domain).collect()
+        page_into_domain(response.scripts, response.next_page_token)
     }
 
-    async fn list_public_scripts(&self) -> Result<Vec<Script>> {
+    async fn list_public_scripts(&self, page_token: Option<String>) -> Result<ScriptMetadataPage> {
         let request = self
             .sessions
-            .authenticated_request(ListPublicScriptsRequest {})
+            .authenticated_request(ListPublicScriptsRequest {
+                page_size: 0,
+                page_token: page_token.unwrap_or_default(),
+            })
             .await?;
 
         let response = self
@@ -244,7 +264,7 @@ impl FydeClient for GrpcClient {
             .context("failed to list public scripts")?
             .into_inner();
 
-        response.scripts.into_iter().map(into_domain).collect()
+        page_into_domain(response.scripts, response.next_page_token)
     }
 }
 
@@ -333,6 +353,46 @@ fn into_domain(script: proto::Script) -> Result<Script> {
     })
 }
 
+/// Converts a listing response's generated `proto::ScriptMetadata`s and
+/// `next_page_token` (empty on the last page) into a domain
+/// [`ScriptMetadataPage`].
+fn page_into_domain(
+    scripts: Vec<proto::ScriptMetadata>,
+    next_page_token: String,
+) -> Result<ScriptMetadataPage> {
+    Ok(ScriptMetadataPage {
+        scripts: scripts
+            .into_iter()
+            .map(metadata_into_domain)
+            .collect::<Result<_>>()?,
+        next_page_token: (!next_page_token.is_empty()).then_some(next_page_token),
+    })
+}
+
+/// Converts a generated `proto::ScriptMetadata` into the domain
+/// [`ScriptMetadata`] type, parsing it like [`into_domain`] does a script.
+fn metadata_into_domain(metadata: proto::ScriptMetadata) -> Result<ScriptMetadata> {
+    Ok(ScriptMetadata {
+        id: metadata
+            .id
+            .parse()
+            .context("failed to parse script id returned by the server")?,
+        name: metadata.name,
+        description: metadata.description,
+        short_description: metadata.short_description,
+        is_public: metadata.is_public,
+        icon: metadata.icon,
+        allowed_domains: metadata.allowed_domains,
+        version: metadata.version,
+        last_updated: metadata.last_updated,
+        script_type: metadata
+            .r#type
+            .parse()
+            .context("failed to parse script type returned by the server")?,
+        parameters: parameters_into_domain(metadata.parameters),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use tonic::transport::Endpoint;
@@ -354,7 +414,7 @@ mod tests {
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
         let grpc = GrpcClient::new(channel, sessions());
 
-        let err = grpc.list_user_scripts().await.unwrap_err();
+        let err = grpc.list_user_scripts(None).await.unwrap_err();
 
         assert!(err.has_context());
     }

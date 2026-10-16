@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -7,9 +8,31 @@ use uuid::Uuid;
 use crate::domains::changelog::{EventType, Service as ChangelogService};
 use crate::{ErrorContext as _, ErrorKind, Result};
 
-use super::grpc_client::{FydeClient, ScriptDraft};
+use super::grpc_client::{FydeClient, ScriptDraft, ScriptMetadataPage};
 use super::storage::Storage;
-use super::{InstallScriptRequest, InstalledScript, Script, ScriptParameter, ScriptType, Service};
+use super::{
+    InstallScriptRequest, InstalledScript, Script, ScriptMetadata, ScriptParameter, ScriptType,
+    Service,
+};
+
+/// Collects every page of one of the server's paginated listings, from the
+/// first one on: `list_page` lists the page a token points at (`None` for
+/// the first), and listing stops at the page handing out no next token.
+async fn all_pages<F>(list_page: impl Fn(Option<String>) -> F) -> Result<Vec<ScriptMetadata>>
+where
+    F: Future<Output = Result<ScriptMetadataPage>>,
+{
+    let mut scripts = Vec::new();
+    let mut page_token = None;
+    loop {
+        let page = list_page(page_token).await?;
+        scripts.extend(page.scripts);
+        match page.next_page_token {
+            Some(next_page_token) => page_token = Some(next_page_token),
+            None => return Ok(scripts),
+        }
+    }
+}
 
 /// The default [`Service`] implementation. Composes the injected `grpc`
 /// client for talking to the server's scripts service, `changelog` to
@@ -102,12 +125,12 @@ impl<S: Storage> Service for ScriptsClient<S> {
         self.grpc.disable_script(script_id).await
     }
 
-    async fn list_user_scripts(&self) -> Result<Vec<Script>> {
-        self.grpc.list_user_scripts().await
+    async fn list_user_scripts(&self) -> Result<Vec<ScriptMetadata>> {
+        all_pages(|page_token| self.grpc.list_user_scripts(page_token)).await
     }
 
-    async fn list_public_scripts(&self) -> Result<Vec<Script>> {
-        self.grpc.list_public_scripts().await
+    async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>> {
+        all_pages(|page_token| self.grpc.list_public_scripts(page_token)).await
     }
 
     async fn install_script(&self, request: InstallScriptRequest) -> Result<()> {
@@ -173,7 +196,9 @@ mod tests {
     use crate::domains::documents::Metadata;
     use crate::domains::scripts::grpc_client::MockFydeClient;
     use crate::domains::scripts::storage::MockStorage;
-    use crate::domains::scripts::{FakeInstalledScript, FakeScript, ScriptParameterType};
+    use crate::domains::scripts::{
+        FakeInstalledScript, FakeScript, FakeScriptMetadata, ScriptParameterType,
+    };
 
     fn no_parameters() -> HashMap<String, ScriptParameter> {
         HashMap::new()
@@ -547,32 +572,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_user_scripts_delegates_to_grpc() {
-        let expected = vec![FakeScript::new().build(), FakeScript::new().build()];
-        let returned = expected.clone();
+    async fn list_user_scripts_fetches_every_page() {
+        let first = FakeScriptMetadata::new().build();
+        let second = FakeScriptMetadata::new().build();
         let mut mock_grpc = MockFydeClient::new();
+        let first_page = ScriptMetadataPage {
+            scripts: vec![first.clone()],
+            next_page_token: Some("next".to_string()),
+        };
         mock_grpc
             .expect_list_user_scripts()
+            .withf(|page_token| page_token.is_none())
             .times(1)
-            .returning(move || Ok(returned.clone()));
+            .return_once(move |_| Ok(first_page));
+        let last_page = ScriptMetadataPage {
+            scripts: vec![second.clone()],
+            next_page_token: None,
+        };
+        mock_grpc
+            .expect_list_user_scripts()
+            .withf(|page_token| page_token.as_deref() == Some("next"))
+            .times(1)
+            .return_once(move |_| Ok(last_page));
 
         let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
-        assert_eq!(client.list_user_scripts().await.unwrap(), expected);
+        assert_eq!(
+            client.list_user_scripts().await.unwrap(),
+            vec![first, second]
+        );
     }
 
     #[tokio::test]
-    async fn list_public_scripts_delegates_to_grpc() {
-        let expected = vec![FakeScript::new().build(), FakeScript::new().build()];
-        let returned = expected.clone();
+    async fn list_public_scripts_fetches_every_page() {
+        let first = FakeScriptMetadata::new().build();
+        let second = FakeScriptMetadata::new().build();
         let mut mock_grpc = MockFydeClient::new();
+        let first_page = ScriptMetadataPage {
+            scripts: vec![first.clone()],
+            next_page_token: Some("next".to_string()),
+        };
         mock_grpc
             .expect_list_public_scripts()
+            .withf(|page_token| page_token.is_none())
             .times(1)
-            .returning(move || Ok(returned.clone()));
+            .return_once(move |_| Ok(first_page));
+        let last_page = ScriptMetadataPage {
+            scripts: vec![second.clone()],
+            next_page_token: None,
+        };
+        mock_grpc
+            .expect_list_public_scripts()
+            .withf(|page_token| page_token.as_deref() == Some("next"))
+            .times(1)
+            .return_once(move |_| Ok(last_page));
 
         let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
-        assert_eq!(client.list_public_scripts().await.unwrap(), expected);
+        assert_eq!(
+            client.list_public_scripts().await.unwrap(),
+            vec![first, second]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_public_scripts_fails_if_a_page_fails() {
+        let mut mock_grpc = MockFydeClient::new();
+        let first_page = ScriptMetadataPage {
+            scripts: vec![FakeScriptMetadata::new().build()],
+            next_page_token: Some("next".to_string()),
+        };
+        mock_grpc
+            .expect_list_public_scripts()
+            .withf(|page_token| page_token.is_none())
+            .times(1)
+            .return_once(move |_| Ok(first_page));
+        mock_grpc
+            .expect_list_public_scripts()
+            .withf(|page_token| page_token.is_some())
+            .times(1)
+            .return_once(|_| Err(ErrorKind::InvalidResponse("boom".to_string()).into()));
+
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
+
+        client.list_public_scripts().await.unwrap_err();
     }
 }
