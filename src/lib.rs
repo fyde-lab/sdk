@@ -37,8 +37,11 @@ use tools::sql::{self, SqliteClient};
 /// Selects which SQLite backend a [`Client`] persists local state to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Storage {
-    /// An on-disk database at the given path (see
-    /// [`sql::SqliteClient::connect_with`]).
+    /// An on-disk database under the given data directory, in a
+    /// subdirectory named after [`ClientConfig::client_name`] (both created
+    /// if missing): `<dir>/<client_name>/fyde.db`. Two clients sharing a
+    /// data directory therefore never share a database, nor the secrets
+    /// namespaced by its path.
     Disk(std::path::PathBuf),
     /// A private in-memory database that only lives for the process's
     /// lifetime (see [`sql::SqliteClient::connect_with`]).
@@ -50,6 +53,11 @@ pub struct ClientConfig {
     /// The `http://` or `https://` base URL of the fyde server to connect
     /// to (e.g. `http://127.0.0.1:40051`).
     pub url: String,
+    /// Identifies this client (e.g. `desktop`, `android`) among those
+    /// sharing a [`Storage::Disk`] data directory: names the subdirectory
+    /// its database lives in. 1 to 64 ASCII letters, digits, `-`, `_` or
+    /// `.`, not starting with `.`; checked even for [`Storage::Memory`].
+    pub client_name: String,
     /// Which SQLite backend to persist local state to.
     pub storage: Storage,
     /// The verbosity of the SDK's internal logs.
@@ -100,8 +108,9 @@ impl Client {
     /// Connects to a fyde server per `config`.
     pub async fn init(config: ClientConfig) -> Result<Self> {
         install_tracing(config.log_level, config.on_log.clone());
-        let sqlite = open_database(&config.storage).await?;
-        let secrets = open_secrets(&config.storage, &sqlite)?;
+        let location = DatabaseLocation::resolve(&config.storage, &config.client_name)?;
+        let sqlite = open_database(&location).await?;
+        let secrets = open_secrets(&location, &sqlite)?;
         let channel = lazy_channel(config.url)?;
 
         let settings = domains::settings::init(sqlite.pool().clone());
@@ -117,7 +126,7 @@ impl Client {
             secrets.clone(),
             sessions.clone(),
             server_state.clone(),
-            changelog_lock_path(&config.storage),
+            changelog_lock_path(&location),
         )
         .await
         .context("failed to initialize changelog service")?;
@@ -258,50 +267,107 @@ fn install_tracing(
         .try_init();
 }
 
-/// Opens the local SQLite database `storage` selects.
-async fn open_database(storage: &Storage) -> Result<Arc<SqliteClient>> {
-    let sqlite = match storage {
-        Storage::Disk(path) => SqliteClient::connect_at(path.clone()).await,
-        Storage::Memory => SqliteClient::connect_with(sql::IN_MEMORY_DB).await,
+/// Where a [`Client`]'s local database lives, once its [`Storage`] and
+/// client name are resolved together.
+enum DatabaseLocation {
+    /// The database file itself (see [`client_database_path`]).
+    Disk(std::path::PathBuf),
+    Memory,
+}
+
+impl DatabaseLocation {
+    fn resolve(storage: &Storage, client_name: &str) -> Result<Self> {
+        validate_client_name(client_name)?;
+        Ok(match storage {
+            Storage::Disk(data_dir) => Self::Disk(client_database_path(data_dir, client_name)?),
+            Storage::Memory => Self::Memory,
+        })
+    }
+}
+
+/// File name of the local database inside a client's own directory.
+const DATABASE_FILE_NAME: &str = "fyde.db";
+
+/// Rejects a client name that isn't a single, unambiguous path segment
+/// (e.g. `..`, `a/b`, an empty or hidden name), so it can never point a
+/// client's database outside its data directory or into another client's.
+fn validate_client_name(client_name: &str) -> Result<()> {
+    let valid = (1..=64).contains(&client_name.len())
+        && !client_name.starts_with('.')
+        && client_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if !valid {
+        return Err(ErrorKind::InvalidClientName(client_name.to_string()).into());
+    }
+    Ok(())
+}
+
+/// The database path of the client named `client_name` under `data_dir`:
+/// `<data_dir>/<client_name>/fyde.db`, creating that directory (owner-only
+/// on Unix) if it doesn't exist yet.
+fn client_database_path(
+    data_dir: &std::path::Path,
+    client_name: &str,
+) -> Result<std::path::PathBuf> {
+    let client_dir = data_dir.join(client_name);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(&client_dir).with_context(|| {
+        format!(
+            "failed to create local data directory {}",
+            client_dir.display()
+        )
+    })?;
+    Ok(client_dir.join(DATABASE_FILE_NAME))
+}
+
+/// Opens the local SQLite database at `location`.
+async fn open_database(location: &DatabaseLocation) -> Result<Arc<SqliteClient>> {
+    let sqlite = match location {
+        DatabaseLocation::Disk(path) => SqliteClient::connect_at(path.clone()).await,
+        DatabaseLocation::Memory => SqliteClient::connect_with(sql::IN_MEMORY_DB).await,
     }
     .context("failed to open local database")?;
     Ok(Arc::new(sqlite))
 }
 
-/// The changelog write lock for the database `storage` selects (see
+/// The changelog write lock for the database at `location` (see
 /// `ChangelogClient::lock_path`): beside an on-disk database, so every
 /// process opening that file arbitrates over the same lock and no other
 /// process does; unique to the process for an in-memory one, which no
 /// other process can open.
-fn changelog_lock_path(storage: &Storage) -> std::path::PathBuf {
-    match storage {
-        Storage::Disk(path) => {
+fn changelog_lock_path(location: &DatabaseLocation) -> std::path::PathBuf {
+    match location {
+        DatabaseLocation::Disk(path) => {
             let mut lock = path.clone().into_os_string();
             lock.push(".consume.lock");
             lock.into()
         }
-        Storage::Memory => std::env::temp_dir().join(format!(
+        DatabaseLocation::Memory => std::env::temp_dir().join(format!(
             "fyde-changelog-consume-{}.lock",
             uuid::Uuid::new_v4()
         )),
     }
 }
 
-/// Opens the secrets store matching `storage`. Secrets (master key, session
+/// Opens the secrets store matching `location`. Secrets (master key, session
 /// token) live in the OS credential store next to an on-disk database, and
 /// only in `sqlite` itself on a device without one whose user explicitly
 /// accepted it (see `UsersService::create`'s `allow_insecure_storage`); an
 /// in-memory client keeps them in memory, like everything else.
 fn open_secrets(
-    storage: &Storage,
+    location: &DatabaseLocation,
     sqlite: &SqliteClient,
 ) -> Result<Arc<dyn domains::secrets::Service>> {
     domains::secrets::init(
-        match storage {
-            Storage::Disk(path) => domains::secrets::StorageConfig::Keystore {
+        match location {
+            DatabaseLocation::Disk(path) => domains::secrets::StorageConfig::Keystore {
                 database_path: path,
             },
-            Storage::Memory => domains::secrets::StorageConfig::Memory,
+            DatabaseLocation::Memory => domains::secrets::StorageConfig::Memory,
         },
         sqlite.pool().clone(),
     )
@@ -381,6 +447,7 @@ mod tests {
     async fn init_rejects_a_malformed_url() {
         let config = ClientConfig {
             url: "not a valid uri".to_string(),
+            client_name: "test".to_string(),
             storage: Storage::Memory,
             log_level: LogLevel::Off,
             on_log: None,
@@ -395,5 +462,67 @@ mod tests {
         };
 
         assert_eq!(err.code(), ErrorCode::InvalidServerUrl);
+    }
+
+    #[test]
+    fn validate_client_name_accepts_a_single_safe_path_segment() {
+        for name in ["desktop", "android", "fyde-scripts", "a_b.c", "X1"] {
+            assert!(
+                validate_client_name(name).is_ok(),
+                "{name:?} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_client_name_rejects_anything_else() {
+        let too_long = "a".repeat(65);
+        for name in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "a/b",
+            "a\\b",
+            "../x",
+            "with space",
+            "é",
+            &too_long,
+        ] {
+            let err = validate_client_name(name).expect_err(name);
+            assert_eq!(err.code(), ErrorCode::InvalidClientName, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_puts_each_client_in_its_own_subdirectory() {
+        let data_dir = std::env::temp_dir().join(format!("fyde-sdk-test-{}", uuid::Uuid::now_v7()));
+        let storage = Storage::Disk(data_dir.clone());
+
+        let paths: Vec<_> = ["desktop", "android"]
+            .into_iter()
+            .map(
+                |name| match DatabaseLocation::resolve(&storage, name).unwrap() {
+                    DatabaseLocation::Disk(path) => path,
+                    DatabaseLocation::Memory => panic!("a disk storage must resolve to a file"),
+                },
+            )
+            .collect();
+
+        assert_eq!(paths[0], data_dir.join("desktop").join(DATABASE_FILE_NAME));
+        assert_eq!(paths[1], data_dir.join("android").join(DATABASE_FILE_NAME));
+        assert!(data_dir.join("desktop").is_dir());
+        assert!(data_dir.join("android").is_dir());
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_rejects_an_invalid_client_name_even_in_memory() {
+        let err = match DatabaseLocation::resolve(&Storage::Memory, "..") {
+            Ok(_) => panic!("an invalid client name must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), ErrorCode::InvalidClientName);
     }
 }

@@ -68,6 +68,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "A background task stopped unexpectedly.",
             "Une tâche en arrière-plan s'est arrêtée de manière inattendue.",
         ),
+        ErrorCode::InvalidClientName => (
+            "The application is misconfigured: its name is invalid.",
+            "L'application est mal configurée : son nom est invalide.",
+        ),
         ErrorCode::Encryption => (
             "Your data couldn't be encrypted or decrypted.",
             "Vos données n'ont pas pu être chiffrées ou déchiffrées.",

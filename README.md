@@ -7,7 +7,9 @@ use fyde_sdk::{Client, ClientConfig, LogLevel, Storage};
 
 let client = Client::init(ClientConfig {
     url: "http://127.0.0.1:40051".into(),
-    storage: Storage::Disk("fyde.db".into()),
+    client_name: "desktop".into(),
+    // The database lands at fyde-data/desktop/fyde.db.
+    storage: Storage::Disk("fyde-data".into()),
     log_level: LogLevel::Info,
     on_log: None,
     on_document_change: None,

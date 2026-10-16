@@ -1028,6 +1028,7 @@ pub trait LogListener: Send + Sync {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FfiClientConfig {
     pub url: String,
+    pub client_name: String,
     pub storage: FfiStorage,
     pub log_level: FfiLogLevel,
 }
@@ -1036,6 +1037,7 @@ impl From<FfiClientConfig> for ClientConfig {
     fn from(config: FfiClientConfig) -> Self {
         Self {
             url: config.url,
+            client_name: config.client_name,
             storage: config.storage.into(),
             log_level: config.log_level.into(),
             on_log: None,

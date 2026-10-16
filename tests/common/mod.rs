@@ -61,6 +61,7 @@ impl Scenario {
 
         let client = Client::init(ClientConfig {
             url: server.url().to_string(),
+            client_name: "test".to_string(),
             storage: Storage::Memory,
             log_level: LogLevel::Off,
             on_log: None,

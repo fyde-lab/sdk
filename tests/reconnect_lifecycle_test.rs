@@ -15,20 +15,17 @@ use serial_test::serial;
 
 use common::{TEST_PASSWORD, TestServer, random_username, wait_for, write_temp_pdf};
 
-/// A filesystem path for a SQLite database that doesn't exist yet, for
-/// `Storage::Disk` to create on first connect (mirrors
-/// `sql::sqlite::tests::temp_db_path`).
-fn temp_db_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "fyde-sdk-reconnect-test-{}.db",
-        uuid::Uuid::now_v7()
-    ))
+/// A data directory that doesn't exist yet, for `Storage::Disk` to
+/// create (with the client's database inside it) on first connect.
+fn temp_data_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("fyde-sdk-reconnect-test-{}", uuid::Uuid::now_v7()))
 }
 
-fn config(url: &str, db_path: &std::path::Path) -> ClientConfig {
+fn config(url: &str, data_dir: &std::path::Path) -> ClientConfig {
     ClientConfig {
         url: url.to_string(),
-        storage: Storage::Disk(db_path.to_path_buf()),
+        client_name: "test".to_string(),
+        storage: Storage::Disk(data_dir.to_path_buf()),
         log_level: fyde_sdk::LogLevel::Off,
         on_log: None,
         on_document_change: None,
@@ -48,11 +45,11 @@ async fn reconnecting_with_a_persisted_session_resumes_sync_without_logging_in_a
     // have one) while still letting them outlive the first `Client`.
     fyde_sdk::use_in_process_keystore_for_tests().expect("failed to swap in a test keystore");
     let server = TestServer::start();
-    let db_path = temp_db_path();
+    let data_dir = temp_data_dir();
     let username = random_username();
 
     let document_id = {
-        let client = Client::init(config(server.url(), &db_path))
+        let client = Client::init(config(server.url(), &data_dir))
             .await
             .expect("failed to connect the first client");
 
@@ -75,7 +72,7 @@ async fn reconnecting_with_a_persisted_session_resumes_sync_without_logging_in_a
         // process exiting while a session is still open.
     };
 
-    let client = Client::init(config(server.url(), &db_path))
+    let client = Client::init(config(server.url(), &data_dir))
         .await
         .expect("failed to reconnect a second client against the same local database");
 
@@ -89,5 +86,5 @@ async fn reconnecting_with_a_persisted_session_resumes_sync_without_logging_in_a
 
     assert_eq!(document.id(), document_id);
 
-    std::fs::remove_file(&db_path).ok();
+    std::fs::remove_dir_all(&data_dir).ok();
 }

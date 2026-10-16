@@ -15,6 +15,7 @@ use common::{TEST_PASSWORD, TestServer, random_username, write_temp_pdf};
 async fn client(server: &TestServer) -> Client {
     Client::init(ClientConfig {
         url: server.url().to_string(),
+        client_name: "test".to_string(),
         storage: Storage::Memory,
         log_level: LogLevel::Off,
         on_log: None,
