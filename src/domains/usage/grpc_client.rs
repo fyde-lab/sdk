@@ -12,7 +12,7 @@ use super::Usage;
 
 /// Generated protobuf/gRPC bindings for the `usage` service, compiled by
 /// `build.rs` from `usage/v1/usage.proto` in the `buf.build/fyde-lab/api`
-/// BSR module (sourced from `../api-protos`).
+/// BSR module (sourced from `../server/protos`).
 mod proto {
     tonic::include_proto!("usage.v1");
 }

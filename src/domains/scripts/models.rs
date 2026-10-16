@@ -94,8 +94,8 @@ pub struct Script {
     pub(super) icon: Vec<u8>,
     /// The only hosts (or subdomains of them) this script's `fyde.http`/
     /// `fyde.browser` calls may reach (see
-    /// `../scrapers/host/mod.rs::is_host_allowed`). Empty means
-    /// unrestricted.
+    /// `../scrapers/host/mod.rs::is_host_allowed`). Empty blocks every
+    /// host.
     pub(super) allowed_domains: Vec<String>,
     pub(super) version: u64,
     pub(super) script: String,
