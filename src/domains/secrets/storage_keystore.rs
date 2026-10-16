@@ -96,7 +96,8 @@ static STORE: Mutex<Option<Arc<CredentialStore>>> = Mutex::new(None);
 /// this process: secrets still outlive any one `Client` — so a test can
 /// drop one and re-`init` another against the same database, like an app
 /// restart — but never the process, and never touch the machine's real
-/// keychain. Only for tests (see `tests/reconnect_lifecycle_test.rs`).
+/// keychain. Only for tests (see
+/// `../server/tests/reconnect_lifecycle_test.rs`).
 pub(crate) fn use_in_process_store() -> Result<()> {
     let store: Arc<CredentialStore> = keyring_core::mock::Store::new()?;
     *STORE.lock().unwrap_or_else(|p| p.into_inner()) = Some(store);

@@ -45,12 +45,12 @@ FYDE_PROTO_DIR=../server/protos cargo build  # protos from a local checkout
 ## Testing
 
 ```sh
-cargo test       # unit tests, then the end-to-end suites in tests/
+cargo test       # unit tests
 cargo clippy --all-targets
 cargo fmt --check
 ```
 
-The end-to-end suites in `tests/` start a real `fyde-server`, so they need the [`server`](https://github.com/fyde-lab/server) repository checked out next to this one (`../server`).
+The end-to-end suites, which drive a real `Client` against a real server, live in the [`server`](https://github.com/fyde-lab/server) repository's `tests/`.
 
 ## Further reading
 

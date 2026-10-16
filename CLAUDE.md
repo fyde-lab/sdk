@@ -19,8 +19,6 @@ FYDE_PROTO_DIR=../server/protos cargo build  # build without buf / network acces
   `go`/`clang` for `wreq`'s vendored BoringSSL; `webkitgtk_4_1`/`gtk3` for `wry`.
 - `build.rs` runs `buf export buf.build/fyde-lab/api` (needs `buf` on `PATH` + network) unless
   `FYDE_PROTO_DIR` is set.
-- `tests/` (and so `cargo test` / `clippy --all-targets`) need `../server` checked out
-  (`fyde-server` is a path dev-dependency).
 
 ## Non-negotiable rules
 
@@ -80,10 +78,9 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   `FakeMetadata`, `FakeChangelogEvent`, `FakeScript`, ...), using `tools::testing`'s random
   helpers. Use them instead of struct literals. Keep them `pub(crate)` and re-export one only
   when another file needs it (unused re-exports fail clippy).
-- Every top-level test in `tests/*_test.rs` must be `#[serial(e2e)]` (`serial_test`): each
-  spins up a real server and real OPAQUE/Argon2id, and parallel runs make `tests/common`'s
-  timeouts flaky. `tests/` suites using `Storage::Disk` must call
-  `use_in_process_keystore_for_tests` so they never touch the real keychain.
+- No `tests/` here: the end-to-end suites driving a real `Client` against a real server live in
+  `../server/tests/` (which dev-depends on this crate). Keep the API they use public (e.g. the
+  `#[doc(hidden)]` `use_in_process_keystore_for_tests`), and update them with any API change.
 
 ## Architecture
 
