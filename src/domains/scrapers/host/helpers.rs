@@ -63,4 +63,18 @@ mod tests {
 
         assert_eq!(message, "INVALID_CREDENTIALS");
     }
+
+    #[test]
+    fn contains_ignores_case_and_a_missing_haystack() {
+        let lua = lua("");
+
+        let (found, missing): (bool, bool) = eval(
+            &lua,
+            r#"local h = fyde.helpers
+               return h.contains("Mot de PASSE", "passe"), h.contains(nil, "x")"#,
+        );
+
+        assert!(found);
+        assert!(!missing);
+    }
 }

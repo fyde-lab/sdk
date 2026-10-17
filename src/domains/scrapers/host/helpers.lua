@@ -28,8 +28,13 @@ local function fail(code, detail)
   error(code, 0)
 end
 
+local function contains(haystack, needle)
+  return (haystack or ""):lower():find(needle:lower(), 1, true) ~= nil
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
   fail = fail,
+  contains = contains,
 }
