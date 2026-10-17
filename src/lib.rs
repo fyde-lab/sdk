@@ -18,7 +18,9 @@ pub use domains::documents::{
     FacetCount, Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery,
     Service as DocumentsService, SetAttributeRequest, UploadRequest,
 };
-pub use domains::scrapers::{ProgressEvent, Service as ScrapersService};
+pub use domains::scrapers::{
+    HELPERS_LUA as SCRAPER_HELPERS_LUA, ProgressEvent, Service as ScrapersService,
+};
 pub use domains::scripts::{
     InMemoryScriptStorage, InstallScriptRequest, InstalledScript, Script, ScriptMetadata,
     ScriptParameter, ScriptParameterType, ScriptType, Service as ScriptsService,

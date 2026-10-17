@@ -6,6 +6,7 @@ mod reports;
 mod service;
 mod session;
 
+pub use host::helpers::SOURCE as HELPERS_LUA;
 pub use models::ProgressEvent;
 
 use std::path::PathBuf;

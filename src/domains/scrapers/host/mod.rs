@@ -1,5 +1,6 @@
 mod browser;
 mod documents;
+pub(super) mod helpers;
 mod html;
 mod http;
 mod input;
@@ -136,7 +137,8 @@ pub(super) struct HostConfig {
 /// Wires every host capability a scraper script is allowed to use into a
 /// single `fyde` global table: `fyde.log`, `fyde.http`, `fyde.html`,
 /// `fyde.json`, `fyde.progress`, `fyde.input`, `fyde.save_document`,
-/// `fyde.session`, `fyde.browser`. Scripts never reach outside this table —
+/// `fyde.session`, `fyde.browser`, plus `fyde.helpers` (Lua helpers built
+/// on top of the others, see `helpers.lua`). Scripts never reach outside this table —
 /// no raw `io`/`os`/socket access from script code, enforced by the VM
 /// itself: `service.rs`'s `sandboxed_lua` builds the `Lua` instance this is
 /// installed into with those standard libraries never loaded in the first
@@ -223,6 +225,8 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
         )?,
     )
     .context("installing fyde.browser")?;
+    fyde.set("helpers", helpers::table(lua)?)
+        .context("installing fyde.helpers")?;
 
     let session_value = lua
         .to_value(&session_data)
