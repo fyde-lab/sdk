@@ -346,4 +346,24 @@ mod tests {
 
         assert_eq!(text, "Hello world");
     }
+
+    #[test]
+    fn wait_state_polls_until_a_state_matches_or_times_out() {
+        // The page changes while the helper sleeps between two polls.
+        let lua = lua("page = '<p>loading</p>'
+             fyde.browser = {
+               html = function() return page end,
+               wait_for = function() page = '<p>Mot de passe incorrect</p>' error('timed out') end,
+             }");
+
+        let (state, timed_out): (String, Option<String>) = eval(
+            &lua,
+            r#"local h = fyde.helpers
+               local states = { { "form", selector = "form" }, { "bad", text = { "mot de passe incorrect" } } }
+               return h.wait_state(states, 5000), h.wait_state({ { "form", selector = "form" } }, 2000)"#,
+        );
+
+        assert_eq!(state, "bad");
+        assert_eq!(timed_out, None);
+    }
 }

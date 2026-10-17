@@ -206,6 +206,35 @@ local function page_text()
   return body and body.text or ""
 end
 
+-- Polls the current page until one of `states` matches and returns its name (or nil after
+-- `timeout_ms`). Each state is `{ name, selector = css }` or `{ name, text = { needles } }`.
+-- Polling in short chunks also survives `fyde.browser:open` not waiting for navigation (a
+-- `wait_for` issued against the previous page just times out and gets retried).
+local function wait_state(states, timeout_ms)
+  local waited = 0
+  repeat
+    local html = page_html()
+    local text
+    for _, state in ipairs(states) do
+      if state.selector and #fyde.html.select(html, state.selector) > 0 then
+        return state[1]
+      end
+      if state.text then
+        if not text then
+          local body = fyde.html.select(html, "body")[1]
+          text = body and body.text or ""
+        end
+        if contains_any(text, state.text) then
+          return state[1]
+        end
+      end
+    end
+    sleep(1000)
+    waited = waited + 1000
+  until waited >= (timeout_ms or 30000)
+  return nil
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -227,4 +256,5 @@ return {
   page_html = page_html,
   present = present,
   page_text = page_text,
+  wait_state = wait_state,
 }
