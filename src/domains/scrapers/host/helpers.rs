@@ -1,0 +1,476 @@
+use mlua::{Lua, Result as LuaResult, Table};
+
+use crate::tools::sandbox;
+
+/// Lua source of `fyde.helpers` (see `helpers.lua`'s header comment). Public
+/// (re-exported as `fyde_sdk::SCRAPER_HELPERS_LUA`) so tooling that loads a
+/// scraper script outside a real run, like `fyde-scripts check`, can provide
+/// the same table to the script's top-level chunk.
+pub const SOURCE: &str = include_str!("helpers.lua");
+
+/// `fyde.helpers`: the generic helpers scraper scripts share (login error
+/// contract, string/URL utilities, form submission, PDF downloads, browser
+/// polling, a text-only PDF writer...), written in Lua rather than Rust since
+/// they only compose the other `fyde.*` host functions. They look those up
+/// through the `fyde` global when called, so the table can be built before
+/// `fyde` is exposed.
+pub(super) fn table(lua: &Lua) -> LuaResult<Table> {
+    sandbox::load_source(lua, SOURCE)
+        .set_name("fyde.helpers")
+        .eval()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A VM whose `fyde` global holds `fyde.helpers` and the real
+    /// `fyde.html`/`fyde.json` the helpers call into, then runs `stubs` (Lua
+    /// code standing in for the other `fyde.*` tables a test needs).
+    fn lua(stubs: &str) -> Lua {
+        let lua = Lua::new();
+        let fyde = lua.create_table().unwrap();
+        fyde.set("helpers", table(&lua).unwrap()).unwrap();
+        fyde.set("html", super::super::html::table(&lua).unwrap())
+            .unwrap();
+        fyde.set("json", super::super::json::table(&lua).unwrap())
+            .unwrap();
+        lua.globals().set("fyde", fyde).unwrap();
+        lua.load(stubs).exec().unwrap();
+        lua
+    }
+
+    fn eval<T: mlua::FromLuaMulti>(lua: &Lua, code: &str) -> T {
+        lua.load(code).eval().unwrap()
+    }
+
+    #[test]
+    fn table_loads_without_the_rest_of_fyde() {
+        let lua = lua("");
+
+        let _helpers: Table = eval(&lua, "return fyde.helpers");
+    }
+
+    /// Stubs for `fyde.save_document` (recording each save into the global
+    /// `saved`) and `fyde.log`, used by the helpers that save a document.
+    const SAVE_STUBS: &str = "saved = {}
+        fyde.log = { warn = function() end }
+        fyde.save_document = function(name, _, fields)
+          saved[#saved + 1] = { name = name, type = fields and fields.type }
+        end";
+
+    #[test]
+    fn fail_raises_exactly_the_code_without_a_position_prefix() {
+        let lua = lua("fyde.log = { warn = function() end }");
+
+        let message: String = eval(
+            &lua,
+            "local h = fyde.helpers \
+             local _, err = pcall(h.fail, h.INVALID_CREDENTIALS, 'bad') return err",
+        );
+
+        assert_eq!(message, "INVALID_CREDENTIALS");
+    }
+
+    #[test]
+    fn contains_ignores_case_and_a_missing_haystack() {
+        let lua = lua("");
+
+        let (found, missing): (bool, bool) = eval(
+            &lua,
+            r#"local h = fyde.helpers
+               return h.contains("Mot de PASSE", "passe"), h.contains(nil, "x")"#,
+        );
+
+        assert!(found);
+        assert!(!missing);
+    }
+
+    #[test]
+    fn contains_any_matches_any_of_the_needles() {
+        let lua = lua("");
+
+        let (found, missing): (bool, bool) = eval(
+            &lua,
+            r#"local h = fyde.helpers
+               return h.contains_any("Identifiant inconnu", { "mot de passe", "IDENTIFIANT" }),
+                 h.contains_any("ok", { "x" })"#,
+        );
+
+        assert!(found);
+        assert!(!missing);
+    }
+
+    #[test]
+    fn trim_strips_surrounding_whitespace_and_a_missing_string() {
+        let lua = lua("");
+
+        let (trimmed, missing): (String, String) = eval(
+            &lua,
+            r#"return fyde.helpers.trim("  a b \n"), fyde.helpers.trim(nil)"#,
+        );
+
+        assert_eq!(trimmed, "a b");
+        assert_eq!(missing, "");
+    }
+
+    #[test]
+    fn sanitize_makes_a_safe_file_name() {
+        let lua = lua("");
+
+        let (sanitized, empty): (String, String) = eval(
+            &lua,
+            r#"local h = fyde.helpers return h.sanitize(' a/b:  c?.pdf '), h.sanitize("  ")"#,
+        );
+
+        assert_eq!(sanitized, "a_b_ c_.pdf");
+        assert_eq!(empty, "document");
+    }
+
+    #[test]
+    fn ask_code_fails_with_mfa_failed_when_nobody_answers() {
+        let lua = lua("fyde.log = { warn = function() end } \
+             fyde.input = { ask = function() error('no handler') end }");
+
+        let message: String = eval(
+            &lua,
+            "local _, err = pcall(fyde.helpers.ask_code, 'code?') return err",
+        );
+
+        assert_eq!(message, "MFA_FAILED");
+    }
+
+    #[test]
+    fn ask_code_strips_whitespace_from_the_answer() {
+        let lua = lua("fyde.input = { ask = function() return ' 12 34 ' end }");
+
+        let code: String = eval(&lua, "return fyde.helpers.ask_code('code?')");
+
+        assert_eq!(code, "1234");
+    }
+
+    #[test]
+    fn base64url_decode_decodes_a_jwt_segment() {
+        let lua = lua("");
+
+        let decoded: String = eval(
+            &lua,
+            r#"return fyde.helpers.base64url_decode("eyJzdWIiOiIxMjM-In0")"#,
+        );
+
+        assert_eq!(decoded, r#"{"sub":"123>"}"#);
+    }
+
+    #[test]
+    fn url_encode_keeps_only_unreserved_characters() {
+        let lua = lua("");
+
+        let encoded: String = eval(&lua, r#"return fyde.helpers.url_encode("a b&c=é~")"#);
+
+        assert_eq!(encoded, "a%20b%26c%3D%C3%A9~");
+    }
+
+    #[test]
+    fn absolute_resolves_every_kind_of_href() {
+        let lua = lua("");
+        let absolute: mlua::Function = eval(&lua, "return fyde.helpers.absolute");
+        let base = "https://example.com/a/b?x=1";
+
+        for (href, expected) in [
+            ("", base),
+            ("https://other.org/z", "https://other.org/z"),
+            ("//cdn.example.com/f", "https://cdn.example.com/f"),
+            ("/root?a=1&amp;b=2", "https://example.com/root?a=1&b=2"),
+            ("?page=2", "https://example.com/a/b?page=2"),
+            ("c.pdf", "https://example.com/a/c.pdf"),
+        ] {
+            let resolved: String = absolute.call((base, href)).unwrap();
+            assert_eq!(resolved, expected, "href {href:?}");
+        }
+    }
+
+    #[test]
+    fn read_form_returns_the_absolute_action_and_the_fields_a_browser_would_send() {
+        let lua = lua("");
+
+        let (action, user, token, remember, unchecked): (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = eval(
+            &lua,
+            r##"local page = { url = "https://example.com/login/", body = [[
+                 <form id="login" action="check">
+                   <input name="user"><input type="hidden" name="token" value="t0k">
+                   <input type="checkbox" name="remember" value="on" checked>
+                   <input type="checkbox" name="newsletter" value="on">
+                 </form>]] }
+               local action, fields = fyde.helpers.read_form(page, "#login")
+               return action, fields.user, fields.token, fields.remember, fields.newsletter"##,
+        );
+
+        assert_eq!(action, "https://example.com/login/check");
+        assert_eq!(user, "");
+        assert_eq!(token, "t0k");
+        assert_eq!(remember, "on");
+        assert_eq!(unchecked, None);
+    }
+
+    #[test]
+    fn submit_form_posts_the_form_with_the_given_values_filled_in() {
+        let lua = lua("fyde.http = { post_form = function(url, fields, headers) \
+               posted = { url = url, fields = fields, headers = headers } return {} end }");
+
+        let (url, token, user, header, missing_form): (String, String, String, String, bool) = eval(
+            &lua,
+            r##"local h = fyde.helpers
+                   local page = { url = "https://example.com/login", body = [[
+                     <form id="f" action="/check">
+                       <input type="hidden" name="token" value="t"><input name="user">
+                     </form>]] }
+                   h.submit_form(page, "#f", { user = "me" }, { ["X-Test"] = "1" })
+                   local ok = pcall(h.submit_form, { url = "u", body = "<p></p>" }, "#f", {})
+                   return posted.url, posted.fields.token, posted.fields.user,
+                     posted.headers["X-Test"], ok"##,
+        );
+
+        assert_eq!(url, "https://example.com/check");
+        assert_eq!(token, "t");
+        assert_eq!(user, "me");
+        assert_eq!(header, "1");
+        assert!(!missing_form);
+    }
+
+    #[test]
+    fn has_accepts_a_page_or_a_raw_string() {
+        let lua = lua("");
+
+        let (on_page, on_html): (bool, bool) = eval(
+            &lua,
+            r#"local h = fyde.helpers
+               return h.has({ body = "<p class='x'></p>" }, ".x"), h.has("<p></p>", ".x")"#,
+        );
+
+        assert!(on_page);
+        assert!(!on_html);
+    }
+
+    #[test]
+    fn json_or_nil_returns_nil_for_invalid_json() {
+        let lua = lua("");
+
+        let (decoded, invalid): (i64, Option<Table>) = eval(
+            &lua,
+            r#"local h = fyde.helpers return h.json_or_nil('{"a": 3}').a, h.json_or_nil("<html>")"#,
+        );
+
+        assert_eq!(decoded, 3);
+        assert!(invalid.is_none());
+    }
+
+    #[test]
+    fn save_pdf_only_saves_a_pdf() {
+        let lua = lua(&format!(
+            "{SAVE_STUBS}
+             fyde.http = {{ download = function(url)
+               if url:find('pdf') then
+                 return {{ status = 200, content_type = 'application/octet-stream', body = '%PDF-1.4' }}
+               end
+               return {{ status = 200, content_type = 'text/html', body = '<html>' }}
+             end }}"
+        ));
+
+        let (pdf, html, count, name, kind): (bool, bool, i64, String, String) = eval(
+            &lua,
+            r#"local h = fyde.helpers
+               return h.save_pdf("https://e/x.pdf", "a/b.pdf", { type = "invoice" }),
+                 h.save_pdf("https://e/login", "c.pdf"), #saved, saved[1].name, saved[1].type"#,
+        );
+
+        assert!(pdf);
+        assert!(!html);
+        assert_eq!(count, 1);
+        assert_eq!(name, "a_b.pdf");
+        assert_eq!(kind, "invoice");
+    }
+
+    #[test]
+    fn sleep_waits_on_a_selector_that_never_appears() {
+        let lua = lua(
+            "fyde.browser = { wait_for = function(_, _, ms) waited = ms error('timed out') end }",
+        );
+
+        let waited: i64 = eval(&lua, "fyde.helpers.sleep(250) return waited");
+
+        assert_eq!(waited, 250);
+    }
+
+    #[test]
+    fn page_html_is_empty_while_the_page_cannot_be_read() {
+        let lua = lua(
+            "fyde.browser = { html = function() if page then return page end error('loading') end }",
+        );
+
+        let (before, after): (String, String) = eval(
+            &lua,
+            r#"local before = fyde.helpers.page_html()
+               page = "<p>x</p>"
+               return before, fyde.helpers.page_html()"#,
+        );
+
+        assert_eq!(before, "");
+        assert_eq!(after, "<p>x</p>");
+    }
+
+    #[test]
+    fn present_checks_the_current_page_for_a_selector() {
+        let lua = lua(r#"fyde.browser = { html = function() return '<div class="a"></div>' end }"#);
+
+        let (found, missing): (bool, bool) = eval(
+            &lua,
+            r#"return fyde.helpers.present(".a"), fyde.helpers.present(".b")"#,
+        );
+
+        assert!(found);
+        assert!(!missing);
+    }
+
+    #[test]
+    fn page_text_is_the_current_pages_body_text() {
+        let lua = lua("fyde.browser = { html = function() \
+               return '<head><title>T</title></head><body><p>Hello</p> <p>world</p></body>' end }");
+
+        let text: String = eval(&lua, "return fyde.helpers.page_text()");
+
+        assert_eq!(text, "Hello world");
+    }
+
+    #[test]
+    fn wait_state_polls_until_a_state_matches_or_times_out() {
+        // The page changes while the helper sleeps between two polls.
+        let lua = lua("page = '<p>loading</p>'
+             fyde.browser = {
+               html = function() return page end,
+               wait_for = function() page = '<p>Mot de passe incorrect</p>' error('timed out') end,
+             }");
+
+        let (state, timed_out): (String, Option<String>) = eval(
+            &lua,
+            r#"local h = fyde.helpers
+               local states = { { "form", selector = "form" }, { "bad", text = { "mot de passe incorrect" } } }
+               return h.wait_state(states, 5000), h.wait_state({ { "form", selector = "form" } }, 2000)"#,
+        );
+
+        assert_eq!(state, "bad");
+        assert_eq!(timed_out, None);
+    }
+
+    #[test]
+    fn open_and_wait_opens_the_url_then_waits_for_a_state() {
+        let lua = lua("fyde.browser = {
+               open = function(_, url) opened = url end,
+               html = function() return '<form></form>' end,
+               wait_for = function() error('timed out') end,
+             }");
+
+        let (state, opened): (String, String) = eval(
+            &lua,
+            r#"return fyde.helpers.open_and_wait("https://e/login", { { "form", selector = "form" } }),
+                 opened"#,
+        );
+
+        assert_eq!(state, "form");
+        assert_eq!(opened, "https://e/login");
+    }
+
+    #[test]
+    fn fill_first_fills_the_first_selector_on_the_page() {
+        let lua = lua(r#"fyde.browser = {
+                 html = function() return '<input id="b">' end,
+                 fill = function(_, selector, value) filled = selector .. "=" .. value end,
+               }"#);
+
+        let (selector, filled, none_present): (String, String, bool) = eval(
+            &lua,
+            r##"local h = fyde.helpers
+               return h.fill_first({ "#a", "#b" }, "v"), filled, pcall(h.fill_first, { "#c" }, "v")"##,
+        );
+
+        assert_eq!(selector, "#b");
+        assert_eq!(filled, "#b=v");
+        assert!(!none_present);
+    }
+
+    #[test]
+    fn click_first_clicks_the_first_selector_on_the_page() {
+        let lua = lua(r#"fyde.browser = {
+                 html = function() return '<button id="b"></button>' end,
+                 click = function(_, selector) clicked = selector end,
+               }"#);
+
+        let (selector, clicked, none_present): (String, String, bool) = eval(
+            &lua,
+            r##"local h = fyde.helpers
+               return h.click_first({ "#a", "#b" }), clicked, pcall(h.click_first, { "#c" })"##,
+        );
+
+        assert_eq!(selector, "#b");
+        assert_eq!(clicked, "#b");
+        assert!(!none_present);
+    }
+
+    #[test]
+    fn browser_save_only_saves_a_downloaded_pdf() {
+        let lua = lua(&format!(
+            "{SAVE_STUBS}
+             fyde.browser = {{ download = function(_, selector)
+               if selector == '#pdf' then return '%PDF-1.4' end
+               return '<html>'
+             end }}"
+        ));
+
+        let (pdf, html, count, name): (bool, bool, i64, String) = eval(
+            &lua,
+            r##"local h = fyde.helpers
+               return h.browser_save("#pdf", "a?.pdf", { type = "invoice" }),
+                 h.browser_save("#html", "b.pdf"), #saved, saved[1].name"##,
+        );
+
+        assert!(pdf);
+        assert!(!html);
+        assert_eq!(count, 1);
+        assert_eq!(name, "a_.pdf");
+    }
+
+    #[test]
+    fn text_pdf_writes_a_complete_pdf() {
+        let lua = lua("");
+
+        let pdf: mlua::LuaString = eval(
+            &lua,
+            r#"return fyde.helpers.text_pdf("Titre (1)", { "Total : 12 €" })"#,
+        );
+        let pdf = pdf.as_bytes().to_vec();
+
+        assert!(pdf.starts_with(b"%PDF-1.4\n"));
+        assert!(pdf.ends_with(b"%%EOF\n"));
+        // Parentheses are escaped, and "€" (outside Latin-1) becomes "?".
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(text.contains(r"(Titre \(1\)) Tj"));
+        assert!(text.contains("(Total : 12 ?) Tj"));
+    }
+
+    #[test]
+    fn html_lines_flattens_html_into_text_lines() {
+        let lua = lua("");
+
+        let lines: Vec<String> = eval(
+            &lua,
+            "return fyde.helpers.html_lines('<h1> Facture </h1><p>Total : 12 €</p><p> </p>')",
+        );
+
+        assert_eq!(lines, ["Facture", "Total : 12 €"]);
+    }
+}
