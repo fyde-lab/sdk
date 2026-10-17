@@ -45,6 +45,15 @@ local function trim(s)
   return ((s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+local function sanitize(name)
+  name = trim((name or ""):gsub("%s+", " "))
+  name = name:gsub('[<>:"/\\|%?%*]', "_"):gsub("%c", "")
+  if name == "" then
+    name = "document"
+  end
+  return name
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -52,4 +61,5 @@ return {
   contains = contains,
   contains_any = contains_any,
   trim = trim,
+  sanitize = sanitize,
 }

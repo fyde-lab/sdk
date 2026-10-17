@@ -105,4 +105,17 @@ mod tests {
         assert_eq!(trimmed, "a b");
         assert_eq!(missing, "");
     }
+
+    #[test]
+    fn sanitize_makes_a_safe_file_name() {
+        let lua = lua("");
+
+        let (sanitized, empty): (String, String) = eval(
+            &lua,
+            r#"local h = fyde.helpers return h.sanitize(' a/b:  c?.pdf '), h.sanitize("  ")"#,
+        );
+
+        assert_eq!(sanitized, "a_b_ c_.pdf");
+        assert_eq!(empty, "document");
+    }
 }
