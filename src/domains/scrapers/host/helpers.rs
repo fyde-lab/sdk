@@ -50,4 +50,17 @@ mod tests {
 
         let _helpers: Table = eval(&lua, "return fyde.helpers");
     }
+
+    #[test]
+    fn fail_raises_exactly_the_code_without_a_position_prefix() {
+        let lua = lua("fyde.log = { warn = function() end }");
+
+        let message: String = eval(
+            &lua,
+            "local h = fyde.helpers \
+             local _, err = pcall(h.fail, h.INVALID_CREDENTIALS, 'bad') return err",
+        );
+
+        assert_eq!(message, "INVALID_CREDENTIALS");
+    }
 }

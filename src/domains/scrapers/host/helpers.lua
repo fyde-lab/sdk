@@ -15,4 +15,21 @@
 -- login form has been seen, `ALREADY_LOGGED_IN` when a restored session made the login step
 -- unnecessary.
 
-return {}
+-- ---------------------------------------------------------------------------------------------
+-- Errors, strings and user input
+-- ---------------------------------------------------------------------------------------------
+local INVALID_CREDENTIALS = "INVALID_CREDENTIALS"
+local MFA_FAILED = "MFA_FAILED"
+
+local function fail(code, detail)
+  if detail then
+    fyde.log.warn(code .. ": " .. detail)
+  end
+  error(code, 0)
+end
+
+return {
+  INVALID_CREDENTIALS = INVALID_CREDENTIALS,
+  MFA_FAILED = MFA_FAILED,
+  fail = fail,
+}
