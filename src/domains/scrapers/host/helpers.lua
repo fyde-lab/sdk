@@ -140,6 +140,18 @@ local function read_form(page, selector)
   return absolute(page.url, form.attrs.action), fields
 end
 
+-- Fills `values` into the form matching `selector` on `page` and posts it.
+local function submit_form(page, selector, values, headers)
+  local action, fields = read_form(page, selector)
+  if not action then
+    error("no form matching '" .. selector .. "' on " .. tostring(page.url))
+  end
+  for name, value in pairs(values) do
+    fields[name] = value
+  end
+  return fyde.http.post_form(action, fields, headers)
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -153,4 +165,5 @@ return {
   url_encode = url_encode,
   absolute = absolute,
   read_form = read_form,
+  submit_form = submit_form,
 }

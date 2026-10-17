@@ -209,4 +209,29 @@ mod tests {
         assert_eq!(remember, "on");
         assert_eq!(unchecked, None);
     }
+
+    #[test]
+    fn submit_form_posts_the_form_with_the_given_values_filled_in() {
+        let lua = lua("fyde.http = { post_form = function(url, fields, headers) \
+               posted = { url = url, fields = fields, headers = headers } return {} end }");
+
+        let (url, token, user, header, missing_form): (String, String, String, String, bool) = eval(
+            &lua,
+            r##"local h = fyde.helpers
+                   local page = { url = "https://example.com/login", body = [[
+                     <form id="f" action="/check">
+                       <input type="hidden" name="token" value="t"><input name="user">
+                     </form>]] }
+                   h.submit_form(page, "#f", { user = "me" }, { ["X-Test"] = "1" })
+                   local ok = pcall(h.submit_form, { url = "u", body = "<p></p>" }, "#f", {})
+                   return posted.url, posted.fields.token, posted.fields.user,
+                     posted.headers["X-Test"], ok"##,
+        );
+
+        assert_eq!(url, "https://example.com/check");
+        assert_eq!(token, "t");
+        assert_eq!(user, "me");
+        assert_eq!(header, "1");
+        assert!(!missing_form);
+    }
 }
