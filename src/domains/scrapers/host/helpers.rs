@@ -77,4 +77,19 @@ mod tests {
         assert!(found);
         assert!(!missing);
     }
+
+    #[test]
+    fn contains_any_matches_any_of_the_needles() {
+        let lua = lua("");
+
+        let (found, missing): (bool, bool) = eval(
+            &lua,
+            r#"local h = fyde.helpers
+               return h.contains_any("Identifiant inconnu", { "mot de passe", "IDENTIFIANT" }),
+                 h.contains_any("ok", { "x" })"#,
+        );
+
+        assert!(found);
+        assert!(!missing);
+    }
 }

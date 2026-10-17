@@ -32,9 +32,19 @@ local function contains(haystack, needle)
   return (haystack or ""):lower():find(needle:lower(), 1, true) ~= nil
 end
 
+local function contains_any(haystack, needles)
+  for _, needle in ipairs(needles) do
+    if contains(haystack, needle) then
+      return true
+    end
+  end
+  return false
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
   fail = fail,
   contains = contains,
+  contains_any = contains_any,
 }
