@@ -366,4 +366,22 @@ mod tests {
         assert_eq!(state, "bad");
         assert_eq!(timed_out, None);
     }
+
+    #[test]
+    fn open_and_wait_opens_the_url_then_waits_for_a_state() {
+        let lua = lua("fyde.browser = {
+               open = function(_, url) opened = url end,
+               html = function() return '<form></form>' end,
+               wait_for = function() error('timed out') end,
+             }");
+
+        let (state, opened): (String, String) = eval(
+            &lua,
+            r#"return fyde.helpers.open_and_wait("https://e/login", { { "form", selector = "form" } }),
+                 opened"#,
+        );
+
+        assert_eq!(state, "form");
+        assert_eq!(opened, "https://e/login");
+    }
 }

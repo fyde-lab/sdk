@@ -235,6 +235,12 @@ local function wait_state(states, timeout_ms)
   return nil
 end
 
+local function open_and_wait(url, states, timeout_ms)
+  fyde.browser:open(url)
+  sleep(1500)
+  return wait_state(states, timeout_ms)
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -257,4 +263,5 @@ return {
   present = present,
   page_text = page_text,
   wait_state = wait_state,
+  open_and_wait = open_and_wait,
 }
