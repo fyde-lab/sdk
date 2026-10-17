@@ -323,4 +323,17 @@ mod tests {
         assert_eq!(before, "");
         assert_eq!(after, "<p>x</p>");
     }
+
+    #[test]
+    fn present_checks_the_current_page_for_a_selector() {
+        let lua = lua(r#"fyde.browser = { html = function() return '<div class="a"></div>' end }"#);
+
+        let (found, missing): (bool, bool) = eval(
+            &lua,
+            r#"return fyde.helpers.present(".a"), fyde.helpers.present(".b")"#,
+        );
+
+        assert!(found);
+        assert!(!missing);
+    }
 }

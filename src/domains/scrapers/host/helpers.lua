@@ -197,6 +197,10 @@ local function page_html()
   return ok and html or ""
 end
 
+local function present(selector)
+  return #fyde.html.select(page_html(), selector) > 0
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -216,4 +220,5 @@ return {
   save_pdf = save_pdf,
   sleep = sleep,
   page_html = page_html,
+  present = present,
 }
