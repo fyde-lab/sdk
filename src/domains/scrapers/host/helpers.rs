@@ -161,4 +161,23 @@ mod tests {
 
         assert_eq!(encoded, "a%20b%26c%3D%C3%A9~");
     }
+
+    #[test]
+    fn absolute_resolves_every_kind_of_href() {
+        let lua = lua("");
+        let absolute: mlua::Function = eval(&lua, "return fyde.helpers.absolute");
+        let base = "https://example.com/a/b?x=1";
+
+        for (href, expected) in [
+            ("", base),
+            ("https://other.org/z", "https://other.org/z"),
+            ("//cdn.example.com/f", "https://cdn.example.com/f"),
+            ("/root?a=1&amp;b=2", "https://example.com/root?a=1&b=2"),
+            ("?page=2", "https://example.com/a/b?page=2"),
+            ("c.pdf", "https://example.com/a/c.pdf"),
+        ] {
+            let resolved: String = absolute.call((base, href)).unwrap();
+            assert_eq!(resolved, expected, "href {href:?}");
+        }
+    }
 }

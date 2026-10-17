@@ -96,6 +96,32 @@ local function url_encode(s)
   end))
 end
 
+-- ---------------------------------------------------------------------------------------------
+-- Plain HTTP (`fyde.http`/`fyde.html`/`fyde.json`)
+-- ---------------------------------------------------------------------------------------------
+
+local function absolute(base, href)
+  if not href or href == "" then
+    return base
+  end
+  href = href:gsub("&amp;", "&")
+  if href:match("^https?://") then
+    return href
+  end
+  local origin = base:match("^(https?://[^/]+)")
+  if href:sub(1, 2) == "//" then
+    return base:match("^(https?:)") .. href
+  end
+  if href:sub(1, 1) == "/" then
+    return origin .. href
+  end
+  if href:sub(1, 1) == "?" then
+    return (base:gsub("%?.*$", "")) .. href
+  end
+  local dir = (base:gsub("[?#].*$", "")):match("^(https?://.*/)") or (origin .. "/")
+  return dir .. href
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -107,4 +133,5 @@ return {
   ask_code = ask_code,
   base64url_decode = base64url_decode,
   url_encode = url_encode,
+  absolute = absolute,
 }
