@@ -336,4 +336,14 @@ mod tests {
         assert!(found);
         assert!(!missing);
     }
+
+    #[test]
+    fn page_text_is_the_current_pages_body_text() {
+        let lua = lua("fyde.browser = { html = function() \
+               return '<head><title>T</title></head><body><p>Hello</p> <p>world</p></body>' end }");
+
+        let text: String = eval(&lua, "return fyde.helpers.page_text()");
+
+        assert_eq!(text, "Hello world");
+    }
 }

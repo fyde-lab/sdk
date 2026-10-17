@@ -201,6 +201,11 @@ local function present(selector)
   return #fyde.html.select(page_html(), selector) > 0
 end
 
+local function page_text()
+  local body = fyde.html.select(page_html(), "body")[1]
+  return body and body.text or ""
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -221,4 +226,5 @@ return {
   sleep = sleep,
   page_html = page_html,
   present = present,
+  page_text = page_text,
 }
