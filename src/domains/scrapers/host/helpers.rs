@@ -248,4 +248,17 @@ mod tests {
         assert!(on_page);
         assert!(!on_html);
     }
+
+    #[test]
+    fn json_or_nil_returns_nil_for_invalid_json() {
+        let lua = lua("");
+
+        let (decoded, invalid): (i64, Option<Table>) = eval(
+            &lua,
+            r#"local h = fyde.helpers return h.json_or_nil('{"a": 3}').a, h.json_or_nil("<html>")"#,
+        );
+
+        assert_eq!(decoded, 3);
+        assert!(invalid.is_none());
+    }
 }

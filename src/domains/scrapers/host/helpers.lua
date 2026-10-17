@@ -157,6 +157,14 @@ local function has(page_or_html, selector)
   return #fyde.html.select(html or "", selector) > 0
 end
 
+local function json_or_nil(body)
+  local ok, value = pcall(fyde.json.decode, body or "")
+  if ok then
+    return value
+  end
+  return nil
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -172,4 +180,5 @@ return {
   read_form = read_form,
   submit_form = submit_form,
   has = has,
+  json_or_nil = json_or_nil,
 }
