@@ -8,9 +8,11 @@ use super::super::reports::Recorder;
 use super::super::{ProgressEvent, ProgressStep};
 
 /// `fyde.progress.step(step)` announces a new high-level stage of the scrape,
-/// named by one of [`ProgressStep`]'s [`ProgressStep::as_str`] names
-/// (`"logging_in"`, `"downloading_documents"`, ...) — any other value raises
-/// a Lua error, since the application only has wording for those.
+/// named by one of [`ProgressStep`]'s [`ProgressStep::as_str`] names — any
+/// other value raises a Lua error, since the application only has wording
+/// for those. Each name is also exposed as an upper-cased constant
+/// (`fyde.progress.LOGGING_IN == "logging_in"`, ...), which scripts use
+/// instead of the literal string.
 /// `fyde.progress.update(current, total)` reports fine-grained progress
 /// within the current step (e.g. 3 of 12 documents downloaded). Neither
 /// takes free text: it couldn't be shown in the user's language. Unlike
@@ -25,6 +27,9 @@ pub(super) fn table(
     recorder: Arc<Recorder>,
 ) -> LuaResult<Table> {
     let progress = lua.create_table()?;
+    for step in ProgressStep::ALL {
+        progress.set(step.as_str().to_ascii_uppercase(), step.as_str())?;
+    }
 
     let step_callback = on_progress.clone();
     let step_recorder = recorder.clone();
@@ -93,6 +98,42 @@ mod tests {
             *received.lock().unwrap(),
             vec![ProgressEvent::Step {
                 step: ProgressStep::LoggingIn
+            }]
+        );
+    }
+
+    #[test]
+    fn every_step_is_exposed_as_an_upper_cased_constant() {
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let progress = table(&lua, None, recorder).unwrap();
+
+        for step in ProgressStep::ALL {
+            let name = step.as_str().to_ascii_uppercase();
+            assert_eq!(progress.get::<String>(name).unwrap(), step.as_str());
+        }
+    }
+
+    #[test]
+    fn step_accepts_a_constant() {
+        let (received, on_progress) = recording_callback();
+
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        lua.globals()
+            .set(
+                "progress",
+                table(&lua, Some(on_progress), recorder).unwrap(),
+            )
+            .unwrap();
+        lua.load(r#"progress.step(progress.DOWNLOADING_DOCUMENTS)"#)
+            .exec()
+            .unwrap();
+
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![ProgressEvent::Step {
+                step: ProgressStep::DownloadingDocuments
             }]
         );
     }
