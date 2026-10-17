@@ -190,6 +190,13 @@ local function sleep(ms)
   end)
 end
 
+local function page_html()
+  local ok, html = pcall(function()
+    return fyde.browser:html()
+  end)
+  return ok and html or ""
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -208,4 +215,5 @@ return {
   json_or_nil = json_or_nil,
   save_pdf = save_pdf,
   sleep = sleep,
+  page_html = page_html,
 }

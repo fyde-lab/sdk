@@ -306,4 +306,21 @@ mod tests {
 
         assert_eq!(waited, 250);
     }
+
+    #[test]
+    fn page_html_is_empty_while_the_page_cannot_be_read() {
+        let lua = lua(
+            "fyde.browser = { html = function() if page then return page end error('loading') end }",
+        );
+
+        let (before, after): (String, String) = eval(
+            &lua,
+            r#"local before = fyde.helpers.page_html()
+               page = "<p>x</p>"
+               return before, fyde.helpers.page_html()"#,
+        );
+
+        assert_eq!(before, "");
+        assert_eq!(after, "<p>x</p>");
+    }
 }
