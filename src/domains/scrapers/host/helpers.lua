@@ -178,6 +178,18 @@ local function save_pdf(url, filename, fields, headers)
   return false
 end
 
+-- ---------------------------------------------------------------------------------------------
+-- Embedded browser (`fyde.browser`)
+-- ---------------------------------------------------------------------------------------------
+
+-- `wait_for` only waits for a selector to appear, so sleeping means waiting on one that never
+-- exists.
+local function sleep(ms)
+  pcall(function()
+    fyde.browser:wait_for("#__fyde_scraper_sleep__", ms)
+  end)
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -195,4 +207,5 @@ return {
   has = has,
   json_or_nil = json_or_nil,
   save_pdf = save_pdf,
+  sleep = sleep,
 }

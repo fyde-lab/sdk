@@ -295,4 +295,15 @@ mod tests {
         assert_eq!(name, "a_b.pdf");
         assert_eq!(kind, "invoice");
     }
+
+    #[test]
+    fn sleep_waits_on_a_selector_that_never_appears() {
+        let lua = lua(
+            "fyde.browser = { wait_for = function(_, _, ms) waited = ms error('timed out') end }",
+        );
+
+        let waited: i64 = eval(&lua, "fyde.helpers.sleep(250) return waited");
+
+        assert_eq!(waited, 250);
+    }
 }
