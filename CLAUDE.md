@@ -150,6 +150,7 @@ Non-domain helpers live in `src/tools/` (`log`, `sandbox`, `sql`, `testing`).
     a captured runtime `Handle::block_on`. Never move a `Lua` across threads.
   - `fyde.progress` carries no free text, so the UI can word it in the user's language:
     `step(name)` only accepts a `ProgressStep` name (`"logging_in"`, ...; anything else raises),
+    each also exposed as a constant scripts use instead (`fyde.progress.LOGGING_IN`),
     `update(current, total)` has no message. New steps need wording in every language in
     `ProgressStep::user_message` plus an `ffi::FfiProgressStep` variant; FFI `Step` events carry
     it localized (language refreshed at each `run_installed_script`).
