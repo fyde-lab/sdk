@@ -64,6 +64,31 @@ local function ask_code(question)
   return (code:gsub("%s", ""))
 end
 
+-- ---------------------------------------------------------------------------------------------
+-- Encoding
+-- ---------------------------------------------------------------------------------------------
+
+-- Decodes base64url (or plain base64; padding and any other stray characters are ignored),
+-- e.g. a JWT segment.
+local function base64url_decode(s)
+  local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  s = s:gsub("-", "+"):gsub("_", "/"):gsub("[^%w%+/]", "")
+  local bits = s:gsub(".", function(c)
+    local v = alphabet:find(c, 1, true) - 1
+    local out = ""
+    for i = 6, 1, -1 do
+      out = out .. ((v >> (i - 1)) & 1)
+    end
+    return out
+  end)
+  return (bits:gsub("%d%d%d?%d?%d?%d?%d?%d?", function(byte)
+    if #byte ~= 8 then
+      return ""
+    end
+    return string.char(tonumber(byte, 2))
+  end))
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -73,4 +98,5 @@ return {
   trim = trim,
   sanitize = sanitize,
   ask_code = ask_code,
+  base64url_decode = base64url_decode,
 }

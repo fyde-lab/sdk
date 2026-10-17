@@ -140,4 +140,16 @@ mod tests {
 
         assert_eq!(code, "1234");
     }
+
+    #[test]
+    fn base64url_decode_decodes_a_jwt_segment() {
+        let lua = lua("");
+
+        let decoded: String = eval(
+            &lua,
+            r#"return fyde.helpers.base64url_decode("eyJzdWIiOiIxMjM-In0")"#,
+        );
+
+        assert_eq!(decoded, r#"{"sub":"123>"}"#);
+    }
 }
