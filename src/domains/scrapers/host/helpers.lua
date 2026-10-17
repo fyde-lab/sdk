@@ -275,58 +275,6 @@ local function browser_save(selector, filename, fields)
   return false
 end
 
--- ---------------------------------------------------------------------------------------------
--- Rendering data into a PDF
--- ---------------------------------------------------------------------------------------------
--- Minimal text-only PDF writer, for sites that have
--- no downloadable document and whose data has to be rendered into one: each entry of `lines`
--- becomes one line of Helvetica (WinAnsi; characters outside Latin-1 become '?').
-local function text_pdf(title, lines)
-  local function latin1(s)
-    local out = {}
-    for _, cp in utf8.codes(s) do
-      out[#out + 1] = cp < 256 and string.char(cp) or "?"
-    end
-    return (table.concat(out):gsub("[\\()]", "\\%0"))
-  end
-  local all = { title, "" }
-  for _, line in ipairs(lines) do
-    all[#all + 1] = line
-  end
-  local per_page, pages = 48, {}
-  for first = 1, #all, per_page do
-    local ops = { "BT /F1 11 Tf 14 TL 50 790 Td" }
-    for i = first, math.min(first + per_page - 1, #all) do
-      ops[#ops + 1] = "(" .. latin1(all[i]) .. ") Tj T*"
-    end
-    ops[#ops + 1] = "ET"
-    pages[#pages + 1] = table.concat(ops, "\n")
-  end
-  local objects = { "<< /Type /Catalog /Pages 2 0 R >>", "", "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>" }
-  local kids = {}
-  for _, content in ipairs(pages) do
-    objects[#objects + 1] = "<< /Length " .. #content .. " >>\nstream\n" .. content .. "\nendstream"
-    objects[#objects + 1] = "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents " .. (#objects) .. " 0 R >>"
-    kids[#kids + 1] = #objects .. " 0 R"
-  end
-  objects[2] = "<< /Type /Pages /Kids [" .. table.concat(kids, " ") .. "] /Count " .. #kids .. " >>"
-  local out, offsets = { "%PDF-1.4\n" }, {}
-  local size = #out[1]
-  for i, body in ipairs(objects) do
-    offsets[i] = size
-    local chunk = i .. " 0 obj\n" .. body .. "\nendobj\n"
-    out[#out + 1] = chunk
-    size = size + #chunk
-  end
-  local xref = { "xref\n0 " .. (#objects + 1) .. "\n0000000000 65535 f \n" }
-  for _, offset in ipairs(offsets) do
-    xref[#xref + 1] = string.format("%010d 00000 n \n", offset)
-  end
-  out[#out + 1] = table.concat(xref)
-  out[#out + 1] = "trailer\n<< /Size " .. (#objects + 1) .. " /Root 1 0 R >>\nstartxref\n" .. size .. "\n%%EOF\n"
-  return table.concat(out)
-end
-
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -353,5 +301,4 @@ return {
   fill_first = fill_first,
   click_first = click_first,
   browser_save = browser_save,
-  text_pdf = text_pdf,
 }
