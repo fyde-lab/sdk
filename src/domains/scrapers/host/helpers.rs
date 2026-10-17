@@ -234,4 +234,18 @@ mod tests {
         assert_eq!(header, "1");
         assert!(!missing_form);
     }
+
+    #[test]
+    fn has_accepts_a_page_or_a_raw_string() {
+        let lua = lua("");
+
+        let (on_page, on_html): (bool, bool) = eval(
+            &lua,
+            r#"local h = fyde.helpers
+               return h.has({ body = "<p class='x'></p>" }, ".x"), h.has("<p></p>", ".x")"#,
+        );
+
+        assert!(on_page);
+        assert!(!on_html);
+    }
 }

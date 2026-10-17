@@ -152,6 +152,11 @@ local function submit_form(page, selector, values, headers)
   return fyde.http.post_form(action, fields, headers)
 end
 
+local function has(page_or_html, selector)
+  local html = type(page_or_html) == "table" and page_or_html.body or page_or_html
+  return #fyde.html.select(html or "", selector) > 0
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -166,4 +171,5 @@ return {
   absolute = absolute,
   read_form = read_form,
   submit_form = submit_form,
+  has = has,
 }
