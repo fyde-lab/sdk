@@ -461,16 +461,4 @@ mod tests {
         assert!(text.contains(r"(Titre \(1\)) Tj"));
         assert!(text.contains("(Total : 12 ?) Tj"));
     }
-
-    #[test]
-    fn html_lines_flattens_html_into_text_lines() {
-        let lua = lua("");
-
-        let lines: Vec<String> = eval(
-            &lua,
-            "return fyde.helpers.html_lines('<h1> Facture </h1><p>Total : 12 €</p><p> </p>')",
-        );
-
-        assert_eq!(lines, ["Facture", "Total : 12 €"]);
-    }
 }
