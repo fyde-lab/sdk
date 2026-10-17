@@ -384,4 +384,22 @@ mod tests {
         assert_eq!(state, "form");
         assert_eq!(opened, "https://e/login");
     }
+
+    #[test]
+    fn fill_first_fills_the_first_selector_on_the_page() {
+        let lua = lua(r#"fyde.browser = {
+                 html = function() return '<input id="b">' end,
+                 fill = function(_, selector, value) filled = selector .. "=" .. value end,
+               }"#);
+
+        let (selector, filled, none_present): (String, String, bool) = eval(
+            &lua,
+            r##"local h = fyde.helpers
+               return h.fill_first({ "#a", "#b" }, "v"), filled, pcall(h.fill_first, { "#c" }, "v")"##,
+        );
+
+        assert_eq!(selector, "#b");
+        assert_eq!(filled, "#b=v");
+        assert!(!none_present);
+    }
 }

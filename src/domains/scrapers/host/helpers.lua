@@ -241,6 +241,17 @@ local function open_and_wait(url, states, timeout_ms)
   return wait_state(states, timeout_ms)
 end
 
+-- Fills the first present selector of each candidate list.
+local function fill_first(selectors, value)
+  for _, selector in ipairs(selectors) do
+    if present(selector) then
+      fyde.browser:fill(selector, value)
+      return selector
+    end
+  end
+  error("none of " .. table.concat(selectors, ", ") .. " is on the page")
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -264,4 +275,5 @@ return {
   page_text = page_text,
   wait_state = wait_state,
   open_and_wait = open_and_wait,
+  fill_first = fill_first,
 }
