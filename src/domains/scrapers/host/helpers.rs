@@ -443,4 +443,22 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(name, "a_.pdf");
     }
+
+    #[test]
+    fn text_pdf_writes_a_complete_pdf() {
+        let lua = lua("");
+
+        let pdf: mlua::LuaString = eval(
+            &lua,
+            r#"return fyde.helpers.text_pdf("Titre (1)", { "Total : 12 €" })"#,
+        );
+        let pdf = pdf.as_bytes().to_vec();
+
+        assert!(pdf.starts_with(b"%PDF-1.4\n"));
+        assert!(pdf.ends_with(b"%%EOF\n"));
+        // Parentheses are escaped, and "€" (outside Latin-1) becomes "?".
+        let text = String::from_utf8_lossy(&pdf);
+        assert!(text.contains(r"(Titre \(1\)) Tj"));
+        assert!(text.contains("(Total : 12 ?) Tj"));
+    }
 }
