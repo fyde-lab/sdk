@@ -402,4 +402,22 @@ mod tests {
         assert_eq!(filled, "#b=v");
         assert!(!none_present);
     }
+
+    #[test]
+    fn click_first_clicks_the_first_selector_on_the_page() {
+        let lua = lua(r#"fyde.browser = {
+                 html = function() return '<button id="b"></button>' end,
+                 click = function(_, selector) clicked = selector end,
+               }"#);
+
+        let (selector, clicked, none_present): (String, String, bool) = eval(
+            &lua,
+            r##"local h = fyde.helpers
+               return h.click_first({ "#a", "#b" }), clicked, pcall(h.click_first, { "#c" })"##,
+        );
+
+        assert_eq!(selector, "#b");
+        assert_eq!(clicked, "#b");
+        assert!(!none_present);
+    }
 }

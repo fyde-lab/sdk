@@ -252,6 +252,16 @@ local function fill_first(selectors, value)
   error("none of " .. table.concat(selectors, ", ") .. " is on the page")
 end
 
+local function click_first(selectors)
+  for _, selector in ipairs(selectors) do
+    if present(selector) then
+      fyde.browser:click(selector)
+      return selector
+    end
+  end
+  error("none of " .. table.concat(selectors, ", ") .. " is on the page")
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -276,4 +286,5 @@ return {
   wait_state = wait_state,
   open_and_wait = open_and_wait,
   fill_first = fill_first,
+  click_first = click_first,
 }
