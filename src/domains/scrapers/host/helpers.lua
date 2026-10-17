@@ -327,6 +327,19 @@ local function text_pdf(title, lines)
   return table.concat(out)
 end
 
+-- Flattens an HTML page/fragment into text lines for text_pdf (headings, paragraphs, list
+-- items and table rows, in document order).
+local function html_lines(html)
+  local lines = {}
+  for _, el in ipairs(fyde.html.select(html, "h1, h2, h3, h4, p, li, tr, dt, dd")) do
+    local text = trim(el.text:gsub("%s+", " "))
+    if text ~= "" then
+      lines[#lines + 1] = text
+    end
+  end
+  return lines
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -354,4 +367,5 @@ return {
   click_first = click_first,
   browser_save = browser_save,
   text_pdf = text_pdf,
+  html_lines = html_lines,
 }
