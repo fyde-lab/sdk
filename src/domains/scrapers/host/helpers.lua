@@ -165,6 +165,19 @@ local function json_or_nil(body)
   return nil
 end
 
+-- Downloads `url` and saves it as `filename` when it really is a PDF; returns true on success.
+local function save_pdf(url, filename, fields, headers)
+  local resp = fyde.http.download(url, headers)
+  local content_type = resp.content_type or ""
+  local is_pdf = content_type:find("pdf", 1, true) or (resp.body or ""):sub(1, 4) == "%PDF"
+  if resp.status == 200 and is_pdf then
+    fyde.save_document(sanitize(filename), resp.body, fields)
+    return true
+  end
+  fyde.log.warn(string.format("skipping %s (status %d, content-type %s)", filename, resp.status, content_type))
+  return false
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -181,4 +194,5 @@ return {
   submit_form = submit_form,
   has = has,
   json_or_nil = json_or_nil,
+  save_pdf = save_pdf,
 }

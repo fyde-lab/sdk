@@ -51,6 +51,14 @@ mod tests {
         let _helpers: Table = eval(&lua, "return fyde.helpers");
     }
 
+    /// Stubs for `fyde.save_document` (recording each save into the global
+    /// `saved`) and `fyde.log`, used by the helpers that save a document.
+    const SAVE_STUBS: &str = "saved = {}
+        fyde.log = { warn = function() end }
+        fyde.save_document = function(name, _, fields)
+          saved[#saved + 1] = { name = name, type = fields and fields.type }
+        end";
+
     #[test]
     fn fail_raises_exactly_the_code_without_a_position_prefix() {
         let lua = lua("fyde.log = { warn = function() end }");
@@ -260,5 +268,31 @@ mod tests {
 
         assert_eq!(decoded, 3);
         assert!(invalid.is_none());
+    }
+
+    #[test]
+    fn save_pdf_only_saves_a_pdf() {
+        let lua = lua(&format!(
+            "{SAVE_STUBS}
+             fyde.http = {{ download = function(url)
+               if url:find('pdf') then
+                 return {{ status = 200, content_type = 'application/octet-stream', body = '%PDF-1.4' }}
+               end
+               return {{ status = 200, content_type = 'text/html', body = '<html>' }}
+             end }}"
+        ));
+
+        let (pdf, html, count, name, kind): (bool, bool, i64, String, String) = eval(
+            &lua,
+            r#"local h = fyde.helpers
+               return h.save_pdf("https://e/x.pdf", "a/b.pdf", { type = "invoice" }),
+                 h.save_pdf("https://e/login", "c.pdf"), #saved, saved[1].name, saved[1].type"#,
+        );
+
+        assert!(pdf);
+        assert!(!html);
+        assert_eq!(count, 1);
+        assert_eq!(name, "a_b.pdf");
+        assert_eq!(kind, "invoice");
     }
 }
