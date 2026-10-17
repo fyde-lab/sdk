@@ -420,4 +420,27 @@ mod tests {
         assert_eq!(clicked, "#b");
         assert!(!none_present);
     }
+
+    #[test]
+    fn browser_save_only_saves_a_downloaded_pdf() {
+        let lua = lua(&format!(
+            "{SAVE_STUBS}
+             fyde.browser = {{ download = function(_, selector)
+               if selector == '#pdf' then return '%PDF-1.4' end
+               return '<html>'
+             end }}"
+        ));
+
+        let (pdf, html, count, name): (bool, bool, i64, String) = eval(
+            &lua,
+            r##"local h = fyde.helpers
+               return h.browser_save("#pdf", "a?.pdf", { type = "invoice" }),
+                 h.browser_save("#html", "b.pdf"), #saved, saved[1].name"##,
+        );
+
+        assert!(pdf);
+        assert!(!html);
+        assert_eq!(count, 1);
+        assert_eq!(name, "a_.pdf");
+    }
 }

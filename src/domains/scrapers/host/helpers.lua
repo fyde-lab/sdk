@@ -262,6 +262,19 @@ local function click_first(selectors)
   error("none of " .. table.concat(selectors, ", ") .. " is on the page")
 end
 
+-- Clicks `selector` (a download link/button) and saves what the browser downloads.
+local function browser_save(selector, filename, fields)
+  local ok, bytes = pcall(function()
+    return fyde.browser:download(selector, 60000)
+  end)
+  if ok and type(bytes) == "string" and bytes:sub(1, 4) == "%PDF" then
+    fyde.save_document(sanitize(filename), bytes, fields)
+    return true
+  end
+  fyde.log.warn("could not download " .. filename .. ": " .. tostring(ok and "not a PDF" or bytes))
+  return false
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -287,4 +300,5 @@ return {
   open_and_wait = open_and_wait,
   fill_first = fill_first,
   click_first = click_first,
+  browser_save = browser_save,
 }
