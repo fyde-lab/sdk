@@ -19,7 +19,7 @@ pub use domains::documents::{
     Service as DocumentsService, SetAttributeRequest, UploadRequest,
 };
 pub use domains::scrapers::{
-    HELPERS_LUA as SCRAPER_HELPERS_LUA, ProgressEvent, Service as ScrapersService,
+    HELPERS_LUA as SCRAPER_HELPERS_LUA, ProgressEvent, ProgressStep, Service as ScrapersService,
 };
 pub use domains::scripts::{
     InMemoryScriptStorage, InstallScriptRequest, InstalledScript, Script, ScriptMetadata,
@@ -80,7 +80,9 @@ pub struct ClientConfig {
     pub on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
     /// Called once for every `fyde.progress.step`/`fyde.progress.update`
     /// call made by a scraper script running via `ScrapersService::run`, so
-    /// the caller can render its own progress bar. `None` if the caller
+    /// the caller can render its own progress bar. Steps are a fixed set of
+    /// [`ProgressStep`]s, never free text: word one for the user with
+    /// [`ProgressStep::user_message`]. `None` if the caller
     /// doesn't need to observe scraper progress.
     pub on_scraper_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
     /// Called once for every `fyde.input.ask(question)` call made by a
@@ -235,11 +237,18 @@ impl Client {
     /// one — or if reading their preference fails, since this is meant to
     /// be called while already reporting a failure.
     pub async fn user_message(&self, err: &Error) -> &'static str {
-        let language = match self.users.get_language().await {
+        err.user_message(&self.language().await)
+    }
+
+    /// The language user-facing wording should be in: the one the user
+    /// picked via [`UsersService::set_language`], falling back to the
+    /// device's system language if they never picked one or reading their
+    /// preference fails.
+    pub(crate) async fn language(&self) -> String {
+        match self.users.get_language().await {
             Ok(Some(language)) => language,
             Ok(None) | Err(_) => domains::users::system_language(),
-        };
-        err.user_message(&language)
+        }
     }
 
     /// Returns a reference to the client's sessions service. Returns the

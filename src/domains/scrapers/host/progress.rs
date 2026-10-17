@@ -1,18 +1,23 @@
+use std::str::FromStr;
 use std::sync::Arc;
 
 use mlua::{Lua, Result as LuaResult, Table};
 use serde_json::json;
 
-use super::super::ProgressEvent;
 use super::super::reports::Recorder;
+use super::super::{ProgressEvent, ProgressStep};
 
-/// `fyde.progress.step(name)` announces a new high-level stage of the scrape
-/// (login, a given document section, ...). `fyde.progress.update(current,
-/// total, message)` reports fine-grained progress within the current step
-/// (e.g. "3/12 documents downloaded"). Unlike `demo-rust-fyde`'s
-/// `host/progress.rs` (which just prints to stdout), both forward to
-/// `on_progress` — see [`crate::ClientConfig::on_scraper_progress`] — so the
-/// consuming application can render its own progress bar. Both also write a
+/// `fyde.progress.step(step)` announces a new high-level stage of the scrape,
+/// named by one of [`ProgressStep`]'s [`ProgressStep::as_str`] names
+/// (`"logging_in"`, `"downloading_documents"`, ...) — any other value raises
+/// a Lua error, since the application only has wording for those.
+/// `fyde.progress.update(current, total)` reports fine-grained progress
+/// within the current step (e.g. 3 of 12 documents downloaded). Neither
+/// takes free text: it couldn't be shown in the user's language. Unlike
+/// `demo-rust-fyde`'s `host/progress.rs` (which just prints to stdout), both
+/// forward to `on_progress` — see
+/// [`crate::ClientConfig::on_scraper_progress`] — so the consuming
+/// application can render its own progress bar. Both also write a
 /// `progress` entry to `recorder`.
 pub(super) fn table(
     lua: &Lua,
@@ -26,10 +31,11 @@ pub(super) fn table(
     progress.set(
         "step",
         lua.create_function(move |_, name: String| {
+            let step = ProgressStep::from_str(&name).map_err(mlua::Error::external)?;
             if let Some(callback) = &step_callback {
-                callback(ProgressEvent::Step { name: name.clone() });
+                callback(ProgressEvent::Step { step });
             }
-            step_recorder.record("progress", json!({ "kind": "step", "name": name }));
+            step_recorder.record("progress", json!({ "kind": "step", "step": step.as_str() }));
             Ok(())
         })?,
     )?;
@@ -37,17 +43,13 @@ pub(super) fn table(
     let update_callback = on_progress;
     progress.set(
         "update",
-        lua.create_function(move |_, (current, total, message): (i64, i64, String)| {
+        lua.create_function(move |_, (current, total): (i64, i64)| {
             if let Some(callback) = &update_callback {
-                callback(ProgressEvent::Update {
-                    current,
-                    total,
-                    message: message.clone(),
-                });
+                callback(ProgressEvent::Update { current, total });
             }
             recorder.record(
                 "progress",
-                json!({ "kind": "update", "current": current, "total": total, "message": message }),
+                json!({ "kind": "update", "current": current, "total": total }),
             );
             Ok(())
         })?,
@@ -62,12 +64,20 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn step_invokes_the_callback_with_the_given_name() {
+    type OnProgress = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
+
+    fn recording_callback() -> (Arc<Mutex<Vec<ProgressEvent>>>, OnProgress) {
         let received = Arc::new(Mutex::new(Vec::new()));
         let callback = received.clone();
-        let on_progress: Arc<dyn Fn(ProgressEvent) + Send + Sync> =
-            Arc::new(move |event| callback.lock().unwrap().push(event));
+        (
+            received,
+            Arc::new(move |event| callback.lock().unwrap().push(event)),
+        )
+    }
+
+    #[test]
+    fn step_invokes_the_callback_with_the_given_step() {
+        let (received, on_progress) = recording_callback();
 
         let lua = Lua::new();
         let recorder = Arc::new(Recorder::new("didaxis"));
@@ -77,22 +87,19 @@ mod tests {
                 table(&lua, Some(on_progress), recorder).unwrap(),
             )
             .unwrap();
-        lua.load(r#"progress.step("Logging in")"#).exec().unwrap();
+        lua.load(r#"progress.step("logging_in")"#).exec().unwrap();
 
         assert_eq!(
             *received.lock().unwrap(),
             vec![ProgressEvent::Step {
-                name: "Logging in".to_string()
+                step: ProgressStep::LoggingIn
             }]
         );
     }
 
     #[test]
-    fn update_invokes_the_callback_with_current_total_and_message() {
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let callback = received.clone();
-        let on_progress: Arc<dyn Fn(ProgressEvent) + Send + Sync> =
-            Arc::new(move |event| callback.lock().unwrap().push(event));
+    fn step_rejects_an_unknown_step_without_invoking_the_callback() {
+        let (received, on_progress) = recording_callback();
 
         let lua = Lua::new();
         let recorder = Arc::new(Recorder::new("didaxis"));
@@ -102,16 +109,31 @@ mod tests {
                 table(&lua, Some(on_progress), recorder).unwrap(),
             )
             .unwrap();
-        lua.load(r#"progress.update(3, 12, "payslip.pdf")"#)
-            .exec()
+        let result = lua.load(r#"progress.step("Logging in")"#).exec();
+
+        assert!(result.is_err());
+        assert!(received.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn update_invokes_the_callback_with_current_and_total() {
+        let (received, on_progress) = recording_callback();
+
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        lua.globals()
+            .set(
+                "progress",
+                table(&lua, Some(on_progress), recorder).unwrap(),
+            )
             .unwrap();
+        lua.load(r#"progress.update(3, 12)"#).exec().unwrap();
 
         assert_eq!(
             *received.lock().unwrap(),
             vec![ProgressEvent::Update {
                 current: 3,
-                total: 12,
-                message: "payslip.pdf".to_string()
+                total: 12
             }]
         );
     }
@@ -124,7 +146,7 @@ mod tests {
             .set("progress", table(&lua, None, recorder).unwrap())
             .unwrap();
 
-        lua.load(r#"progress.step("x"); progress.update(1, 2, "y")"#)
+        lua.load(r#"progress.step("done"); progress.update(1, 2)"#)
             .exec()
             .unwrap();
     }
@@ -137,7 +159,7 @@ mod tests {
             .set("progress", table(&lua, None, recorder.clone()).unwrap())
             .unwrap();
 
-        lua.load(r#"progress.step("Logging in"); progress.update(1, 2, "halfway")"#)
+        lua.load(r#"progress.step("logging_in"); progress.update(1, 2)"#)
             .exec()
             .unwrap();
 

@@ -338,6 +338,7 @@ mod tests {
     use mockall::predicate::eq;
     use serde_json::json;
 
+    use super::super::ProgressStep;
     use super::super::cookies::{FakeCookie, MockService as MockCookiesService};
     use super::super::reports::MockService as MockReportsService;
     use super::super::session::MockService as MockSessionService;
@@ -612,8 +613,8 @@ mod tests {
         let script = r#"
             local M = {}
             function M.run(parameters)
-                fyde.progress.step("Logging in")
-                fyde.progress.update(1, 2, "halfway")
+                fyde.progress.step("logging_in")
+                fyde.progress.update(1, 2)
             end
             return M
         "#;
@@ -636,12 +637,11 @@ mod tests {
             *received.lock().unwrap(),
             vec![
                 ProgressEvent::Step {
-                    name: "Logging in".to_string()
+                    step: ProgressStep::LoggingIn
                 },
                 ProgressEvent::Update {
                     current: 1,
-                    total: 2,
-                    message: "halfway".to_string()
+                    total: 2
                 },
             ]
         );

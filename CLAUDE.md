@@ -148,6 +148,11 @@ Non-domain helpers live in `src/tools/` (`log`, `sandbox`, `sql`, `testing`).
   `browser`).
   - `mlua::Lua` is `!Send`: `run` builds the VM inside `spawn_blocking` and host functions use
     a captured runtime `Handle::block_on`. Never move a `Lua` across threads.
+  - `fyde.progress` carries no free text, so the UI can word it in the user's language:
+    `step(name)` only accepts a `ProgressStep` name (`"logging_in"`, ...; anything else raises),
+    `update(current, total)` has no message. New steps need wording in every language in
+    `ProgressStep::user_message` plus an `ffi::FfiProgressStep` variant; FFI `Step` events carry
+    it localized (language refreshed at each `run_installed_script`).
   - `save_document` uploads via `documents::Service::upload`; `DuplicateDocument` is skipped.
   - `session/`, `cookies/`, `reports/` persist per scraper through a `StorageConfig`
     (`Sqlite` for a `Client`, `File` for `init_dev_scrapers`). `fyde.session` is saved even

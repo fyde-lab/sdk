@@ -7,7 +7,7 @@ mod service;
 mod session;
 
 pub use host::helpers::SOURCE as HELPERS_LUA;
-pub use models::ProgressEvent;
+pub use models::{ProgressEvent, ProgressStep};
 
 use std::path::PathBuf;
 use std::sync::Arc;

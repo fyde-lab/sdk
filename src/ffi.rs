@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use uuid::Uuid;
 
@@ -26,7 +26,7 @@ use crate::domains::sessions::Service as SessionsService;
 use crate::domains::users::system_language;
 use crate::{
     ChangelogEvent, Client, ClientConfig, Document, Error, ErrorCode, ErrorContext as _, ErrorKind,
-    LogLevel, LoginOutcome, OpenSession, ProgressEvent, Storage, Usage,
+    LogLevel, LoginOutcome, OpenSession, ProgressEvent, ProgressStep, Storage, Usage,
 };
 
 macro_rules! define_ffi_error {
@@ -1099,33 +1099,57 @@ pub trait DocumentChangeListener: Send + Sync {
     fn on_event(&self, event: FfiChangelogEvent);
 }
 
-/// A scraper run's progress, mirroring [`ProgressEvent`]: a named step
-/// starting, or how far the current step has got.
+/// A high-level stage of a scraper run, mirroring [`ProgressStep`] across
+/// the FFI boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiProgressStep {
+    LoggingIn,
+    CheckingSession,
+    WaitingForVerificationCode,
+    WaitingForCaptcha,
+    ListingDocuments,
+    DownloadingDocuments,
+    Done,
+}
+
+impl From<ProgressStep> for FfiProgressStep {
+    fn from(step: ProgressStep) -> Self {
+        match step {
+            ProgressStep::LoggingIn => Self::LoggingIn,
+            ProgressStep::CheckingSession => Self::CheckingSession,
+            ProgressStep::WaitingForVerificationCode => Self::WaitingForVerificationCode,
+            ProgressStep::WaitingForCaptcha => Self::WaitingForCaptcha,
+            ProgressStep::ListingDocuments => Self::ListingDocuments,
+            ProgressStep::DownloadingDocuments => Self::DownloadingDocuments,
+            ProgressStep::Done => Self::Done,
+        }
+    }
+}
+
+/// A scraper run's progress, mirroring [`ProgressEvent`]: a step starting
+/// — with `message`, its wording in the user's language (see
+/// [`ProgressStep::user_message`]) — or how far the current step has got.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiProgressEvent {
     Step {
-        name: String,
+        step: FfiProgressStep,
+        message: String,
     },
     Update {
         current: i64,
         total: i64,
-        message: String,
     },
 }
 
-impl From<ProgressEvent> for FfiProgressEvent {
-    fn from(event: ProgressEvent) -> Self {
+impl FfiProgressEvent {
+    /// Converts `event`, wording its step (if any) in `language`.
+    fn localized(event: ProgressEvent, language: &str) -> Self {
         match event {
-            ProgressEvent::Step { name } => Self::Step { name },
-            ProgressEvent::Update {
-                current,
-                total,
-                message,
-            } => Self::Update {
-                current,
-                total,
-                message,
+            ProgressEvent::Step { step } => Self::Step {
+                step: step.into(),
+                message: step.user_message(language).to_string(),
             },
+            ProgressEvent::Update { current, total } => Self::Update { current, total },
         }
     }
 }
@@ -1146,6 +1170,12 @@ pub trait ScraperListener: Send + Sync {
 #[derive(uniffi::Object)]
 pub struct FydeClient {
     inner: Client,
+    /// The language scraper progress steps are worded in for
+    /// `init`'s `scraper_listener`, refreshed from [`Client::language`]
+    /// at the start of each [`Self::run_installed_script`]. The progress
+    /// callback runs synchronously on the run's blocking thread, so it
+    /// can't await the user's preference itself.
+    scraper_language: Arc<RwLock<String>>,
 }
 
 impl FydeClient {
@@ -1193,11 +1223,14 @@ impl FydeClient {
                 let listener: Arc<dyn DocumentChangeListener> = Arc::from(listener);
                 Arc::new(move |event| listener.on_event(event.into()))
             });
+        let scraper_language = Arc::new(RwLock::new(system_language()));
         if let Some(listener) = scraper_listener {
             let listener: Arc<dyn ScraperListener> = Arc::from(listener);
             let for_progress = listener.clone();
+            let language = scraper_language.clone();
             config.on_scraper_progress = Some(Arc::new(move |event: ProgressEvent| {
-                for_progress.on_progress(event.into())
+                let language = language.read().unwrap_or_else(PoisonError::into_inner);
+                for_progress.on_progress(FfiProgressEvent::localized(event, &language))
             }));
             config.on_scraper_question = Some(Arc::new(move |question: String| {
                 listener.on_question(question)
@@ -1205,7 +1238,10 @@ impl FydeClient {
         }
 
         match Client::init(config).await {
-            Ok(inner) => Ok(Arc::new(Self { inner })),
+            Ok(inner) => Ok(Arc::new(Self {
+                inner,
+                scraper_language,
+            })),
             Err(err) => Err(FfiError::from_error(&err, &system_language())),
         }
     }
@@ -1687,6 +1723,10 @@ impl FydeClient {
                 .scripts()
                 .fetch_installed_script(script_id)
                 .await?;
+            *self
+                .scraper_language
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = self.inner.language().await;
             self.inner.scrapers().run_installed(&installed).await
         })
         .await

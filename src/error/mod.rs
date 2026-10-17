@@ -16,6 +16,8 @@
 
 mod messages;
 
+pub(crate) use messages::Language;
+
 use std::fmt;
 
 /// Expands `$callback!` with every [`ErrorCode`] variant, its doc comment
@@ -254,6 +256,8 @@ pub(crate) enum ErrorKind {
     InvalidSearchQuery(String),
     #[error("invalid script type: {0:?}")]
     InvalidScriptType(String),
+    #[error("invalid progress step: {0:?}")]
+    InvalidProgressStep(String),
     #[error("invalid server response: {0}")]
     InvalidResponse(String),
     #[error("encryption error: {0}")]
@@ -311,6 +315,7 @@ impl ErrorKind {
             ErrorKind::InvalidAttribute(_) => ErrorCode::InvalidAttribute,
             ErrorKind::InvalidSearchQuery(_) => ErrorCode::InvalidSearchQuery,
             ErrorKind::InvalidScriptType(_) => ErrorCode::InvalidScriptType,
+            ErrorKind::InvalidProgressStep(_) => ErrorCode::ScriptFailed,
             ErrorKind::InvalidResponse(_) => ErrorCode::InvalidServerResponse,
             ErrorKind::Encryption(_) => ErrorCode::Encryption,
             ErrorKind::InvalidCredentials => ErrorCode::InvalidCredentials,

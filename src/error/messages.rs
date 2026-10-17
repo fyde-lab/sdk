@@ -9,7 +9,7 @@ use super::ErrorCode;
 
 /// A language the SDK has error wording for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Language {
+pub(crate) enum Language {
     English,
     French,
 }
@@ -18,7 +18,7 @@ impl Language {
     /// Parses a short code (`"fr"`) or a locale (`"fr-FR"`, `"fr_FR.UTF-8"`),
     /// case-insensitively, falling back to [`Language::English`] for
     /// anything it doesn't recognize.
-    pub(super) fn parse(language: &str) -> Self {
+    pub(crate) fn parse(language: &str) -> Self {
         let code = language
             .split(['-', '_', '.'])
             .next()

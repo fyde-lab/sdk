@@ -83,7 +83,7 @@ mod tests {
         );
         recorder.record(
             "progress",
-            serde_json::json!({ "kind": "step", "name": "b" }),
+            serde_json::json!({ "kind": "step", "step": "done" }),
         );
 
         let report = recorder.finish();
