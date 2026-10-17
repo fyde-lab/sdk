@@ -89,6 +89,13 @@ local function base64url_decode(s)
   end))
 end
 
+-- Percent-encodes everything but RFC 3986 unreserved characters, for a query-string value.
+local function url_encode(s)
+  return (tostring(s):gsub("[^%w%-_%.~]", function(c)
+    return string.format("%%%02X", c:byte())
+  end))
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -99,4 +106,5 @@ return {
   sanitize = sanitize,
   ask_code = ask_code,
   base64url_decode = base64url_decode,
+  url_encode = url_encode,
 }

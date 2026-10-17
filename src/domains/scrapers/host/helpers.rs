@@ -152,4 +152,13 @@ mod tests {
 
         assert_eq!(decoded, r#"{"sub":"123>"}"#);
     }
+
+    #[test]
+    fn url_encode_keeps_only_unreserved_characters() {
+        let lua = lua("");
+
+        let encoded: String = eval(&lua, r#"return fyde.helpers.url_encode("a b&c=é~")"#);
+
+        assert_eq!(encoded, "a%20b%26c%3D%C3%A9~");
+    }
 }
