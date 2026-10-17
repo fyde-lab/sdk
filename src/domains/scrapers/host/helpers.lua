@@ -41,10 +41,15 @@ local function contains_any(haystack, needles)
   return false
 end
 
+local function trim(s)
+  return ((s or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
   fail = fail,
   contains = contains,
   contains_any = contains_any,
+  trim = trim,
 }

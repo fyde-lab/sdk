@@ -92,4 +92,17 @@ mod tests {
         assert!(found);
         assert!(!missing);
     }
+
+    #[test]
+    fn trim_strips_surrounding_whitespace_and_a_missing_string() {
+        let lua = lua("");
+
+        let (trimmed, missing): (String, String) = eval(
+            &lua,
+            r#"return fyde.helpers.trim("  a b \n"), fyde.helpers.trim(nil)"#,
+        );
+
+        assert_eq!(trimmed, "a b");
+        assert_eq!(missing, "");
+    }
 }
