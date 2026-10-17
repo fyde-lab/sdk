@@ -54,6 +54,16 @@ local function sanitize(name)
   return name
 end
 
+-- Asks the user for a one-time code through fyde.input.ask; an unanswered/empty prompt (or no
+-- input handler at all, e.g. an unattended run) is an MFA failure.
+local function ask_code(question)
+  local ok, code = pcall(fyde.input.ask, question)
+  if not ok or type(code) ~= "string" or trim(code) == "" then
+    fail(MFA_FAILED, "no one-time code was provided")
+  end
+  return (code:gsub("%s", ""))
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -62,4 +72,5 @@ return {
   contains_any = contains_any,
   trim = trim,
   sanitize = sanitize,
+  ask_code = ask_code,
 }

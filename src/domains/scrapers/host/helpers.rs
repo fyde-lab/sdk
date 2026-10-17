@@ -118,4 +118,26 @@ mod tests {
         assert_eq!(sanitized, "a_b_ c_.pdf");
         assert_eq!(empty, "document");
     }
+
+    #[test]
+    fn ask_code_fails_with_mfa_failed_when_nobody_answers() {
+        let lua = lua("fyde.log = { warn = function() end } \
+             fyde.input = { ask = function() error('no handler') end }");
+
+        let message: String = eval(
+            &lua,
+            "local _, err = pcall(fyde.helpers.ask_code, 'code?') return err",
+        );
+
+        assert_eq!(message, "MFA_FAILED");
+    }
+
+    #[test]
+    fn ask_code_strips_whitespace_from_the_answer() {
+        let lua = lua("fyde.input = { ask = function() return ' 12 34 ' end }");
+
+        let code: String = eval(&lua, "return fyde.helpers.ask_code('code?')");
+
+        assert_eq!(code, "1234");
+    }
 }
