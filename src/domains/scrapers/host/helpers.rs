@@ -180,4 +180,33 @@ mod tests {
             assert_eq!(resolved, expected, "href {href:?}");
         }
     }
+
+    #[test]
+    fn read_form_returns_the_absolute_action_and_the_fields_a_browser_would_send() {
+        let lua = lua("");
+
+        let (action, user, token, remember, unchecked): (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = eval(
+            &lua,
+            r##"local page = { url = "https://example.com/login/", body = [[
+                 <form id="login" action="check">
+                   <input name="user"><input type="hidden" name="token" value="t0k">
+                   <input type="checkbox" name="remember" value="on" checked>
+                   <input type="checkbox" name="newsletter" value="on">
+                 </form>]] }
+               local action, fields = fyde.helpers.read_form(page, "#login")
+               return action, fields.user, fields.token, fields.remember, fields.newsletter"##,
+        );
+
+        assert_eq!(action, "https://example.com/login/check");
+        assert_eq!(user, "");
+        assert_eq!(token, "t0k");
+        assert_eq!(remember, "on");
+        assert_eq!(unchecked, None);
+    }
 }

@@ -122,6 +122,24 @@ local function absolute(base, href)
   return dir .. href
 end
 
+-- Form login helper (`signin({ formSelector })`-style): reads the first form matching
+-- `selector` on `page` (a fyde.http response) and returns its absolute action URL plus every
+-- named input's current value (unchecked checkboxes/radios left out, like a browser does).
+local function read_form(page, selector)
+  local form = fyde.html.select(page.body, selector)[1]
+  if not form then
+    return nil
+  end
+  local fields = {}
+  for _, input in ipairs(fyde.html.select(form.html, "input[name]")) do
+    local kind = (input.attrs.type or "text"):lower()
+    if (kind ~= "checkbox" and kind ~= "radio") or input.attrs.checked then
+      fields[input.attrs.name] = input.attrs.value or ""
+    end
+  end
+  return absolute(page.url, form.attrs.action), fields
+end
+
 return {
   INVALID_CREDENTIALS = INVALID_CREDENTIALS,
   MFA_FAILED = MFA_FAILED,
@@ -134,4 +152,5 @@ return {
   base64url_decode = base64url_decode,
   url_encode = url_encode,
   absolute = absolute,
+  read_form = read_form,
 }
