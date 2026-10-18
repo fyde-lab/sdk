@@ -146,7 +146,8 @@ Non-domain helpers live in `src/tools/` (`log`, `sandbox`, `sql`, `testing`).
 - **scrapers** — runs Lua scripts that log into third-party sites. Contract: the script
   returns `{ run = function(parameters) ... }` and only calls the `fyde` table built in
   `host/` (`http`, `html`, `json`, `log`, `progress`, `input`, `save_document`, `session`,
-  `browser`).
+  `browser`, plus `helpers`: shared Lua helpers in `host/helpers.lua` that scripts alias instead
+  of inlining — `../scripts` relies on their names and behaviour).
   - `mlua::Lua` is `!Send`: `run` builds the VM inside `spawn_blocking` and host functions use
     a captured runtime `Handle::block_on`. Never move a `Lua` across threads.
   - `fyde.progress` carries no free text, so the UI can word it in the user's language:
