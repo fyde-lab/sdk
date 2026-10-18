@@ -17,7 +17,7 @@ use wry::{WebView, WebViewBuilder};
 use crate::{ErrorKind, Result};
 
 use super::super::cookies::Cookie;
-use super::super::host::is_host_allowed;
+use super::super::host::{MAX_BODY_BYTES, is_host_allowed};
 use super::Service;
 
 /// One pending `Eval` call's reply slot, keyed by the id embedded in the JS
@@ -704,6 +704,9 @@ fn fetch_script(id: u64, url: &str) -> String {
                 }}
                 return response.arrayBuffer();
             }}).then(function(buffer){{
+                if (buffer.byteLength > {MAX_BODY_BYTES}) {{
+                    throw new Error("download is larger than the {MAX_BODY_BYTES} byte limit");
+                }}
                 // `String.fromCharCode.apply` over the whole buffer would
                 // overflow the call stack on a large file.
                 var bytes = new Uint8Array(buffer), chunks = [];
@@ -857,6 +860,14 @@ fn parse_fetched(value: Value) -> Result<Vec<u8>> {
         .get("data")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    // Checked here too: the page's own JS could post a reply that skips
+    // `fetch_script`'s check.
+    if base64::decoded_len_estimate(data.len()) > MAX_BODY_BYTES {
+        return Err(ErrorKind::Browser(format!(
+            "download is larger than the {MAX_BODY_BYTES} byte limit"
+        ))
+        .into());
+    }
     base64::engine::general_purpose::STANDARD
         .decode(data)
         .map_err(|err| ErrorKind::Browser(format!("invalid downloaded data: {err}")).into())

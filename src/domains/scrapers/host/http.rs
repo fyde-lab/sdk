@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::StreamExt as _;
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value as LuaValue};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
@@ -114,9 +115,14 @@ fn response_to_table(lua: &Lua, runtime: &Handle, resp: wreq::Response) -> LuaRe
     // request, mimicking a real browser submitting a form from the page it
     // was just redirected to).
     let url = resp.uri().to_string();
-    let body = runtime
-        .block_on(resp.text())
-        .map_err(mlua::Error::external)?;
+    let content_type = resp
+        .headers()
+        .get(wreq::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = read_body(runtime, resp, super::MAX_BODY_BYTES).map_err(mlua::Error::external)?;
+    let body = decode_text(&content_type, &body);
 
     let out = lua.create_table()?;
     out.set("status", status)?;
@@ -334,9 +340,7 @@ pub(super) fn table(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            let bytes = download
-                .runtime
-                .block_on(resp.bytes())
+            let bytes = read_body(&download.runtime, resp, super::MAX_BODY_BYTES)
                 .map_err(|err| download.record_error("http.download", &url, err))?;
 
             // The body is never dumped here, even under `debug_http_dump`:
@@ -364,6 +368,48 @@ pub(super) fn table(
     )?;
 
     Ok(http)
+}
+
+/// Reads `resp`'s whole body, failing as soon as it grows past `max_bytes`
+/// ([`super::MAX_BODY_BYTES`] outside tests; counted after decompression)
+/// instead of buffering it all first.
+fn read_body(
+    runtime: &Handle,
+    resp: wreq::Response,
+    max_bytes: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    runtime.block_on(async {
+        let mut stream = resp.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|err| err.to_string())?;
+            if body.len() + chunk.len() > max_bytes {
+                return Err(format!(
+                    "response body is larger than the {max_bytes} byte limit"
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    })
+}
+
+/// Decodes `body` the way `wreq::Response::text` does: in the `charset` of
+/// `content_type` (UTF-8 by default), BOM-sniffed, with malformed sequences
+/// replaced.
+fn decode_text(content_type: &str, body: &[u8]) -> String {
+    let label = content_type
+        .split(';')
+        .skip(1)
+        .find_map(|param| {
+            let (name, value) = param.split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case("charset")
+                .then(|| value.trim().trim_matches('"'))
+        })
+        .unwrap_or("utf-8");
+    let encoding = encoding_rs::Encoding::for_label(label.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+    encoding.decode(body).0.into_owned()
 }
 
 /// Builds this run's `wreq` client on `jar`, per `options` (see [`table`]'s
@@ -472,7 +518,12 @@ impl HttpHost {
 
     /// Records `err` as an `error` entry for `action` on `url` and converts
     /// it into the Lua error that fails the script's call.
-    fn record_error(&self, action: &str, url: &str, err: wreq::Error) -> mlua::Error {
+    fn record_error(
+        &self,
+        action: &str,
+        url: &str,
+        err: impl std::fmt::Display + Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> mlua::Error {
         self.recorder.record(
             "error",
             json!({ "action": action, "url": url, "message": err.to_string() }),
@@ -624,6 +675,46 @@ mod tests {
         });
 
         format!("http://127.0.0.1:{}/", addr.port())
+    }
+
+    #[test]
+    fn read_body_returns_a_body_within_the_limit() {
+        let runtime = runtime();
+        let url = spawn_ok_server(&runtime, "hello");
+        let resp = runtime.block_on(Client::new().get(&url).send()).unwrap();
+
+        let body = read_body(runtime.handle(), resp, 5).unwrap();
+
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn read_body_fails_on_a_body_over_the_limit() {
+        let runtime = runtime();
+        let url = spawn_ok_server(&runtime, "hello");
+        let resp = runtime.block_on(Client::new().get(&url).send()).unwrap();
+
+        let err = read_body(runtime.handle(), resp, 4).unwrap_err();
+
+        assert!(err.contains("4 byte limit"), "{err}");
+    }
+
+    #[test]
+    fn decode_text_uses_the_content_types_charset() {
+        assert_eq!(
+            decode_text("text/html; charset=ISO-8859-1", b"caf\xe9"),
+            "café"
+        );
+        assert_eq!(
+            decode_text("text/html; Charset=\"utf-8\"", "café".as_bytes()),
+            "café"
+        );
+    }
+
+    #[test]
+    fn decode_text_defaults_to_utf8() {
+        assert_eq!(decode_text("text/html", "café".as_bytes()), "café");
+        assert_eq!(decode_text("", b"caf\xe9"), "caf\u{fffd}");
     }
 
     #[test]

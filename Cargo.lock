@@ -1955,6 +1955,7 @@ dependencies = [
  "base64",
  "cookie",
  "dbus-secret-service-keyring-store",
+ "encoding_rs",
  "futures",
  "hkdf 0.12.4",
  "keyring-core",
@@ -5467,6 +5468,9 @@ name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bf256ce5efdfa370213c1dabab5935a12e49f2c58d15e9eac2870d3b4f27263"
+dependencies = [
+ "futures-core",
+]
 
 [[package]]
 name = "synstructure"
@@ -6994,8 +6998,10 @@ dependencies = [
  "serde_html_form",
  "serde_json",
  "socket2",
+ "sync_wrapper",
  "tokio",
  "tokio-btls",
+ "tokio-util",
  "tower",
  "tower-http",
  "url",
