@@ -16,6 +16,9 @@ base64 = "0.22.1"
 # Cookie type `wry`'s `WebView::cookies`/`set_cookie` speak — must stay on the
 # same major version `wry` itself depends on.
 cookie = "0.18"
+# Decodes `fyde.http` text bodies in their `charset` (`domains/scrapers/host/http.rs`'s
+# `decode_text`), the way `wreq::Response::text` would.
+encoding_rs = "0.8.41"
 futures = "0.3.34"
 hkdf = "0.12.4"
 # The `secrets` domain (`domains/secrets`) keeps the account master key and
@@ -106,7 +109,7 @@ url = "2.5.8"
 # `demo-rust-fyde`'s own `host/http.rs`, which this is ported from. Building
 # it vendors a patched BoringSSL (`btls-sys`), which needs
 # `cmake`/`perl`/`go`/`libclang` at build time — see `shell.nix`.
-wreq = { version = "0.16.1", features = ["cookies", "charset", "gzip", "brotli", "deflate", "zstd", "form", "json", "webpki-roots"] }
+wreq = { version = "0.16.1", features = ["cookies", "charset", "gzip", "brotli", "deflate", "zstd", "form", "json", "stream", "webpki-roots"] }
 wreq-util = "0.2.0"
 # `fyde.browser` (see the `tao` entry above) — the actual webview.
 wry = "0.57"

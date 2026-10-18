@@ -58,6 +58,15 @@ impl Installed {
     }
 }
 
+/// Upper bound on one response body a scraper receives, from `fyde.http`
+/// (`http::read_body`) or `fyde.browser:download` (`browser::driver`).
+/// Bodies are buffered in the host's own memory before they become Lua
+/// strings, outside the VM's memory limit, and `fyde.http` transparently
+/// decompresses gzip/brotli/zstd: without a cap, a small compressed
+/// response from a hostile or compromised allowed site could expand until
+/// the host process runs out of memory.
+pub(super) const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
+
 /// Enforced by every `fyde.http.get/post_form/post_json/download` call and
 /// `fyde.browser:open` — the one network entry point each of those has —
 /// before it ever reaches the network: `url`'s host must equal, or be a
