@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -7,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine as _;
+use rand::RngExt as _;
 use serde_json::Value;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
@@ -92,7 +92,6 @@ struct Running {
 /// echoes back — see [`call`](Self::call).
 pub(super) struct BrowserDriver {
     running: Mutex<Option<Running>>,
-    next_id: AtomicU64,
     allowed_domains: Arc<Vec<String>>,
     visible: bool,
     initial_cookies: Vec<Cookie>,
@@ -106,15 +105,21 @@ impl BrowserDriver {
     ) -> Self {
         Self {
             running: Mutex::new(None),
-            next_id: AtomicU64::new(1),
             allowed_domains,
             visible,
             initial_cookies,
         }
     }
 
+    /// A fresh, unguessable id for one `Eval` round-trip. The IPC handler
+    /// accepts a reply from any script running in the page, so a sequential
+    /// id would let any of its scripts answer a pending call blind (e.g. a
+    /// forged `html` or download). It can't stop page JS that hooks
+    /// `window.ipc.postMessage` to rewrite our own replies — the snippets
+    /// run in the page's realm. 53 bits, so it survives the trip through a
+    /// JS number unchanged.
     fn next_id(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+        rand::rng().random::<u64>() >> 11
     }
 
     /// Spawns the dedicated OS thread owning this run's `tao` event loop and
