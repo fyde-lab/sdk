@@ -89,11 +89,11 @@ pub(super) trait Service: Send + Sync {
     /// [`Service::html`] can ever observe since nothing in the DOM changes
     /// (confirmed live against `cesu.urssaf.fr`'s "Bulletin de salaire"
     /// buttons — see the `scripts` repo's `scrapers/cesu/script.lua` header
-    /// comment). Blocks until the download finishes (or `timeout` elapses)
-    /// and returns the downloaded file's raw bytes, read back from wherever
-    /// the webview engine saved it — see `driver::BrowserDriver`'s
-    /// `download_started_handler`/`download_completed_handler` for how that
-    /// destination is chosen and captured. Only one `download` call may be
+    /// comment). Cancels that native download as soon as it starts, before
+    /// anything is written to disk, and instead fetches its URL from inside
+    /// the page (same cookies, and the page's own `blob:` URLs) — see
+    /// `driver::fetch_script` — returning the bytes once they're in
+    /// memory (or failing once `timeout` elapses). Only one `download` call may be
     /// in flight at a time per driver (matching every scraper script's own
     /// single-threaded, one-step-at-a-time use of `fyde.browser`).
     async fn download(&self, selector: &str, timeout: Duration) -> Result<Vec<u8>>;
