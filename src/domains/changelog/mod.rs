@@ -111,7 +111,7 @@ pub(crate) trait Service: Send + Sync {
 /// consumed events directly into the local `documents` table (and installed
 /// scripts into the `scripts` domain's `installed_scripts` table), `settings`
 /// to persist the changelog cursor consumed so far (see
-/// [`storage_settings::SettingsCursorStorage`]), `secrets` to read the
+/// [`storage_settings::LocalCursorStorage`]), `secrets` to read the
 /// account master key `crypto` derives every event's KEK from, and `sessions` to
 /// attach the session token as a bearer `authorization` header on every
 /// outgoing call once a session is opened (see
@@ -128,8 +128,8 @@ pub(crate) async fn init(
     lock_path: std::path::PathBuf,
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool.clone());
-    let script_storage = scripts::SqliteStorage::new(pool);
-    let cursor_storage = storage_settings::SettingsCursorStorage::new(settings);
+    let script_storage = scripts::SqliteStorage::new(pool.clone());
+    let cursor_storage = storage_settings::LocalCursorStorage::new(settings, pool);
     let client = service::ChangelogClient::new(
         grpc_client::GrpcClient::new(channel, sessions),
         document_storage,

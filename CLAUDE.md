@@ -119,7 +119,8 @@ Non-domain helpers live in `src/tools/` (`log`, `sandbox`, `sql`, `testing`).
   (`SaveDocument`, `UpdateMetadata`, `InstallScript`). `crypto.rs`: AES-256-GCM, per-event DEK
   wrapped by a KEK derived from the master key. The consume job replays from the persisted
   cursor then tails live, materializing documents and installed scripts; only the process
-  holding the `flock` (`write_lock`) writes local storage.
+  holding the `flock` (`write_lock`) writes local storage. Applied events are recorded by
+  ciphertext digest (`applied_changelog_events`), so one the server serves again is skipped.
 - **users** — OPAQUE (RFC 9807, `opaque-ke`); the password never leaves the SDK.
   `FydeCipherSuite` (ristretto255 + 3DH/SHA-512 + Argon2id 64 MiB/3 iters/4 lanes) must match
   `../server`'s. `crypto.rs`'s `OpaqueClient` trait exists so service tests skip real KSF cost.
