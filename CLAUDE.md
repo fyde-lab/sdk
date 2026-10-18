@@ -164,8 +164,8 @@ Non-domain helpers live in `src/tools/` (`log`, `sandbox`, `sql`, `testing`).
     `!Send`; calls cross over via `EventLoopProxy` commands and IPC replies). Only verified on
     Linux/WebKitGTK. Webview cookies are merged into the saved jar (browser wins) and restored
     as domain cookies (`driver::to_webview_cookie`). Forms are submitted with `click`, never
-    an in-page `fetch` (it bypasses bot-mitigation hooks); `download` captures native
-    downloads.
+    an in-page `fetch` (it bypasses bot-mitigation hooks); `download` cancels the native
+    download and re-fetches its URL in-page, so its bytes never touch the disk.
   - `run_installed` runs an installed script (`wreq_emulation`/`follow_redirects` default on).
   - `crate::init_dev_scrapers` builds a scrapers service without a `Client` (file storage +
     `DevDocumentsClient`); `../scripts` is its caller.

@@ -10,6 +10,9 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 aes-gcm = "0.11.1"
 argon2 = "0.5.3"
 async-trait = "0.1.92"
+# `fyde.browser:download` gets its bytes back over IPC base64-encoded
+# (`domains/scrapers/browser/driver.rs`'s `fetch_script`).
+base64 = "0.22.1"
 # Cookie type `wry`'s `WebView::cookies`/`set_cookie` speak — must stay on the
 # same major version `wry` itself depends on.
 cookie = "0.18"
@@ -128,14 +131,6 @@ android-native-keyring-store = "1.0.0"
 # which `wry`/`tao` already need on Linux (see `shell.nix`).
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
 dbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# `wry`'s own WebKitGTK backend types — `domains/scrapers/browser/driver.rs`
-# calls `WebViewExt::download_uri` on the `webkit2gtk::WebView` wry hands
-# its new-window handler, to turn a popup into a real download (see
-# `run_event_loop`'s `with_new_window_req_handler`). Must stay on the same
-# major version `wry` itself depends on, so the `WebView` types match.
-webkit2gtk = "2.0"
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

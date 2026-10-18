@@ -1,18 +1,17 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::Value;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::platform::run_return::EventLoopExtRunReturn as _;
 use tao::window::{Window, WindowBuilder};
-use uuid::Uuid;
 use wry::{WebView, WebViewBuilder};
 
 use crate::{ErrorKind, Result};
@@ -30,16 +29,33 @@ type PendingReplies = Arc<Mutex<HashMap<u64, SyncSender<Value>>>>;
 
 /// The single in-flight download's reply slot, if any — set by
 /// [`BrowserDriver::download`] right before it triggers the click that
-/// starts the download, and filled in by the `download_completed_handler`
-/// installed in [`run_event_loop`] once the webview engine reports the
-/// download finished (or failed). `None` here (checked by the handler) means
-/// no script-level `download` call is currently waiting, which can happen if
-/// a page starts a download on its own outside of `download`'s control —
-/// that outcome is logged and the file cleaned up rather than delivered
-/// nowhere. Only one slot, not a map keyed by id like [`PendingReplies`],
-/// since nothing here runs more than one download at a time (see
-/// [`Service::download`]'s own doc comment).
-type PendingDownload = Arc<Mutex<Option<SyncSender<Option<PathBuf>>>>>;
+/// starts the download, and filled in with the download's URL by the
+/// `download_started_handler` (or, for a popup, the
+/// `new_window_req_handler`) installed in [`build_webview`]. `None` here
+/// means no script-level `download` call is currently waiting, which can
+/// happen if a page starts a download on its own outside of `download`'s
+/// control — that download is just cancelled. Only one slot, not a map
+/// keyed by id like [`PendingReplies`], since nothing here runs more than
+/// one download at a time (see [`Service::download`]'s own doc comment).
+type PendingDownload = Arc<Mutex<Option<SyncSender<String>>>>;
+
+/// Hands `url` to the `download` call waiting in `pending_download`, if
+/// any, emptying the slot.
+fn deliver_download_url(pending_download: &PendingDownload, url: String) {
+    let waiting = pending_download
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    match waiting {
+        Some(sender) => {
+            let _ = sender.send(url);
+        }
+        None => tracing::warn!(
+            %url,
+            "fyde.browser: cancelled a download no `download` call was waiting for"
+        ),
+    }
+}
 
 /// Sent from a [`BrowserDriver`] method to the dedicated OS thread actually
 /// holding the `tao` event loop and `wry` webview — neither type is `Send`,
@@ -291,6 +307,7 @@ impl Service for BrowserDriver {
     }
 
     async fn download(&self, selector: &str, timeout: Duration) -> Result<Vec<u8>> {
+        let deadline = Instant::now() + timeout;
         let (_proxy, _pending, pending_download) = self.ensure_started()?;
 
         let (tx, rx) = sync_channel(1);
@@ -303,28 +320,25 @@ impl Service for BrowserDriver {
             return Err(err);
         }
 
-        let path = match rx.recv_timeout(timeout) {
-            Ok(Some(path)) => path,
-            Ok(None) => {
-                return Err(ErrorKind::Browser(
-                    "download failed or was cancelled by the browser engine".to_string(),
-                )
-                .into());
-            }
-            Err(_) => {
-                *pending_download.lock().unwrap_or_else(|p| p.into_inner()) = None;
-                return Err(ErrorKind::Browser(format!(
-                    "timed out after {timeout:?} waiting for a download to complete"
-                ))
-                .into());
-            }
+        let Ok(url) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
+            *pending_download.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            return Err(ErrorKind::Browser(format!(
+                "timed out after {timeout:?} waiting for a download to start"
+            ))
+            .into());
         };
+        if !is_download_allowed(&url, &self.allowed_domains) {
+            return Err(ErrorKind::Browser(format!(
+                "download url {url:?} is not in this scraper's allowed_domains list"
+            ))
+            .into());
+        }
 
-        let bytes = std::fs::read(&path).map_err(|err| {
-            ErrorKind::Browser(format!("failed to read downloaded file {path:?}: {err}"))
-        })?;
-        let _ = std::fs::remove_file(&path);
-        Ok(bytes)
+        let value = self.call(
+            |id| fetch_script(id, &url),
+            deadline.saturating_duration_since(Instant::now()),
+        )?;
+        parse_fetched(value)
     }
 }
 
@@ -428,8 +442,8 @@ fn build_window(event_loop: &EventLoop<Command>, visible: bool) -> Result<Window
 }
 
 /// Builds the webview inside `window`: replies to [`PendingReplies`] over
-/// IPC, gates navigations and popups against `allowed_domains`, and routes
-/// downloads to whichever `download` call [`PendingDownload`] holds.
+/// IPC, gates navigations and popups against `allowed_domains`, and hands
+/// download URLs to whichever `download` call [`PendingDownload`] holds.
 fn build_webview(
     window: &Window,
     pending: PendingReplies,
@@ -483,78 +497,37 @@ fn build_webview(
         // navigation of the webview that requested it.
         //
         // While a `Service::download` call is waiting, an allowed popup is
-        // denied and its URL downloaded through the opener webview instead:
-        // on Linux, wry's `Allow` builds a separate, always-shown GTK window
-        // (ignoring `visible`) whose webview has none of the download
-        // handlers below, so a page that opens its PDF in a popup (cesu's
+        // denied and its URL handed to that call instead: on Linux, wry's
+        // `Allow` builds a separate, always-shown GTK window (ignoring
+        // `visible`), so a page that opens its PDF in a popup (cesu's
         // `affichagePdf_<id>` buttons) would just display it there and
-        // `download` would time out. `download_uri` goes through the same
-        // `WebContext` (cookies included) the handlers below are registered
-        // on, so it lands in `pending_download` like any other download.
+        // `download` would time out.
         .with_new_window_req_handler({
             let pending_download = pending_download.clone();
-            move |url, features| {
+            move |url, _features| {
                 if !is_navigation_allowed(&url, &new_window_allowed_domains) {
                     tracing::warn!(%url, "browser popup blocked by allowed_domains");
                     return wry::NewWindowResponse::Deny;
                 }
-                #[cfg(target_os = "linux")]
-                {
-                    use webkit2gtk::WebViewExt as _;
-                    let download_waiting = pending_download
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .is_some();
-                    if download_waiting {
-                        features.opener.webview.download_uri(&url);
-                        return wry::NewWindowResponse::Deny;
-                    }
+                let download_waiting = pending_download
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_some();
+                if download_waiting {
+                    deliver_download_url(&pending_download, url);
+                    return wry::NewWindowResponse::Deny;
                 }
-                #[cfg(not(target_os = "linux"))]
-                let _ = (&pending_download, features);
                 wry::NewWindowResponse::Allow
             }
         })
-        // Redirects every download to a fresh, unique path under the OS
-        // temp dir instead of the engine's default (a real downloads
-        // directory, which would also prompt/collide across concurrent
-        // runs) — `Service::download` reads this path back once the
-        // completed handler below reports it finished, then deletes it.
-        // Always allows the download (`true`): the resource it downloads
-        // from was already reached through a page this webview navigated
-        // to, which `with_navigation_handler`/`with_new_window_req_handler`
-        // above already gated against `allowed_domains`.
-        .with_download_started_handler(move |_url, path| {
-            *path = std::env::temp_dir().join(format!("fyde-browser-download-{}", Uuid::new_v4()));
-            true
-        })
-        // Delivers the finished (or failed) download to whichever
-        // `Service::download` call is currently waiting, via
-        // `pending_download` — see that type's own doc comment for why a
-        // single slot, not a map, is enough here. A download that
-        // completes with nobody waiting (nothing in this host triggers one
-        // outside of `Service::download` itself, but a page could still do
-        // it unprompted) is logged and its file cleaned up rather than
-        // silently leaked on disk.
-        .with_download_completed_handler(move |_url, path, success| {
-            let waiting = pending_download
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take();
-            match waiting {
-                Some(sender) => {
-                    let _ = sender.send(if success { path } else { None });
-                }
-                None => {
-                    tracing::warn!(
-                        "fyde.browser: a download completed (success={success}) with no \
-                         pending `download` call waiting for it"
-                    );
-                    if let Some(path) = path {
-                        let _ = std::fs::remove_file(path);
-                    }
-                }
-            }
+        // Cancels every native download (`false`) before the engine writes
+        // anything to disk, handing its URL to the waiting
+        // `Service::download` call instead, which fetches the bytes from
+        // inside the page (see `fetch_script`) so they only ever exist in
+        // memory.
+        .with_download_started_handler(move |url, _path| {
+            deliver_download_url(&pending_download, url);
+            false
         });
 
     #[cfg(target_os = "linux")]
@@ -714,6 +687,44 @@ fn html_script(id: u64) -> String {
     )
 }
 
+/// JS that `fetch`es `url` from inside the page — so with the page's own
+/// cookies, and for a `blob:` URL the page itself created — and reports
+/// its body back over IPC, base64-encoded (see [`parse_fetched`]). The
+/// download's bytes never touch the disk this way, unlike the engine's
+/// native download machinery (see `build_webview`'s
+/// `with_download_started_handler`).
+fn fetch_script(id: u64, url: &str) -> String {
+    let url_json = json_literal(url);
+    format!(
+        r#"(function(){{
+            var __id = {id};
+            fetch({url_json}, {{credentials: "include"}}).then(function(response){{
+                if (!response.ok) {{
+                    throw new Error("download failed with HTTP status " + response.status);
+                }}
+                return response.arrayBuffer();
+            }}).then(function(buffer){{
+                // `String.fromCharCode.apply` over the whole buffer would
+                // overflow the call stack on a large file.
+                var bytes = new Uint8Array(buffer), chunks = [];
+                for (var i = 0; i < bytes.length; i += 0x8000) {{
+                    chunks.push(String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)));
+                }}
+                window.ipc.postMessage(JSON.stringify({{id: __id, ok: true, data: btoa(chunks.join(""))}}));
+            }}).catch(function(e){{
+                window.ipc.postMessage(JSON.stringify({{id: __id, ok: false, error: String(e)}}));
+            }});
+        }})();"#
+    )
+}
+
+/// Checks a download's `url` before [`fetch_script`] fetches it: the same
+/// rule as [`is_navigation_allowed`], plus `data:` URLs, which carry their
+/// content inline and never touch the network.
+fn is_download_allowed(url: &str, allowed_domains: &[String]) -> bool {
+    url.starts_with("data:") || is_navigation_allowed(url, allowed_domains)
+}
+
 /// Checks a navigation/new-window request's target `url` against
 /// `allowed_domains`, the same way (and using the same rule — exact host or
 /// subdomain match, empty list allowing nothing) `host::browser`'s
@@ -836,6 +847,19 @@ fn parse_html(value: Value) -> Result<String> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string())
+}
+
+fn parse_fetched(value: Value) -> Result<Vec<u8>> {
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(ErrorKind::Browser(error_message(&value)).into());
+    }
+    let data = value
+        .get("data")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|err| ErrorKind::Browser(format!("invalid downloaded data: {err}")).into())
 }
 
 #[cfg(test)]
@@ -998,6 +1022,45 @@ mod tests {
         .unwrap();
 
         assert_eq!(html, "<html><body>hi</body></html>");
+    }
+
+    #[test]
+    fn parse_fetched_decodes_the_downloaded_bytes() {
+        let bytes =
+            parse_fetched(serde_json::json!({"id": 1, "ok": true, "data": "JVBERi0="})).unwrap();
+
+        assert_eq!(bytes, b"%PDF-");
+    }
+
+    #[test]
+    fn parse_fetched_fails_with_the_reported_error_message() {
+        let err = parse_fetched(serde_json::json!({
+            "id": 1,
+            "ok": false,
+            "error": "download failed with HTTP status 403"
+        }))
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "browser error: download failed with HTTP status 403"
+        );
+    }
+
+    #[test]
+    fn is_download_allowed_accepts_data_urls_and_allowed_hosts_only() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(is_download_allowed(
+            "data:application/pdf;base64,JVBERi0=",
+            &allowed
+        ));
+        assert!(is_download_allowed(
+            "https://www.example.com/doc.pdf",
+            &allowed
+        ));
+        assert!(!is_download_allowed(
+            "https://evil.example/doc.pdf",
+            &allowed
+        ));
     }
 
     #[test]
