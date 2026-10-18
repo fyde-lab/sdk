@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
 use uuid::Uuid;
 
@@ -212,7 +213,41 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
 
         while let Some(proto_event) = stream.next().await {
             let proto_event = proto_event.context("failed to read next changelog event")?;
+            let digest: [u8; 32] = Sha256::digest(&proto_event.encrypted_content).into();
             let event = ChangelogEvent::from_proto(proto_event, &*self.secrets).await?;
+
+            // The server can't forge or re-encrypt an event, but it can serve
+            // an old one again under a new id, e.g. to roll an installed
+            // script or a document's metadata back: an event this database
+            // already applied is skipped, byte-identical ciphertext being
+            // how a replay is told apart from a genuine new event.
+            if self
+                .cursor_storage
+                .is_applied(&digest)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to check whether changelog event {} was already applied",
+                        event.id
+                    )
+                })?
+            {
+                tracing::warn!(
+                    event_id = %event.id,
+                    subject_id = %event.subject_id,
+                    "skipping changelog event {}: it replays an event already applied",
+                    event.id
+                );
+                if self.has_write_permission() {
+                    self.cursor_storage
+                        .save_cursor(event.id)
+                        .await
+                        .with_context(|| {
+                            format!("failed to persist changelog cursor {}", event.id)
+                        })?;
+                }
+                continue;
+            }
 
             match event.event_type {
                 EventType::SaveDocument => {
@@ -324,6 +359,12 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
             // that script then can't find. The lock holder (or this
             // process, once it holds the lock) stores them instead.
             if self.has_write_permission() {
+                self.cursor_storage
+                    .mark_applied(&digest)
+                    .await
+                    .with_context(|| {
+                        format!("failed to record changelog event {} as applied", event.id)
+                    })?;
                 self.cursor_storage
                     .save_cursor(event.id)
                     .await
@@ -507,6 +548,14 @@ mod tests {
 
         let mut cursor_storage = MockCursorStorage::new();
         cursor_storage
+            .expect_is_applied()
+            .times(1)
+            .returning(|_| Ok(false));
+        cursor_storage
+            .expect_mark_applied()
+            .times(1)
+            .returning(|_| Ok(()));
+        cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
         cursor_storage
@@ -539,6 +588,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consume_records_each_applied_event_by_the_digest_of_its_ciphertext() {
+        let document_id = Uuid::now_v7();
+        let event_id = Uuid::now_v7();
+        let proto = proto_event(event_id, document_id);
+        let expected: [u8; 32] = Sha256::digest(&proto.encrypted_content).into();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_consume_since()
+            .returning(move |_| Ok(futures::stream::iter(vec![Ok(proto.clone())]).boxed()));
+
+        let mut document_storage = MockStorage::new();
+        document_storage
+            .expect_find_document_by_checksum()
+            .returning(|_| Ok(None));
+        document_storage
+            .expect_save_document()
+            .returning(|_| Ok(()));
+
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+        cursor_storage
+            .expect_is_applied()
+            .withf(move |digest| *digest == expected)
+            .times(1)
+            .returning(|_| Ok(false));
+        cursor_storage
+            .expect_mark_applied()
+            .withf(move |digest| *digest == expected)
+            .times(1)
+            .returning(|_| Ok(()));
+        cursor_storage.expect_save_cursor().returning(|_| Ok(()));
+
+        let client = ChangelogClient::new(
+            mock_grpc,
+            document_storage,
+            MockScriptStorage::new(),
+            cursor_storage,
+            reachable_server_state(),
+            fake_secrets(),
+            test_lock_path(),
+        );
+        client.acquire_write_lock();
+
+        client.consume_once(&mut |_| {}).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn consume_skips_a_replayed_event_but_still_advances_the_cursor() {
+        let document_id = Uuid::now_v7();
+        let event_id = Uuid::now_v7();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(vec![Ok(proto_event(event_id, document_id))]).boxed())
+        });
+
+        // No expectations set up: the mocks panic if the replay is applied.
+        let document_storage = MockStorage::new();
+
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+        cursor_storage
+            .expect_is_applied()
+            .times(1)
+            .returning(|_| Ok(true));
+        cursor_storage
+            .expect_save_cursor()
+            .withf(move |id| *id == event_id)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let client = ChangelogClient::new(
+            mock_grpc,
+            document_storage,
+            MockScriptStorage::new(),
+            cursor_storage,
+            reachable_server_state(),
+            fake_secrets(),
+            test_lock_path(),
+        );
+        client.acquire_write_lock();
+
+        let calls = Arc::new(Mutex::new(0));
+        let calls_in_callback = calls.clone();
+        client
+            .consume_once(&mut move |_| *calls_in_callback.lock().unwrap() += 1)
+            .await
+            .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn consume_skips_caching_a_document_whose_content_is_already_cached_but_still_calls_back()
     {
         let document_id = Uuid::now_v7();
@@ -560,6 +707,14 @@ mod tests {
             .returning(move |_| Ok(Some(existing)));
 
         let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_is_applied()
+            .times(1)
+            .returning(|_| Ok(false));
+        cursor_storage
+            .expect_mark_applied()
+            .times(1)
+            .returning(|_| Ok(()));
         cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
@@ -606,6 +761,10 @@ mod tests {
         let document_storage = MockStorage::new();
 
         let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_is_applied()
+            .times(1)
+            .returning(|_| Ok(false));
         cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
@@ -729,6 +888,10 @@ mod tests {
 
         let mut cursor_storage = MockCursorStorage::new();
         cursor_storage
+            .expect_is_applied()
+            .times(1)
+            .returning(|_| Ok(false));
+        cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
         cursor_storage.expect_save_cursor().returning(|_| Ok(()));
@@ -802,6 +965,14 @@ mod tests {
     /// the changelog that consumes exactly `event_id`.
     fn cursor_storage_consuming(event_id: Uuid) -> MockCursorStorage {
         let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_is_applied()
+            .times(1)
+            .returning(|_| Ok(false));
+        cursor_storage
+            .expect_mark_applied()
+            .times(1)
+            .returning(|_| Ok(()));
         cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
@@ -880,6 +1051,10 @@ mod tests {
         // the cursor past it is persisted without the write lock.
         let mut cursor_storage = MockCursorStorage::new();
         cursor_storage
+            .expect_is_applied()
+            .times(1)
+            .returning(|_| Ok(false));
+        cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
         let client = ChangelogClient::new(
@@ -912,6 +1087,10 @@ mod tests {
 
         // The cursor must not advance past an event that failed to apply.
         let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_is_applied()
+            .times(1)
+            .returning(|_| Ok(false));
         cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
@@ -956,6 +1135,14 @@ mod tests {
         let document_storage = MockStorage::new();
 
         let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_is_applied()
+            .times(1)
+            .returning(|_| Ok(false));
+        cursor_storage
+            .expect_mark_applied()
+            .times(1)
+            .returning(|_| Ok(()));
         cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
@@ -1002,6 +1189,14 @@ mod tests {
             .returning(|_, _| Ok(()));
 
         let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_is_applied()
+            .times(1)
+            .returning(|_| Ok(false));
+        cursor_storage
+            .expect_mark_applied()
+            .times(1)
+            .returning(|_| Ok(()));
         cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
@@ -1055,6 +1250,10 @@ mod tests {
         let document_storage = MockStorage::new();
         let mut cursor_storage = MockCursorStorage::new();
         cursor_storage
+            .expect_is_applied()
+            .times(1)
+            .returning(|_| Ok(false));
+        cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
 
@@ -1099,6 +1298,14 @@ mod tests {
             .returning(|_| Ok(()));
 
         let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_is_applied()
+            .times(1)
+            .returning(|_| Ok(false));
+        cursor_storage
+            .expect_mark_applied()
+            .times(1)
+            .returning(|_| Ok(()));
         cursor_storage
             .expect_get_cursor()
             .returning(move || Ok(cursor));
