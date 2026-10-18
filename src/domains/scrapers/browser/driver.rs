@@ -455,6 +455,14 @@ fn build_webview(
     let navigation_allowed_domains = allowed_domains.clone();
     let new_window_allowed_domains = allowed_domains;
     let builder = WebViewBuilder::new()
+        // Ephemeral: without it wry uses the engine's default, persistent
+        // data store (on Linux, `$XDG_DATA_HOME`/`$XDG_CACHE_HOME/<prgname>`),
+        // leaving every site's localStorage, IndexedDB, service workers and
+        // HTTP cache on disk outside the database `logout` wipes, shared
+        // across runs, scrapers and accounts. The only state meant to
+        // outlive a run is cookies, which `cookies` persists and `init`
+        // seeds back in.
+        .with_incognito(true)
         .with_ipc_handler(ipc_handler)
         // Gates every top-level (and subframe) navigation the webview makes
         // on its own after `open`'s initial load — a link click, a form
