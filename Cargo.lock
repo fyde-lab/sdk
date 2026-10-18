@@ -1955,6 +1955,7 @@ dependencies = [
  "cookie",
  "dbus-secret-service-keyring-store",
  "futures",
+ "gtk",
  "hkdf 0.12.4",
  "keyring-core",
  "lopdf",

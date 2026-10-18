@@ -83,9 +83,10 @@ pub(super) trait Service: Send + Sync {
     /// Clicks the first element matched by `selector`, the same way
     /// [`Service::click`] does, but for a button/link whose handler doesn't
     /// change the page at all — instead it triggers the webview engine's own
-    /// native file-download machinery (a `window.open()`/popup whose
-    /// response carries `Content-Disposition: attachment`, or an anchor with
-    /// a `download` attribute), which neither [`Service::wait_for`] nor
+    /// native file-download machinery (a response carrying
+    /// `Content-Disposition: attachment`, an anchor with a `download`
+    /// attribute, or a `window.open()`/`target="_blank"` popup whose
+    /// response isn't an HTML page), which neither [`Service::wait_for`] nor
     /// [`Service::html`] can ever observe since nothing in the DOM changes
     /// (confirmed live against `cesu.urssaf.fr`'s "Bulletin de salaire"
     /// buttons — see the `scripts` repo's `scrapers/cesu/script.lua` header

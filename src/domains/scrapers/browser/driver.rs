@@ -427,6 +427,74 @@ fn build_window(event_loop: &EventLoop<Command>, visible: bool) -> Result<Window
         .map_err(|err| ErrorKind::Browser(format!("failed to create browser window: {err}")).into())
 }
 
+/// The hidden window holding the last [`download_popup`] webview, kept alive
+/// until the next popup replaces it (by then its download is over, since
+/// only one `download` call runs at a time).
+#[cfg(target_os = "linux")]
+type PopupWindow = std::rc::Rc<std::cell::RefCell<Option<gtk::OffscreenWindow>>>;
+
+/// Builds the webview a popup opened during a `download` call loads in:
+/// related to `opener` (same `WebContext`, so the same cookies and download
+/// handlers), never shown, and turning any response that isn't an HTML
+/// page into a native download of that very response, rather than
+/// displaying it. Its navigations are gated against `allowed_domains` like
+/// the main webview's.
+#[cfg(target_os = "linux")]
+fn download_popup(
+    opener: &webkit2gtk::WebView,
+    popup_window: &PopupWindow,
+    allowed_domains: Arc<Vec<String>>,
+) -> webkit2gtk::WebView {
+    use gtk::prelude::{ContainerExt as _, GtkWindowExt as _, WidgetExt as _};
+    use webkit2gtk::glib::object::Cast as _;
+    use webkit2gtk::{
+        NavigationPolicyDecision, NavigationPolicyDecisionExt as _, PolicyDecisionExt as _,
+        PolicyDecisionType, ResponsePolicyDecision, ResponsePolicyDecisionExt as _,
+        URIRequestExt as _, URIResponseExt as _, WebViewExt as _,
+    };
+
+    let webview = webkit2gtk::WebView::builder().related_view(opener).build();
+    webview.connect_decide_policy(move |_, decision, kind| match kind {
+        PolicyDecisionType::NavigationAction | PolicyDecisionType::NewWindowAction => {
+            let url = decision
+                .downcast_ref::<NavigationPolicyDecision>()
+                .and_then(|navigation| navigation.navigation_action())
+                .and_then(|action| action.request())
+                .and_then(|request| request.uri())
+                .unwrap_or_default();
+            if is_navigation_allowed(&url, &allowed_domains) {
+                return false;
+            }
+            tracing::warn!(%url, "browser popup navigation blocked by allowed_domains");
+            decision.ignore();
+            true
+        }
+        PolicyDecisionType::Response => {
+            let Some(response) = decision.downcast_ref::<ResponsePolicyDecision>() else {
+                return false;
+            };
+            let is_html = response
+                .response()
+                .and_then(|response| response.mime_type())
+                .is_some_and(|mime| mime.starts_with("text/html"));
+            if is_html {
+                return false;
+            }
+            decision.download();
+            true
+        }
+        _ => false,
+    });
+
+    let window = gtk::OffscreenWindow::new();
+    window.add(&webview);
+    window.show_all();
+    if let Some(previous) = popup_window.borrow_mut().replace(window) {
+        previous.close();
+    }
+    webview
+}
+
 /// Builds the webview inside `window`: replies to [`PendingReplies`] over
 /// IPC, gates navigations and popups against `allowed_domains`, and routes
 /// downloads to whichever `download` call [`PendingDownload`] holds.
@@ -475,16 +543,21 @@ fn build_webview(
         // navigation of the webview that requested it.
         //
         // While a `Service::download` call is waiting, an allowed popup is
-        // denied and its URL downloaded through the opener webview instead:
-        // on Linux, wry's `Allow` builds a separate, always-shown GTK window
-        // (ignoring `visible`) whose webview has none of the download
-        // handlers below, so a page that opens its PDF in a popup (cesu's
-        // `affichagePdf_<id>` buttons) would just display it there and
-        // `download` would time out. `download_uri` goes through the same
-        // `WebContext` (cookies included) the handlers below are registered
-        // on, so it lands in `pending_download` like any other download.
+        // opened in a hidden webview that turns its response into a native
+        // download (see `download_popup`): on Linux, wry's `Allow` builds a
+        // separate, always-shown GTK window (ignoring `visible`) that would
+        // just display a page's PDF popup (cesu's `affichagePdf_<id>`
+        // buttons), so `download` would time out. The popup's own request is
+        // the one downloaded — never re-issued, which would turn a
+        // `target="_blank"` form POST into a GET — and it shares the
+        // opener's `WebContext`, so it lands in `pending_download` through
+        // the handlers below like any other download.
         .with_new_window_req_handler({
             let pending_download = pending_download.clone();
+            #[cfg(target_os = "linux")]
+            let popup_allowed_domains = new_window_allowed_domains.clone();
+            #[cfg(target_os = "linux")]
+            let popup_window = std::rc::Rc::new(std::cell::RefCell::new(None));
             move |url, features| {
                 if !is_navigation_allowed(&url, &new_window_allowed_domains) {
                     tracing::warn!(%url, "browser popup blocked by allowed_domains");
@@ -492,14 +565,17 @@ fn build_webview(
                 }
                 #[cfg(target_os = "linux")]
                 {
-                    use webkit2gtk::WebViewExt as _;
                     let download_waiting = pending_download
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .is_some();
                     if download_waiting {
-                        features.opener.webview.download_uri(&url);
-                        return wry::NewWindowResponse::Deny;
+                        let webview = download_popup(
+                            &features.opener.webview,
+                            &popup_window,
+                            popup_allowed_domains.clone(),
+                        );
+                        return wry::NewWindowResponse::Create { webview };
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
