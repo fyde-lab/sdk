@@ -1442,23 +1442,26 @@ impl FydeClient {
         .await
     }
 
-    /// Lists documents previously cached locally, oldest first, one page at
-    /// a time. Mirrors [`crate::DocumentsService::list`].
+    /// Lists the metadata of documents previously cached locally, oldest
+    /// first, one page at a time, without their content — fetch that with
+    /// [`Self::get_document`] once a document is shown. Mirrors
+    /// [`crate::DocumentsService::list`].
     pub async fn list_documents(
         &self,
         offset: i64,
         limit: i64,
-    ) -> Result<Vec<FfiDocument>, FfiError> {
+    ) -> Result<Vec<FfiMetadata>, FfiError> {
         self.localized(async {
             let documents = self.inner.documents().list(offset, limit).await?;
-            Ok(documents.into_iter().map(FfiDocument::from).collect())
+            Ok(documents.into_iter().map(FfiMetadata::from).collect())
         })
         .await
     }
 
     /// Searches documents previously cached locally for `text`, keeping
-    /// only those matching `filters`, one page at a time in `order`.
-    /// Mirrors [`crate::DocumentsService::search`].
+    /// only those matching `filters`, one page at a time in `order`,
+    /// returning their metadata without their content (see
+    /// [`Self::list_documents`]). Mirrors [`crate::DocumentsService::search`].
     pub async fn search_documents(
         &self,
         text: String,
@@ -1466,7 +1469,7 @@ impl FydeClient {
         order: FfiSearchOrder,
         offset: i64,
         limit: i64,
-    ) -> Result<Vec<FfiDocument>, FfiError> {
+    ) -> Result<Vec<FfiMetadata>, FfiError> {
         self.localized(async {
             let documents = self
                 .inner
@@ -1479,7 +1482,7 @@ impl FydeClient {
                     limit,
                 })
                 .await?;
-            Ok(documents.into_iter().map(FfiDocument::from).collect())
+            Ok(documents.into_iter().map(FfiMetadata::from).collect())
         })
         .await
     }

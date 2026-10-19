@@ -59,26 +59,31 @@ pub trait Service: Send + Sync {
     async fn upload(&self, request: UploadRequest) -> Result<Uuid>;
 
     /// Fetches a document previously cached in local storage by
-    /// [`Self::start_sync`], or `None` if it doesn't exist.
+    /// [`Self::start_sync`], content included, or `None` if it doesn't
+    /// exist. The only way to read a document's content: [`Self::list`]
+    /// and [`Self::search`] return metadata alone, so fetch it with this
+    /// once the document is actually shown.
     async fn get(&self, id: Uuid) -> Result<Option<Document>>;
 
-    /// Lists documents previously cached in local storage, oldest first,
-    /// one page at a time.
+    /// Lists the metadata of documents previously cached in local storage,
+    /// oldest first, one page at a time. Never loads their content (see
+    /// [`Self::get`]).
     ///
     /// Paginate by repeatedly incrementing `offset` by the returned page's
     /// length until it comes back shorter than `limit`.
-    async fn list(&self, offset: i64, limit: i64) -> Result<Vec<Document>>;
+    async fn list(&self, offset: i64, limit: i64) -> Result<Vec<Metadata>>;
 
     /// Searches documents previously cached in local storage for
     /// `query.text` (see [`SearchQuery::text`] for which fields it's
     /// matched against and how), keeping only those matching every one of
-    /// `query.filters`, one page at a time in `query.order`. Like
-    /// [`Self::list`], never talks to the server.
+    /// `query.filters`, one page at a time in `query.order`, returning their
+    /// metadata. Like [`Self::list`], never talks to the server nor loads
+    /// their content.
     ///
     /// Fails with [`crate::ErrorCode::InvalidSearchQuery`] for a negative
     /// `offset`, a non-positive `limit`, or a `created_from` later than
     /// `created_until`.
-    async fn search(&self, query: SearchQuery) -> Result<Vec<Document>>;
+    async fn search(&self, query: SearchQuery) -> Result<Vec<Metadata>>;
 
     /// Lists, for every field [`SearchFilters`] can filter on, the values
     /// still worth offering for a search of `text` narrowed by `filters`

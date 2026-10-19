@@ -178,11 +178,11 @@ impl<S: Storage> Service for DocumentsClient<S> {
         self.storage.get_document(id).await
     }
 
-    async fn list(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
+    async fn list(&self, offset: i64, limit: i64) -> Result<Vec<Metadata>> {
         self.storage.list_documents(offset, limit).await
     }
 
-    async fn search(&self, query: SearchQuery) -> Result<Vec<Document>> {
+    async fn search(&self, query: SearchQuery) -> Result<Vec<Metadata>> {
         if query.offset < 0 {
             return Err(ErrorKind::InvalidSearchQuery(format!(
                 "offset must not be negative, got {}",
@@ -893,44 +893,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_pages_through_documents_previously_cached_locally() {
-        let (id_two, id_three) = (Uuid::now_v7(), Uuid::now_v7());
         let page = vec![
-            Document {
-                id: id_two,
-                content: Vec::new(),
-                metadata: Metadata {
-                    id: id_two,
-                    name: "two".to_string(),
-                    original_name: "two".to_string(),
-                    content_type: PDF_CONTENT_TYPE.to_string(),
-                    created_at: 1_700_000_001,
-                    size: 0,
-                    checksum: String::new(),
-                    transcript: String::new(),
-                    r#type: None,
-                    category: None,
-                    subcategory: None,
-                    attributes: BTreeMap::new(),
-                },
-            },
-            Document {
-                id: id_three,
-                content: Vec::new(),
-                metadata: Metadata {
-                    id: id_three,
-                    name: "three".to_string(),
-                    original_name: "three".to_string(),
-                    content_type: PDF_CONTENT_TYPE.to_string(),
-                    created_at: 1_700_000_002,
-                    size: 0,
-                    checksum: String::new(),
-                    transcript: String::new(),
-                    r#type: None,
-                    category: None,
-                    subcategory: None,
-                    attributes: BTreeMap::new(),
-                },
-            },
+            super::super::FakeMetadata::new().with_name("two").build(),
+            super::super::FakeMetadata::new().with_name("three").build(),
         ];
 
         let mut storage = MockStorage::new();
@@ -952,7 +917,7 @@ mod tests {
 
         assert_eq!(
             page.into_iter()
-                .map(|document| document.metadata.name)
+                .map(|metadata| metadata.name)
                 .collect::<Vec<_>>(),
             vec!["two", "three"]
         );
@@ -966,7 +931,7 @@ mod tests {
             created_until: Some(2),
             ..Default::default()
         };
-        let found = vec![super::super::FakeDocument::new().build()];
+        let found = vec![super::super::FakeMetadata::new().build()];
 
         let mut storage = MockStorage::new();
         let expected_filters = filters.clone();

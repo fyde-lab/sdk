@@ -534,14 +534,14 @@ mod tests {
             &self,
             _offset: i64,
             _limit: i64,
-        ) -> Result<Vec<crate::domains::documents::Document>> {
+        ) -> Result<Vec<crate::domains::documents::Metadata>> {
             unimplemented!()
         }
 
         async fn search(
             &self,
             _query: crate::domains::documents::SearchQuery,
-        ) -> Result<Vec<crate::domains::documents::Document>> {
+        ) -> Result<Vec<crate::domains::documents::Metadata>> {
             unimplemented!()
         }
 

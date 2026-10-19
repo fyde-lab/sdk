@@ -103,7 +103,9 @@ Non-domain helpers live in `src/tools/` (`log`, `sandbox`, `sql`, `testing`).
   master key, rejects a known checksum (`DuplicateDocument`, before parsing), parses, then
   publishes an encrypted `SaveDocument` event; the document reaches the local cache only when
   the sync job consumes it back. `get`/`list`/`search`/`search_facets` are local-only
-  (`storage_sqlite.rs`, FTS5 `bm25` ranking over contentless `documents_fts`).
+  (`storage_sqlite.rs`, FTS5 `bm25` ranking over contentless `documents_fts`). `list`/`search`
+  return `Metadata` only (their query never selects `content`; `size` is `length(content)`):
+  `get` is the only call that loads a document's content, for when it's actually shown.
   `search_facets` counts each field with its own filter lifted so UIs only offer reachable
   choices. A `Subcategory` belongs to one `Category`; mismatches fail
   (`MismatchedSubcategory`).

@@ -35,15 +35,17 @@ pub(crate) trait Storage: Send + Sync {
     /// SHA-256 `checksum`, or `None` if there's none.
     async fn find_document_by_checksum(&self, checksum: &str) -> Result<Option<Uuid>>;
 
-    /// Lists documents previously saved locally by [`Self::save_document`],
-    /// ordered oldest first, skipping `offset` and returning at most `limit`.
-    async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>>;
+    /// Lists the metadata of documents previously saved locally by
+    /// [`Self::save_document`], ordered oldest first, skipping `offset` and
+    /// returning at most `limit`. Never loads their content.
+    async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Metadata>>;
 
-    /// Lists documents previously saved locally by [`Self::save_document`]
-    /// that match every one of `terms` (each as a case- and
+    /// Lists the metadata of documents previously saved locally by
+    /// [`Self::save_document`] that match every one of `terms` (each as a case- and
     /// accent-insensitive prefix of a word in any searchable field — all of
     /// them when `terms` is empty) and every one of `filters`, in `order`,
-    /// skipping `offset` and returning at most `limit`.
+    /// skipping `offset` and returning at most `limit`. Never loads their
+    /// content.
     async fn search_documents(
         &self,
         terms: &[String],
@@ -51,7 +53,7 @@ pub(crate) trait Storage: Send + Sync {
         order: SearchOrder,
         offset: i64,
         limit: i64,
-    ) -> Result<Vec<Document>>;
+    ) -> Result<Vec<Metadata>>;
 
     /// Counts, per distinct non-empty value of `field`, how many documents
     /// [`Self::search_documents`] would match for `terms` and `filters`,
