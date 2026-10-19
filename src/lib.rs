@@ -260,19 +260,30 @@ impl Client {
 }
 
 /// Routes the SDK's `tracing` output to the terminal and, when set, to
-/// `on_log`, at `log_level`. Ignores the result: a subscriber may already be
-/// installed by the consuming binary or by a previous `Client::init` call,
-/// and a library must not panic over it.
+/// `on_log`. The SDK's own targets log at `log_level`, while dependencies
+/// (bridged from the `log` crate as well as native `tracing` ones) are capped
+/// at WARN so their internals don't drown the SDK's logs, and `pdf_oxide` at
+/// ERROR since it warns about every slightly malformed PDF it extracts.
+/// Ignores the result: a subscriber may already be installed by the consuming
+/// binary or by a previous `Client::init` call, and a library must not panic
+/// over it.
 fn install_tracing(
     log_level: LogLevel,
     on_log: Option<Arc<dyn Fn(LogLevel, String) + Send + Sync>>,
 ) {
+    use tracing_subscriber::filter::{LevelFilter, Targets};
     use tracing_subscriber::prelude::*;
+    let level = LevelFilter::from(log_level);
+    let filter = Targets::new()
+        .with_default(level.min(LevelFilter::WARN))
+        .with_target("fyde_sdk", level)
+        .with_target("fyde::scrapers", level)
+        .with_target("pdf_oxide", level.min(LevelFilter::ERROR));
     let callback_layer = on_log.map(|callback| CallbackLayer { callback });
     let _ = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
         .with(callback_layer)
-        .with(tracing_subscriber::filter::LevelFilter::from(log_level))
+        .with(filter)
         .try_init();
 }
 

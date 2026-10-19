@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tracing_log::NormalizeEvent;
+
 /// The verbosity of the SDK's internal `tracing` logs, set up by
 /// [`crate::Client::init`]. Mirrors [`tracing::Level`] plus an `Off` variant
 /// to silence logging entirely, since callers (in particular FFI callers
@@ -60,7 +62,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallbackLayer {
         impl tracing::field::Visit for MessageVisitor {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 use std::fmt::Write;
-                if field.name() == "message" {
+                if field.name().starts_with("log.") {
+                    // Metadata of a bridged `log` record, recovered below.
+                } else if field.name() == "message" {
                     let _ = write!(self.0, "{value:?}");
                 } else {
                     let _ = write!(self.0, " {}={value:?}", field.name());
@@ -71,9 +75,14 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallbackLayer {
         let mut visitor = MessageVisitor(String::new());
         event.record(&mut visitor);
 
+        // Records bridged from the `log` crate all share a generic `log`
+        // target and carry their real one in `log.*` fields, so recover it.
+        let normalized = event.normalized_metadata();
+        let metadata = normalized.as_ref().unwrap_or_else(|| event.metadata());
+
         (self.callback)(
-            LogLevel::from(event.metadata().level()),
-            format!("{}: {}", event.metadata().target(), visitor.0),
+            LogLevel::from(metadata.level()),
+            format!("{}: {}", metadata.target(), visitor.0),
         );
     }
 }
@@ -119,6 +128,28 @@ mod tests {
             vec![(
                 LogLevel::Warn,
                 "fyde_sdk::sync: retrying attempt=3 host=\"example.com\"".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn recovers_the_target_of_records_bridged_from_log() {
+        let lines = forwarded(|| {
+            let record = log::Record::builder()
+                .level(log::Level::Warn)
+                .target("pdf_oxide::object")
+                .file(Some("object.rs"))
+                .line(Some(291))
+                .args(format_args!("treating as empty stream"))
+                .build();
+            tracing_log::format_trace(&record).unwrap();
+        });
+
+        assert_eq!(
+            lines,
+            vec![(
+                LogLevel::Warn,
+                "pdf_oxide::object: treating as empty stream".to_string()
             )]
         );
     }
