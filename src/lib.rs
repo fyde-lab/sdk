@@ -266,9 +266,12 @@ impl Client {
 /// ERROR since it warns about every slightly malformed PDF it extracts.
 /// Every span also logs its busy/idle time to the terminal when it closes, to
 /// show where time goes (e.g. `upload`'s PDF parsing, at DEBUG).
-/// Ignores the result: a subscriber may already be installed by the consuming
-/// binary or by a previous `Client::init` call, and a library must not panic
-/// over it.
+/// With the `tokio-console` feature, also serves the runtime's tasks to
+/// `tokio-console`; that layer stays outside the filter above, which would
+/// otherwise drop the `tokio`/`runtime` events it reads.
+/// Does nothing when a subscriber is already installed, by the consuming
+/// binary or by a previous `Client::init` call: a library must not panic over
+/// it, nor start a second console server.
 fn install_tracing(
     log_level: LogLevel,
     on_log: Option<Arc<dyn Fn(LogLevel, String) + Send + Sync>>,
@@ -276,6 +279,9 @@ fn install_tracing(
     use tracing_subscriber::filter::{LevelFilter, Targets};
     use tracing_subscriber::fmt::format::FmtSpan;
     use tracing_subscriber::prelude::*;
+    if tracing::dispatcher::has_been_set() {
+        return;
+    }
     let level = LevelFilter::from(log_level);
     let filter = Targets::new()
         .with_default(level.min(LevelFilter::WARN))
@@ -283,11 +289,14 @@ fn install_tracing(
         .with_target("fyde::scrapers", level)
         .with_target("pdf_oxide", level.min(LevelFilter::ERROR));
     let callback_layer = on_log.map(|callback| CallbackLayer { callback });
-    let _ = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_span_events(FmtSpan::CLOSE))
-        .with(callback_layer)
-        .with(filter)
-        .try_init();
+    let logs = tracing_subscriber::fmt::layer()
+        .with_span_events(FmtSpan::CLOSE)
+        .and_then(callback_layer)
+        .with_filter(filter);
+    let subscriber = tracing_subscriber::registry().with(logs);
+    #[cfg(feature = "tokio-console")]
+    let subscriber = subscriber.with(console_subscriber::spawn());
+    let _ = subscriber.try_init();
 }
 
 /// Where a [`Client`]'s local database lives, once its [`Storage`] and
