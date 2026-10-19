@@ -286,14 +286,21 @@ impl InstalledScript {
 
 /// Builds a [`Script`] filled with random-but-plausible data, for use in
 /// tests.
-#[cfg(test)]
-pub(crate) struct FakeScript {
+#[cfg(any(test, feature = "testing"))]
+pub struct FakeScript {
     script: Script,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
+impl Default for FakeScript {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
 impl FakeScript {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             script: Script {
                 id: Uuid::now_v7(),
@@ -312,17 +319,17 @@ impl FakeScript {
         }
     }
 
-    pub(crate) fn with_script(mut self, script: &str) -> Self {
+    pub fn with_script(mut self, script: &str) -> Self {
         self.script.script = script.to_string();
         self
     }
 
-    pub(crate) fn with_parameter(mut self, name: &str, parameter: ScriptParameter) -> Self {
+    pub fn with_parameter(mut self, name: &str, parameter: ScriptParameter) -> Self {
         self.script.parameters.insert(name.to_string(), parameter);
         self
     }
 
-    pub(crate) fn build(self) -> Script {
+    pub fn build(self) -> Script {
         self.script
     }
 }

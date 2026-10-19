@@ -21,8 +21,10 @@ use sqlx::SqlitePool;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
+#[cfg(any(test, feature = "testing"))]
+pub use models::FakeScript;
 #[cfg(test)]
-pub(crate) use models::{FakeInstalledScript, FakeScript, FakeScriptMetadata};
+pub(crate) use models::{FakeInstalledScript, FakeScriptMetadata};
 pub use models::{
     InstallScriptRequest, InstalledScript, Script, ScriptMetadata, ScriptParameter,
     ScriptParameterType, ScriptType,

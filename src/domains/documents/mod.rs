@@ -6,19 +6,21 @@ mod storage;
 mod storage_sqlite;
 mod transcript;
 
-#[cfg(test)]
-pub(crate) use crate::domains::changelog::FakeChangelogEvent;
+#[cfg(any(test, feature = "testing"))]
+pub use crate::domains::changelog::FakeChangelogEvent;
 pub use crate::domains::changelog::{ChangelogEvent, EventType};
 pub use attributes::{
     Attribute, AttributeDefinition, AttributeType, Service as AttributesService,
     SetAttributeRequest,
 };
+#[cfg(test)]
+pub(crate) use models::FakeSearchFacets;
 pub use models::{
     Category, Document, DocumentType, FacetCount, Metadata, SearchFacets, SearchFilters,
     SearchOrder, SearchQuery, Subcategory, UploadRequest, UploadSource,
 };
-#[cfg(test)]
-pub(crate) use models::{FakeDocument, FakeMetadata, FakeSearchFacets};
+#[cfg(any(test, feature = "testing"))]
+pub use models::{FakeDocument, FakeMetadata};
 #[cfg(test)]
 pub(crate) use storage::MockStorage;
 pub(crate) use storage::Storage;

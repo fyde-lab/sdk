@@ -3,7 +3,7 @@ mod grpc_client;
 mod service;
 
 pub use service::UsersClient;
-pub(crate) use service::system_language;
+pub use service::system_language;
 
 use std::sync::Arc;
 
@@ -120,14 +120,21 @@ impl OpenSession {
 
 /// Builds an [`OpenSession`] filled with random-but-plausible data,
 /// overridable field by field, for use in tests.
-#[cfg(test)]
-pub(crate) struct FakeOpenSession {
+#[cfg(any(test, feature = "testing"))]
+pub struct FakeOpenSession {
     session: OpenSession,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
+impl Default for FakeOpenSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
 impl FakeOpenSession {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             session: OpenSession {
                 id: uuid::Uuid::now_v7().to_string(),
@@ -138,27 +145,27 @@ impl FakeOpenSession {
         }
     }
 
-    pub(crate) fn with_id(mut self, id: &str) -> Self {
+    pub fn with_id(mut self, id: &str) -> Self {
         self.session.id = id.to_string();
         self
     }
 
-    pub(crate) fn with_created_at(mut self, created_at: i64) -> Self {
+    pub fn with_created_at(mut self, created_at: i64) -> Self {
         self.session.created_at = created_at;
         self
     }
 
-    pub(crate) fn with_is_current(mut self, is_current: bool) -> Self {
+    pub fn with_is_current(mut self, is_current: bool) -> Self {
         self.session.is_current = is_current;
         self
     }
 
-    pub(crate) fn with_device_name(mut self, device_name: &str) -> Self {
+    pub fn with_device_name(mut self, device_name: &str) -> Self {
         self.session.device_name = device_name.to_string();
         self
     }
 
-    pub(crate) fn build(self) -> OpenSession {
+    pub fn build(self) -> OpenSession {
         self.session
     }
 }

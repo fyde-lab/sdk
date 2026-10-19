@@ -1,21 +1,18 @@
 mod domains;
 mod error;
-mod ffi;
 mod tools;
 
-uniffi::setup_scaffolding!();
+pub use error::{Error, ErrorCode, ErrorContext, Result};
 
-pub use error::{Error, ErrorCode, Result};
-pub use ffi::{FfiError, FydeClient};
-
-pub(crate) use error::{ErrorContext, ErrorKind};
+pub(crate) use error::ErrorKind;
 
 use std::sync::Arc;
 
 pub use domains::documents::{
-    Attribute, AttributeDefinition, AttributeType, AttributesService, ChangelogEvent, Document,
-    FacetCount, Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery,
-    Service as DocumentsService, SetAttributeRequest, UploadRequest,
+    Attribute, AttributeDefinition, AttributeType, AttributesService, Category, ChangelogEvent,
+    Document, DocumentType, EventType, FacetCount, Metadata, SearchFacets, SearchFilters,
+    SearchOrder, SearchQuery, Service as DocumentsService, SetAttributeRequest, Subcategory,
+    UploadRequest,
 };
 pub use domains::scrapers::{
     HELPERS_LUA as SCRAPER_HELPERS_LUA, ProgressEvent, ProgressStep, Service as ScrapersService,
@@ -27,9 +24,10 @@ pub use domains::scripts::{
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
 pub use domains::usage::{Service as UsageService, Usage};
-pub use domains::users::{LoginOutcome, OpenSession, Service as UsersService};
+pub use domains::users::{LoginOutcome, OpenSession, Service as UsersService, system_language};
 pub use tools::log::LogLevel;
 
+use domains::secrets::SecretLocation;
 use domains::sessions::{Service as SessionsService, SessionsClient};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tools::log::CallbackLayer;
@@ -65,8 +63,8 @@ pub struct ClientConfig {
     pub log_level: LogLevel,
     /// Called once for every log line emitted by the SDK, in addition to the
     /// usual terminal output, when set. Useful for callers with no
-    /// terminal/stderr to inspect (in particular FFI callers like the Kotlin
-    /// Multiplatform app).
+    /// terminal/stderr to inspect (in particular the Kotlin Multiplatform
+    /// app).
     pub on_log: Option<Arc<dyn Fn(LogLevel, String) + Send + Sync>>,
     /// Called once for every changelog event consumed by the background
     /// sync job that `UsersService::create`/`login` start automatically
@@ -242,11 +240,31 @@ impl Client {
     /// picked via [`UsersService::set_language`], falling back to the
     /// device's system language if they never picked one or reading their
     /// preference fails.
-    pub(crate) async fn language(&self) -> String {
+    pub async fn language(&self) -> String {
         match self.users.get_language().await {
             Ok(Some(language)) => language,
             Ok(None) | Err(_) => domains::users::system_language(),
         }
+    }
+
+    /// Persists `token` in the OS credential store as the session token
+    /// attached to every subsequent authenticated request, overwriting any
+    /// token already stored. `UsersService::create`/`login` already do this
+    /// as part of opening a session; this is for restoring a
+    /// previously-issued token (e.g. one a caller kept across app restarts)
+    /// without a network round trip.
+    pub async fn save_new_session(&self, token: &str) -> Result<()> {
+        self.sessions()
+            .save_new_session(token, SecretLocation::SecureStorage)
+            .await
+    }
+
+    /// Returns whether a session token is currently persisted, i.e. a
+    /// `UsersService::create`/`login` or [`Self::save_new_session`] call
+    /// succeeded and `UsersService::logout` hasn't been called since (nor
+    /// has the server rejected the session).
+    pub async fn is_connected(&self) -> Result<bool> {
+        self.sessions().is_connected().await
     }
 
     /// Returns a reference to the client's sessions service. Returns the
@@ -435,6 +453,18 @@ fn lazy_channel(url: String) -> Result<Channel> {
 #[doc(hidden)]
 pub fn use_in_process_keystore_for_tests() -> Result<()> {
     domains::secrets::use_in_process_store()
+}
+
+/// Fixture builders for the SDK's own types, filled with
+/// random-but-plausible data and overridable field by field, for other
+/// crates' tests (e.g. the application's native bindings, which mirror these
+/// types). Only built with the `testing` feature, never meant for
+/// production code.
+#[cfg(feature = "testing")]
+pub mod testing {
+    pub use crate::domains::documents::{FakeChangelogEvent, FakeDocument, FakeMetadata};
+    pub use crate::domains::scripts::FakeScript;
+    pub use crate::domains::users::FakeOpenSession;
 }
 
 /// Builds a standalone [`ScrapersService`] for local/dev use — no

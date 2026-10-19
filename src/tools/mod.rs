@@ -4,5 +4,5 @@
 pub(crate) mod log;
 pub(crate) mod sandbox;
 pub(crate) mod sql;
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub(crate) mod testing;

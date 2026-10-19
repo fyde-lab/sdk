@@ -21,8 +21,10 @@ pub(crate) use messages::Language;
 use std::fmt;
 
 /// Expands `$callback!` with every [`ErrorCode`] variant, its doc comment
-/// and its numeric value, so the FFI layer's error type (`crate::ffi`) is
-/// generated from this one list instead of duplicating it.
+/// and its numeric value, so [`ErrorCode`] itself, and any type a caller
+/// mirrors it with (e.g. the error type of the application's native
+/// bindings), are generated from this one list instead of duplicating it.
+#[macro_export]
 macro_rules! for_each_error_code {
     ($callback:ident) => {
         $callback! {
@@ -140,7 +142,6 @@ macro_rules! for_each_error_code {
         }
     };
 }
-pub(crate) use for_each_error_code;
 
 macro_rules! define_error_code {
     ($($(#[$meta:meta])* $name:ident = $value:literal,)*) => {
@@ -473,7 +474,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// preserving the original error as its source. Used throughout the crate
 /// so every `?` site reports what it was trying to do, not just the bare
 /// underlying error. Never changes the error's [`ErrorCode`].
-pub(crate) trait ErrorContext<T> {
+pub trait ErrorContext<T> {
     fn context(self, message: &str) -> Result<T>;
     fn with_context<F: FnOnce() -> String>(self, f: F) -> Result<T>;
 }
