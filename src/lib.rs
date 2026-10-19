@@ -266,7 +266,7 @@ impl Client {
 /// ERROR since it warns about every slightly malformed PDF it extracts.
 /// Every span also logs its busy/idle time to the terminal when it closes, to
 /// show where time goes (e.g. `upload`'s PDF parsing, at DEBUG).
-/// With the `tokio-console` feature, also serves the runtime's tasks to
+/// Built with `--cfg tokio_unstable`, also serves the runtime's tasks to
 /// `tokio-console`; that layer stays outside the filter above, which would
 /// otherwise drop the `tokio`/`runtime` events it reads.
 /// Does nothing when a subscriber is already installed, by the consuming
@@ -294,7 +294,7 @@ fn install_tracing(
         .and_then(callback_layer)
         .with_filter(filter);
     let subscriber = tracing_subscriber::registry().with(logs);
-    #[cfg(feature = "tokio-console")]
+    #[cfg(tokio_unstable)]
     let subscriber = subscriber.with(console_subscriber::spawn());
     let _ = subscriber.try_init();
 }
