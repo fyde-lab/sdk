@@ -285,7 +285,7 @@ fn merge_cookies(http_cookies: Vec<Cookie>, browser_cookies: Vec<Cookie>) -> Vec
 /// Builds a fully sandboxed Lua VM for running a scraper script: only the
 /// side-effect-free `table`/`string`/`math`/`utf8` subset of the standard
 /// library is loaded — no `io`, `os`, `package` (so no `require`), `debug`,
-/// or FFI libraries — so a script has no path to the filesystem, OS
+/// or native-code loaders — so a script has no path to the filesystem, OS
 /// environment, subprocesses, dynamic library loading, or raw sockets. The
 /// only network access a script gets is through the `fyde.http`/
 /// `fyde.browser` host functions `host::install` wires into the `fyde`

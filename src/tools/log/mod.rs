@@ -4,9 +4,9 @@ use tracing_log::NormalizeEvent;
 
 /// The verbosity of the SDK's internal `tracing` logs, set up by
 /// [`crate::Client::init`]. Mirrors [`tracing::Level`] plus an `Off` variant
-/// to silence logging entirely, since callers (in particular FFI callers
-/// like the Kotlin Multiplatform app) have no `RUST_LOG` environment
-/// variable to set.
+/// to silence logging entirely, since some callers (in particular the
+/// Kotlin Multiplatform app) have no `RUST_LOG` environment variable to
+/// set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Off,
@@ -45,8 +45,9 @@ impl From<&tracing::Level> for LogLevel {
 /// A `tracing_subscriber` [`Layer`](tracing_subscriber::Layer) that forwards
 /// every log line it sees, formatted as a single string, to a caller-supplied
 /// callback. Installed alongside the crate's usual `fmt` layer when
-/// [`crate::ClientConfig::on_log`] is set, so callers (in particular FFI
-/// callers with no terminal to print to) can observe SDK logs directly.
+/// [`crate::ClientConfig::on_log`] is set, so callers with no terminal to
+/// print to (in particular the Kotlin Multiplatform app) can observe SDK
+/// logs directly.
 pub(crate) struct CallbackLayer {
     pub(crate) callback: Arc<dyn Fn(LogLevel, String) + Send + Sync>,
 }

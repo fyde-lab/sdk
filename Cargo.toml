@@ -3,9 +3,6 @@ name = "fyde-sdk"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
-
 [dependencies]
 aes-gcm = "0.11.1"
 argon2 = "0.5.3"
@@ -102,7 +99,6 @@ tonic-prost = "0.14.6"
 # exercised on Linux while writing this; `wry`'s own docs cover macOS/Windows
 # as a different `build()` call, not `build_gtk()` — see `driver.rs`.
 tao = "0.37"
-uniffi = { version = "=0.32.0", features = ["tokio"] }
 uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
 # Already pulled in transitively by `wreq`; declared directly here too since
 # `domains/scrapers/host/mod.rs`'s `ensure_domain_allowed` parses URLs with
@@ -126,6 +122,11 @@ xdg = "2.5.2"
 # is only recorded when also built with `RUSTFLAGS="--cfg tokio_unstable"`,
 # which `tokio/tracing` needs to emit it.
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
+# Exposes the `Fake*` fixture builders (`fyde_sdk::testing`) to other crates'
+# tests, e.g. the application's native bindings, which mirror the SDK's types
+# and need values of them to test their conversions against. Never enable it
+# outside `[dev-dependencies]`.
+testing = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }

@@ -1,6 +1,6 @@
 # fyde-sdk
 
-Rust client library for a fyde server. It handles accounts (OPAQUE password authentication), end-to-end encrypted documents synced through the server's changelog, and Lua scripts: parsers that classify documents and scrapers that fetch them from third-party sites. It is built as an `rlib` for Rust callers, and as a `cdylib`/`staticlib` with [uniffi](https://mozilla.github.io/uniffi-rs/) bindings (`FydeClient`) for the Kotlin/Swift apps.
+Rust client library for a fyde server. It handles accounts (OPAQUE password authentication), end-to-end encrypted documents synced through the server's changelog, and Lua scripts: parsers that classify documents and scrapers that fetch them from third-party sites. It is a plain Rust library: the Kotlin Multiplatform app (`../application`) reaches it through its own native bindings crate (`application/sdkBridge/rust`).
 
 ```rust
 use fyde_sdk::{Client, ClientConfig, LogLevel, Storage};

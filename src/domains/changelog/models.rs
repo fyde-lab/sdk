@@ -64,14 +64,21 @@ impl ChangelogEvent {
 
 /// Builds a [`ChangelogEvent`] filled with random-but-plausible data,
 /// overridable field by field, for use in tests.
-#[cfg(test)]
-pub(crate) struct FakeChangelogEvent {
+#[cfg(any(test, feature = "testing"))]
+pub struct FakeChangelogEvent {
     event: ChangelogEvent,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
+impl Default for FakeChangelogEvent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
 impl FakeChangelogEvent {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             event: ChangelogEvent {
                 id: Uuid::now_v7(),
@@ -83,49 +90,49 @@ impl FakeChangelogEvent {
         }
     }
 
-    pub(crate) fn with_id(mut self, id: Uuid) -> Self {
+    pub fn with_id(mut self, id: Uuid) -> Self {
         self.event.id = id;
         self
     }
 
-    pub(crate) fn with_event_type(mut self, event_type: EventType) -> Self {
+    pub fn with_event_type(mut self, event_type: EventType) -> Self {
         self.event.event_type = event_type;
         self
     }
 
     /// Sets `subject_id` to `document`'s id, so the event refers to a
     /// document that actually exists in the test's fixtures.
-    pub(crate) fn for_document(mut self, document: &crate::domains::documents::Document) -> Self {
+    pub fn for_document(mut self, document: &crate::domains::documents::Document) -> Self {
         self.event.subject_id = document.id();
         self
     }
 
-    pub(crate) fn with_subject_id(mut self, subject_id: Uuid) -> Self {
+    pub fn with_subject_id(mut self, subject_id: Uuid) -> Self {
         self.event.subject_id = subject_id;
         self
     }
 
-    pub(crate) fn with_content(mut self, content: Vec<u8>) -> Self {
+    pub fn with_content(mut self, content: Vec<u8>) -> Self {
         self.event.content = Some(content);
         self
     }
 
-    pub(crate) fn without_content(mut self) -> Self {
+    pub fn without_content(mut self) -> Self {
         self.event.content = None;
         self
     }
 
-    pub(crate) fn with_metadata(mut self, metadata: Metadata) -> Self {
+    pub fn with_metadata(mut self, metadata: Metadata) -> Self {
         self.event.metadata = Some(metadata);
         self
     }
 
-    pub(crate) fn without_metadata(mut self) -> Self {
+    pub fn without_metadata(mut self) -> Self {
         self.event.metadata = None;
         self
     }
 
-    pub(crate) fn build(self) -> ChangelogEvent {
+    pub fn build(self) -> ChangelogEvent {
         self.event
     }
 }

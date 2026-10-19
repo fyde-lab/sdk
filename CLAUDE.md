@@ -2,7 +2,8 @@
 
 `fyde-sdk` is a Rust client library (no binary) for a fyde server (`../server`). It's built
 standalone (not a Cargo workspace member); `../scripts`, `../cli` and `../application` (via
-UniFFI, `src/ffi.rs`) consume it. Protos come from the Buf Schema Registry
+its own native bindings crate, `../application/sdkBridge/rust`, which mirrors this crate's
+public API: update it with any API change) consume it. Protos come from the Buf Schema Registry
 (`buf.build/fyde-lab/api`, published from `../server/protos`).
 
 ## Commands
@@ -34,11 +35,10 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   `.with_context(|| format!(...))` (`ErrorContext`). No bare `?` without context.
 - Raise failures as `ErrorKind::X(..).into()`. New failure: add an `ErrorKind` variant, map it
   in `ErrorKind::code`, and if it needs its own code add it to `for_each_error_code!` (generates
-  both `ErrorCode` and `ffi::FfiError`) plus wording in every language in `messages.rs`.
+  `ErrorCode`, and is exported so the application's bindings generate their error type from
+  it too) plus wording in every language in `messages.rs`.
 - `ErrorCode` values (`1xxx` device, `2xxx` server, `3xxx` account, `4xxx` documents, `5xxx`
   scripts) are persisted by callers: **never renumber or reuse one**.
-- FFI: every exported `FydeClient` method runs through `FydeClient::localized`; never add a
-  `From<Error> for FfiError`.
 
 **Wire formats — never break old events or older clients:**
 - `Attribute` variants (`documents/attributes/models.rs`, serialized via `AttributeWire`):
@@ -78,7 +78,9 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   same `models.rs` (`FakeDocument::new().with_x(..).build()`; see `FakeDocument`,
   `FakeMetadata`, `FakeChangelogEvent`, `FakeScript`, ...), using `tools::testing`'s random
   helpers. Use them instead of struct literals. Keep them `pub(crate)` and re-export one only
-  when another file needs it (unused re-exports fail clippy).
+  when another file needs it (unused re-exports fail clippy). Exception: the builders other
+  crates' tests need are gated `#[cfg(any(test, feature = "testing"))]`, `pub`, and re-exported
+  from `fyde_sdk::testing` (the `testing` feature, for `[dev-dependencies]` only).
 - No `tests/` here: the end-to-end suites driving a real `Client` against a real server live in
   `../server/tests/` (which dev-depends on this crate). Keep the API they use public (e.g. the
   `#[doc(hidden)]` `use_in_process_keystore_for_tests`), and update them with any API change.
@@ -90,8 +92,10 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
 `config.storage` (`Storage::Disk(dir)` → `<dir>/<client_name>/fyde.db`, `Storage::Memory`) and
 wires every domain. `client_name` must be a safe single path segment (`InvalidClientName`).
 Public accessors: `documents()`, `attributes()`, `users()`, `settings()`, `server_state()`,
-`scripts()`, `scrapers()`, `usage()`, `user_message(&err)`. `ClientConfig` carries the FFI
-callbacks (`on_log`, `on_document_change`, `on_scraper_progress`, `on_scraper_question`).
+`scripts()`, `scrapers()`, `usage()`, `user_message(&err)`, `language()`, plus
+`save_new_session(token)`/`is_connected()` over the crate-private `sessions` domain.
+`ClientConfig` carries the caller's callbacks (`on_log`, `on_document_change`,
+`on_scraper_progress`, `on_scraper_question`).
 
 New server services follow the same pattern: a module under `src/domains/` with `mod.rs`
 (the `Service` trait, methods take `&self` so it can live behind `Arc<dyn Service>`),
@@ -156,8 +160,8 @@ Non-domain helpers live in `src/tools/` (`log`, `sandbox`, `sql`, `testing`).
     `step(name)` only accepts a `ProgressStep` name (`"logging_in"`, ...; anything else raises),
     each also exposed as a constant scripts use instead (`fyde.progress.LOGGING_IN`),
     `update(current, total)` has no message. New steps need wording in every language in
-    `ProgressStep::user_message` plus an `ffi::FfiProgressStep` variant; FFI `Step` events carry
-    it localized (language refreshed at each `run_installed_script`).
+    `ProgressStep::user_message`, plus a matching variant in the application's bindings
+    (`../application/sdkBridge/rust`).
   - `save_document` uploads via `documents::Service::upload`; `DuplicateDocument` is skipped.
   - `session/`, `cookies/`, `reports/` persist per scraper through a `StorageConfig`
     (`Sqlite` for a `Client`, `File` for `init_dev_scrapers`). `fyde.session` is saved even
