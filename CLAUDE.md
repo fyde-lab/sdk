@@ -13,6 +13,7 @@ cargo test                       # or: cargo test <name>
 cargo clippy --all-targets -- -D warnings   # what CI runs (with cargo fmt --check, cargo test)
 cargo fmt
 FYDE_PROTO_DIR=../server/protos cargo build  # build without buf / network access
+RUSTFLAGS="--cfg tokio_unstable" cargo build --features tokio-console  # serve tasks to tokio-console (127.0.0.1:6669)
 ```
 
 - Dev shell: `shell.nix` via direnv. Rust **1.98+** (`wreq`'s MSRV); `protobuf`; `cmake`/`perl`/

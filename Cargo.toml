@@ -16,9 +16,9 @@ base64 = "0.22.1"
 # Cookie type `wry`'s `WebView::cookies`/`set_cookie` speak — must stay on the
 # same major version `wry` itself depends on.
 cookie = "0.18"
-# `tokio-console` instrumentation. Task data is only recorded when built with
-# `RUSTFLAGS="--cfg tokio_unstable"`.
-console-subscriber = "0.5.0"
+# `tokio-console` instrumentation, behind the `tokio-console` feature (see
+# `[features]` and `install_tracing` in `src/lib.rs`).
+console-subscriber = { version = "0.5.0", optional = true }
 # Decodes `fyde.http` text bodies in their `charset` (`domains/scrapers/host/http.rs`'s
 # `decode_text`), the way `wreq::Response::text` would.
 encoding_rs = "0.8.41"
@@ -120,6 +120,12 @@ wreq-util = "0.2.0"
 # `fyde.browser` (see the `tao` entry above) — the actual webview.
 wry = "0.57"
 xdg = "2.5.2"
+
+[features]
+# Serves the runtime's tasks to `tokio-console` (on `127.0.0.1:6669`). Task data
+# is only recorded when also built with `RUSTFLAGS="--cfg tokio_unstable"`,
+# which `tokio/tracing` needs to emit it.
+tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
