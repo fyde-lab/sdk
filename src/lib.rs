@@ -12,7 +12,6 @@ pub(crate) use error::{ErrorContext, ErrorKind};
 
 use std::sync::Arc;
 
-pub use domains::documents::parser::{Service as ParserService, init as init_parser};
 pub use domains::documents::{
     Attribute, AttributeDefinition, AttributeType, AttributesService, ChangelogEvent, Document,
     FacetCount, Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery,
@@ -145,7 +144,6 @@ impl Client {
         let documents = domains::documents::init(
             sqlite.pool().clone(),
             changelog,
-            scripts.clone(),
             attributes.clone(),
             config.on_document_change,
         );

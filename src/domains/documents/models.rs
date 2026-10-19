@@ -335,11 +335,9 @@ pub struct Metadata {
     /// Plaintext transcript of the document's PDF text content, extracted
     /// on upload.
     pub transcript: String,
-    /// `None` until a classification script, or the uploader, sets it.
+    /// `None` unless the uploader, or a later metadata update, sets it.
     pub r#type: Option<DocumentType>,
-    /// `None` until a classification script sets it — scripts never
-    /// persist anything themselves, so a freshly parsed document has no
-    /// category yet.
+    /// `None` unless the uploader, or a later metadata update, sets it.
     pub category: Option<Category>,
     pub subcategory: Option<Subcategory>,
     /// Every unstructured piece of data a document carries beyond the

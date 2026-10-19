@@ -8,7 +8,7 @@ use crate::{ErrorContext as _, Result};
 /// searched without re-decrypting and re-parsing the document itself.
 ///
 /// Callers are expected to have already verified `content` is a PDF (see
-/// [`super::PDF_CONTENT_TYPE`]) — this always attempts to parse it as one.
+/// [`super::service::PDF_CONTENT_TYPE`]) — this always attempts to parse it as one.
 pub(super) fn extract(content: &[u8]) -> Result<String> {
     let pdf = PdfDocument::from_bytes(content.to_vec()).context("failed to parse PDF document")?;
     let transcript = pdf

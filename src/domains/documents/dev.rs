@@ -118,14 +118,6 @@ impl Service for DevDocumentsClient {
         Ok(())
     }
 
-    async fn run_scripts(&self, _document: &Document) -> Result<Metadata> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "run_scripts is not supported by the dev documents service",
-        )
-        .into())
-    }
-
     async fn start_sync(&self) -> Result<()> {
         Ok(())
     }

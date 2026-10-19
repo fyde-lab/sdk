@@ -1,10 +1,10 @@
 pub(crate) mod attributes;
 mod dev;
 mod models;
-pub(crate) mod parser;
 mod service;
 mod storage;
 mod storage_sqlite;
+mod transcript;
 
 #[cfg(test)]
 pub(crate) use crate::domains::changelog::FakeChangelogEvent;
@@ -34,7 +34,6 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::domains::changelog;
-use crate::domains::scripts::Service as ScriptsService;
 
 /// Uploads documents by publishing them as encrypted changelog events, and
 /// reads back documents materialized locally from consumed events (see
@@ -47,12 +46,12 @@ pub trait Service: Send + Sync {
     /// disk or already-in-memory bytes), encrypts it and its metadata, then
     /// publishes it as a "created" changelog event, returning its
     /// generated id. Metadata fields set on `request` (`name`, `type`,
-    /// `category`, `subcategory`)
-    /// override whatever would otherwise be derived from the document
-    /// itself and any scripts run against it; `request.attributes` are
-    /// merged over the scripts' attributes, replacing those of the same
-    /// name. Attributes that aren't valid — see [`AttributesService::check`]
-    /// — are rejected with [`crate::ErrorCode::InvalidAttribute`].
+    /// `category`, `subcategory`, `attributes`) override whatever would
+    /// otherwise be derived from the document itself: its name comes from
+    /// the source's file name, its type, classification and attributes are
+    /// left empty. Attributes that aren't valid — see
+    /// [`AttributesService::check`] — are rejected with
+    /// [`crate::ErrorCode::InvalidAttribute`].
     ///
     /// The file type is determined from the source's name's extension;
     /// only `.pdf` is currently accepted, anything else is rejected with
@@ -100,15 +99,6 @@ pub trait Service: Send + Sync {
     /// it is removed. Rejects invalid attributes like [`Self::upload`].
     async fn update_metadata(&self, metadata: Metadata) -> Result<()>;
 
-    /// Fetches the scripts currently enabled for the authenticated user and
-    /// runs each of them, in its own freshly-constructed sandboxed Lua VM,
-    /// scoped to `document`, folding each script's changes into the next's
-    /// starting point. Returns the resulting metadata without publishing or
-    /// otherwise persisting it anywhere — a script only ever computes new
-    /// metadata, it never updates the document itself; that's left to the
-    /// caller to do (or not).
-    async fn run_scripts(&self, document: &Document) -> Result<Metadata>;
-
     /// Starts a background job that streams and decrypts every changelog
     /// event since the last consumed id, oldest first (replaying persisted
     /// history, then continuing with the live tail). Resumes from the
@@ -147,25 +137,20 @@ pub trait Service: Send + Sync {
 /// shared `changelog` service (which also materializes consumed events
 /// into the local `documents` table — see `changelog::init`), wires up
 /// local SQLite-backed reads (via `pool`) of the documents it cached,
-/// initializes the internal parser service (see `parser::init`) with
-/// `scripts` to derive a newly uploaded document's metadata and fill in its
-/// classification fields, and calls `on_document_change` (see
+/// and calls `on_document_change` (see
 /// [`crate::ClientConfig`]) for every event [`Service::start_sync`]
 /// consumes.
 pub(crate) fn init(
     pool: SqlitePool,
     changelog: Arc<dyn changelog::Service>,
-    scripts: Arc<dyn ScriptsService>,
     attributes: Arc<dyn AttributesService>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Arc<dyn Service> {
     let storage = storage_sqlite::SqliteStorage::new(pool);
-    let parser = parser::init(scripts);
 
     Arc::new(service::DocumentsClient::new(
         storage,
         changelog,
-        parser,
         on_document_change,
         attributes,
     ))

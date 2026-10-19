@@ -1,84 +1,21 @@
-//! Converts attributes to and from the Lua tables classification and
-//! scraper scripts read and write them as — an adapter between the Lua VMs
-//! (`parser/vm.rs`, `scrapers/host/documents.rs`) and [`Attribute`], with no
-//! business rules: a value that converts is checked by [`super::Service`]
-//! like any other.
+//! Converts attributes from the Lua tables scraper scripts write them as —
+//! an adapter between the Lua VM (`scrapers/host/documents.rs`) and
+//! [`Attribute`], with no business rules: a value that converts is checked
+//! by [`super::Service`] like any other.
 
 use std::collections::BTreeMap;
-
-use mlua::Lua;
 
 use super::Attribute;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
-/// Mirrors `attributes` as a Lua table of `{ type = ..., value = ... }`
-/// entries keyed by name — the same shape [`Attribute`] serializes to — so
-/// a script adds one with e.g.
-/// `document.metadata.attributes.price = { type = "float", value = 32.3 }`.
-/// A date's value is its `"YYYY-MM-DD"` string, an amount's a
+/// Parses `fyde.save_document`'s `attributes` field: a Lua table of
+/// `{ type = ..., value = ... }` entries keyed by name — the same shape
+/// [`Attribute`] serializes to, e.g. `{ type = "float", value = 32.3 }`. A
+/// date's value is its `"YYYY-MM-DD"` string, an amount's a
 /// `{ minor_units = 215050, currency = "EUR" }` table, and a select's a
-/// `{ selected = "paid", options = { "paid", "unpaid" } }` table.
-pub(crate) fn attributes_to_table(
-    lua: &Lua,
-    attributes: &BTreeMap<String, Attribute>,
-) -> Result<mlua::Table> {
-    let attributes_table = lua
-        .create_table()
-        .context("failed to create the document.metadata.attributes lua table")?;
-    for (name, attribute) in attributes {
-        let attribute_table = lua
-            .create_table()
-            .with_context(|| format!("failed to create the lua table for attribute {name:?}"))?;
-        attribute_table
-            .set("type", attribute.type_name())
-            .with_context(|| format!("failed to set the type of attribute {name:?}"))?;
-        let value = match attribute {
-            Attribute::String(value) | Attribute::Date(value) => {
-                attribute_table.set("value", value.as_str())
-            }
-            Attribute::Integer(value) => attribute_table.set("value", *value),
-            Attribute::Float(value) => attribute_table.set("value", *value),
-            Attribute::Boolean(value) => attribute_table.set("value", *value),
-            Attribute::Amount {
-                minor_units,
-                currency,
-            } => lua
-                .create_table_from([
-                    ("minor_units", mlua::Value::Integer(*minor_units)),
-                    (
-                        "currency",
-                        mlua::Value::String(lua.create_string(currency)?),
-                    ),
-                ])
-                .and_then(|value| attribute_table.set("value", value)),
-            Attribute::Select { selected, options } => lua
-                .create_sequence_from(options.iter().map(String::as_str))
-                .and_then(|options| {
-                    lua.create_table_from([
-                        (
-                            "selected",
-                            mlua::Value::String(lua.create_string(selected)?),
-                        ),
-                        ("options", mlua::Value::Table(options)),
-                    ])
-                })
-                .and_then(|value| attribute_table.set("value", value)),
-        };
-        value.with_context(|| format!("failed to set the value of attribute {name:?}"))?;
-        attributes_table
-            .set(name.as_str(), attribute_table)
-            .with_context(|| format!("failed to set attribute {name:?}"))?;
-    }
-
-    Ok(attributes_table)
-}
-
-/// Reads `document.metadata.attributes` back out of the table
-/// [`attributes_to_table`] wrote, validating every entry a script added or
-/// changed: an unknown `type`, or a `value` that doesn't fit it, fails with
-/// [`ErrorKind::InvalidAttribute`]. A script that set the whole table to
-/// `nil` cleared every attribute. Also parses `fyde.save_document`'s
-/// `attributes` field, which takes the same shape.
+/// `{ selected = "paid", options = { "paid", "unpaid" } }` table. An
+/// unknown `type`, or a `value` that doesn't fit it, fails with
+/// [`ErrorKind::InvalidAttribute`]; no table at all means no attributes.
 pub(crate) fn attributes_from_table(
     attributes_table: Option<mlua::Table>,
 ) -> Result<BTreeMap<String, Attribute>> {
@@ -89,13 +26,13 @@ pub(crate) fn attributes_from_table(
     let mut attributes = BTreeMap::new();
     for pair in attributes_table.pairs::<String, mlua::Table>() {
         let (name, attribute_table) =
-            pair.context("script left an invalid entry in document.metadata.attributes")?;
+            pair.context("script passed an invalid entry in a document's attributes")?;
         let r#type: String = attribute_table
             .get("type")
-            .with_context(|| format!("failed to read the type of attribute {name:?} back"))?;
+            .with_context(|| format!("failed to read the type of attribute {name:?}"))?;
         let value: mlua::Value = attribute_table
             .get("value")
-            .with_context(|| format!("failed to read the value of attribute {name:?} back"))?;
+            .with_context(|| format!("failed to read the value of attribute {name:?}"))?;
         let attribute = match (r#type.as_str(), value) {
             ("string", mlua::Value::String(value)) => {
                 Attribute::String(lua_to_string(&value, &name, "value")?)
@@ -135,7 +72,7 @@ pub(crate) fn attributes_from_table(
 fn amount_from_table(value: &mlua::Table, name: &str) -> Result<Attribute> {
     let minor_units = match value
         .get::<mlua::Value>("minor_units")
-        .with_context(|| format!("failed to read the minor_units of attribute {name:?} back"))?
+        .with_context(|| format!("failed to read the minor_units of attribute {name:?}"))?
     {
         mlua::Value::Integer(minor_units) => minor_units,
         other => {
@@ -148,7 +85,7 @@ fn amount_from_table(value: &mlua::Table, name: &str) -> Result<Attribute> {
     };
     let currency = match value
         .get::<mlua::Value>("currency")
-        .with_context(|| format!("failed to read the currency of attribute {name:?} back"))?
+        .with_context(|| format!("failed to read the currency of attribute {name:?}"))?
     {
         mlua::Value::String(currency) => lua_to_string(&currency, name, "currency")?,
         other => {
@@ -171,7 +108,7 @@ fn amount_from_table(value: &mlua::Table, name: &str) -> Result<Attribute> {
 fn select_from_table(value: &mlua::Table, name: &str) -> Result<Attribute> {
     let selected = match value
         .get::<mlua::Value>("selected")
-        .with_context(|| format!("failed to read the selected value of attribute {name:?} back"))?
+        .with_context(|| format!("failed to read the selected value of attribute {name:?}"))?
     {
         mlua::Value::String(selected) => lua_to_string(&selected, name, "selected value")?,
         other => {
@@ -184,7 +121,7 @@ fn select_from_table(value: &mlua::Table, name: &str) -> Result<Attribute> {
     };
     let options_table = match value
         .get::<mlua::Value>("options")
-        .with_context(|| format!("failed to read the options of attribute {name:?} back"))?
+        .with_context(|| format!("failed to read the options of attribute {name:?}"))?
     {
         mlua::Value::Table(options) => options,
         other => {
@@ -197,9 +134,7 @@ fn select_from_table(value: &mlua::Table, name: &str) -> Result<Attribute> {
     };
     let mut options = Vec::new();
     for option in options_table.sequence_values::<mlua::Value>() {
-        match option
-            .with_context(|| format!("failed to read an option of attribute {name:?} back"))?
-        {
+        match option.with_context(|| format!("failed to read an option of attribute {name:?}"))? {
             mlua::Value::String(option) => options.push(lua_to_string(&option, name, "option")?),
             other => {
                 return Err(ErrorKind::InvalidAttribute(format!(
@@ -221,4 +156,96 @@ fn lua_to_string(value: &mlua::LuaString, name: &str, what: &str) -> Result<Stri
         .to_str()
         .with_context(|| format!("attribute {name:?} has a non-UTF-8 {what}"))?
         .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use mlua::Lua;
+
+    use super::*;
+
+    /// Evaluates the Lua table expression `table` and parses it with
+    /// [`attributes_from_table`].
+    fn parse(table: &str) -> Result<BTreeMap<String, Attribute>> {
+        let lua = Lua::new();
+        let table: mlua::Table = lua.load(table).eval().unwrap();
+        attributes_from_table(Some(table))
+    }
+
+    #[test]
+    fn attributes_from_table_parses_every_attribute_type() {
+        let attributes = parse(
+            r#"{
+                paid = { type = "boolean", value = true },
+                price = { type = "float", value = 32.3 },
+                quantity = { type = "integer", value = 2 },
+                reference = { type = "string", value = "F-42" },
+                due_on = { type = "date", value = "2026-11-01" },
+                total_amount = {
+                    type = "amount",
+                    value = { minor_units = math.floor(32.3 * 100 + 0.5), currency = "EUR" },
+                },
+                status = {
+                    type = "select",
+                    value = { selected = "unpaid", options = { "paid", "unpaid" } },
+                },
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            attributes,
+            BTreeMap::from([
+                (
+                    "due_on".to_string(),
+                    Attribute::Date("2026-11-01".to_string())
+                ),
+                ("paid".to_string(), Attribute::Boolean(true)),
+                ("price".to_string(), Attribute::Float(32.3)),
+                ("quantity".to_string(), Attribute::Integer(2)),
+                (
+                    "reference".to_string(),
+                    Attribute::String("F-42".to_string())
+                ),
+                (
+                    "status".to_string(),
+                    Attribute::Select {
+                        selected: "unpaid".to_string(),
+                        options: vec!["paid".to_string(), "unpaid".to_string()],
+                    }
+                ),
+                (
+                    "total_amount".to_string(),
+                    Attribute::Amount {
+                        minor_units: 3230,
+                        currency: "EUR".to_string(),
+                    }
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn attributes_from_table_returns_no_attributes_without_a_table() {
+        assert!(attributes_from_table(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn attributes_from_table_rejects_malformed_attributes() {
+        for table in [
+            r#"{ price = { type = "money", value = 32.3 } }"#,
+            r#"{ paid = { type = "boolean", value = "yes" } }"#,
+            r#"{ price = { type = "amount", value = 32.3 } }"#,
+            r#"{ price = { type = "amount", value = { minor_units = 32.3, currency = "EUR" } } }"#,
+            r#"{ price = { type = "amount", value = { minor_units = 3230 } } }"#,
+            r#"{ status = { type = "select", value = { selected = 1, options = { "1" } } } }"#,
+            r#"{ status = { type = "select", value = { selected = "1", options = { 1 } } } }"#,
+            r#"{ status = { type = "select", value = { selected = "1", options = "1" } } }"#,
+            r#"{ on = { type = "date", value = 20261015 } }"#,
+        ] {
+            let err = parse(table).unwrap_err();
+
+            assert_eq!(err.code(), crate::ErrorCode::InvalidAttribute, "{table}");
+        }
+    }
 }

@@ -25,8 +25,8 @@ use crate::domains::secrets::SecretLocation;
 use crate::domains::sessions::Service as SessionsService;
 use crate::domains::users::system_language;
 use crate::{
-    ChangelogEvent, Client, ClientConfig, Document, Error, ErrorCode, ErrorContext as _, ErrorKind,
-    LogLevel, LoginOutcome, OpenSession, ProgressEvent, ProgressStep, Storage, Usage,
+    ChangelogEvent, Client, ClientConfig, Document, Error, ErrorCode, ErrorContext as _, LogLevel,
+    LoginOutcome, OpenSession, ProgressEvent, ProgressStep, Storage, Usage,
 };
 
 macro_rules! define_ffi_error {
@@ -1377,7 +1377,7 @@ impl FydeClient {
     }
 
     /// Like [`Self::upload_document`], also setting `attributes` on the
-    /// document, over any its classification scripts set. Mirrors
+    /// document. Mirrors
     /// [`crate::DocumentsService::upload`] with
     /// [`UploadRequest::attributes`].
     pub async fn upload_document_with_attributes(
@@ -1731,34 +1731,12 @@ impl FydeClient {
         })
         .await
     }
-
-    /// Runs every script currently enabled for the authenticated user
-    /// against the document matching `document_id`, then publishes the
-    /// resulting metadata if any script changed it. Mirrors
-    /// [`crate::DocumentsService::run_scripts`], which only computes the
-    /// updated metadata and never persists it itself.
-    pub async fn run_scripts_for_document(&self, document_id: String) -> Result<(), FfiError> {
-        self.localized(async {
-            let id = parse_uuid(&document_id)?;
-            let document = self
-                .inner
-                .documents()
-                .get(id)
-                .await?
-                .ok_or(ErrorKind::DocumentNotFound(id))?;
-            let metadata = self.inner.documents().run_scripts(&document).await?;
-            if metadata != *document.metadata() {
-                self.inner.documents().update_metadata(metadata).await?;
-            }
-            Ok(())
-        })
-        .await
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ErrorKind;
     use crate::domains::documents::{EventType, FakeChangelogEvent, FakeDocument, FakeMetadata};
     use crate::domains::scripts::FakeScript;
     use crate::domains::users::FakeOpenSession;

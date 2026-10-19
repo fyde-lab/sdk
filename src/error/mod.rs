@@ -103,8 +103,6 @@ macro_rules! for_each_error_code {
             SessionExpired = 3003,
             /// The document's file type isn't supported.
             UnsupportedDocumentExtension = 4001,
-            /// No such document in the local cache.
-            DocumentNotFound = 4002,
             /// A PDF document couldn't be read.
             UnreadablePdf = 4003,
             /// A changelog event was malformed.
@@ -227,8 +225,6 @@ pub(crate) enum ErrorKind {
     Lua(#[from] mlua::Error),
     #[error("unsupported document extension {0:?}: only .pdf is supported")]
     UnsupportedDocumentExtension(String),
-    #[error("document {0} not found in local cache")]
-    DocumentNotFound(uuid::Uuid),
     #[error("a document with the same content is already saved locally as {0}")]
     DuplicateDocument(uuid::Uuid),
     #[error("script {0} not found")]
@@ -302,7 +298,6 @@ impl ErrorKind {
             ErrorKind::Pdf(_) => ErrorCode::UnreadablePdf,
             ErrorKind::Lua(_) => ErrorCode::ScriptFailed,
             ErrorKind::UnsupportedDocumentExtension(_) => ErrorCode::UnsupportedDocumentExtension,
-            ErrorKind::DocumentNotFound(_) => ErrorCode::DocumentNotFound,
             ErrorKind::DuplicateDocument(_) => ErrorCode::DuplicateDocument,
             ErrorKind::ScriptNotFound(_) => ErrorCode::ScriptNotFound,
             ErrorKind::ScriptNotInstalled(_) => ErrorCode::ScriptNotInstalled,

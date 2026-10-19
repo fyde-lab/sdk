@@ -1,6 +1,10 @@
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{ErrorContext as _, ErrorKind, Result};
@@ -8,12 +12,15 @@ use crate::{ErrorContext as _, ErrorKind, Result};
 use crate::domains::changelog::{ChangelogEvent, EventType, Service as ChangelogService};
 
 use super::attributes::{self, Service as AttributesService};
-use super::parser::Service as ParserService;
 use super::storage::{FacetField, Storage};
+use super::transcript;
 use super::{
     Category, Document, FacetCount, Metadata, SearchFacets, SearchFilters, SearchQuery, Service,
     Subcategory, UploadRequest, UploadSource,
 };
+
+/// The only content type [`Service::upload`] currently accepts.
+pub(super) const PDF_CONTENT_TYPE: &str = "application/pdf";
 
 /// The default [`Service`] implementation: publishes new documents as
 /// encrypted changelog events via an injected [`ChangelogService`], and
@@ -21,7 +28,6 @@ use super::{
 pub(super) struct DocumentsClient<S: Storage> {
     storage: S,
     changelog: Arc<dyn ChangelogService>,
-    parser: Arc<dyn ParserService>,
     /// Invoked once per event by [`Service::start_sync`]'s consume job, when
     /// set — see [`crate::ClientConfig::on_document_change`].
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
@@ -31,22 +37,18 @@ pub(super) struct DocumentsClient<S: Storage> {
 impl<S: Storage> DocumentsClient<S> {
     /// Creates a documents client using `storage` to cache documents
     /// locally, `changelog` to publish new ones and drive
-    /// [`Service::start_sync`], `parser` to derive a newly uploaded
-    /// document's metadata and to fill in its classification metadata (see
-    /// [`Service::run_scripts`]), and `on_document_change` as the callback
+    /// [`Service::start_sync`], `on_document_change` as the callback
     /// [`Service::start_sync`] invokes per consumed event, and `attributes`
     /// to check the attributes of every document before it's published.
     pub(super) fn new(
         storage: S,
         changelog: Arc<dyn ChangelogService>,
-        parser: Arc<dyn ParserService>,
         on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
         attributes: Arc<dyn AttributesService>,
     ) -> Self {
         Self {
             storage,
             changelog,
-            parser,
             on_document_change,
             attributes,
         }
@@ -100,13 +102,10 @@ impl<S: Storage> Service for DocumentsClient<S> {
     /// being sent alongside the ciphertext. Only the wrapped DEK and
     /// ciphertext ever leave this process.
     async fn upload(&self, mut request: UploadRequest) -> Result<Uuid> {
-        // Checked before anything else — parsing below also lists and runs
-        // the user's enabled scripts against the document (see
-        // `Self::run_scripts`), which needs a session just as much as
-        // actually publishing the event does. Failing fast here means a
-        // caller who never logged in gets this specific, recognizable
-        // error instead of whatever that unrelated, also-authenticated
-        // work happens to fail with first.
+        // Checked before anything else: publishing the event needs a
+        // session, so a caller who never logged in gets this specific,
+        // recognizable error before any time is spent reading and parsing
+        // the document.
         self.changelog
             .ensure_master_key()
             .await
@@ -133,11 +132,11 @@ impl<S: Storage> Service for DocumentsClient<S> {
             }
         };
 
-        // Checked before parsing, which runs the user's scripts against the
-        // document: no point paying for that only to reject it. This only
+        // Checked before extracting the transcript: no point paying for
+        // that only to reject the document. This only
         // sees documents the sync job already cached locally, so the consume
         // job checks again before caching one (see `changelog::service`).
-        let checksum = super::parser::checksum(&content);
+        let checksum = checksum(&content);
         if let Some(existing) = self
             .storage
             .find_document_by_checksum(&checksum)
@@ -147,10 +146,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
             return Err(ErrorKind::DuplicateDocument(existing).into());
         }
 
-        let mut metadata = self
-            .parser
-            .parse_content(&content, &original_name)
-            .await
+        let mut metadata = parse_content(&content, &original_name, checksum)
             .with_context(|| format!("failed to parse document {original_name:?}"))?;
         if let Some(name) = request.name {
             metadata.name = name;
@@ -164,8 +160,6 @@ impl<S: Storage> Service for DocumentsClient<S> {
         }
         metadata.attributes.extend(request.attributes);
 
-        // Checked again after parsing: the user's classification scripts may
-        // have set attributes of their own.
         self.check_metadata(&metadata)
             .await
             .with_context(|| format!("invalid metadata for document {original_name:?}"))?;
@@ -261,10 +255,6 @@ impl<S: Storage> Service for DocumentsClient<S> {
             earliest_created_at: created_at_range.map(|(earliest, _)| earliest),
             latest_created_at: created_at_range.map(|(_, latest)| latest),
         })
-    }
-
-    async fn run_scripts(&self, document: &Document) -> Result<Metadata> {
-        self.parser.run_scripts(document).await
     }
 
     async fn update_metadata(&self, metadata: Metadata) -> Result<()> {
@@ -392,6 +382,51 @@ fn check_extension(name: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// The hex-encoded SHA-256 checksum of a document's `content`, as stored in
+/// its [`Metadata::checksum`].
+fn checksum(content: &[u8]) -> String {
+    Sha256::digest(content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Builds the [`Metadata`] of a freshly uploaded PDF `content`, originally
+/// named `original_name`, whose [`checksum`] is `checksum`: a new id, its
+/// name (the file name without extension), size and transcript. Its type,
+/// classification and attributes are left empty, for the upload request to
+/// fill in.
+fn parse_content(content: &[u8], original_name: &str, checksum: String) -> Result<Metadata> {
+    let name = Path::new(original_name)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let transcript =
+        transcript::extract(content).context("failed to extract document transcript")?;
+
+    Ok(Metadata {
+        id: Uuid::now_v7(),
+        original_name: original_name.to_string(),
+        name,
+        content_type: PDF_CONTENT_TYPE.to_string(),
+        created_at,
+        size: content.len() as u64,
+        checksum,
+        transcript,
+        r#type: None,
+        category: None,
+        subcategory: None,
+        attributes: BTreeMap::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
@@ -399,19 +434,11 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
-    use std::collections::BTreeMap;
-
     use super::super::attributes::MockService as MockAttributesService;
-    use super::super::parser::MockService as MockParserService;
     use super::super::storage::MockStorage;
+    use super::super::transcript::tests::build_pdf;
     use super::super::{Attribute, DocumentType};
     use super::*;
-
-    /// A [`ParserService`] fake that's never expected to be called, for
-    /// tests that don't exercise document parsing/script running.
-    fn no_op_parser() -> Arc<dyn ParserService> {
-        Arc::new(MockParserService::new())
-    }
 
     /// An [`AttributesService`] fake accepting any attributes, for tests
     /// that don't exercise attribute checks.
@@ -432,22 +459,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_fails_fast_with_no_master_key_before_ever_parsing_the_document() {
+    async fn upload_fails_fast_with_no_master_key_before_ever_reading_the_document() {
         let file = write_temp_file("pdf", b"hello world");
 
         let changelog = Arc::new(RecordingChangelog {
             no_master_key: true,
             ..Default::default()
         });
-        // `no_op_parser` panics on any call, proving `upload` never reaches
-        // parsing (and so never lists/runs scripts) once this check fails.
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            changelog,
-            no_op_parser(),
-            None,
-            accepting_attributes(),
-        );
+        // `MockStorage` panics on any call, proving `upload` never reaches
+        // the duplicate check (or anything after it) once this check fails.
+        let client =
+            DocumentsClient::new(MockStorage::new(), changelog, None, accepting_attributes());
 
         let err = client
             .upload(UploadRequest::from_path(file.path()))
@@ -458,35 +480,6 @@ mod tests {
             err.to_string().contains("no master key found"),
             "unexpected error: {err}"
         );
-    }
-
-    #[tokio::test]
-    async fn run_scripts_delegates_to_the_parser_service() {
-        let document = super::super::FakeDocument::new().build();
-        let expected = super::super::FakeMetadata::new().build();
-
-        let mut parser = MockParserService::new();
-        let returned = expected.clone();
-        parser
-            .expect_run_scripts()
-            .withf({
-                let expected_id = document.id();
-                move |queried_document| queried_document.id() == expected_id
-            })
-            .times(1)
-            .returning(move |_| Ok(returned.clone()));
-
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            Arc::new(RecordingChangelog::default()),
-            Arc::new(parser),
-            None,
-            accepting_attributes(),
-        );
-
-        let metadata = client.run_scripts(&document).await.unwrap();
-
-        assert_eq!(metadata, expected);
     }
 
     /// A single `send` call recorded by [`RecordingChangelog`].
@@ -565,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_publishes_a_save_document_event_for_the_document() {
-        let pdf = b"hello world".to_vec();
+        let pdf = build_pdf("hello world");
         let file = write_temp_file("pdf", &pdf);
         let file_name = file
             .path()
@@ -575,21 +568,8 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let metadata = super::super::FakeMetadata::new().build();
-        let expected_content = pdf.clone();
-        let expected_name = file_name.clone();
-        let returned_metadata = metadata.clone();
-        let mut parser = MockParserService::new();
-        parser
-            .expect_parse_content()
-            .withf(move |content, original_name| {
-                content == expected_content.as_slice() && original_name == expected_name
-            })
-            .times(1)
-            .returning(move |_, _| Ok(returned_metadata.clone()));
-
         let mut storage = MockStorage::new();
-        let expected_checksum = super::super::parser::checksum(&pdf);
+        let expected_checksum = checksum(&pdf);
         storage
             .expect_find_document_by_checksum()
             .withf(move |checksum| checksum == expected_checksum)
@@ -597,53 +577,55 @@ mod tests {
             .returning(|_| Ok(None));
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            storage,
-            changelog.clone(),
-            Arc::new(parser),
-            None,
-            accepting_attributes(),
-        );
+        let client = DocumentsClient::new(storage, changelog.clone(), None, accepting_attributes());
 
         let id = client
             .upload(UploadRequest::from_path(file.path()))
             .await
             .unwrap();
 
-        assert_eq!(id, metadata.id);
         let sent = changelog.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         let (event_type, document_id, content, sent_metadata) = &sent[0];
         assert_eq!(*event_type, EventType::SaveDocument);
-        assert_eq!(*document_id, metadata.id);
+        assert_eq!(*document_id, id);
         assert_eq!(content.as_deref(), Some(pdf.as_slice()));
-        assert_eq!(sent_metadata.as_ref(), Some(&metadata));
+        let sent_metadata = sent_metadata.as_ref().unwrap();
+        assert_eq!(sent_metadata.id, id);
+        assert_eq!(sent_metadata.original_name, file_name);
+        assert_eq!(sent_metadata.name, file_name.strip_suffix(".pdf").unwrap());
+        assert_eq!(sent_metadata.content_type, PDF_CONTENT_TYPE);
+        assert_eq!(sent_metadata.size, pdf.len() as u64);
+        assert_eq!(sent_metadata.checksum, checksum(&pdf));
+        assert!(
+            sent_metadata.transcript.contains("hello world"),
+            "unexpected transcript: {:?}",
+            sent_metadata.transcript
+        );
+        assert_eq!(sent_metadata.r#type, None);
+        assert_eq!(sent_metadata.category, None);
+        assert_eq!(sent_metadata.subcategory, None);
+        assert!(sent_metadata.attributes.is_empty());
     }
 
     #[tokio::test]
     async fn upload_rejects_a_document_already_saved_locally_before_parsing_or_publishing_it() {
+        // Not a valid PDF: parsing it would fail, so this also proves the
+        // duplicate is rejected before parsing.
         let pdf = b"hello world".to_vec();
         let file = write_temp_file("pdf", &pdf);
         let existing = Uuid::now_v7();
 
         let mut storage = MockStorage::new();
-        let expected_checksum = super::super::parser::checksum(&pdf);
+        let expected_checksum = checksum(&pdf);
         storage
             .expect_find_document_by_checksum()
             .withf(move |checksum| checksum == expected_checksum)
             .times(1)
             .returning(move |_| Ok(Some(existing)));
 
-        // `no_op_parser` panics on any call, proving the duplicate is
-        // rejected before parsing (and so before running any script).
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            storage,
-            changelog.clone(),
-            no_op_parser(),
-            None,
-            accepting_attributes(),
-        );
+        let client = DocumentsClient::new(storage, changelog.clone(), None, accepting_attributes());
 
         let err = client
             .upload(UploadRequest::from_path(file.path()))
@@ -664,7 +646,6 @@ mod tests {
         let client = DocumentsClient::new(
             MockStorage::new(),
             Arc::new(RecordingChangelog::default()),
-            no_op_parser(),
             None,
             accepting_attributes(),
         );
@@ -676,21 +657,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_applies_metadata_overrides_from_the_request() {
-        let raw = b"hello world".to_vec();
-        let parsed = super::super::FakeMetadata::new()
-            .with_name("original.pdf")
-            .build();
-
-        let expected_content = raw.clone();
-        let returned_metadata = parsed.clone();
-        let mut parser = MockParserService::new();
-        parser
-            .expect_parse_content()
-            .withf(move |content, original_name| {
-                content == expected_content.as_slice() && original_name == "raw.pdf"
-            })
-            .times(1)
-            .returning(move |_, _| Ok(returned_metadata.clone()));
+        let raw = build_pdf("hello world");
 
         let mut storage = MockStorage::new();
         storage
@@ -699,13 +666,7 @@ mod tests {
             .returning(|_| Ok(None));
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            storage,
-            changelog.clone(),
-            Arc::new(parser),
-            None,
-            accepting_attributes(),
-        );
+        let client = DocumentsClient::new(storage, changelog.clone(), None, accepting_attributes());
 
         let request = UploadRequest {
             source: super::super::UploadSource::Raw {
@@ -725,36 +686,26 @@ mod tests {
         assert_eq!(sent.len(), 1);
         let (_, _, _, sent_metadata) = &sent[0];
         let sent_metadata = sent_metadata.as_ref().unwrap();
+        assert_eq!(sent_metadata.original_name, "raw.pdf");
         assert_eq!(sent_metadata.name, "overridden.pdf");
         assert_eq!(sent_metadata.r#type, Some(DocumentType::Payslip));
         assert_eq!(sent_metadata.category, Some(super::super::Category::Work));
     }
 
-    /// Uploads a document whose parsed metadata is `parsed` with `request`'s
-    /// overrides, returning the metadata it was published with.
-    async fn upload_with(parsed: Metadata, mut request: UploadRequest) -> Metadata {
-        let mut parser = MockParserService::new();
-        parser
-            .expect_parse_content()
-            .times(1)
-            .returning(move |_, _| Ok(parsed.clone()));
+    /// Uploads a PDF with `request`'s overrides, returning the metadata it
+    /// was published with.
+    async fn upload_with(mut request: UploadRequest) -> Metadata {
         let mut storage = MockStorage::new();
         storage
             .expect_find_document_by_checksum()
             .times(1)
             .returning(|_| Ok(None));
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            storage,
-            changelog.clone(),
-            Arc::new(parser),
-            None,
-            accepting_attributes(),
-        );
+        let client = DocumentsClient::new(storage, changelog.clone(), None, accepting_attributes());
 
         request.source = super::super::UploadSource::Raw {
             name: "raw.pdf".to_string(),
-            content: b"hello world".to_vec(),
+            content: build_pdf("hello world"),
         };
         client.upload(request).await.unwrap();
 
@@ -764,38 +715,22 @@ mod tests {
 
     #[tokio::test]
     async fn upload_infers_the_category_of_a_lone_subcategory() {
-        let parsed = super::super::FakeMetadata::new().build();
         let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
         request.subcategory = Some(Subcategory::Energy);
 
-        let metadata = upload_with(parsed, request).await;
+        let metadata = upload_with(request).await;
 
         assert_eq!(metadata.category, Some(Category::Housing));
         assert_eq!(metadata.subcategory, Some(Subcategory::Energy));
     }
 
     #[tokio::test]
-    async fn upload_drops_the_parsed_subcategory_when_overriding_the_category() {
-        let parsed = super::super::FakeMetadata::new()
-            .with_category(Category::Housing)
-            .with_subcategory(Subcategory::Energy)
-            .build();
-        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
-        request.category = Some(Category::Donations);
-
-        let metadata = upload_with(parsed, request).await;
-
-        assert_eq!(metadata.category, Some(Category::Donations));
-        assert_eq!(metadata.subcategory, None);
-    }
-
-    #[tokio::test]
     async fn upload_rejects_a_subcategory_of_another_category_before_parsing() {
-        // No `expect_parse_content()`: the parser must never be reached.
+        // `MockStorage` panics on any call, proving the request is rejected
+        // before the duplicate check and parsing.
         let client = DocumentsClient::new(
             MockStorage::new(),
             Arc::new(RecordingChangelog::default()),
-            Arc::new(MockParserService::new()),
             None,
             accepting_attributes(),
         );
@@ -809,75 +744,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_rejects_attributes_the_attributes_service_rejects_once_parsed() {
-        let parsed = super::super::FakeMetadata::new()
-            .with_attributes([("price".to_string(), Attribute::Integer(1))])
-            .build();
-        let mut parser = MockParserService::new();
-        parser
-            .expect_parse_content()
-            .returning(move |_, _| Ok(parsed.clone()));
+    async fn upload_rejects_attributes_the_attributes_service_rejects() {
         let mut storage = MockStorage::new();
         storage
             .expect_find_document_by_checksum()
             .returning(|_| Ok(None));
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            storage,
-            changelog.clone(),
-            Arc::new(parser),
-            None,
-            rejecting_attributes(),
-        );
+        let client = DocumentsClient::new(storage, changelog.clone(), None, rejecting_attributes());
+        let mut request = UploadRequest::from_raw("raw.pdf", build_pdf("hello world"));
+        request.attributes = BTreeMap::from([("price".to_string(), Attribute::Integer(1))]);
 
-        let err = client
-            .upload(UploadRequest::from_raw("raw.pdf", Vec::new()))
-            .await
-            .unwrap_err();
+        let err = client.upload(request).await.unwrap_err();
 
         assert_eq!(err.code(), crate::ErrorCode::InvalidAttribute);
         assert!(changelog.sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn upload_merges_requested_attributes_over_the_scripts_ones() {
-        let parsed = super::super::FakeMetadata::new()
-            .with_attributes([
-                ("price".to_string(), Attribute::Float(10.0)),
-                (
-                    "reference".to_string(),
-                    Attribute::String("F-42".to_string()),
-                ),
-            ])
-            .build();
-        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
-        request.attributes = BTreeMap::from([
+    async fn upload_keeps_the_requested_attributes() {
+        let attributes = BTreeMap::from([
             ("price".to_string(), Attribute::Float(32.3)),
             ("paid".to_string(), Attribute::Boolean(true)),
         ]);
+        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
+        request.attributes = attributes.clone();
 
-        let metadata = upload_with(parsed, request).await;
+        let metadata = upload_with(request).await;
 
-        assert_eq!(
-            metadata.attributes,
-            BTreeMap::from([
-                ("paid".to_string(), Attribute::Boolean(true)),
-                ("price".to_string(), Attribute::Float(32.3)),
-                (
-                    "reference".to_string(),
-                    Attribute::String("F-42".to_string())
-                ),
-            ])
-        );
+        assert_eq!(metadata.attributes, attributes);
     }
 
     #[tokio::test]
     async fn upload_rejects_a_requested_non_finite_attribute_before_parsing() {
-        // No `expect_parse_content()`: the parser must never be reached.
+        // `MockStorage` panics on any call, proving the request is rejected
+        // before the duplicate check and parsing.
         let client = DocumentsClient::new(
             MockStorage::new(),
             Arc::new(RecordingChangelog::default()),
-            Arc::new(MockParserService::new()),
             None,
             accepting_attributes(),
         );
@@ -895,7 +798,6 @@ mod tests {
         let client = DocumentsClient::new(
             MockStorage::new(),
             changelog.clone(),
-            no_op_parser(),
             None,
             rejecting_attributes(),
         );
@@ -915,7 +817,6 @@ mod tests {
         let client = DocumentsClient::new(
             MockStorage::new(),
             changelog.clone(),
-            no_op_parser(),
             None,
             accepting_attributes(),
         );
@@ -936,7 +837,6 @@ mod tests {
         let client = DocumentsClient::new(
             MockStorage::new(),
             changelog.clone(),
-            no_op_parser(),
             None,
             accepting_attributes(),
         );
@@ -961,7 +861,7 @@ mod tests {
                 id,
                 name: "report.pdf".to_string(),
                 original_name: "report.pdf".to_string(),
-                content_type: super::super::parser::PDF_CONTENT_TYPE.to_string(),
+                content_type: PDF_CONTENT_TYPE.to_string(),
                 created_at: 1_700_000_000,
                 size: 5,
                 checksum: "deadbeef".to_string(),
@@ -984,7 +884,6 @@ mod tests {
         let client = DocumentsClient::new(
             storage,
             Arc::new(RecordingChangelog::default()),
-            no_op_parser(),
             None,
             accepting_attributes(),
         );
@@ -1003,7 +902,7 @@ mod tests {
                     id: id_two,
                     name: "two".to_string(),
                     original_name: "two".to_string(),
-                    content_type: super::super::parser::PDF_CONTENT_TYPE.to_string(),
+                    content_type: PDF_CONTENT_TYPE.to_string(),
                     created_at: 1_700_000_001,
                     size: 0,
                     checksum: String::new(),
@@ -1021,7 +920,7 @@ mod tests {
                     id: id_three,
                     name: "three".to_string(),
                     original_name: "three".to_string(),
-                    content_type: super::super::parser::PDF_CONTENT_TYPE.to_string(),
+                    content_type: PDF_CONTENT_TYPE.to_string(),
                     created_at: 1_700_000_002,
                     size: 0,
                     checksum: String::new(),
@@ -1045,7 +944,6 @@ mod tests {
         let client = DocumentsClient::new(
             storage,
             Arc::new(RecordingChangelog::default()),
-            no_op_parser(),
             None,
             accepting_attributes(),
         );
@@ -1088,7 +986,6 @@ mod tests {
         let client = DocumentsClient::new(
             storage,
             Arc::new(RecordingChangelog::default()),
-            no_op_parser(),
             None,
             accepting_attributes(),
         );
@@ -1119,7 +1016,6 @@ mod tests {
         let client = DocumentsClient::new(
             storage,
             Arc::new(RecordingChangelog::default()),
-            no_op_parser(),
             None,
             accepting_attributes(),
         );
@@ -1142,7 +1038,6 @@ mod tests {
             let client = DocumentsClient::new(
                 MockStorage::new(),
                 Arc::new(RecordingChangelog::default()),
-                no_op_parser(),
                 None,
                 accepting_attributes(),
             );
@@ -1257,7 +1152,6 @@ mod tests {
         let client = DocumentsClient::new(
             storage,
             Arc::new(RecordingChangelog::default()),
-            no_op_parser(),
             None,
             accepting_attributes(),
         );
@@ -1287,7 +1181,6 @@ mod tests {
         let client = DocumentsClient::new(
             storage,
             Arc::new(RecordingChangelog::default()),
-            no_op_parser(),
             None,
             accepting_attributes(),
         );
@@ -1305,7 +1198,6 @@ mod tests {
         let client = DocumentsClient::new(
             MockStorage::new(),
             Arc::new(RecordingChangelog::default()),
-            no_op_parser(),
             None,
             accepting_attributes(),
         );
@@ -1336,7 +1228,6 @@ mod tests {
         let client = DocumentsClient::new(
             MockStorage::new(),
             changelog.clone(),
-            no_op_parser(),
             None,
             accepting_attributes(),
         );
@@ -1369,7 +1260,6 @@ mod tests {
         let client = DocumentsClient::new(
             MockStorage::new(),
             changelog,
-            no_op_parser(),
             Some(on_document_change),
             accepting_attributes(),
         );
@@ -1387,13 +1277,8 @@ mod tests {
             to_consume: Mutex::new(vec![event]),
             ..Default::default()
         });
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            changelog,
-            no_op_parser(),
-            None,
-            accepting_attributes(),
-        );
+        let client =
+            DocumentsClient::new(MockStorage::new(), changelog, None, accepting_attributes());
 
         client.start_sync().await.unwrap();
     }
@@ -1404,7 +1289,6 @@ mod tests {
         let client = DocumentsClient::new(
             MockStorage::new(),
             changelog.clone(),
-            no_op_parser(),
             None,
             accepting_attributes(),
         );

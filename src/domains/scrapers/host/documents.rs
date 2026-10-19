@@ -21,10 +21,8 @@ use crate::domains::documents::{
 /// returns). The optional `fields` table lets a script set any of
 /// [`UploadRequest`]'s other metadata overrides up front (`name`, `type`,
 /// `category`, `subcategory`, and `attributes` —
-/// `{ price = { type = "float", value = 32.3 } }`, the same shape as a
-/// classification script's `document.metadata.attributes`) instead
-/// of leaving them to be derived later by a classification script. A
-/// document whose content is already saved locally is silently skipped,
+/// `{ price = { type = "float", value = 32.3 } }`, see
+/// `attributes_from_table`); left out, they stay empty. A document whose content is already saved locally is silently skipped,
 /// not an error, so re-running a scraper doesn't fail on what it already
 /// fetched.
 pub(super) fn save_document_fn(

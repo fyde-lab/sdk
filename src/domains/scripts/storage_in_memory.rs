@@ -15,8 +15,8 @@ use super::Service;
 use super::{InstallScriptRequest, InstalledScript};
 
 /// A [`Service`] implementation holding scripts purely in memory, for
-/// running scripts (e.g. via `documents::Service`'s `run_scripts`) without a
-/// live scripts server. State doesn't survive past the process's lifetime.
+/// running scripts (e.g. via `init_dev_scrapers`) without a live scripts
+/// server. State doesn't survive past the process's lifetime.
 /// With no changelog to publish through, [`Service::install_script`] saves
 /// the installation directly, so it shows up in
 /// [`Service::list_installed_scripts`] immediately.
