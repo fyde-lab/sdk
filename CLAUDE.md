@@ -112,8 +112,7 @@ Non-domain helpers live in `src/tools/` (`log`, `sandbox`, `sql`, `testing`).
     (`AttributesService::list`/`set`/`check`). Checks (`check_values`, then defined types) run on
     upload and `update_metadata`. Promote anything that needs filtering/sorting to a real
     `Metadata` field instead of querying attributes JSON.
-  - `parser/` — `ParserService` (`init_parser`): derives metadata, extracts text (PDF/office),
-    runs the user's enabled classification scripts in a sandboxed VM.
+  - `transcript.rs` — extracts a PDF's text into `Metadata::transcript` on upload.
   - `dev.rs` — `DevDocumentsClient`, plain-file writes for `init_dev_scrapers`.
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
   (`SaveDocument`, `UpdateMetadata`, `InstallScript`). `crypto.rs`: AES-256-GCM, per-event DEK

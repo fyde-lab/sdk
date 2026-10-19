@@ -289,9 +289,8 @@ fn merge_cookies(http_cookies: Vec<Cookie>, browser_cookies: Vec<Cookie>) -> Vec
 /// environment, subprocesses, dynamic library loading, or raw sockets. The
 /// only network access a script gets is through the `fyde.http`/
 /// `fyde.browser` host functions `host::install` wires into the `fyde`
-/// global table below — there is no other way out of this VM. `utf8` (unlike
-/// `documents::parser::vm::sandboxed`, which doesn't need it) is kept because
-/// `didaxis.lua` calls `utf8.len`.
+/// global table below — there is no other way out of this VM. `utf8` is kept
+/// because `didaxis.lua` calls `utf8.len`.
 ///
 /// See [`crate::tools::sandbox::new_vm`] for the globals it strips on top of that
 /// and the limits it enforces, so a script that loops forever or allocates

@@ -12,7 +12,7 @@ use crate::{ErrorContext as _, Result};
 const HOOK_INTERVAL: u32 = 10_000;
 
 /// Resource limits for one sandboxed Lua VM, so a script (often
-/// server-supplied — see `documents::parser` and `scrapers`) can't hang or
+/// server-supplied — see `scrapers`) can't hang or
 /// crash its host by looping forever or allocating without bound.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Limits {

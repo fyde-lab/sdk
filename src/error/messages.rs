@@ -157,10 +157,6 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "This file type isn't supported. Only PDF files can be added.",
             "Ce type de fichier n'est pas pris en charge. Seuls les fichiers PDF peuvent être ajoutés.",
         ),
-        ErrorCode::DocumentNotFound => (
-            "This document couldn't be found.",
-            "Ce document est introuvable.",
-        ),
         ErrorCode::UnreadablePdf => (
             "This PDF file couldn't be read.",
             "Ce fichier PDF n'a pas pu être lu.",
