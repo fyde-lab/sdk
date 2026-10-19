@@ -9,11 +9,15 @@ use crate::{ErrorContext as _, Result};
 ///
 /// Callers are expected to have already verified `content` is a PDF (see
 /// [`super::service::PDF_CONTENT_TYPE`]) — this always attempts to parse it as one.
+#[tracing::instrument(level = "debug", skip_all, fields(size = content.len()))]
 pub(super) fn extract(content: &[u8]) -> Result<String> {
-    let pdf = PdfDocument::from_bytes(content.to_vec()).context("failed to parse PDF document")?;
-    let transcript = pdf
-        .to_plain_text_all(&ConversionOptions::default())
-        .context("failed to extract text from PDF document")?;
+    let pdf = tracing::debug_span!("parse_pdf").in_scope(|| {
+        PdfDocument::from_bytes(content.to_vec()).context("failed to parse PDF document")
+    })?;
+    let transcript = tracing::debug_span!("extract_text").in_scope(|| {
+        pdf.to_plain_text_all(&ConversionOptions::default())
+            .context("failed to extract text from PDF document")
+    })?;
 
     Ok(transcript)
 }
