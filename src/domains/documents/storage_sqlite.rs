@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::{ErrorContext as _, Result};
@@ -107,19 +108,22 @@ impl Storage for SqliteStorage {
         Ok(Some(id))
     }
 
-    async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Metadata>> {
         let rows = sqlx::query(
-            "SELECT id, name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, attributes FROM documents
+            "SELECT id, name, original_name, content_type, length(content) AS size, checksum, created_at, transcript, type, category, subcategory, attributes FROM documents
              ORDER BY created_at ASC, id ASC
              LIMIT ?1 OFFSET ?2",
         )
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
+        .instrument(tracing::debug_span!("query"))
         .await
         .with_context(|| format!("failed to list documents at offset {offset}"))?;
 
-        rows.iter().map(document_from_row).collect()
+        tracing::debug_span!("map_rows", rows = rows.len())
+            .in_scope(|| rows.iter().map(metadata_from_row).collect())
     }
 
     async fn search_documents(
@@ -129,9 +133,9 @@ impl Storage for SqliteStorage {
         order: SearchOrder,
         offset: i64,
         limit: i64,
-    ) -> Result<Vec<Document>> {
+    ) -> Result<Vec<Metadata>> {
         let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT d.id, d.name, d.original_name, d.content_type, d.content, d.checksum, d.created_at, d.transcript, d.type, d.category, d.subcategory, d.attributes",
+            "SELECT d.id, d.name, d.original_name, d.content_type, length(d.content) AS size, d.checksum, d.created_at, d.transcript, d.type, d.category, d.subcategory, d.attributes",
         );
         push_matching(&mut query, terms, filters);
 
@@ -166,7 +170,7 @@ impl Storage for SqliteStorage {
             .await
             .with_context(|| format!("failed to search documents at offset {offset}"))?;
 
-        rows.iter().map(document_from_row).collect()
+        rows.iter().map(metadata_from_row).collect()
     }
 
     async fn count_documents_by(
@@ -316,31 +320,28 @@ fn attributes_from_column(column: String) -> Result<BTreeMap<String, Attribute>>
         .with_context(|| format!("invalid attributes json in local database: {column}"))
 }
 
-/// Maps a row selecting every `documents` column (`id` included) back to a
-/// [`Document`].
-fn document_from_row(row: &SqliteRow) -> Result<Document> {
+/// Maps a row selecting every `documents` column but `content` (`id`
+/// included), with the content's length in bytes as `size`, back to a
+/// [`Metadata`] — so listing documents never loads their content.
+fn metadata_from_row(row: &SqliteRow) -> Result<Metadata> {
     let id: String = row.get("id");
-    let content: Vec<u8> = row.get("content");
     let id = Uuid::parse_str(&id)
         .with_context(|| format!("invalid document id in local database: {id}"))?;
+    let size: i64 = row.get("size");
 
-    Ok(Document {
+    Ok(Metadata {
         id,
-        metadata: Metadata {
-            id,
-            name: row.get("name"),
-            original_name: row.get("original_name"),
-            content_type: row.get("content_type"),
-            created_at: row.get("created_at"),
-            size: content.len() as u64,
-            checksum: row.get("checksum"),
-            transcript: row.get("transcript"),
-            r#type: type_from_column(row.get("type"))?,
-            category: category_from_column(row.get("category"))?,
-            subcategory: subcategory_from_column(row.get("subcategory"))?,
-            attributes: attributes_from_column(row.get("attributes"))?,
-        },
-        content,
+        name: row.get("name"),
+        original_name: row.get("original_name"),
+        content_type: row.get("content_type"),
+        created_at: row.get("created_at"),
+        size: size as u64,
+        checksum: row.get("checksum"),
+        transcript: row.get("transcript"),
+        r#type: type_from_column(row.get("type"))?,
+        category: category_from_column(row.get("category"))?,
+        subcategory: subcategory_from_column(row.get("subcategory"))?,
+        attributes: attributes_from_column(row.get("attributes"))?,
     })
 }
 
@@ -652,9 +653,7 @@ mod tests {
         let page = storage.list_documents(0, 2).await.unwrap();
 
         assert_eq!(
-            page.into_iter()
-                .map(|d| d.metadata.name)
-                .collect::<Vec<_>>(),
+            page.into_iter().map(|d| d.name).collect::<Vec<_>>(),
             vec!["one", "two"]
         );
     }
@@ -667,9 +666,7 @@ mod tests {
         let page = storage.list_documents(1, 2).await.unwrap();
 
         assert_eq!(
-            page.into_iter()
-                .map(|d| d.metadata.name)
-                .collect::<Vec<_>>(),
+            page.into_iter().map(|d| d.name).collect::<Vec<_>>(),
             vec!["two", "three"]
         );
     }
@@ -682,6 +679,31 @@ mod tests {
         let page = storage.list_documents(5, 2).await.unwrap();
 
         assert_eq!(page, Vec::new());
+    }
+
+    #[tokio::test]
+    async fn list_and_search_documents_report_the_content_size_without_loading_it() {
+        let storage = setup().await;
+        let metadata = FakeMetadata::new().build();
+        storage
+            .save_document(
+                &FakeDocument::new()
+                    .with_id(metadata.id)
+                    .with_content(b"hello".to_vec())
+                    .with_metadata(metadata)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let listed = storage.list_documents(0, 1).await.unwrap();
+        let found = storage
+            .search_documents(&[], &SearchFilters::default(), SearchOrder::Oldest, 0, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(listed[0].size, 5);
+        assert_eq!(found[0].size, 5);
     }
 
     #[tokio::test]
@@ -804,7 +826,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .map(|document| document.metadata.name)
+            .map(|metadata| metadata.name)
             .collect()
     }
 
@@ -1098,7 +1120,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.len(), 1);
-        assert_eq!(page[0].metadata.name, "two");
+        assert_eq!(page[0].name, "two");
 
         let names = search_names(
             &storage,

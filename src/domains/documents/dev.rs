@@ -102,11 +102,11 @@ impl Service for DevDocumentsClient {
         Ok(None)
     }
 
-    async fn list(&self, _offset: i64, _limit: i64) -> Result<Vec<Document>> {
+    async fn list(&self, _offset: i64, _limit: i64) -> Result<Vec<Metadata>> {
         Ok(Vec::new())
     }
 
-    async fn search(&self, _query: SearchQuery) -> Result<Vec<Document>> {
+    async fn search(&self, _query: SearchQuery) -> Result<Vec<Metadata>> {
         Ok(Vec::new())
     }
 

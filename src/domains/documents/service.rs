@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::{ErrorContext as _, ErrorKind, Result};
@@ -101,6 +102,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
     /// AES-256-GCM, and is itself wrapped under a key-encryption-key before
     /// being sent alongside the ciphertext. Only the wrapped DEK and
     /// ciphertext ever leave this process.
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn upload(&self, mut request: UploadRequest) -> Result<Uuid> {
         // Checked before anything else: publishing the event needs a
         // session, so a caller who never logged in gets this specific,
@@ -117,6 +119,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
             UploadSource::Path(path) => {
                 check_extension(&path)?;
                 let content = tokio::fs::read(&path)
+                    .instrument(tracing::debug_span!("read_document"))
                     .await
                     .with_context(|| format!("failed to read document at {}", path.display()))?;
                 let original_name = path
@@ -140,6 +143,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
         if let Some(existing) = self
             .storage
             .find_document_by_checksum(&checksum)
+            .instrument(tracing::debug_span!("find_document_by_checksum"))
             .await
             .context("failed to look up local documents with the same content")?
         {
@@ -161,6 +165,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
         metadata.attributes.extend(request.attributes);
 
         self.check_metadata(&metadata)
+            .instrument(tracing::debug_span!("check_metadata"))
             .await
             .with_context(|| format!("invalid metadata for document {original_name:?}"))?;
 
@@ -168,6 +173,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
         self.changelog
             .send(EventType::SaveDocument, id, Some(&content), Some(&metadata))
+            .instrument(tracing::debug_span!("publish_event"))
             .await
             .with_context(|| format!("failed to publish changelog event for document {id}"))?;
 
@@ -178,11 +184,12 @@ impl<S: Storage> Service for DocumentsClient<S> {
         self.storage.get_document(id).await
     }
 
-    async fn list(&self, offset: i64, limit: i64) -> Result<Vec<Document>> {
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn list(&self, offset: i64, limit: i64) -> Result<Vec<Metadata>> {
         self.storage.list_documents(offset, limit).await
     }
 
-    async fn search(&self, query: SearchQuery) -> Result<Vec<Document>> {
+    async fn search(&self, query: SearchQuery) -> Result<Vec<Metadata>> {
         if query.offset < 0 {
             return Err(ErrorKind::InvalidSearchQuery(format!(
                 "offset must not be negative, got {}",
@@ -384,6 +391,7 @@ fn check_extension(name: &std::path::Path) -> Result<()> {
 
 /// The hex-encoded SHA-256 checksum of a document's `content`, as stored in
 /// its [`Metadata::checksum`].
+#[tracing::instrument(level = "debug", skip_all, fields(size = content.len()))]
 fn checksum(content: &[u8]) -> String {
     Sha256::digest(content)
         .iter()
@@ -396,6 +404,7 @@ fn checksum(content: &[u8]) -> String {
 /// name (the file name without extension), size and transcript. Its type,
 /// classification and attributes are left empty, for the upload request to
 /// fill in.
+#[tracing::instrument(level = "debug", skip(content, checksum), fields(size = content.len()))]
 fn parse_content(content: &[u8], original_name: &str, checksum: String) -> Result<Metadata> {
     let name = Path::new(original_name)
         .file_stem()
@@ -893,44 +902,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_pages_through_documents_previously_cached_locally() {
-        let (id_two, id_three) = (Uuid::now_v7(), Uuid::now_v7());
         let page = vec![
-            Document {
-                id: id_two,
-                content: Vec::new(),
-                metadata: Metadata {
-                    id: id_two,
-                    name: "two".to_string(),
-                    original_name: "two".to_string(),
-                    content_type: PDF_CONTENT_TYPE.to_string(),
-                    created_at: 1_700_000_001,
-                    size: 0,
-                    checksum: String::new(),
-                    transcript: String::new(),
-                    r#type: None,
-                    category: None,
-                    subcategory: None,
-                    attributes: BTreeMap::new(),
-                },
-            },
-            Document {
-                id: id_three,
-                content: Vec::new(),
-                metadata: Metadata {
-                    id: id_three,
-                    name: "three".to_string(),
-                    original_name: "three".to_string(),
-                    content_type: PDF_CONTENT_TYPE.to_string(),
-                    created_at: 1_700_000_002,
-                    size: 0,
-                    checksum: String::new(),
-                    transcript: String::new(),
-                    r#type: None,
-                    category: None,
-                    subcategory: None,
-                    attributes: BTreeMap::new(),
-                },
-            },
+            super::super::FakeMetadata::new().with_name("two").build(),
+            super::super::FakeMetadata::new().with_name("three").build(),
         ];
 
         let mut storage = MockStorage::new();
@@ -952,7 +926,7 @@ mod tests {
 
         assert_eq!(
             page.into_iter()
-                .map(|document| document.metadata.name)
+                .map(|metadata| metadata.name)
                 .collect::<Vec<_>>(),
             vec!["two", "three"]
         );
@@ -966,7 +940,7 @@ mod tests {
             created_until: Some(2),
             ..Default::default()
         };
-        let found = vec![super::super::FakeDocument::new().build()];
+        let found = vec![super::super::FakeMetadata::new().build()];
 
         let mut storage = MockStorage::new();
         let expected_filters = filters.clone();

@@ -264,6 +264,8 @@ impl Client {
 /// (bridged from the `log` crate as well as native `tracing` ones) are capped
 /// at WARN so their internals don't drown the SDK's logs, and `pdf_oxide` at
 /// ERROR since it warns about every slightly malformed PDF it extracts.
+/// Every span also logs its busy/idle time to the terminal when it closes, to
+/// show where time goes (e.g. `upload`'s PDF parsing, at DEBUG).
 /// Ignores the result: a subscriber may already be installed by the consuming
 /// binary or by a previous `Client::init` call, and a library must not panic
 /// over it.
@@ -272,6 +274,7 @@ fn install_tracing(
     on_log: Option<Arc<dyn Fn(LogLevel, String) + Send + Sync>>,
 ) {
     use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::fmt::format::FmtSpan;
     use tracing_subscriber::prelude::*;
     let level = LevelFilter::from(log_level);
     let filter = Targets::new()
@@ -281,7 +284,7 @@ fn install_tracing(
         .with_target("pdf_oxide", level.min(LevelFilter::ERROR));
     let callback_layer = on_log.map(|callback| CallbackLayer { callback });
     let _ = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_span_events(FmtSpan::CLOSE))
         .with(callback_layer)
         .with(filter)
         .try_init();
