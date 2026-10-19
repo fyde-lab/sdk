@@ -16,6 +16,9 @@ base64 = "0.22.1"
 # Cookie type `wry`'s `WebView::cookies`/`set_cookie` speak — must stay on the
 # same major version `wry` itself depends on.
 cookie = "0.18"
+# `tokio-console` instrumentation. Task data is only recorded when built with
+# `RUSTFLAGS="--cfg tokio_unstable"`.
+console-subscriber = "0.5.0"
 # Decodes `fyde.http` text bodies in their `charset` (`domains/scrapers/host/http.rs`'s
 # `decode_text`), the way `wreq::Response::text` would.
 encoding_rs = "0.8.41"
