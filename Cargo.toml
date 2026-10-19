@@ -79,6 +79,9 @@ thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt", "macros", "sync", "time", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["registry", "fmt"] }
+# `NormalizeEvent`: recovers the real target of records `tracing-subscriber`
+# bridges from the `log` crate (e.g. `pdf_oxide`'s), see `tools::log`.
+tracing-log = "0.2.0"
 # `tls-ring`/`tls-webpki-roots`: TLS for `https://` server URLs (see
 # `lazy_channel` in `src/lib.rs`), with Mozilla's root store bundled in
 # rather than read from the OS, which Android/iOS don't expose the same way
@@ -155,6 +158,8 @@ opt-level = 3
 # Only used to hand-build minimal PDF fixtures for `documents/transcript.rs`
 # tests; extraction itself uses `pdf_oxide` (a regular dependency).
 lopdf = "0.39"
+# Only used to hand-build a `log` record for `tools::log` tests.
+log = "0.4.34"
 mockall = "0.15.0"
 tempfile = "3.14.0"
 tokio = { version = "1.53.1", features = ["test-util", "rt-multi-thread", "net", "io-util"] }
