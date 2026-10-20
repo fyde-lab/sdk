@@ -1,5 +1,6 @@
 pub(crate) mod changelog;
 pub(crate) mod documents;
+pub(crate) mod icons;
 pub(crate) mod scrapers;
 pub(crate) mod scripts;
 pub(crate) mod secrets;

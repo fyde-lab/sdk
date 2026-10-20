@@ -14,6 +14,7 @@ pub use domains::documents::{
     SearchOrder, SearchQuery, Service as DocumentsService, SetAttributeRequest, Subcategory,
     UploadRequest,
 };
+pub use domains::icons::{Icon, Service as IconsService};
 pub use domains::scrapers::{
     HELPERS_LUA as SCRAPER_HELPERS_LUA, ProgressEvent, ProgressStep, Service as ScrapersService,
 };
@@ -96,6 +97,7 @@ pub struct ClientConfig {
 pub struct Client {
     attributes: Arc<dyn AttributesService>,
     documents: Arc<dyn DocumentsService>,
+    icons: Arc<dyn IconsService>,
     scrapers: Arc<dyn ScrapersService>,
     scripts: Arc<dyn ScriptsService>,
     server_state: Arc<dyn ServerStateService>,
@@ -131,11 +133,13 @@ impl Client {
         )
         .await
         .context("failed to initialize changelog service")?;
+        let icons = domains::icons::init(channel.clone(), sessions.clone(), sqlite.pool().clone());
         let scripts = domains::scripts::init(
             channel.clone(),
             sessions.clone(),
             sqlite.pool().clone(),
             changelog.clone(),
+            icons.clone(),
         );
         let usage = domains::usage::init(channel.clone(), sessions.clone());
         let attributes = domains::documents::attributes::init(channel.clone(), sessions.clone());
@@ -176,6 +180,7 @@ impl Client {
         Ok(Self {
             attributes,
             documents,
+            icons,
             scrapers,
             scripts,
             server_state,
@@ -215,6 +220,13 @@ impl Client {
     /// Returns a reference to the client's scripts service.
     pub fn scripts(&self) -> &dyn ScriptsService {
         self.scripts.as_ref()
+    }
+
+    /// Returns a reference to the client's icons service: the images shown
+    /// for other entities (e.g. [`ScriptMetadata::icon_id`]), cached
+    /// locally.
+    pub fn icons(&self) -> &dyn IconsService {
+        self.icons.as_ref()
     }
 
     /// Returns a reference to the client's usage service.
