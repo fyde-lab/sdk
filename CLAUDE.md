@@ -163,6 +163,9 @@ Non-domain helpers live in `src/tools/` (`log`, `sandbox`, `sql`, `testing`).
     `ProgressStep::user_message`, plus a matching variant in the application's bindings
     (`../application/sdkBridge/rust`).
   - `save_document` uploads via `documents::Service::upload`; `DuplicateDocument` is skipped.
+    `helpers.save_pdf` records each URL it saved from in `fyde.session.saved_urls`
+    (`helpers.already_saved`/`mark_saved`) and skips it on later runs without downloading,
+    unless called with `{ refresh = true }` (a fixed URL whose document changes).
   - `session/`, `cookies/`, `reports/` persist per scraper through a `StorageConfig`
     (`Sqlite` for a `Client`, `File` for `init_dev_scrapers`). `fyde.session` is saved even
     on failure; cookies only on success (a failed run deletes them).
