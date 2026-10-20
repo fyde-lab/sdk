@@ -54,7 +54,8 @@ mod tests {
     /// Stubs for `fyde.save_document` (recording each save into the global
     /// `saved`) and `fyde.log`, used by the helpers that save a document.
     const SAVE_STUBS: &str = "saved = {}
-        fyde.log = { warn = function() end }
+        fyde.session = {}
+        fyde.log = { debug = function() end, warn = function() end }
         fyde.save_document = function(name, _, fields)
           saved[#saved + 1] = { name = name, type = fields and fields.type }
         end";
@@ -294,6 +295,90 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(name, "a_b.pdf");
         assert_eq!(kind, "invoice");
+    }
+
+    /// Stub for `fyde.http.download` always returning a PDF, counting calls
+    /// in the global `downloads`.
+    const PDF_DOWNLOAD_STUB: &str = "downloads = 0
+        fyde.http = { download = function()
+          downloads = downloads + 1
+          return { status = 200, content_type = 'application/pdf', body = '%PDF-1.4' }
+        end }";
+
+    #[test]
+    fn save_pdf_skips_a_url_a_previous_run_already_saved() {
+        let lua = lua(&format!("{SAVE_STUBS}\n{PDF_DOWNLOAD_STUB}"));
+
+        let (first, second, downloads, count, recorded): (bool, bool, i64, i64, bool) = eval(
+            &lua,
+            r#"local h = fyde.helpers
+               local first = h.save_pdf("https://e/x.pdf", "x.pdf")
+               return first, h.save_pdf("https://e/x.pdf", "x.pdf"), downloads, #saved,
+                 fyde.session.saved_urls["https://e/x.pdf"]"#,
+        );
+
+        assert!(first);
+        assert!(second);
+        assert_eq!(downloads, 1);
+        assert_eq!(count, 1);
+        assert!(recorded);
+    }
+
+    #[test]
+    fn save_pdf_does_not_record_a_url_it_failed_to_save() {
+        let lua = lua(&format!(
+            "{SAVE_STUBS}
+             fyde.http = {{ download = function()
+               return {{ status = 500, content_type = 'text/html', body = '<html>' }}
+             end }}"
+        ));
+
+        let saved: bool = eval(
+            &lua,
+            r#"fyde.helpers.save_pdf("https://e/x.pdf", "x.pdf")
+               return fyde.helpers.already_saved("https://e/x.pdf")"#,
+        );
+
+        assert!(!saved);
+    }
+
+    #[test]
+    fn save_pdf_with_refresh_always_downloads_and_records_nothing() {
+        let lua = lua(&format!(
+            "{SAVE_STUBS}\n{PDF_DOWNLOAD_STUB}
+             fyde.session.saved_urls = {{ ['https://e/x.pdf'] = true }}"
+        ));
+
+        let (downloads, count): (i64, i64) = eval(
+            &lua,
+            r#"local h = fyde.helpers
+               h.save_pdf("https://e/x.pdf", "x.pdf", nil, nil, { refresh = true })
+               h.save_pdf("https://e/y.pdf", "y.pdf", nil, nil, { refresh = true })
+               return downloads, #saved"#,
+        );
+
+        assert_eq!(downloads, 2);
+        assert_eq!(count, 2);
+        assert!(!eval::<bool>(
+            &lua,
+            r#"return fyde.helpers.already_saved("https://e/y.pdf")"#
+        ));
+    }
+
+    #[test]
+    fn mark_saved_records_a_url_for_already_saved() {
+        let lua = lua("fyde.session = {}");
+
+        let (before, after): (bool, bool) = eval(
+            &lua,
+            r#"local h = fyde.helpers
+               local before = h.already_saved("https://e/x.pdf")
+               h.mark_saved("https://e/x.pdf")
+               return before, h.already_saved("https://e/x.pdf")"#,
+        );
+
+        assert!(!before);
+        assert!(after);
     }
 
     #[test]

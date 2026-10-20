@@ -165,13 +165,37 @@ local function json_or_nil(body)
   return nil
 end
 
+-- Saved-URL tracking: every URL a document was saved from is recorded in
+-- `fyde.session.saved_urls` (persisted with the rest of the session, even when the run fails
+-- later), so the next run can skip downloading it again.
+local function already_saved(url)
+  local saved = fyde.session.saved_urls
+  return saved ~= nil and saved[url] == true
+end
+
+local function mark_saved(url)
+  fyde.session.saved_urls = fyde.session.saved_urls or {}
+  fyde.session.saved_urls[url] = true
+end
+
 -- Downloads `url` and saves it as `filename` when it really is a PDF; returns true on success.
-local function save_pdf(url, filename, fields, headers)
+-- A URL a previous run already saved a document from is skipped without downloading (and
+-- counts as a success), unless `opts.refresh` is set: use it for a fixed URL whose document
+-- changes over time (e.g. a dated certificate).
+local function save_pdf(url, filename, fields, headers, opts)
+  local refresh = opts and opts.refresh
+  if not refresh and already_saved(url) then
+    fyde.log.debug("skipping " .. filename .. ": already saved by a previous run")
+    return true
+  end
   local resp = fyde.http.download(url, headers)
   local content_type = resp.content_type or ""
   local is_pdf = content_type:find("pdf", 1, true) or (resp.body or ""):sub(1, 4) == "%PDF"
   if resp.status == 200 and is_pdf then
     fyde.save_document(sanitize(filename), resp.body, fields)
+    if not refresh then
+      mark_saved(url)
+    end
     return true
   end
   fyde.log.warn(string.format("skipping %s (status %d, content-type %s)", filename, resp.status, content_type))
@@ -291,6 +315,8 @@ return {
   submit_form = submit_form,
   has = has,
   json_or_nil = json_or_nil,
+  already_saved = already_saved,
+  mark_saved = mark_saved,
   save_pdf = save_pdf,
   sleep = sleep,
   page_html = page_html,
