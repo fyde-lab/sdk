@@ -162,10 +162,12 @@ impl Script {
     }
 }
 
-/// Everything about a [`Script`] but its content ([`Script::script`]), as
-/// returned by [`super::Service::list_user_scripts`]/
+/// Everything about a [`Script`] but its content ([`Script::script`]) and
+/// icon ([`Script::icon`]), as returned by
+/// [`super::Service::list_user_scripts`]/
 /// [`super::Service::list_public_scripts`]. Fetch the script itself with
-/// [`super::Service::fetch_script`] to run it.
+/// [`super::Service::fetch_script`] to run it, and its icon with
+/// [`super::Service::fetch_script_icon`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptMetadata {
     pub(super) id: Uuid,
@@ -173,7 +175,6 @@ pub struct ScriptMetadata {
     pub(super) description: String,
     pub(super) short_description: String,
     pub(super) is_public: bool,
-    pub(super) icon: Vec<u8>,
     /// See [`Script::allowed_domains`].
     pub(super) allowed_domains: Vec<String>,
     pub(super) version: u64,
@@ -208,10 +209,6 @@ impl ScriptMetadata {
         self.is_public
     }
 
-    pub fn icon(&self) -> &[u8] {
-        &self.icon
-    }
-
     pub fn allowed_domains(&self) -> &[String] {
         &self.allowed_domains
     }
@@ -241,7 +238,6 @@ impl From<Script> for ScriptMetadata {
             description: script.description,
             short_description: script.short_description,
             is_public: script.is_public,
-            icon: script.icon,
             allowed_domains: script.allowed_domains,
             version: script.version,
             last_updated: script.last_updated,
