@@ -29,6 +29,12 @@ use proto::{
     scripts_service_client::ScriptsServiceClient as GeneratedScriptsClient,
 };
 
+/// How many scripts [`FydeClient::list_user_scripts`] and
+/// [`FydeClient::list_public_scripts`] ask the server for a page: its
+/// maximum, so the whole catalog usually comes back in a single call
+/// instead of one round trip per page of the server's default 20.
+const LISTING_PAGE_SIZE: u32 = 200;
+
 /// Every field a script is created or updated with, by name rather than as
 /// a long run of positional arguments — several of them are `String`s, so
 /// swapping two (say `description` and `short_description`) at a call site
@@ -82,8 +88,8 @@ pub(super) trait FydeClient: Send + Sync {
 
     /// Lists one page of the metadata of the scripts currently enabled for
     /// the authenticated user: the first one for a `None` `page_token`,
-    /// otherwise the one after the page that returned it. The page size is
-    /// left to the server's default.
+    /// otherwise the one after the page that returned it. Asks for
+    /// [`LISTING_PAGE_SIZE`] scripts a page.
     async fn list_user_scripts(&self, page_token: Option<String>) -> Result<ScriptMetadataPage>;
 
     /// Lists one page of the metadata of every script marked public,
@@ -234,7 +240,7 @@ impl FydeClient for GrpcClient {
         let request = self
             .sessions
             .authenticated_request(ListUserScriptsRequest {
-                page_size: 0,
+                page_size: LISTING_PAGE_SIZE,
                 page_token: page_token.unwrap_or_default(),
             })
             .await?;
@@ -253,7 +259,7 @@ impl FydeClient for GrpcClient {
         let request = self
             .sessions
             .authenticated_request(ListPublicScriptsRequest {
-                page_size: 0,
+                page_size: LISTING_PAGE_SIZE,
                 page_token: page_token.unwrap_or_default(),
             })
             .await?;
