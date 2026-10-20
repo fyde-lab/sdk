@@ -92,11 +92,7 @@ pub struct Script {
     pub(super) short_description: String,
     pub(super) is_public: bool,
     /// The id of the script's icon, fetched with
-    /// [`crate::IconsService::fetch_icon`]. `#[serde(default)]` so the
-    /// installed scripts persisted (and published in changelog events)
-    /// while the icon was embedded instead still deserialize, as having
-    /// none.
-    #[serde(default)]
+    /// [`crate::IconsService::fetch_icon`].
     pub(super) icon_id: Option<Uuid>,
     /// The only hosts (or subdomains of them) this script's `fyde.http`/
     /// `fyde.browser` calls may reach (see
@@ -183,7 +179,6 @@ pub struct ScriptMetadata {
     pub(super) short_description: String,
     pub(super) is_public: bool,
     /// See [`Script::icon_id`].
-    #[serde(default)]
     pub(super) icon_id: Option<Uuid>,
     /// See [`Script::allowed_domains`].
     pub(super) allowed_domains: Vec<String>,
