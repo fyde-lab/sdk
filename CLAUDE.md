@@ -92,7 +92,7 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
 `config.storage` (`Storage::Disk(dir)` → `<dir>/<client_name>/fyde.db`, `Storage::Memory`) and
 wires every domain. `client_name` must be a safe single path segment (`InvalidClientName`).
 Public accessors: `documents()`, `attributes()`, `users()`, `settings()`, `server_state()`,
-`scripts()`, `scrapers()`, `usage()`, `user_message(&err)`, `language()`, plus
+`scripts()`, `icons()`, `scrapers()`, `usage()`, `user_message(&err)`, `language()`, plus
 `save_new_session(token)`/`is_connected()` over the crate-private `sessions` domain.
 `ClientConfig` carries the caller's callbacks (`on_log`, `on_document_change`,
 `on_scraper_progress`, `on_scraper_question`).
@@ -146,7 +146,12 @@ Non-domain helpers live in `src/tools/` (`log`, `sandbox`, `sql`, `testing`).
   the `ExpiredSessionHandler` wipe runs on its own spawned task), `is_connected`.
 - **scripts** — server-side script CRUD and per-user enabling; `install_script` publishes an
   encrypted `InstallScript` event, and installed scripts are read from the local
-  `installed_scripts` table. `InMemoryScriptStorage` is a server-less `Service` for tooling.
+  `installed_scripts` table. A script carries only its `icon_id`: `create_script`/
+  `update_script` still take the icon's bytes and save them through `icons` first.
+  `InMemoryScriptStorage` is a server-less `Service` for tooling (it drops icons).
+- **icons** — read-through cache over the server's `icons.v1.IconsService`: `fetch_icon(id)`
+  serves the local `icons` table, else fetches and caches (icons never change, so never
+  revalidated); `create_icon` uploads then caches.
 - **settings** (public key/value, non-secret), **server_state** (gRPC health; never fails),
   **usage** (`get_usage`, plan limits + current usage; never cached).
 - **scrapers** — runs Lua scripts that log into third-party sites. Contract: the script

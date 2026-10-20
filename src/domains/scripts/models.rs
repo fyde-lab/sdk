@@ -91,7 +91,13 @@ pub struct Script {
     pub(super) description: String,
     pub(super) short_description: String,
     pub(super) is_public: bool,
-    pub(super) icon: Vec<u8>,
+    /// The id of the script's icon, fetched with
+    /// [`crate::IconsService::fetch_icon`]. `#[serde(default)]` so the
+    /// installed scripts persisted (and published in changelog events)
+    /// while the icon was embedded instead still deserialize, as having
+    /// none.
+    #[serde(default)]
+    pub(super) icon_id: Option<Uuid>,
     /// The only hosts (or subdomains of them) this script's `fyde.http`/
     /// `fyde.browser` calls may reach (see
     /// `../scrapers/host/mod.rs::is_host_allowed`). Empty blocks every
@@ -133,8 +139,10 @@ impl Script {
         self.is_public
     }
 
-    pub fn icon(&self) -> &[u8] {
-        &self.icon
+    /// The id of the script's icon, to fetch with
+    /// [`crate::IconsService::fetch_icon`], `None` if it has none.
+    pub fn icon_id(&self) -> Option<Uuid> {
+        self.icon_id
     }
 
     pub fn allowed_domains(&self) -> &[String] {
@@ -162,12 +170,11 @@ impl Script {
     }
 }
 
-/// Everything about a [`Script`] but its content ([`Script::script`]) and
-/// icon ([`Script::icon`]), as returned by
-/// [`super::Service::list_user_scripts`]/
+/// Everything about a [`Script`] but its content ([`Script::script`]), as
+/// returned by [`super::Service::list_user_scripts`]/
 /// [`super::Service::list_public_scripts`]. Fetch the script itself with
 /// [`super::Service::fetch_script`] to run it, and its icon with
-/// [`super::Service::fetch_script_icon`].
+/// [`crate::IconsService::fetch_icon`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptMetadata {
     pub(super) id: Uuid,
@@ -175,6 +182,9 @@ pub struct ScriptMetadata {
     pub(super) description: String,
     pub(super) short_description: String,
     pub(super) is_public: bool,
+    /// See [`Script::icon_id`].
+    #[serde(default)]
+    pub(super) icon_id: Option<Uuid>,
     /// See [`Script::allowed_domains`].
     pub(super) allowed_domains: Vec<String>,
     pub(super) version: u64,
@@ -209,6 +219,11 @@ impl ScriptMetadata {
         self.is_public
     }
 
+    /// See [`Script::icon_id`].
+    pub fn icon_id(&self) -> Option<Uuid> {
+        self.icon_id
+    }
+
     pub fn allowed_domains(&self) -> &[String] {
         &self.allowed_domains
     }
@@ -238,6 +253,7 @@ impl From<Script> for ScriptMetadata {
             description: script.description,
             short_description: script.short_description,
             is_public: script.is_public,
+            icon_id: script.icon_id,
             allowed_domains: script.allowed_domains,
             version: script.version,
             last_updated: script.last_updated,
@@ -304,7 +320,7 @@ impl FakeScript {
                 description: crate::tools::testing::random_word().to_string(),
                 short_description: crate::tools::testing::random_word().to_string(),
                 is_public: false,
-                icon: crate::tools::testing::random_bytes(16),
+                icon_id: Some(Uuid::now_v7()),
                 allowed_domains: Vec::new(),
                 version: 1,
                 script: "return 1 + 1".to_string(),
@@ -313,6 +329,11 @@ impl FakeScript {
                 parameters: HashMap::new(),
             },
         }
+    }
+
+    pub fn with_icon_id(mut self, icon_id: Option<Uuid>) -> Self {
+        self.script.icon_id = icon_id;
+        self
     }
 
     pub fn with_script(mut self, script: &str) -> Self {

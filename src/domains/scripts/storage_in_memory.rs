@@ -19,7 +19,9 @@ use super::{InstallScriptRequest, InstalledScript};
 /// server. State doesn't survive past the process's lifetime.
 /// With no changelog to publish through, [`Service::install_script`] saves
 /// the installation directly, so it shows up in
-/// [`Service::list_installed_scripts`] immediately.
+/// [`Service::list_installed_scripts`] immediately. With no icons service
+/// either, it keeps no icons: every script it holds has no
+/// [`Script::icon_id`], whatever `icon` it was created or updated with.
 #[derive(Default)]
 pub struct InMemoryScriptStorage {
     scripts: Mutex<HashMap<Uuid, Script>>,
@@ -39,7 +41,7 @@ impl Service for InMemoryScriptStorage {
         &self,
         name: &str,
         is_public: bool,
-        icon: Vec<u8>,
+        _icon: Vec<u8>,
         script: &str,
         description: &str,
         short_description: &str,
@@ -53,7 +55,7 @@ impl Service for InMemoryScriptStorage {
             description: description.to_string(),
             short_description: short_description.to_string(),
             is_public,
-            icon,
+            icon_id: None,
             allowed_domains,
             version: 1,
             script: script.to_string(),
@@ -79,16 +81,12 @@ impl Service for InMemoryScriptStorage {
             .ok_or(ErrorKind::ScriptNotFound(id).into())
     }
 
-    async fn fetch_script_icon(&self, id: Uuid) -> Result<Vec<u8>> {
-        Ok(self.fetch_script(id).await?.icon)
-    }
-
     async fn update_script(
         &self,
         id: Uuid,
         name: &str,
         is_public: bool,
-        icon: Vec<u8>,
+        _icon: Vec<u8>,
         script: &str,
         description: &str,
         short_description: &str,
@@ -106,7 +104,7 @@ impl Service for InMemoryScriptStorage {
             description: description.to_string(),
             short_description: short_description.to_string(),
             is_public,
-            icon,
+            icon_id: None,
             allowed_domains,
             version: existing.version + 1,
             script: script.to_string(),
@@ -249,29 +247,6 @@ mod tests {
         let fetched = storage.fetch_script(created.id).await.unwrap();
 
         assert_eq!(fetched, created);
-    }
-
-    #[tokio::test]
-    async fn fetches_a_previously_created_scripts_icon() {
-        let storage = InMemoryScriptStorage::new();
-        let created = storage
-            .create_script(
-                "example",
-                true,
-                vec![1, 2, 3],
-                "return 1",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
-
-        let icon = storage.fetch_script_icon(created.id).await.unwrap();
-
-        assert_eq!(icon, vec![1, 2, 3]);
     }
 
     #[tokio::test]

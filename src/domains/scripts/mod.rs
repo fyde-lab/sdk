@@ -32,6 +32,7 @@ pub use models::{
 
 use crate::Result;
 use crate::domains::changelog::Service as ChangelogService;
+use crate::domains::icons::Service as IconsService;
 use crate::domains::sessions::SessionsClient;
 
 /// Manages user-authored scripts against the fyde server's scripts service
@@ -46,6 +47,9 @@ use crate::domains::sessions::SessionsClient;
 #[async_trait]
 pub trait Service: Send + Sync {
     /// Creates a new script owned by the authenticated user, at version 1.
+    /// A non-empty `icon` (an encoded image) is first saved through
+    /// [`crate::IconsService::create_icon`], and the script created with
+    /// its id (see [`Script::icon_id`]); an empty one means no icon.
     #[allow(clippy::too_many_arguments)]
     async fn create_script(
         &self,
@@ -63,14 +67,9 @@ pub trait Service: Send + Sync {
     /// Fetches the script matching `id`.
     async fn fetch_script(&self, id: Uuid) -> Result<Script>;
 
-    /// Fetches the icon of the script matching `id` (an encoded image,
-    /// empty if it has none), which [`Self::list_user_scripts`]/
-    /// [`Self::list_public_scripts`] leave out of their [`ScriptMetadata`].
-    async fn fetch_script_icon(&self, id: Uuid) -> Result<Vec<u8>>;
-
     /// Updates a script owned by the authenticated user, incrementing its
     /// version. Fails if the script doesn't exist or the authenticated user
-    /// isn't its owner.
+    /// isn't its owner. `icon` is saved like [`Self::create_script`] does.
     #[allow(clippy::too_many_arguments)]
     async fn update_script(
         &self,
@@ -97,15 +96,16 @@ pub trait Service: Send + Sync {
     /// Lists the metadata of the scripts currently enabled for the
     /// authenticated user, most recently enabled first, fetching every page
     /// of the server's paginated listing. Fetch a script with
-    /// [`Self::fetch_script`] for its content, and
-    /// [`Self::fetch_script_icon`] for its icon.
+    /// [`Self::fetch_script`] for its content, and its icon (by
+    /// [`ScriptMetadata::icon_id`]) with [`crate::IconsService::fetch_icon`].
     async fn list_user_scripts(&self) -> Result<Vec<ScriptMetadata>>;
 
     /// Lists the metadata of every script marked public, regardless of who
     /// owns it or whether the authenticated user has it enabled, most
     /// recently updated first, fetching every page of the server's
     /// paginated listing. Fetch a script with [`Self::fetch_script`] for its
-    /// content, and [`Self::fetch_script_icon`] for its icon.
+    /// content, and its icon (by [`ScriptMetadata::icon_id`]) with
+    /// [`crate::IconsService::fetch_icon`].
     async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>>;
 
     /// Installs the script `request.script_id` for the authenticated user,
@@ -138,16 +138,19 @@ pub trait Service: Send + Sync {
 /// service over the shared `channel` connection, authenticating every call
 /// via `sessions`, publishes script installations through `changelog`, and
 /// reads installed scripts back from the local SQLite database (`pool`)
-/// the changelog materializes them into.
+/// the changelog materializes them into, and saves scripts' icons through
+/// `icons`.
 pub(crate) fn init(
     channel: Channel,
     sessions: Arc<SessionsClient>,
     pool: SqlitePool,
     changelog: Arc<dyn ChangelogService>,
+    icons: Arc<dyn IconsService>,
 ) -> Arc<dyn Service> {
     Arc::new(service::ScriptsClient::new(
         grpc_client::GrpcClient::new(channel, sessions),
         SqliteStorage::new(pool),
         changelog,
+        icons,
     ))
 }

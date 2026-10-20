@@ -24,8 +24,8 @@ mod proto {
 }
 
 use proto::{
-    CreateScriptRequest, DisableScriptRequest, EnableScriptRequest, FetchScriptIconRequest,
-    FetchScriptRequest, ListPublicScriptsRequest, ListUserScriptsRequest, UpdateScriptRequest,
+    CreateScriptRequest, DisableScriptRequest, EnableScriptRequest, FetchScriptRequest,
+    ListPublicScriptsRequest, ListUserScriptsRequest, UpdateScriptRequest,
     scripts_service_client::ScriptsServiceClient as GeneratedScriptsClient,
 };
 
@@ -37,7 +37,8 @@ use proto::{
 pub(super) struct ScriptDraft {
     pub(super) name: String,
     pub(super) is_public: bool,
-    pub(super) icon: Vec<u8>,
+    /// An icon created beforehand with [`crate::IconsService::create_icon`].
+    pub(super) icon_id: Option<Uuid>,
     pub(super) script: String,
     pub(super) description: String,
     pub(super) short_description: String,
@@ -68,9 +69,6 @@ pub(super) trait FydeClient: Send + Sync {
 
     /// Fetches the script matching `id`.
     async fn fetch_script(&self, id: Uuid) -> Result<Script>;
-
-    /// Fetches the icon of the script matching `id`, empty if it has none.
-    async fn fetch_script_icon(&self, id: Uuid) -> Result<Vec<u8>>;
 
     /// Updates a script owned by the authenticated user, incrementing its
     /// version.
@@ -131,7 +129,7 @@ impl FydeClient for GrpcClient {
             .authenticated_request(CreateScriptRequest {
                 name: draft.name,
                 is_public: draft.is_public,
-                icon: draft.icon,
+                icon_id: icon_id_into_proto(draft.icon_id),
                 script: draft.script,
                 description: draft.description,
                 short_description: draft.short_description,
@@ -171,22 +169,6 @@ impl FydeClient for GrpcClient {
         })?)
     }
 
-    async fn fetch_script_icon(&self, id: Uuid) -> Result<Vec<u8>> {
-        let request = self
-            .sessions
-            .authenticated_request(FetchScriptIconRequest { id: id.to_string() })
-            .await?;
-
-        let response = self
-            .sessions
-            .check_response(self.client().fetch_script_icon(request).await)
-            .await
-            .with_context(|| format!("failed to fetch icon of script {id}"))?
-            .into_inner();
-
-        Ok(response.icon)
-    }
-
     async fn update_script(&self, id: Uuid, draft: ScriptDraft) -> Result<Script> {
         let request = self
             .sessions
@@ -194,7 +176,7 @@ impl FydeClient for GrpcClient {
                 id: id.to_string(),
                 name: draft.name,
                 is_public: draft.is_public,
-                icon: draft.icon,
+                icon_id: icon_id_into_proto(draft.icon_id),
                 script: draft.script,
                 description: draft.description,
                 short_description: draft.short_description,
@@ -347,6 +329,23 @@ fn parameters_into_proto(
         .collect()
 }
 
+/// An optional icon id as a request carries it: empty for none.
+fn icon_id_into_proto(icon_id: Option<Uuid>) -> String {
+    icon_id.map(|id| id.to_string()).unwrap_or_default()
+}
+
+/// Parses an icon id as the server returns it: empty for none.
+fn icon_id_into_domain(icon_id: &str) -> Result<Option<Uuid>> {
+    if icon_id.is_empty() {
+        return Ok(None);
+    }
+
+    icon_id
+        .parse()
+        .map(Some)
+        .context("failed to parse icon id returned by the server")
+}
+
 /// Converts a generated `proto::Script` into the domain [`Script`] type,
 /// parsing its canonical UUIDv7 string id and its `type` string.
 fn into_domain(script: proto::Script) -> Result<Script> {
@@ -359,7 +358,7 @@ fn into_domain(script: proto::Script) -> Result<Script> {
         description: script.description,
         short_description: script.short_description,
         is_public: script.is_public,
-        icon: script.icon,
+        icon_id: icon_id_into_domain(&script.icon_id)?,
         allowed_domains: script.allowed_domains,
         version: script.version,
         script: script.script,
@@ -400,6 +399,7 @@ fn metadata_into_domain(metadata: proto::ScriptMetadata) -> Result<ScriptMetadat
         description: metadata.description,
         short_description: metadata.short_description,
         is_public: metadata.is_public,
+        icon_id: icon_id_into_domain(&metadata.icon_id)?,
         allowed_domains: metadata.allowed_domains,
         version: metadata.version,
         last_updated: metadata.last_updated,
@@ -435,5 +435,18 @@ mod tests {
         let err = grpc.list_user_scripts(None).await.unwrap_err();
 
         assert!(err.has_context());
+    }
+
+    #[test]
+    fn icon_ids_round_trip_with_empty_meaning_none() {
+        let id = Uuid::new_v4();
+
+        assert_eq!(icon_id_into_proto(None), "");
+        assert_eq!(icon_id_into_domain("").unwrap(), None);
+        assert_eq!(
+            icon_id_into_domain(&icon_id_into_proto(Some(id))).unwrap(),
+            Some(id)
+        );
+        assert!(icon_id_into_domain("not-a-uuid").is_err());
     }
 }
