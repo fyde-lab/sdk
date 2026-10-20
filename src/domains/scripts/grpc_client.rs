@@ -24,8 +24,8 @@ mod proto {
 }
 
 use proto::{
-    CreateScriptRequest, DisableScriptRequest, EnableScriptRequest, FetchScriptRequest,
-    ListPublicScriptsRequest, ListUserScriptsRequest, UpdateScriptRequest,
+    CreateScriptRequest, DisableScriptRequest, EnableScriptRequest, FetchScriptIconRequest,
+    FetchScriptRequest, ListPublicScriptsRequest, ListUserScriptsRequest, UpdateScriptRequest,
     scripts_service_client::ScriptsServiceClient as GeneratedScriptsClient,
 };
 
@@ -68,6 +68,9 @@ pub(super) trait FydeClient: Send + Sync {
 
     /// Fetches the script matching `id`.
     async fn fetch_script(&self, id: Uuid) -> Result<Script>;
+
+    /// Fetches the icon of the script matching `id`, empty if it has none.
+    async fn fetch_script_icon(&self, id: Uuid) -> Result<Vec<u8>>;
 
     /// Updates a script owned by the authenticated user, incrementing its
     /// version.
@@ -166,6 +169,22 @@ impl FydeClient for GrpcClient {
         into_domain(response.script.ok_or_else(|| {
             crate::ErrorKind::InvalidResponse("fetch script response had no script".to_string())
         })?)
+    }
+
+    async fn fetch_script_icon(&self, id: Uuid) -> Result<Vec<u8>> {
+        let request = self
+            .sessions
+            .authenticated_request(FetchScriptIconRequest { id: id.to_string() })
+            .await?;
+
+        let response = self
+            .sessions
+            .check_response(self.client().fetch_script_icon(request).await)
+            .await
+            .with_context(|| format!("failed to fetch icon of script {id}"))?
+            .into_inner();
+
+        Ok(response.icon)
     }
 
     async fn update_script(&self, id: Uuid, draft: ScriptDraft) -> Result<Script> {
@@ -381,7 +400,6 @@ fn metadata_into_domain(metadata: proto::ScriptMetadata) -> Result<ScriptMetadat
         description: metadata.description,
         short_description: metadata.short_description,
         is_public: metadata.is_public,
-        icon: metadata.icon,
         allowed_domains: metadata.allowed_domains,
         version: metadata.version,
         last_updated: metadata.last_updated,

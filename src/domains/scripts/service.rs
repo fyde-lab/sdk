@@ -90,6 +90,10 @@ impl<S: Storage> Service for ScriptsClient<S> {
         self.grpc.fetch_script(id).await
     }
 
+    async fn fetch_script_icon(&self, id: Uuid) -> Result<Vec<u8>> {
+        self.grpc.fetch_script_icon(id).await
+    }
+
     async fn update_script(
         &self,
         id: Uuid,
@@ -506,6 +510,24 @@ mod tests {
         let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         assert_eq!(client.fetch_script(id).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn fetch_script_icon_delegates_to_grpc() {
+        let id = Uuid::now_v7();
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_fetch_script_icon()
+            .withf(move |requested_id| *requested_id == id)
+            .times(1)
+            .returning(|_| Ok(b"icon-bytes".to_vec()));
+
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
+
+        assert_eq!(
+            client.fetch_script_icon(id).await.unwrap(),
+            b"icon-bytes".to_vec()
+        );
     }
 
     #[tokio::test]

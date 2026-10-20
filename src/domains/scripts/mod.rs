@@ -63,6 +63,11 @@ pub trait Service: Send + Sync {
     /// Fetches the script matching `id`.
     async fn fetch_script(&self, id: Uuid) -> Result<Script>;
 
+    /// Fetches the icon of the script matching `id` (an encoded image,
+    /// empty if it has none), which [`Self::list_user_scripts`]/
+    /// [`Self::list_public_scripts`] leave out of their [`ScriptMetadata`].
+    async fn fetch_script_icon(&self, id: Uuid) -> Result<Vec<u8>>;
+
     /// Updates a script owned by the authenticated user, incrementing its
     /// version. Fails if the script doesn't exist or the authenticated user
     /// isn't its owner.
@@ -92,14 +97,15 @@ pub trait Service: Send + Sync {
     /// Lists the metadata of the scripts currently enabled for the
     /// authenticated user, most recently enabled first, fetching every page
     /// of the server's paginated listing. Fetch a script with
-    /// [`Self::fetch_script`] for its content.
+    /// [`Self::fetch_script`] for its content, and
+    /// [`Self::fetch_script_icon`] for its icon.
     async fn list_user_scripts(&self) -> Result<Vec<ScriptMetadata>>;
 
     /// Lists the metadata of every script marked public, regardless of who
     /// owns it or whether the authenticated user has it enabled, most
     /// recently updated first, fetching every page of the server's
     /// paginated listing. Fetch a script with [`Self::fetch_script`] for its
-    /// content.
+    /// content, and [`Self::fetch_script_icon`] for its icon.
     async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>>;
 
     /// Installs the script `request.script_id` for the authenticated user,

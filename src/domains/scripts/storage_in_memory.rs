@@ -79,6 +79,10 @@ impl Service for InMemoryScriptStorage {
             .ok_or(ErrorKind::ScriptNotFound(id).into())
     }
 
+    async fn fetch_script_icon(&self, id: Uuid) -> Result<Vec<u8>> {
+        Ok(self.fetch_script(id).await?.icon)
+    }
+
     async fn update_script(
         &self,
         id: Uuid,
@@ -245,6 +249,29 @@ mod tests {
         let fetched = storage.fetch_script(created.id).await.unwrap();
 
         assert_eq!(fetched, created);
+    }
+
+    #[tokio::test]
+    async fn fetches_a_previously_created_scripts_icon() {
+        let storage = InMemoryScriptStorage::new();
+        let created = storage
+            .create_script(
+                "example",
+                true,
+                vec![1, 2, 3],
+                "return 1",
+                "",
+                "",
+                Vec::new(),
+                ScriptType::Scraper,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let icon = storage.fetch_script_icon(created.id).await.unwrap();
+
+        assert_eq!(icon, vec![1, 2, 3]);
     }
 
     #[tokio::test]
