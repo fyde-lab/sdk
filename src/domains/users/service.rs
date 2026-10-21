@@ -18,9 +18,38 @@ use super::crypto::{
 };
 use super::grpc_client::{FinishedLogin, FydeClient, GrpcClient};
 use super::{
-    LANGUAGE_SETTING, LoginOutcome, OpenSession, ROLE_SETTING, Role, Service, decode_master_key,
-    encode_master_key,
+    LANGUAGE_SETTING, LoginOutcome, OpenSession, PasswordAnalysis, PasswordStrength, ROLE_SETTING,
+    Role, Service, decode_master_key, encode_master_key,
 };
+
+/// Rates `password` with `passwd-strength`. Only its score and label are
+/// kept: the crate's patterns and suggestions are English-only prose, unfit
+/// for a UI in another language. Its `length` counts bytes, so the
+/// character count is taken here instead.
+fn analyze_password(password: &str) -> PasswordAnalysis {
+    let analysis = passwd_strength::analyze(password);
+    PasswordAnalysis {
+        score: analysis.score,
+        strength: match analysis.strength {
+            passwd_strength::Strength::Weak => PasswordStrength::Weak,
+            passwd_strength::Strength::Fair => PasswordStrength::Fair,
+            passwd_strength::Strength::Strong => PasswordStrength::Strong,
+            passwd_strength::Strength::VeryStrong => PasswordStrength::VeryStrong,
+        },
+        length: u32::try_from(password.chars().count()).unwrap_or(u32::MAX),
+    }
+}
+
+/// Refuses a new password [`analyze_password`] rates
+/// [`PasswordStrength::Weak`].
+fn ensure_strong_enough(password: &str) -> Result<()> {
+    let analysis = analyze_password(password);
+    if analysis.is_accepted() {
+        Ok(())
+    } else {
+        Err(ErrorKind::WeakPassword(analysis.score).into())
+    }
+}
 
 /// How long `logout` waits for the server to acknowledge closing the
 /// session before giving up on it and clearing local state anyway — an
@@ -221,6 +250,7 @@ impl Service for UsersClient {
         device_name: &str,
         allow_insecure_storage: bool,
     ) -> Result<String> {
+        ensure_strong_enough(password).context("refused the new account's password")?;
         self.ensure_no_open_session().await?;
         let location = self.secret_location(allow_insecure_storage).await?;
 
@@ -354,6 +384,7 @@ impl Service for UsersClient {
         old_password: &str,
         new_password: &str,
     ) -> Result<()> {
+        ensure_strong_enough(new_password).context("refused the new password")?;
         // Verifying `old_password` only needs the local half of an OPAQUE
         // login exchange: `finish_login` fails with
         // `ErrorKind::InvalidCredentials` if it can't open the account's
@@ -413,6 +444,10 @@ impl Service for UsersClient {
             .context("failed to finish change password")?;
 
         Ok(())
+    }
+
+    fn analyze_password(&self, password: &str) -> PasswordAnalysis {
+        analyze_password(password)
     }
 
     async fn list_sessions(&self) -> Result<Vec<OpenSession>> {
@@ -1231,6 +1266,67 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err.kind(), ErrorKind::AlreadyLoggedIn));
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_weak_password_before_anything_else() {
+        // No expectations on any mock, not even the open-session check:
+        // the password is refused first.
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            MockSecretsService::new(),
+        );
+
+        let err = client
+            .create("bob", "qwerty", "device", false)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err.kind(), ErrorKind::WeakPassword(_)));
+    }
+
+    #[tokio::test]
+    async fn change_password_refuses_a_weak_new_password_before_checking_the_old_one() {
+        // No `MockOpaqueClient` expectations: the old password is never
+        // verified, and nothing reaches the server.
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            MockSecretsService::new(),
+        );
+
+        let err = client
+            .change_password("alice", "correct horse battery staple", "qwerty")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err.kind(), ErrorKind::WeakPassword(_)));
+    }
+
+    #[test]
+    fn analyze_password_refuses_common_and_short_passwords() {
+        for password in ["", "abc", "qwerty", "12345678"] {
+            let analysis = analyze_password(password);
+            assert_eq!(analysis.strength(), PasswordStrength::Weak, "{password:?}");
+            assert!(!analysis.is_accepted(), "{password:?}");
+        }
+    }
+
+    #[test]
+    fn analyze_password_accepts_long_mixed_passwords() {
+        let analysis = analyze_password("correct horse battery staple");
+
+        assert_eq!(analysis.strength(), PasswordStrength::VeryStrong);
+        assert!(analysis.is_accepted());
+        assert!(analysis.score() >= 75);
+    }
+
+    #[test]
+    fn analyze_password_counts_characters_not_bytes() {
+        assert_eq!(analyze_password("éléphant").length(), 8);
     }
 
     /// A [`MockSecretsService`] with no session open, on a device whose OS

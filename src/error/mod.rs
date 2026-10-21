@@ -103,6 +103,10 @@ macro_rules! for_each_error_code {
             /// revoked or otherwise invalid), so the SDK logged the user out
             /// locally: they must log in again.
             SessionExpired = 3003,
+            /// A new password (at `UsersService::create` or
+            /// `change_password`) is too easy to guess: its
+            /// `UsersService::analyze_password` strength is `Weak`.
+            WeakPassword = 3004,
             /// The document's file type isn't supported.
             UnsupportedDocumentExtension = 4001,
             /// A PDF document couldn't be read.
@@ -263,6 +267,8 @@ pub(crate) enum ErrorKind {
     InvalidCredentials,
     #[error("a session is already open on this device; log out first")]
     AlreadyLoggedIn,
+    #[error("the new password is too weak (score {0}/100)")]
+    WeakPassword(u8),
     /// Not `#[from]`: a plain [`tonic::Status`] converts to
     /// [`ErrorKind::Grpc`]; only `sessions::Service::check_response` decides
     /// a rejection means the session itself is gone.
@@ -316,6 +322,7 @@ impl ErrorKind {
             ErrorKind::Encryption(_) => ErrorCode::Encryption,
             ErrorKind::InvalidCredentials => ErrorCode::InvalidCredentials,
             ErrorKind::AlreadyLoggedIn => ErrorCode::AlreadyLoggedIn,
+            ErrorKind::WeakPassword(_) => ErrorCode::WeakPassword,
             ErrorKind::SessionExpired(_) => ErrorCode::SessionExpired,
             ErrorKind::Keystore(_) => ErrorCode::CredentialStore,
             ErrorKind::SecureStorageUnavailable => ErrorCode::SecureStorageUnavailable,

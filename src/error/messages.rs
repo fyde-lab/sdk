@@ -153,6 +153,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "Your session has expired. Please log in again.",
             "Votre session a expiré. Veuillez vous reconnecter.",
         ),
+        ErrorCode::WeakPassword => (
+            "This password is too easy to guess. Make it longer, or mix letters, digits and symbols.",
+            "Ce mot de passe est trop facile à deviner. Allongez-le, ou mélangez lettres, chiffres et symboles.",
+        ),
         ErrorCode::UnsupportedDocumentExtension => (
             "This file type isn't supported. Only PDF files can be added.",
             "Ce type de fichier n'est pas pris en charge. Seuls les fichiers PDF peuvent être ajoutés.",

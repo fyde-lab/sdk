@@ -25,7 +25,10 @@ pub use domains::scripts::{
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
 pub use domains::usage::{Service as UsageService, Usage};
-pub use domains::users::{LoginOutcome, OpenSession, Service as UsersService, system_language};
+pub use domains::users::{
+    LoginOutcome, OpenSession, PasswordAnalysis, PasswordStrength, Service as UsersService,
+    system_language,
+};
 pub use tools::log::LogLevel;
 
 use domains::secrets::SecretLocation;
