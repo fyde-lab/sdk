@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use std::sync::Mutex;
 
@@ -158,6 +158,19 @@ impl SqliteClient {
 
         Ok(())
     }
+}
+
+/// Every file SQLite keeps for the database at `path`: the database itself
+/// and the journal files it creates beside it (`-wal`/`-shm` in WAL mode,
+/// sqlx's default, or a rollback `-journal`).
+pub(crate) fn database_files(path: &Path) -> Vec<PathBuf> {
+    let mut files = vec![path.to_path_buf()];
+    files.extend(["-wal", "-shm", "-journal"].into_iter().map(|suffix| {
+        let mut file = path.as_os_str().to_os_string();
+        file.push(suffix);
+        PathBuf::from(file)
+    }));
+    files
 }
 
 /// Creates the database file at `path` (if it doesn't exist yet) readable

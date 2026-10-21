@@ -14,6 +14,7 @@ use crate::domains::documents::Service as DocumentsService;
 use crate::domains::secrets::Service as SecretsService;
 use crate::domains::sessions::{ExpiredSessionHandler, Service as _, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
+use crate::tools::client_dir::LocalFiles;
 use crate::tools::sql::LocalDatabase;
 use crate::{ErrorContext as _, Result};
 
@@ -360,7 +361,8 @@ pub trait Service: Send + Sync {
 /// persist the account's master key, and `sessions` the session token (read
 /// back by every other service's gRPC transport to authenticate their own
 /// calls); `settings` holds the cached role and language preference.
-/// `secrets` is cleared and `local_db` wiped by `logout`. `documents`'
+/// `secrets` is cleared, `local_db` wiped and `local_files` deleted by
+/// `logout`. `documents`'
 /// [`DocumentsService::start_sync`] is called by `create`/`login` once a
 /// session is open, and [`DocumentsService::stop_sync`] is called by
 /// `logout` to stop that consumption again. The returned service is also
@@ -372,6 +374,7 @@ pub(crate) async fn init(
     secrets: Arc<dyn SecretsService>,
     sessions: Arc<SessionsClient>,
     local_db: Arc<dyn LocalDatabase>,
+    local_files: Arc<dyn LocalFiles>,
     documents: Arc<dyn DocumentsService>,
 ) -> Result<Arc<dyn Service>> {
     let users = Arc::new(
@@ -381,6 +384,7 @@ pub(crate) async fn init(
             secrets,
             sessions.clone(),
             local_db,
+            local_files,
             documents,
         )
         .await?,

@@ -53,7 +53,10 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   `logout`). That's what turns a rejected token into `ErrorCode::SessionExpired` + local wipe.
 - A new secret must be added to `secrets::ALL_SECRETS`, or logout leaves it behind. Secrets
   (master key, session token) never go in the `settings` table.
-- `logout` always clears secrets and wipes the database, whether or not the server answers.
+- `logout` always clears secrets, wipes the database and deletes every other file in the
+  client's directory (`tools::client_dir`; only the open database's files and the changelog
+  lock stay), whether or not the server answers. Anything a domain writes to disk must live
+  in that directory, or logout leaves it behind.
 - Every Lua VM is built with `tools::sandbox::new_vm` and scripts loaded with
   `sandbox::load_source` — never `Lua::new*` / `lua.load` (that would run precompiled bytecode).
 - Scraper debug reports never record request headers, request/download bodies or form values;
@@ -69,7 +72,7 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   Configure each mock inside its test with exactly the expected calls (an unexpected call
   panicking is often the assertion) — no shared fake-storage builders. A small inline
   `Arc<Mutex<_>>` capture is fine when a test must read back a generated value.
-- Exceptions, which test real adapters: `grpc_client.rs`, `crypto.rs`, `tools/sql/sqlite.rs`,
+- Exceptions, which test real adapters: `grpc_client.rs`, `crypto.rs`, `tools/sql/sqlite.rs`, `tools/client_dir.rs`,
   `storage_sqlite.rs` files, `secrets/storage_keystore.rs` (keyring's in-memory mock),
   `changelog/storage_settings.rs`. `changelog::Service` can't be automocked (its
   `start_consume_job` takes a boxed `FnMut`), so use the hand-written `RecordingChangelog`-style
@@ -100,7 +103,7 @@ Public accessors: `documents()`, `attributes()`, `users()`, `settings()`, `serve
 New server services follow the same pattern: a module under `src/domains/` with `mod.rs`
 (the `Service` trait, methods take `&self` so it can live behind `Arc<dyn Service>`),
 `models.rs` (plain structs), `service.rs`, and adapters; wired into `Client::init`.
-Non-domain helpers live in `src/tools/` (`log`, `sandbox`, `sql`, `testing`).
+Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, `testing`).
 
 ### Domains (`src/domains/`)
 
