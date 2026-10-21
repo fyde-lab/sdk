@@ -151,7 +151,9 @@ Non-domain helpers live in `src/tools/` (`log`, `sandbox`, `sql`, `testing`).
   `InMemoryScriptStorage` is a server-less `Service` for tooling (it drops icons).
 - **icons** — read-through cache over the server's `icons.v1.IconsService`: `fetch_icon(id)`
   serves the local `icons` table, else fetches and caches (icons never change, so never
-  revalidated); `create_icon` uploads then caches.
+  revalidated); `create_icon` uploads (through the admin-only `IconsAdminService`: fails with
+  `PERMISSION_DENIED` for a non-admin, so only admins can save a script with an icon) then
+  caches.
 - **settings** (public key/value, non-secret), **server_state** (gRPC health; never fails),
   **usage** (`get_usage`, plan limits + current usage; never cached).
 - **scrapers** — runs Lua scripts that log into third-party sites. Contract: the script

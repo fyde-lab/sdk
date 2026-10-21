@@ -20,6 +20,7 @@ mod proto {
 
 use proto::{
     CreateIconRequest, FetchIconRequest,
+    icons_admin_service_client::IconsAdminServiceClient as GeneratedIconsAdminClient,
     icons_service_client::IconsServiceClient as GeneratedIconsClient,
 };
 
@@ -31,7 +32,7 @@ use proto::{
 #[async_trait]
 pub(super) trait FydeClient: Send + Sync {
     /// Stores `content` as an icon, or returns the existing icon with the
-    /// same content.
+    /// same content, through the admin-only `IconsAdminService`.
     async fn create_icon(&self, content: Vec<u8>) -> Result<Icon>;
 
     /// Fetches the icon matching `id`.
@@ -62,6 +63,12 @@ impl GrpcClient {
     fn client(&self) -> GeneratedIconsClient<Channel> {
         GeneratedIconsClient::new(self.channel.clone())
     }
+
+    /// Returns a generated client for the admin-only icons API, wrapping
+    /// the shared connection.
+    fn admin_client(&self) -> GeneratedIconsAdminClient<Channel> {
+        GeneratedIconsAdminClient::new(self.channel.clone())
+    }
 }
 
 #[async_trait]
@@ -74,7 +81,7 @@ impl FydeClient for GrpcClient {
 
         let response = self
             .sessions
-            .check_response(self.client().create_icon(request).await)
+            .check_response(self.admin_client().create_icon(request).await)
             .await
             .context("failed to create icon")?
             .into_inner();

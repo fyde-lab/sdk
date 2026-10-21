@@ -49,7 +49,9 @@ pub trait Service: Send + Sync {
     /// Creates a new script owned by the authenticated user, at version 1.
     /// A non-empty `icon` (an encoded image) is first saved through
     /// [`crate::IconsService::create_icon`], and the script created with
-    /// its id (see [`Script::icon_id`]); an empty one means no icon.
+    /// its id (see [`Script::icon_id`]); an empty one means no icon. Saving
+    /// an icon is admin-only, so for any other user a non-empty `icon`
+    /// fails the call before the script is created.
     #[allow(clippy::too_many_arguments)]
     async fn create_script(
         &self,

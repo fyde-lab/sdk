@@ -31,7 +31,8 @@ pub use models::Icon;
 pub trait Service: Send + Sync {
     /// Stores `content` (an encoded image, e.g. a PNG) on the server as an
     /// icon, and caches it. Storing an image the server already has returns
-    /// the existing icon.
+    /// the existing icon. Admin-only: fails for any other user (the
+    /// server's `PERMISSION_DENIED`).
     async fn create_icon(&self, content: Vec<u8>) -> Result<Icon>;
 
     /// The icon matching `id`: from the local cache if it's there,
