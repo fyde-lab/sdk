@@ -138,7 +138,10 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
   `login` persists the session token last. `login` returns `LoginOutcome::LoggedIn` or
   `SessionLimitReached { sessions, .. }`; the caller re-runs the whole login with
   `replace_session_id` (the server's `login_id` is single-use). `list_sessions`/`revoke_session`
-  manage open sessions (never cached).
+  manage open sessions (never cached). `analyze_password` rates a password with the
+  `passwd-strength` crate (score, `PasswordStrength`, length in chars; the crate's English-only
+  tips are dropped); `create`/`change_password` refuse a `Weak` new password first
+  (`WeakPassword`, 3004), before any other check or server call.
 - **secrets** (crate-private) — master key and session token in the OS credential store
   (`keyring-core` + per-platform stores; only Linux/Secret Service has been exercised), entries
   namespaced per database path. If no store is usable, `create`/`login` fail with

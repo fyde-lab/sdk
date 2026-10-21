@@ -39,6 +39,9 @@ keyring-core = "1.0.0"
 # scrapers domain (`domains/scrapers`) to round-trip JSON through Lua tables.
 mlua = { version = "0.12.1", features = ["lua54", "vendored", "error-send", "serialize"] }
 opaque-ke = { version = "4.0.1", features = ["argon2"] }
+# Scores new passwords (`users::Service::analyze_password`) and backs the
+# minimum strength `create`/`change_password` enforce.
+passwd-strength = "0.1.0"
 # Pinned: 0.3.78+ requires `office_oxide ^0.1.9`, and every 0.1.9+ release of
 # `office_oxide` published so far fails to build against pdf_oxide's usage
 # (a missing-field compile error in `DocumentIR` construction) — an upstream

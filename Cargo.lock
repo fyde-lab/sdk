@@ -1889,6 +1889,7 @@ dependencies = [
  "mockall",
  "office_oxide",
  "opaque-ke",
+ "passwd-strength",
  "pdf_oxide",
  "prost",
  "rand 0.10.2",
@@ -3791,6 +3792,15 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
+]
+
+[[package]]
+name = "passwd-strength"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c7b8694bc1030bba8602262276a670e40c232f35468934f0d2577cf1cccd6cd"
+dependencies = [
+ "regex",
 ]
 
 [[package]]

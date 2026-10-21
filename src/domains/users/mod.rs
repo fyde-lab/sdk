@@ -171,6 +171,50 @@ impl FakeOpenSession {
     }
 }
 
+/// How hard a password looks to guess, from weakest to strongest — the
+/// label [`PasswordAnalysis::strength`] derives from its score. A
+/// [`PasswordStrength::Weak`] new password is refused by [`Service::create`]
+/// and [`Service::change_password`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PasswordStrength {
+    Weak,
+    Fair,
+    Strong,
+    VeryStrong,
+}
+
+/// What [`Service::analyze_password`] makes of a password, for a UI to show
+/// while it's being typed (a strength meter) before `create` or
+/// `change_password` enforce the same verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasswordAnalysis {
+    pub(super) score: u8,
+    pub(super) strength: PasswordStrength,
+    pub(super) length: u32,
+}
+
+impl PasswordAnalysis {
+    /// From 0 (weakest) to 100 (strongest).
+    pub fn score(&self) -> u8 {
+        self.score
+    }
+
+    pub fn strength(&self) -> PasswordStrength {
+        self.strength
+    }
+
+    /// Whether `create`/`change_password` accept this password.
+    pub fn is_accepted(&self) -> bool {
+        self.strength > PasswordStrength::Weak
+    }
+
+    /// The password's length in characters (not bytes), e.g. for a
+    /// "16 characters" caption.
+    pub fn length(&self) -> u32 {
+        self.length
+    }
+}
+
 /// JSON-encodes `master_key`'s raw bytes for storage under
 /// [`crate::domains::secrets::MASTER_KEY_SECRET`].
 pub(crate) fn encode_master_key(master_key: &[u8]) -> Result<String> {
@@ -230,7 +274,9 @@ pub trait Service: Send + Sync {
     /// [`crate::ErrorCode::AlreadyLoggedIn`] — before contacting the server — if a
     /// session is already open on this device. Once the session and master
     /// key are persisted, starts changelog consumption via
-    /// [`DocumentsService::start_sync`].
+    /// [`DocumentsService::start_sync`]. Fails with
+    /// [`crate::ErrorCode::WeakPassword`], before anything else, if
+    /// `password` isn't [`PasswordAnalysis::is_accepted`].
     async fn create(
         &self,
         username: &str,
@@ -305,13 +351,21 @@ pub trait Service: Send + Sync {
     /// fresh under the new password's export key, to send the server in
     /// place of its previous wrapped copy — so every document encrypted
     /// under the old password stays decryptable, and there is nothing to
-    /// update locally once the server confirms the change.
+    /// update locally once the server confirms the change. Fails with
+    /// [`crate::ErrorCode::WeakPassword`], before verifying `old_password`,
+    /// if `new_password` isn't [`PasswordAnalysis::is_accepted`].
     async fn change_password(
         &self,
         username: &str,
         old_password: &str,
         new_password: &str,
     ) -> Result<()>;
+
+    /// Rates how hard `password` looks to guess (length, kinds of
+    /// characters, common passwords and patterns such as keyboard walks or
+    /// years), with the same verdict `create` and `change_password`
+    /// enforce. Purely local and cheap enough to call on every keystroke.
+    fn analyze_password(&self, password: &str) -> PasswordAnalysis;
 
     /// Lists every session open on the signed-in account, across all of its
     /// users, oldest first — the sessions its plan's `max_sessions` counts
