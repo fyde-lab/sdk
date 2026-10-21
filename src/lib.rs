@@ -31,6 +31,7 @@ pub use tools::log::LogLevel;
 use domains::secrets::SecretLocation;
 use domains::sessions::{Service as SessionsService, SessionsClient};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
+use tools::client_dir::ClientDirectory;
 use tools::log::CallbackLayer;
 use tools::sql::{self, SqliteClient};
 
@@ -155,6 +156,7 @@ impl Client {
             secrets,
             sessions.clone(),
             sqlite.clone(),
+            Arc::new(client_directory(&location)),
             documents.clone(),
         )
         .await
@@ -415,6 +417,28 @@ fn changelog_lock_path(location: &DatabaseLocation) -> std::path::PathBuf {
     }
 }
 
+/// The directory holding the database at `location`, which `logout` empties
+/// of everything but the database itself (wiped in place instead, since the
+/// `Client` keeps it open) and its changelog lock (see
+/// [`changelog_lock_path`]), which other processes may hold. Nothing for an
+/// in-memory database, which keeps no files.
+fn client_directory(location: &DatabaseLocation) -> ClientDirectory {
+    match location {
+        DatabaseLocation::Disk(path) => {
+            let mut keep = sql::database_files(path);
+            keep.push(changelog_lock_path(location));
+            ClientDirectory::Disk {
+                dir: path
+                    .parent()
+                    .expect("a client database path is always inside its client directory")
+                    .to_path_buf(),
+                keep,
+            }
+        }
+        DatabaseLocation::Memory => ClientDirectory::Memory,
+    }
+}
+
 /// Opens the secrets store matching `location`. Secrets (master key, session
 /// token) live in the OS credential store next to an on-disk database, and
 /// only in `sqlite` itself on a device without one whose user explicitly
@@ -588,6 +612,32 @@ mod tests {
         assert!(data_dir.join("desktop").is_dir());
         assert!(data_dir.join("android").is_dir());
         std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[test]
+    fn client_directory_keeps_only_the_open_database_and_changelog_lock() {
+        let client_dir = std::path::PathBuf::from("/data/desktop");
+        let database = client_dir.join(DATABASE_FILE_NAME);
+
+        let ClientDirectory::Disk { dir, mut keep } =
+            client_directory(&DatabaseLocation::Disk(database))
+        else {
+            panic!("a disk database must have a client directory");
+        };
+        keep.sort();
+
+        assert_eq!(dir, client_dir);
+        assert_eq!(
+            keep,
+            [
+                "fyde.db",
+                "fyde.db-journal",
+                "fyde.db-shm",
+                "fyde.db-wal",
+                "fyde.db.consume.lock",
+            ]
+            .map(|name| client_dir.join(name))
+        );
     }
 
     #[test]

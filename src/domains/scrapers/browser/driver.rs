@@ -477,7 +477,7 @@ fn build_webview(
         // Ephemeral: without it wry uses the engine's default, persistent
         // data store (on Linux, `$XDG_DATA_HOME`/`$XDG_CACHE_HOME/<prgname>`),
         // leaving every site's localStorage, IndexedDB, service workers and
-        // HTTP cache on disk outside the database `logout` wipes, shared
+        // HTTP cache on disk outside the client directory `logout` wipes, shared
         // across runs, scrapers and accounts. The only state meant to
         // outlive a run is cookies, which `cookies` persists and `init`
         // seeds back in.

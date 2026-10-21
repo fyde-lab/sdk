@@ -8,6 +8,7 @@ use crate::domains::documents::Service as DocumentsService;
 use crate::domains::secrets::{MASTER_KEY_SECRET, SecretLocation, Service as SecretsService};
 use crate::domains::sessions::{ExpiredSessionHandler, Service as SessionsService, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
+use crate::tools::client_dir::LocalFiles;
 use crate::tools::sql::LocalDatabase;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
@@ -60,6 +61,7 @@ pub struct UsersClient {
     secrets: Arc<dyn SecretsService>,
     sessions: Arc<SessionsClient>,
     local_db: Arc<dyn LocalDatabase>,
+    local_files: Arc<dyn LocalFiles>,
     documents: Arc<dyn DocumentsService>,
 }
 
@@ -68,7 +70,8 @@ impl UsersClient {
     /// connection to the fyde server. The account's master key is persisted
     /// in `secrets` and its role in `settings`; the session token is
     /// persisted, and outgoing calls authenticated, via `sessions`;
-    /// `secrets` is cleared and `local_db` wiped on `logout`; and changelog
+    /// `secrets` is cleared, `local_db` wiped and `local_files` deleted on
+    /// `logout`; and changelog
     /// consumption on `documents` is started by `create`/`login` and stopped
     /// by `logout`.
     pub(super) async fn new(
@@ -77,6 +80,7 @@ impl UsersClient {
         secrets: Arc<dyn SecretsService>,
         sessions: Arc<SessionsClient>,
         local_db: Arc<dyn LocalDatabase>,
+        local_files: Arc<dyn LocalFiles>,
         documents: Arc<dyn DocumentsService>,
     ) -> Result<Self> {
         Ok(Self {
@@ -86,6 +90,7 @@ impl UsersClient {
             secrets,
             sessions,
             local_db,
+            local_files,
             documents,
         })
     }
@@ -101,6 +106,7 @@ impl UsersClient {
         settings: Arc<dyn SettingsService>,
         secrets: Arc<dyn SecretsService>,
         local_db: Arc<dyn LocalDatabase>,
+        local_files: Arc<dyn LocalFiles>,
         documents: Arc<dyn DocumentsService>,
     ) -> Self {
         Self {
@@ -110,15 +116,17 @@ impl UsersClient {
             sessions: Arc::new(SessionsClient::new(secrets.clone())),
             secrets,
             local_db,
+            local_files,
             documents,
         }
     }
 
     /// Clears every trace of the account from this device: its secrets
-    /// from the credential store and every row of the local database. Both
-    /// always run, so a failure in one never leaves the other's data
-    /// behind. Changelog consumption must already be stopped, so it can't
-    /// write back what's being wiped.
+    /// from the credential store, every row of the local database and every
+    /// other file in the client's directory. All three always run, so a
+    /// failure in one never leaves the others' data behind. Changelog
+    /// consumption must already be stopped, so it can't write back what's
+    /// being wiped.
     async fn clear_local_state(&self) -> Result<()> {
         let cleared = self
             .secrets
@@ -130,7 +138,12 @@ impl UsersClient {
             .wipe()
             .await
             .context("failed to wipe local database");
-        cleared.and(wiped)
+        let deleted = self
+            .local_files
+            .clear()
+            .await
+            .context("failed to delete local files");
+        cleared.and(wiped).and(deleted)
     }
 
     /// Fails with [`crate::ErrorCode::AlreadyLoggedIn`] if a session is already open on
@@ -486,6 +499,7 @@ mod tests {
     use super::*;
     use crate::domains::secrets::{MockService as MockSecretsService, SESSION_TOKEN_SECRET};
     use crate::domains::settings::MockService as MockSettingsService;
+    use crate::tools::client_dir::MockLocalFiles;
     use crate::tools::sql::MockLocalDatabase;
 
     fn client_with_deps(
@@ -500,6 +514,7 @@ mod tests {
             Arc::new(settings),
             Arc::new(secrets),
             Arc::new(MockLocalDatabase::new()),
+            Arc::new(MockLocalFiles::new()),
             Arc::new(RecordingDocuments::default()),
         )
     }
@@ -1519,6 +1534,8 @@ mod tests {
         secrets.expect_clear().times(1).returning(|| Ok(()));
         let mut local_db = MockLocalDatabase::new();
         local_db.expect_wipe().times(1).returning(|| Ok(()));
+        let mut local_files = MockLocalFiles::new();
+        local_files.expect_clear().times(1).returning(|| Ok(()));
 
         let client = UsersClient::with_deps(
             mock_grpc,
@@ -1526,6 +1543,7 @@ mod tests {
             Arc::new(MockSettingsService::new()),
             Arc::new(secrets),
             Arc::new(local_db),
+            Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
         );
 
@@ -1544,6 +1562,8 @@ mod tests {
         secrets.expect_clear().times(1).returning(|| Ok(()));
         let mut local_db = MockLocalDatabase::new();
         local_db.expect_wipe().times(1).returning(|| Ok(()));
+        let mut local_files = MockLocalFiles::new();
+        local_files.expect_clear().times(1).returning(|| Ok(()));
 
         let client = UsersClient::with_deps(
             mock_grpc,
@@ -1551,6 +1571,7 @@ mod tests {
             Arc::new(MockSettingsService::new()),
             Arc::new(secrets),
             Arc::new(local_db),
+            Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
         );
 
@@ -1569,6 +1590,8 @@ mod tests {
             .returning(|| Err(ErrorKind::Encryption("keychain locked".into()).into()));
         let mut local_db = MockLocalDatabase::new();
         local_db.expect_wipe().times(1).returning(|| Ok(()));
+        let mut local_files = MockLocalFiles::new();
+        local_files.expect_clear().times(1).returning(|| Ok(()));
 
         let client = UsersClient::with_deps(
             mock_grpc,
@@ -1576,6 +1599,35 @@ mod tests {
             Arc::new(MockSettingsService::new()),
             Arc::new(secrets),
             Arc::new(local_db),
+            Arc::new(local_files),
+            Arc::new(RecordingDocuments::default()),
+        );
+
+        assert!(client.logout().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn logout_still_clears_secrets_and_the_local_database_if_deleting_files_fails() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_logout().times(1).returning(|| Ok(()));
+
+        let mut secrets = secrets_with_open_session();
+        secrets.expect_clear().times(1).returning(|| Ok(()));
+        let mut local_db = MockLocalDatabase::new();
+        local_db.expect_wipe().times(1).returning(|| Ok(()));
+        let mut local_files = MockLocalFiles::new();
+        local_files
+            .expect_clear()
+            .times(1)
+            .returning(|| Err(std::io::Error::other("permission denied").into()));
+
+        let client = UsersClient::with_deps(
+            mock_grpc,
+            MockOpaqueClient::new(),
+            Arc::new(MockSettingsService::new()),
+            Arc::new(secrets),
+            Arc::new(local_db),
+            Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
         );
 
@@ -1600,6 +1652,7 @@ mod tests {
             Arc::new(MockSettingsService::new()),
             Arc::new(secrets),
             Arc::new(MockLocalDatabase::new()),
+            Arc::new(MockLocalFiles::new()),
             documents.clone(),
         );
 
@@ -1621,6 +1674,8 @@ mod tests {
         secrets.expect_clear().returning(|| Ok(()));
         let mut local_db = MockLocalDatabase::new();
         local_db.expect_wipe().returning(|| Ok(()));
+        let mut local_files = MockLocalFiles::new();
+        local_files.expect_clear().returning(|| Ok(()));
         let documents = Arc::new(RecordingDocuments::default());
 
         let client = UsersClient::with_deps(
@@ -1629,6 +1684,7 @@ mod tests {
             Arc::new(MockSettingsService::new()),
             Arc::new(secrets),
             Arc::new(local_db),
+            Arc::new(local_files),
             documents.clone(),
         );
 
@@ -1648,6 +1704,8 @@ mod tests {
         secrets.expect_clear().times(1).returning(|| Ok(()));
         let mut local_db = MockLocalDatabase::new();
         local_db.expect_wipe().times(1).returning(|| Ok(()));
+        let mut local_files = MockLocalFiles::new();
+        local_files.expect_clear().times(1).returning(|| Ok(()));
         let documents = Arc::new(RecordingDocuments::default());
 
         let client = UsersClient::with_deps(
@@ -1656,6 +1714,7 @@ mod tests {
             Arc::new(MockSettingsService::new()),
             Arc::new(secrets),
             Arc::new(local_db),
+            Arc::new(local_files),
             documents.clone(),
         );
 
@@ -1677,6 +1736,8 @@ mod tests {
             .returning(|| Err(ErrorKind::Encryption("keychain locked".into()).into()));
         let mut local_db = MockLocalDatabase::new();
         local_db.expect_wipe().times(1).returning(|| Ok(()));
+        let mut local_files = MockLocalFiles::new();
+        local_files.expect_clear().times(1).returning(|| Ok(()));
 
         let client = UsersClient::with_deps(
             MockFydeClient::new(),
@@ -1684,6 +1745,7 @@ mod tests {
             Arc::new(MockSettingsService::new()),
             Arc::new(secrets),
             Arc::new(local_db),
+            Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
         );
 
@@ -1709,6 +1771,7 @@ mod tests {
             Arc::new(MockSettingsService::new()),
             Arc::new(secrets),
             Arc::new(MockLocalDatabase::new()),
+            Arc::new(MockLocalFiles::new()),
             documents.clone(),
         );
 

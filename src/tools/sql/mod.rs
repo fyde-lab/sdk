@@ -1,5 +1,6 @@
 mod sqlite;
 
+pub(crate) use sqlite::database_files;
 pub use sqlite::{IN_MEMORY_DB, SqliteClient};
 
 use async_trait::async_trait;
