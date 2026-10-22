@@ -157,6 +157,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "This password is too easy to guess. Make it longer, or mix letters, digits and symbols.",
             "Ce mot de passe est trop facile à deviner. Allongez-le, ou mélangez lettres, chiffres et symboles.",
         ),
+        ErrorCode::InvalidRecoveryKey => (
+            "This recovery key is incorrect. Check every word, in order, or use your account's latest recovery key.",
+            "Cette clé de récupération est incorrecte. Vérifiez chaque mot, dans l'ordre, ou utilisez la dernière clé de récupération de votre compte.",
+        ),
         ErrorCode::UnsupportedDocumentExtension => (
             "This file type isn't supported. Only PDF files can be added.",
             "Ce type de fichier n'est pas pris en charge. Seuls les fichiers PDF peuvent être ajoutés.",

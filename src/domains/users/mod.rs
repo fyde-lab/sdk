@@ -361,6 +361,56 @@ pub trait Service: Send + Sync {
         new_password: &str,
     ) -> Result<()>;
 
+    /// Generates a new recovery key for the signed-in account and returns
+    /// it, for the UI to show the user once, to write down: 24 English
+    /// BIP39 words separated by single spaces. It's never stored anywhere,
+    /// on this device or on the server, so it can't be shown again. An
+    /// account has at most one recovery key: generating one replaces
+    /// (regenerates) the previous one, which stops working. Lets
+    /// [`Service::recover_account`] set a new password if the current one is
+    /// forgotten, without losing any document: the server keeps the master
+    /// key encrypted under a key derived from the recovery key (read here
+    /// from the credential store, like `change_password` does), plus a
+    /// digest of another key derived from it, to check it at recovery.
+    async fn generate_recovery_key(&self) -> Result<String>;
+
+    /// Deletes the signed-in account's recovery key, if any: it can no
+    /// longer be used to recover the account.
+    async fn delete_recovery_key(&self) -> Result<()>;
+
+    /// Returns when the signed-in account's current recovery key was
+    /// generated, as a Unix timestamp in seconds, or `None` if it has none —
+    /// for a UI to offer generating or regenerating it. Never cached.
+    async fn recovery_key_status(&self) -> Result<Option<i64>>;
+
+    /// Regains access to `username`'s account when its password is
+    /// forgotten, with the recovery key [`Service::generate_recovery_key`]
+    /// returned (case and spacing don't matter): sets `new_password` as the
+    /// account's password and opens a session for the device named
+    /// `device_name`, returning its token, like `login`. Every other session
+    /// of the account is closed server-side. The master key is recovered
+    /// from the server, decrypted with the recovery key, and re-encrypted
+    /// under the new password, so every document stays readable; the
+    /// recovery key stays valid. Fails with
+    /// [`crate::ErrorCode::InvalidRecoveryKey`] if `recovery_key` isn't a
+    /// 24-word BIP39 mnemonic (checked locally, which catches most typos),
+    /// or isn't the account's current recovery key — including when the
+    /// username is unknown or the account has none, which the server
+    /// doesn't tell apart. Like `create`, fails before contacting the server
+    /// with [`crate::ErrorCode::WeakPassword`] if `new_password` isn't
+    /// [`PasswordAnalysis::is_accepted`], with
+    /// [`crate::ErrorCode::AlreadyLoggedIn`] if a session is open on this
+    /// device, and with [`crate::ErrorCode::SecureStorageUnavailable`]
+    /// without a usable credential store unless `allow_insecure_storage`.
+    async fn recover_account(
+        &self,
+        username: &str,
+        recovery_key: &str,
+        new_password: &str,
+        device_name: &str,
+        allow_insecure_storage: bool,
+    ) -> Result<String>;
+
     /// Rates how hard `password` looks to guess (length, kinds of
     /// characters, common passwords and patterns such as keyboard walks or
     /// years), with the same verdict `create` and `change_password`

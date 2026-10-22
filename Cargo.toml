@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 aes-gcm = "0.11.1"
+# Recovery keys are BIP39 mnemonics (`users/crypto.rs`).
+bip39 = { version = "3.0.0", features = ["zeroize"] }
 argon2 = "0.5.3"
 async-trait = "0.1.92"
 # `fyde.browser:download` gets its bytes back over IPC base64-encoded
