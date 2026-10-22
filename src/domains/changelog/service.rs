@@ -47,6 +47,37 @@ impl ChangelogEvent {
     }
 }
 
+/// Checks that `proto` directly follows `offset`, the last event consumed
+/// (`None` before the account's first): the server chains each of a user's
+/// events to that user's previous one through `previous_id` (empty for their
+/// first). Any other `previous_id` means an event is missing in between, or
+/// that this one isn't this account's — applying it, and moving the cursor
+/// past the gap, would lose the missing event for good. Checked before
+/// decrypting, so a foreign event fails as such rather than as undecryptable.
+fn check_follows(proto: &ProtoChangelogEvent, offset: Option<Uuid>) -> Result<()> {
+    let previous_id = if proto.previous_id.is_empty() {
+        None
+    } else {
+        Some(Uuid::parse_str(&proto.previous_id).with_context(|| {
+            format!(
+                "invalid previous id {:?} on changelog event {:?} returned by server",
+                proto.previous_id, proto.id
+            )
+        })?)
+    };
+
+    if previous_id != offset {
+        return Err(ErrorKind::InvalidChangelogEvent(format!(
+            "changelog event {} follows {previous_id:?}, not {offset:?}, the last event \
+             consumed: an event is missing or this one isn't this account's",
+            proto.id
+        ))
+        .into());
+    }
+
+    Ok(())
+}
+
 /// Delay between reachability checks in [`ChangelogClient::consume_once`]
 /// while waiting for the server to come back up.
 const SERVER_REACHABILITY_POLL_INTERVAL: std::time::Duration =
@@ -221,8 +252,14 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
             .await
             .with_context(|| format!("failed to open changelog stream from id {since:?}"))?;
 
+        // The last event this pass went through, starting from the persisted
+        // cursor. Kept here rather than re-read from `cursor_storage`, which
+        // only advances while this process holds the write lock.
+        let mut offset = since;
+
         while let Some(proto_event) = stream.next().await {
             let proto_event = proto_event.context("failed to read next changelog event")?;
+            check_follows(&proto_event, offset)?;
             let digest: [u8; 32] = Sha256::digest(&proto_event.encrypted_content).into();
             let event = ChangelogEvent::from_proto(proto_event, &*self.secrets).await?;
 
@@ -256,6 +293,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
                             format!("failed to persist changelog cursor {}", event.id)
                         })?;
                 }
+                offset = Some(event.id);
                 continue;
             }
 
@@ -381,6 +419,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
                     .with_context(|| format!("failed to persist changelog cursor {}", event.id))?;
             }
 
+            offset = Some(event.id);
             callback(event);
         }
 
@@ -1306,7 +1345,11 @@ mod tests {
             .expect_consume_since()
             .withf(move |id| *id == Some(cursor))
             .returning(move |_| {
-                Ok(futures::stream::iter(vec![Ok(proto_event(event_id, document_id))]).boxed())
+                let event = ProtoChangelogEvent {
+                    previous_id: cursor.to_string(),
+                    ..proto_event(event_id, document_id)
+                };
+                Ok(futures::stream::iter(vec![Ok(event)]).boxed())
             });
 
         let mut document_storage = MockStorage::new();
@@ -1347,6 +1390,91 @@ mod tests {
 
         client.acquire_write_lock();
         client.consume_once(&mut |_| {}).await.unwrap();
+    }
+
+    /// A client streaming `events` from the beginning (nil cursor), in a
+    /// read-only process — nothing is stored, so only `is_applied` is
+    /// reached for each event that gets that far.
+    fn read_only_client_streaming(
+        events: Vec<ProtoChangelogEvent>,
+    ) -> ChangelogClient<MockStorage, MockScriptStorage, MockCursorStorage> {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(events.clone().into_iter().map(Ok)).boxed())
+        });
+
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+        cursor_storage.expect_is_applied().returning(|_| Ok(false));
+
+        ChangelogClient::new(
+            mock_grpc,
+            MockStorage::new(),
+            MockScriptStorage::new(),
+            cursor_storage,
+            reachable_server_state(),
+            fake_secrets(),
+            test_lock_path(),
+        )
+    }
+
+    #[tokio::test]
+    async fn consume_applies_events_chained_through_previous_id() {
+        let (first_id, second_id) = (Uuid::now_v7(), Uuid::now_v7());
+        let first = proto_event(first_id, Uuid::now_v7());
+        let second = ProtoChangelogEvent {
+            previous_id: first_id.to_string(),
+            ..proto_event(second_id, Uuid::now_v7())
+        };
+        // Read-only: the persisted cursor never moves, so the second event
+        // is checked against the first one's id, not the cursor.
+        let client = read_only_client_streaming(vec![first, second]);
+
+        let mut consumed = Vec::new();
+        client
+            .consume_once(&mut |event| consumed.push(event.id()))
+            .await
+            .unwrap();
+
+        assert_eq!(consumed, vec![first_id, second_id]);
+    }
+
+    #[tokio::test]
+    async fn consume_rejects_an_event_that_does_not_follow_the_last_one_before_decrypting_it() {
+        let first_id = Uuid::now_v7();
+        let first = proto_event(first_id, Uuid::now_v7());
+        // Chained to an event this pass never saw, and not decryptable here
+        // either: the gap is what gets reported.
+        let gap = ProtoChangelogEvent {
+            id: Uuid::now_v7().to_string(),
+            encrypted_content: vec![0; 128],
+            previous_id: Uuid::now_v7().to_string(),
+        };
+        let client = read_only_client_streaming(vec![first, gap]);
+
+        let mut consumed = Vec::new();
+        let err = client
+            .consume_once(&mut |event| consumed.push(event.id()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::InvalidChangelogEvent);
+        assert_eq!(consumed, vec![first_id]);
+    }
+
+    #[tokio::test]
+    async fn consume_rejects_a_first_event_chained_to_another_one() {
+        let event = ProtoChangelogEvent {
+            previous_id: Uuid::now_v7().to_string(),
+            ..proto_event(Uuid::now_v7(), Uuid::now_v7())
+        };
+        let client = read_only_client_streaming(vec![event]);
+
+        let err = client.consume_once(&mut |_| {}).await.unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::InvalidChangelogEvent);
     }
 
     #[tokio::test(start_paused = true)]

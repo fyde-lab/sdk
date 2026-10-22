@@ -127,7 +127,10 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
   (`SaveDocument`, `UpdateMetadata`, `InstallScript`). `crypto.rs`: AES-256-GCM, per-event DEK
   wrapped by a KEK derived from the master key. The consume job replays from the persisted
-  cursor then tails live, materializing documents and installed scripts; a failed pass is
+  cursor then tails live, materializing documents and installed scripts. Each event's
+  `previous_id` (the server chains a user's events, empty for their first) must equal the last
+  event the pass went through (starting at the cursor), checked before decrypting: otherwise
+  the pass fails rather than skip past a gap or apply another account's event. A failed pass is
   retried after a backoff (500 ms doubling to 30 s, reset by a clean pass); only the process
   holding the `flock` (`write_lock`) writes local storage. Applied events are recorded by
   ciphertext digest (`applied_changelog_events`), so one the server serves again is skipped.
