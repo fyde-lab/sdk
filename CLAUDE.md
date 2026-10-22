@@ -142,6 +142,13 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
   `passwd-strength` crate (score, `PasswordStrength`, length in chars; the crate's English-only
   tips are dropped); `create`/`change_password` refuse a `Weak` new password first
   (`WeakPassword`, 3004), before any other check or server call.
+  Recovery keys (`crypto.rs`): a 24-word English BIP39 mnemonic (256-bit entropy, `bip39`
+  crate), never stored. HKDF-SHA256 over its entropy derives an auth key (sent to the server,
+  which keeps a digest) and a wrapping key for the master key. `generate_recovery_key`
+  replaces the account's one (at most one); `delete_recovery_key`/`recovery_key_status`.
+  `recover_account` (no session; parses the phrase locally, case/spacing-insensitive, and
+  refuses a `Weak` new password first) re-wraps the recovered master key under the new
+  password and opens a session. A server `UNAUTHENTICATED` there is `InvalidRecoveryKey` (3005).
 - **secrets** (crate-private) — master key and session token in the OS credential store
   (`keyring-core` + per-platform stores; only Linux/Secret Service has been exercised), entries
   namespaced per database path. If no store is usable, `create`/`login` fail with

@@ -1,6 +1,7 @@
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
+use bip39::{Language, Mnemonic};
 use hkdf::Hkdf;
 #[cfg(test)]
 use mockall::automock;
@@ -18,6 +19,9 @@ use crate::{ErrorContext as _, ErrorKind, Result};
 /// Length in bytes of an AES-256 key: the master key, and the key derived
 /// from the OPAQUE export key to wrap it.
 const KEY_LEN: usize = 32;
+/// Length in bytes of a recovery key's entropy: 256 bits, as strong as the
+/// master key it protects, which BIP39 encodes as 24 words.
+const RECOVERY_KEY_ENTROPY_LEN: usize = 32;
 /// Length in bytes of an AES-GCM nonce (96 bits, as recommended by NIST
 /// SP 800-38D / OWASP for AES-GCM).
 const NONCE_LEN: usize = 12;
@@ -286,11 +290,17 @@ pub(super) fn wrap_master_key(master_key: &[u8], export_key: &[u8]) -> Result<St
     let wrapping_key =
         derive_wrapping_key(export_key).context("failed to derive master key wrapping key")?;
 
+    encrypt_master_key(master_key, &wrapping_key)
+}
+
+/// Encrypts `master_key` under `wrapping_key` (AES-256-GCM, random nonce),
+/// returning the JSON-serialized [`WrappedMasterKey`].
+fn encrypt_master_key(master_key: &[u8; KEY_LEN], wrapping_key: &[u8; KEY_LEN]) -> Result<String> {
     let mut nonce_bytes = [0u8; NONCE_LEN];
     rand::rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from(nonce_bytes);
 
-    let cipher = Aes256Gcm::new(&wrapping_key.into());
+    let cipher = Aes256Gcm::new(&(*wrapping_key).into());
     let ciphertext = cipher
         .encrypt(&nonce, master_key.as_slice())
         .map_err(|_| ErrorKind::Encryption("failed to encrypt master key".into()))?;
@@ -321,25 +331,164 @@ pub(super) fn generate_and_wrap_master_key(export_key: &[u8]) -> Result<(Vec<u8>
 /// `FinishLogin` returns, on a device that doesn't already have it cached
 /// locally.
 pub(super) fn unwrap_master_key(export_key: &[u8], wrapped_json: &str) -> Result<Vec<u8>> {
-    let wrapped: WrappedMasterKey =
-        serde_json::from_str(wrapped_json).context("failed to parse wrapped master key")?;
-
     let wrapping_key =
         derive_wrapping_key(export_key).context("failed to derive master key wrapping key")?;
+
+    decrypt_master_key(wrapped_json, &wrapping_key)
+}
+
+/// Decrypts a JSON-serialized [`WrappedMasterKey`] under `wrapping_key`.
+fn decrypt_master_key(wrapped_json: &str, wrapping_key: &[u8; KEY_LEN]) -> Result<Vec<u8>> {
+    let wrapped: WrappedMasterKey =
+        serde_json::from_str(wrapped_json).context("failed to parse wrapped master key")?;
 
     let nonce_bytes: [u8; NONCE_LEN] = wrapped.nonce.try_into().map_err(|_| {
         ErrorKind::Encryption("wrapped master key nonce has the wrong length".into())
     })?;
 
-    let cipher = Aes256Gcm::new(&wrapping_key.into());
+    let cipher = Aes256Gcm::new(&(*wrapping_key).into());
     cipher
         .decrypt(&Nonce::from(nonce_bytes), wrapped.ciphertext.as_slice())
         .map_err(|_| ErrorKind::Encryption("failed to decrypt master key".into()).into())
 }
 
+/// The two independent keys derived from a recovery key (see
+/// [`derive_recovery_keys`]).
+pub(super) struct RecoveryKeys {
+    /// Sent to the server, which keeps only a digest of it, to prove
+    /// knowledge of the recovery key at recovery.
+    pub(super) auth_key: [u8; KEY_LEN],
+    /// Wraps the master key; never leaves this SDK.
+    wrapping_key: [u8; KEY_LEN],
+}
+
+/// Generates a fresh recovery key: 256 bits from the OS CSPRNG, encoded as a
+/// 24-word English BIP39 mnemonic, words separated by single spaces.
+pub(super) fn generate_recovery_key() -> Result<String> {
+    let mut entropy = [0u8; RECOVERY_KEY_ENTROPY_LEN];
+    rand::rng().fill_bytes(&mut entropy);
+    let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)
+        .map_err(|err| ErrorKind::Encryption(format!("failed to encode recovery key: {err}")))?;
+    Ok(mnemonic.to_string())
+}
+
+/// Parses `recovery_key` — as the user typed it back: case, surrounding and
+/// repeated whitespace don't matter — as a 24-word English BIP39 mnemonic,
+/// checksum included, and derives its [`RecoveryKeys`] from its entropy via
+/// HKDF-SHA256, under distinct labels so neither key reveals the other. No
+/// stretching: the entropy is 256 random bits, not a password. Fails with
+/// [`crate::ErrorCode::InvalidRecoveryKey`] if it isn't a valid mnemonic, which
+/// catches most typos locally.
+pub(super) fn derive_recovery_keys(recovery_key: &str) -> Result<RecoveryKeys> {
+    let mnemonic = Mnemonic::parse_in(Language::English, recovery_key.to_lowercase())
+        .map_err(|err| ErrorKind::InvalidRecoveryKey(err.to_string()))?;
+    if mnemonic.word_count() != RECOVERY_KEY_ENTROPY_LEN * 3 / 4 {
+        return Err(ErrorKind::InvalidRecoveryKey(format!(
+            "expected 24 words, got {}",
+            mnemonic.word_count()
+        ))
+        .into());
+    }
+
+    let entropy = mnemonic.to_entropy();
+    let hkdf = Hkdf::<sha2_opaque::Sha256>::new(None, &entropy);
+    let mut keys = RecoveryKeys {
+        auth_key: [0u8; KEY_LEN],
+        wrapping_key: [0u8; KEY_LEN],
+    };
+    hkdf.expand(b"fyde/recovery-auth-key-v1", &mut keys.auth_key)
+        .and_then(|()| hkdf.expand(b"fyde/recovery-wrap-key-v1", &mut keys.wrapping_key))
+        .map_err(|err| {
+            ErrorKind::Encryption(format!("failed to derive keys from recovery key: {err}"))
+        })?;
+    Ok(keys)
+}
+
+/// Encrypts `master_key` under `recovery_keys`' wrapping key, returning it
+/// ready to send to the server as `recovery_encrypted_master_key`.
+pub(super) fn wrap_master_key_for_recovery(
+    master_key: &[u8],
+    recovery_keys: &RecoveryKeys,
+) -> Result<String> {
+    let master_key: &[u8; KEY_LEN] = master_key
+        .try_into()
+        .map_err(|_| ErrorKind::Encryption("master key has an invalid length".into()))?;
+    encrypt_master_key(master_key, &recovery_keys.wrapping_key)
+}
+
+/// Decrypts a [`wrap_master_key_for_recovery`]-produced master key.
+pub(super) fn unwrap_master_key_for_recovery(
+    recovery_keys: &RecoveryKeys,
+    wrapped_json: &str,
+) -> Result<Vec<u8>> {
+    decrypt_master_key(wrapped_json, &recovery_keys.wrapping_key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generate_recovery_key_produces_24_fresh_valid_words() {
+        let first = generate_recovery_key().unwrap();
+        let second = generate_recovery_key().unwrap();
+
+        assert_eq!(first.split(' ').count(), 24);
+        assert_ne!(first, second);
+        derive_recovery_keys(&first).unwrap();
+    }
+
+    #[test]
+    fn derive_recovery_keys_is_deterministic_and_ignores_case_and_spacing() {
+        let recovery_key = generate_recovery_key().unwrap();
+        let retyped = format!("  {}  ", recovery_key.to_uppercase().replace(' ', " \n "));
+
+        let keys = derive_recovery_keys(&recovery_key).unwrap();
+        let retyped_keys = derive_recovery_keys(&retyped).unwrap();
+
+        assert_eq!(keys.auth_key, retyped_keys.auth_key);
+        assert_eq!(keys.wrapping_key, retyped_keys.wrapping_key);
+        assert_ne!(keys.auth_key, keys.wrapping_key);
+    }
+
+    #[test]
+    fn derive_recovery_keys_rejects_a_mnemonic_whose_checksum_doesnt_match() {
+        // All-zero entropy encodes as 23 times "abandon" then "art": "art"
+        // carries the checksum, so a 24th "abandon" breaks it.
+        let valid = format!("{} art", ["abandon"; 23].join(" "));
+        let typo = ["abandon"; 24].join(" ");
+        derive_recovery_keys(&valid).unwrap();
+
+        let err = derive_recovery_keys(&typo).err().unwrap();
+
+        assert!(matches!(err.kind(), ErrorKind::InvalidRecoveryKey(_)));
+    }
+
+    #[test]
+    fn derive_recovery_keys_rejects_unknown_words_and_short_mnemonics() {
+        let twelve_words = Mnemonic::from_entropy(&[1u8; 16]).unwrap().to_string();
+
+        for invalid in ["not a recovery key", "", twelve_words.as_str()] {
+            let err = derive_recovery_keys(invalid).err().unwrap();
+            assert!(matches!(err.kind(), ErrorKind::InvalidRecoveryKey(_)));
+        }
+    }
+
+    #[test]
+    fn a_master_key_wrapped_for_recovery_unwraps_with_the_same_recovery_key_only() {
+        let master_key = generate_master_key();
+        let keys = derive_recovery_keys(&generate_recovery_key().unwrap()).unwrap();
+        let other_keys = derive_recovery_keys(&generate_recovery_key().unwrap()).unwrap();
+
+        let wrapped = wrap_master_key_for_recovery(&master_key, &keys).unwrap();
+
+        assert_eq!(
+            unwrap_master_key_for_recovery(&keys, &wrapped).unwrap(),
+            master_key
+        );
+        let err = unwrap_master_key_for_recovery(&other_keys, &wrapped).unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::Encryption(_)));
+    }
 
     /// Runs a full OPAQUE registration for `password` against an in-process
     /// server (real `opaque-ke`, no mocks, since this module's whole job is

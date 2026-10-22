@@ -107,6 +107,9 @@ macro_rules! for_each_error_code {
             /// `change_password`) is too easy to guess: its
             /// `UsersService::analyze_password` strength is `Weak`.
             WeakPassword = 3004,
+            /// A recovery key (at `UsersService::recover_account`) isn't a
+            /// valid one, or isn't the account's current one.
+            InvalidRecoveryKey = 3005,
             /// The document's file type isn't supported.
             UnsupportedDocumentExtension = 4001,
             /// A PDF document couldn't be read.
@@ -269,6 +272,8 @@ pub(crate) enum ErrorKind {
     AlreadyLoggedIn,
     #[error("the new password is too weak (score {0}/100)")]
     WeakPassword(u8),
+    #[error("invalid recovery key: {0}")]
+    InvalidRecoveryKey(String),
     /// Not `#[from]`: a plain [`tonic::Status`] converts to
     /// [`ErrorKind::Grpc`]; only `sessions::Service::check_response` decides
     /// a rejection means the session itself is gone.
@@ -323,6 +328,7 @@ impl ErrorKind {
             ErrorKind::InvalidCredentials => ErrorCode::InvalidCredentials,
             ErrorKind::AlreadyLoggedIn => ErrorCode::AlreadyLoggedIn,
             ErrorKind::WeakPassword(_) => ErrorCode::WeakPassword,
+            ErrorKind::InvalidRecoveryKey(_) => ErrorCode::InvalidRecoveryKey,
             ErrorKind::SessionExpired(_) => ErrorCode::SessionExpired,
             ErrorKind::Keystore(_) => ErrorCode::CredentialStore,
             ErrorKind::SecureStorageUnavailable => ErrorCode::SecureStorageUnavailable,

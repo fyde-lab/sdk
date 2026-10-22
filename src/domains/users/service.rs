@@ -10,11 +10,12 @@ use crate::domains::sessions::{ExpiredSessionHandler, Service as SessionsService
 use crate::domains::settings::Service as SettingsService;
 use crate::tools::client_dir::LocalFiles;
 use crate::tools::sql::LocalDatabase;
-use crate::{ErrorContext as _, ErrorKind, Result};
+use crate::{Error, ErrorCode, ErrorContext as _, ErrorKind, Result};
 
 use super::crypto::{
-    DefaultOpaqueClient, OpaqueClient, generate_and_wrap_master_key, unwrap_master_key,
-    wrap_master_key,
+    DefaultOpaqueClient, OpaqueClient, derive_recovery_keys, generate_and_wrap_master_key,
+    generate_recovery_key, unwrap_master_key, unwrap_master_key_for_recovery, wrap_master_key,
+    wrap_master_key_for_recovery,
 };
 use super::grpc_client::{FinishedLogin, FydeClient, GrpcClient};
 use super::{
@@ -48,6 +49,17 @@ fn ensure_strong_enough(password: &str) -> Result<()> {
         Ok(())
     } else {
         Err(ErrorKind::WeakPassword(analysis.score).into())
+    }
+}
+
+/// Reports the server rejecting a recovery step as
+/// [`ErrorKind::InvalidRecoveryKey`]: it answers `UNAUTHENTICATED` whether the
+/// recovery key is wrong, the account has none, or the username is unknown.
+fn recovery_key_rejected(err: Error) -> Error {
+    if err.code() == ErrorCode::Unauthenticated {
+        ErrorKind::InvalidRecoveryKey(format!("rejected by the server: {err}")).into()
+    } else {
+        err
     }
 }
 
@@ -204,6 +216,23 @@ impl UsersClient {
             "no OS credential store available, keeping the account's secrets in the local database"
         );
         Ok(SecretLocation::Database)
+    }
+
+    /// Reads back the raw master key `create`/`login` cached in the
+    /// credential store.
+    async fn read_master_key(&self) -> Result<Vec<u8>> {
+        self.secrets
+            .get(MASTER_KEY_SECRET)
+            .await
+            .context("failed to read current master key")?
+            .ok_or_else(|| {
+                ErrorKind::Encryption(
+                    "no master key found in the credential store; log in or create an account first"
+                        .into(),
+                )
+                .into()
+            })
+            .and_then(|encoded| decode_master_key(&encoded))
     }
 
     /// Persists everything a freshly opened session needs locally, at
@@ -422,18 +451,7 @@ impl Service for UsersClient {
             .finish_registration(state, new_password, &opaque_response)
             .context("failed to finish OPAQUE registration")?;
 
-        let raw_master_key = self
-            .secrets
-            .get(MASTER_KEY_SECRET)
-            .await
-            .context("failed to read current master key")?
-            .ok_or_else(|| {
-                ErrorKind::Encryption(
-                    "no master key found in the credential store; log in or create an account first"
-                        .into(),
-                ).into()
-            })
-            .and_then(|encoded| decode_master_key(&encoded))?;
+        let raw_master_key = self.read_master_key().await?;
 
         let new_wrapped_master_key = wrap_master_key(&raw_master_key, &new_export_key)
             .context("failed to wrap master key under the new export key")?;
@@ -444,6 +462,95 @@ impl Service for UsersClient {
             .context("failed to finish change password")?;
 
         Ok(())
+    }
+
+    async fn generate_recovery_key(&self) -> Result<String> {
+        let raw_master_key = self.read_master_key().await?;
+
+        let recovery_key = generate_recovery_key().context("failed to generate recovery key")?;
+        let recovery_keys =
+            derive_recovery_keys(&recovery_key).context("failed to derive recovery keys")?;
+        let wrapped_master_key = wrap_master_key_for_recovery(&raw_master_key, &recovery_keys)
+            .context("failed to wrap master key under the recovery key")?;
+
+        self.grpc
+            .set_recovery_key(&recovery_keys.auth_key, wrapped_master_key.as_bytes())
+            .await
+            .context("failed to set recovery key")?;
+
+        Ok(recovery_key)
+    }
+
+    async fn delete_recovery_key(&self) -> Result<()> {
+        self.grpc
+            .delete_recovery_key()
+            .await
+            .context("failed to delete recovery key")
+    }
+
+    async fn recovery_key_status(&self) -> Result<Option<i64>> {
+        self.grpc
+            .get_recovery_key_status()
+            .await
+            .context("failed to read recovery key status")
+    }
+
+    async fn recover_account(
+        &self,
+        username: &str,
+        recovery_key: &str,
+        new_password: &str,
+        device_name: &str,
+        allow_insecure_storage: bool,
+    ) -> Result<String> {
+        ensure_strong_enough(new_password).context("refused the new password")?;
+        self.ensure_no_open_session().await?;
+        let location = self.secret_location(allow_insecure_storage).await?;
+        let recovery_keys =
+            derive_recovery_keys(recovery_key).context("failed to read recovery key")?;
+
+        let (state, opaque_request) = self
+            .opaque
+            .start_registration(new_password)
+            .context("failed to start OPAQUE registration")?;
+
+        let (opaque_response, recovery_encrypted_master_key) = self
+            .grpc
+            .start_recovery(username, &recovery_keys.auth_key, &opaque_request)
+            .await
+            .map_err(recovery_key_rejected)
+            .context("failed to start recovery")?;
+
+        let wrapped_master_key = String::from_utf8(recovery_encrypted_master_key)
+            .map_err(|_| ErrorKind::Encryption("server returned a non-UTF-8 master key".into()))
+            .context("failed to decode master key returned by the server")?;
+        let raw_master_key = unwrap_master_key_for_recovery(&recovery_keys, &wrapped_master_key)
+            .context("failed to unwrap master key under the recovery key")?;
+
+        let (opaque_upload, export_key) = self
+            .opaque
+            .finish_registration(state, new_password, &opaque_response)
+            .context("failed to finish OPAQUE registration")?;
+        let new_wrapped_master_key = wrap_master_key(&raw_master_key, &export_key)
+            .context("failed to wrap master key under the new export key")?;
+
+        let (token, role) = self
+            .grpc
+            .finish_recovery(
+                username,
+                &recovery_keys.auth_key,
+                &opaque_upload,
+                new_wrapped_master_key.as_bytes(),
+                device_name,
+            )
+            .await
+            .map_err(recovery_key_rejected)
+            .context("failed to finish recovery")?;
+
+        self.open_session(&token, &raw_master_key, role, location)
+            .await?;
+
+        Ok(token)
     }
 
     fn analyze_password(&self, password: &str) -> PasswordAnalysis {
@@ -2135,5 +2242,316 @@ mod tests {
         );
 
         assert_eq!(client.role().await.unwrap(), None);
+    }
+
+    /// A [`MockSecretsService`] holding `master_key` as the cached master key.
+    fn secrets_with_master_key(master_key: Vec<u8>) -> MockSecretsService {
+        let mut secrets = MockSecretsService::new();
+        let encoded = encode_master_key(&master_key).unwrap();
+        secrets
+            .expect_get()
+            .withf(|key| key == MASTER_KEY_SECRET)
+            .times(1)
+            .returning(move |_| Ok(Some(encoded.clone())));
+        secrets
+    }
+
+    #[tokio::test]
+    async fn generate_recovery_key_sends_the_master_key_wrapped_under_the_returned_key() {
+        let master_key = vec![42u8; 32];
+        let sent_auth_key: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let sent_wrapped: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let mut mock_grpc = MockFydeClient::new();
+        let (capture_auth_key, capture_wrapped) = (sent_auth_key.clone(), sent_wrapped.clone());
+        mock_grpc
+            .expect_set_recovery_key()
+            .times(1)
+            .returning(move |auth_key, wrapped| {
+                *capture_auth_key.lock().unwrap() = auth_key.to_vec();
+                *capture_wrapped.lock().unwrap() = wrapped.to_vec();
+                Ok(())
+            });
+
+        let client = client_with_deps(
+            mock_grpc,
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            secrets_with_master_key(master_key.clone()),
+        );
+
+        let recovery_key = client.generate_recovery_key().await.unwrap();
+
+        assert_eq!(recovery_key.split(' ').count(), 24);
+        let keys = derive_recovery_keys(&recovery_key).unwrap();
+        assert_eq!(*sent_auth_key.lock().unwrap(), keys.auth_key);
+        let wrapped = sent_wrapped.lock().unwrap().clone();
+        let unwrapped =
+            unwrap_master_key_for_recovery(&keys, &String::from_utf8(wrapped).unwrap()).unwrap();
+        assert_eq!(unwrapped, master_key);
+    }
+
+    #[tokio::test]
+    async fn generate_recovery_key_generates_a_new_key_each_time() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_set_recovery_key()
+            .times(2)
+            .returning(|_, _| Ok(()));
+        let mut secrets = MockSecretsService::new();
+        let encoded = encode_master_key(&[42u8; 32]).unwrap();
+        secrets
+            .expect_get()
+            .withf(|key| key == MASTER_KEY_SECRET)
+            .times(2)
+            .returning(move |_| Ok(Some(encoded.clone())));
+
+        let client = client_with_deps(
+            mock_grpc,
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            secrets,
+        );
+
+        let first = client.generate_recovery_key().await.unwrap();
+        let second = client.generate_recovery_key().await.unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn generate_recovery_key_fails_without_a_master_key_in_the_credential_store() {
+        // No `expect_set_recovery_key()`: the server must not be called.
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == MASTER_KEY_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
+
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            secrets,
+        );
+
+        let err = client.generate_recovery_key().await.unwrap_err();
+
+        assert!(matches!(err.kind(), ErrorKind::Encryption(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_key_deletes_it_on_the_server() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_delete_recovery_key()
+            .times(1)
+            .returning(|| Ok(()));
+
+        let client = client_with_deps(
+            mock_grpc,
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            MockSecretsService::new(),
+        );
+
+        client.delete_recovery_key().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_key_status_reports_the_servers_answer() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_get_recovery_key_status()
+            .times(1)
+            .returning(|| Ok(Some(1_700_000_000)));
+
+        let client = client_with_deps(
+            mock_grpc,
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            MockSecretsService::new(),
+        );
+
+        assert_eq!(
+            client.recovery_key_status().await.unwrap(),
+            Some(1_700_000_000)
+        );
+    }
+
+    const NEW_PASSWORD: &str = "correct horse battery staple";
+
+    #[tokio::test]
+    async fn recover_account_rewraps_the_recovered_master_key_and_opens_a_session() {
+        let master_key = vec![42u8; 32];
+        let recovery_key = generate_recovery_key().unwrap();
+        let keys = derive_recovery_keys(&recovery_key).unwrap();
+        let recovery_wrapped = wrap_master_key_for_recovery(&master_key, &keys)
+            .unwrap()
+            .into_bytes();
+
+        let opaque = opaque_for_create(b"the-request", b"the-upload", NEW_EXPORT_KEY);
+        let mut mock_grpc = MockFydeClient::new();
+        let auth_key = keys.auth_key;
+        mock_grpc
+            .expect_start_recovery()
+            .withf(move |username, sent_auth_key, request| {
+                username == "alice" && sent_auth_key == auth_key && request == b"the-request"
+            })
+            .times(1)
+            .returning(move |_, _, _| Ok((b"the-response".to_vec(), recovery_wrapped.clone())));
+        let sent_master_key: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let capture = sent_master_key.clone();
+        mock_grpc
+            .expect_finish_recovery()
+            .withf(move |username, sent_auth_key, upload, _, device_name| {
+                username == "alice"
+                    && sent_auth_key == auth_key
+                    && upload == b"the-upload"
+                    && device_name == "device"
+            })
+            .times(1)
+            .returning(move |_, _, _, wrapped, _| {
+                *capture.lock().unwrap() = Some(wrapped.to_vec());
+                Ok(("a-token".to_string(), Role::User))
+            });
+
+        let mut secrets = secrets_without_session(true);
+        secrets
+            .expect_set()
+            .withf(|key, _, _| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        let persisted_master_key: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let persist = persisted_master_key.clone();
+        secrets
+            .expect_set()
+            .withf(|key, _, _| key == MASTER_KEY_SECRET)
+            .times(1)
+            .returning(move |_, value, _| {
+                *persist.lock().unwrap() = Some(value.to_string());
+                Ok(())
+            });
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_set()
+            .withf(|key, value| key == ROLE_SETTING && value == "user")
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
+
+        let token = client
+            .recover_account("alice", &recovery_key, NEW_PASSWORD, "device", false)
+            .await
+            .unwrap();
+
+        assert_eq!(token, "a-token");
+        let persisted = persisted_master_key.lock().unwrap().clone().unwrap();
+        assert_eq!(decode_master_key(&persisted).unwrap(), master_key);
+        let sent = sent_master_key.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            unwrap_master_key(NEW_EXPORT_KEY, &String::from_utf8(sent).unwrap()).unwrap(),
+            master_key
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_account_rejects_a_malformed_recovery_key_without_contacting_the_server() {
+        // No opaque/grpc expectations: neither may be called.
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            secrets_without_session(true),
+        );
+
+        let err = client
+            .recover_account("alice", "not a recovery key", NEW_PASSWORD, "device", false)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::InvalidRecoveryKey);
+    }
+
+    #[tokio::test]
+    async fn recover_account_reports_the_servers_rejection_as_an_invalid_recovery_key() {
+        let mut opaque = MockOpaqueClient::new();
+        opaque
+            .expect_start_registration()
+            .times(1)
+            .returning(|_| Ok((fake_registration_state(), b"the-request".to_vec())));
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_recovery()
+            .times(1)
+            .returning(|_, _, _| Err(ErrorKind::Grpc(tonic::Status::unauthenticated("no")).into()));
+
+        let client = client_with_deps(
+            mock_grpc,
+            opaque,
+            MockSettingsService::new(),
+            secrets_without_session(true),
+        );
+
+        let err = client
+            .recover_account(
+                "alice",
+                &generate_recovery_key().unwrap(),
+                NEW_PASSWORD,
+                "device",
+                false,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::InvalidRecoveryKey);
+    }
+
+    #[tokio::test]
+    async fn recover_account_refuses_a_weak_new_password_before_anything_else() {
+        // No mock expectations at all: nothing may be called.
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            MockSecretsService::new(),
+        );
+
+        let err = client
+            .recover_account(
+                "alice",
+                &generate_recovery_key().unwrap(),
+                "abc",
+                "device",
+                false,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::WeakPassword);
+    }
+
+    #[tokio::test]
+    async fn recover_account_refuses_while_a_session_is_open() {
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            MockSettingsService::new(),
+            secrets_with_open_session(),
+        );
+
+        let err = client
+            .recover_account(
+                "alice",
+                &generate_recovery_key().unwrap(),
+                NEW_PASSWORD,
+                "device",
+                false,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::AlreadyLoggedIn);
     }
 }

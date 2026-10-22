@@ -18,10 +18,11 @@ mod proto {
 }
 
 use proto::{
-    FinishChangePasswordRequest, FinishLoginRequest, FinishRegistrationRequest,
-    ListSessionsRequest, LogoutRequest, RevokeSessionRequest, SessionInfo,
-    StartChangePasswordRequest, StartLoginRequest, StartRegistrationRequest, finish_login_response,
-    users_service_client::UsersServiceClient as GeneratedUsersClient,
+    DeleteRecoveryKeyRequest, FinishChangePasswordRequest, FinishLoginRequest,
+    FinishRecoveryRequest, FinishRegistrationRequest, GetRecoveryKeyStatusRequest,
+    ListSessionsRequest, LogoutRequest, RevokeSessionRequest, SessionInfo, SetRecoveryKeyRequest,
+    StartChangePasswordRequest, StartLoginRequest, StartRecoveryRequest, StartRegistrationRequest,
+    finish_login_response, users_service_client::UsersServiceClient as GeneratedUsersClient,
 };
 
 /// Converts a listed `SessionInfo` into an [`OpenSession`], not flagged as
@@ -144,6 +145,50 @@ pub(super) trait FydeClient: Send + Sync {
         opaque_upload: &[u8],
         encrypted_master_key: &[u8],
     ) -> Result<()>;
+
+    /// Sets up the recovery key of the account behind the currently
+    /// authenticated session, replacing its previous one: sends the auth key
+    /// derived from it and the master key encrypted under it.
+    async fn set_recovery_key(
+        &self,
+        recovery_auth_key: &[u8],
+        recovery_encrypted_master_key: &[u8],
+    ) -> Result<()>;
+
+    /// Deletes the recovery key of the account behind the currently
+    /// authenticated session, if any.
+    async fn delete_recovery_key(&self) -> Result<()>;
+
+    /// Returns when the recovery key of the account behind the currently
+    /// authenticated session was set up, in Unix seconds, or `None` if it
+    /// has none.
+    async fn get_recovery_key_status(&self) -> Result<Option<i64>>;
+
+    /// First step of recovering `username`'s account: sends the auth key
+    /// derived from its recovery key and a serialized OPAQUE
+    /// `RegistrationRequest` derived from the new password, and returns the
+    /// server's serialized `RegistrationResponse` alongside the master key
+    /// encrypted under the recovery key.
+    async fn start_recovery(
+        &self,
+        username: &str,
+        recovery_auth_key: &[u8],
+        opaque_request: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>)>;
+
+    /// Second and final step of recovering `username`'s account: sends the
+    /// serialized OPAQUE `RegistrationUpload` derived from the new password
+    /// and the master key re-encrypted under its export key, and opens a
+    /// session for `device_name`, returning its token and the account's
+    /// role.
+    async fn finish_recovery(
+        &self,
+        username: &str,
+        recovery_auth_key: &[u8],
+        opaque_upload: &[u8],
+        encrypted_master_key: &[u8],
+        device_name: &str,
+    ) -> Result<(String, Role)>;
 }
 
 /// The production [`FydeClient`] implementation, backed by a tonic
@@ -159,12 +204,13 @@ pub(super) trait FydeClient: Send + Sync {
 /// authenticated by attaching the session token currently persisted in
 /// the secrets store (if any) as a bearer `authorization` header (see
 /// [`crate::domains::sessions::Service::authenticated_request`]) — harmless
-/// for the four registration/login steps, which the server doesn't require
-/// one for. Only the change-password steps check their outcome for a
-/// session the server rejected (see
+/// for the registration, login and recovery steps, which the server doesn't
+/// require one for. Only the calls made from a session (change password,
+/// sessions and recovery key management) check their outcome for a session
+/// the server rejected (see
 /// [`crate::domains::sessions::Service::check_response`]): the
-/// registration/login steps run without a session, and `logout` is already
-/// ending it.
+/// registration/login/recovery steps run without a session, and `logout` is
+/// already ending it.
 pub(super) struct GrpcClient {
     channel: Channel,
     sessions: Arc<SessionsClient>,
@@ -388,6 +434,114 @@ impl FydeClient for GrpcClient {
             .context("failed to finish change password")?;
 
         Ok(())
+    }
+
+    async fn set_recovery_key(
+        &self,
+        recovery_auth_key: &[u8],
+        recovery_encrypted_master_key: &[u8],
+    ) -> Result<()> {
+        let request = self
+            .sessions
+            .authenticated_request(SetRecoveryKeyRequest {
+                recovery_auth_key: recovery_auth_key.to_vec(),
+                recovery_encrypted_master_key: recovery_encrypted_master_key.to_vec(),
+            })
+            .await?;
+
+        self.sessions
+            .check_response(self.client().set_recovery_key(request).await)
+            .await
+            .context("failed to set recovery key")?;
+
+        Ok(())
+    }
+
+    async fn delete_recovery_key(&self) -> Result<()> {
+        let request = self
+            .sessions
+            .authenticated_request(DeleteRecoveryKeyRequest {})
+            .await?;
+
+        self.sessions
+            .check_response(self.client().delete_recovery_key(request).await)
+            .await
+            .context("failed to delete recovery key")?;
+
+        Ok(())
+    }
+
+    async fn get_recovery_key_status(&self) -> Result<Option<i64>> {
+        let request = self
+            .sessions
+            .authenticated_request(GetRecoveryKeyStatusRequest {})
+            .await?;
+
+        let response = self
+            .sessions
+            .check_response(self.client().get_recovery_key_status(request).await)
+            .await
+            .context("failed to get recovery key status")?
+            .into_inner();
+
+        Ok(response.configured.then_some(response.created_at))
+    }
+
+    async fn start_recovery(
+        &self,
+        username: &str,
+        recovery_auth_key: &[u8],
+        opaque_request: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let request = self
+            .sessions
+            .authenticated_request(StartRecoveryRequest {
+                username: username.to_string(),
+                recovery_auth_key: recovery_auth_key.to_vec(),
+                opaque_request: opaque_request.to_vec(),
+            })
+            .await?;
+
+        let response = self
+            .client()
+            .start_recovery(request)
+            .await
+            .context("failed to start recovery")?
+            .into_inner();
+
+        Ok((
+            response.opaque_response,
+            response.recovery_encrypted_master_key,
+        ))
+    }
+
+    async fn finish_recovery(
+        &self,
+        username: &str,
+        recovery_auth_key: &[u8],
+        opaque_upload: &[u8],
+        encrypted_master_key: &[u8],
+        device_name: &str,
+    ) -> Result<(String, Role)> {
+        let request = self
+            .sessions
+            .authenticated_request(FinishRecoveryRequest {
+                username: username.to_string(),
+                recovery_auth_key: recovery_auth_key.to_vec(),
+                opaque_upload: opaque_upload.to_vec(),
+                encrypted_master_key: encrypted_master_key.to_vec(),
+                device_name: device_name.to_string(),
+            })
+            .await?;
+
+        let response = self
+            .client()
+            .finish_recovery(request)
+            .await
+            .context("failed to finish recovery")?
+            .into_inner();
+
+        Ok((response.session_token, to_role(response.role)))
     }
 }
 
