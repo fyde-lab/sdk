@@ -127,7 +127,8 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
   (`SaveDocument`, `UpdateMetadata`, `InstallScript`). `crypto.rs`: AES-256-GCM, per-event DEK
   wrapped by a KEK derived from the master key. The consume job replays from the persisted
-  cursor then tails live, materializing documents and installed scripts; only the process
+  cursor then tails live, materializing documents and installed scripts; a failed pass is
+  retried after a backoff (500 ms doubling to 30 s, reset by a clean pass); only the process
   holding the `flock` (`write_lock`) writes local storage. Applied events are recorded by
   ciphertext digest (`applied_changelog_events`), so one the server serves again is skipped.
 - **users** — OPAQUE (RFC 9807, `opaque-ke`); the password never leaves the SDK.
