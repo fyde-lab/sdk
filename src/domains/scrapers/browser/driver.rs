@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::sync::mpsc::{Sender, SyncSender, sync_channel};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, Sender, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -9,7 +9,7 @@ use base64::Engine as _;
 use rand::RngExt as _;
 use serde_json::Value;
 use tao::event::{Event, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
 use tao::platform::run_return::EventLoopExtRunReturn as _;
 use tao::window::{Window, WindowBuilder};
 use wry::{WebView, WebViewBuilder};
@@ -57,44 +57,141 @@ fn deliver_download_url(pending_download: &PendingDownload, url: String) {
     }
 }
 
-/// Sent from a [`BrowserDriver`] method to the dedicated OS thread actually
-/// holding the `tao` event loop and `wry` webview — neither type is `Send`,
-/// so every real interaction with them has to happen as a message over
-/// this channel (via `EventLoopProxy::send_event`) rather than a direct
-/// method call from the caller's own thread.
+/// Sent from a [`BrowserDriver`] method to the process-wide browser thread
+/// (see [`host_proxy`]) actually holding the `tao` event loop and every
+/// run's `wry` webview — neither type is `Send`, so every real interaction
+/// with them has to happen as a message over this channel (via
+/// `EventLoopProxy::send_event`) rather than a direct method call from the
+/// caller's own thread. Every command but `Create` names the [`Session`] it
+/// targets, so concurrent runs never reach each other's webview.
 enum Command {
+    /// Opens a new window and webview for one run — see
+    /// [`BrowserDriver::ensure_started`]. `ready` reports whether it worked.
+    Create {
+        session: u64,
+        setup: SessionSetup,
+        ready: Sender<Result<()>>,
+    },
     /// Starts loading a URL — fire-and-forget, see [`Service::open`].
-    Open(String),
+    Open { session: u64, url: String },
     /// Runs a JS snippet that eventually calls
     /// `window.ipc.postMessage(JSON.stringify({id, ...}))`, whose `id`
     /// `call` is already waiting on in `PendingReplies`.
-    Eval(String),
+    Eval { session: u64, script: String },
     /// Reads back every cookie the webview holds (see [`Service::cookies`]),
     /// already converted and filtered by [`from_webview_cookie`].
-    Cookies(SyncSender<std::result::Result<Vec<Cookie>, String>>),
-    /// Exits the event loop, ending the thread.
-    Shutdown,
+    Cookies {
+        session: u64,
+        reply: SyncSender<std::result::Result<Vec<Cookie>, String>>,
+    },
+    /// Closes a run's window and webview, once its [`BrowserDriver`] is
+    /// dropped.
+    Close(u64),
 }
 
-struct Running {
-    proxy: EventLoopProxy<Command>,
+/// Everything the browser thread needs to build one run's [`Session`]:
+/// its own reply slots, so the IPC and download handlers of its webview
+/// only ever answer its own driver's calls.
+struct SessionSetup {
+    visible: bool,
+    allowed_domains: Arc<Vec<String>>,
+    initial_cookies: Vec<Cookie>,
     pending: PendingReplies,
     pending_download: PendingDownload,
-    thread: Option<JoinHandle<()>>,
+    closed: Arc<AtomicBool>,
+}
+
+/// One run's window and webview, owned by the browser thread. Each
+/// webview is incognito (see [`build_webview`]), which gives it a data store
+/// of its own: cookies, storage and cache are never shared between two
+/// runs, even two running at the same time.
+struct Session {
+    // Kept alive for as long as the session is: dropping it would close the
+    // webview's window under it.
+    window: Window,
+    webview: WebView,
+    allowed_domains: Arc<Vec<String>>,
+    pending: PendingReplies,
+    pending_download: PendingDownload,
+    closed: Arc<AtomicBool>,
+}
+
+impl Session {
+    /// Marks the session closed and drops every reply slot still waiting
+    /// on it, so a driver call blocked on one fails at once instead of
+    /// running into its timeout.
+    fn close(self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.pending_download
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+    }
+}
+
+/// The proxy to the process-wide browser thread, once it's running. There
+/// is only ever one: on Linux, GTK can only be used from the thread that
+/// initialized it (`gtk::init` panics when called from a second one), so
+/// one thread hosts the event loop and every run's webview, rather than a
+/// thread per run.
+static HOST: Mutex<Option<EventLoopProxy<Command>>> = Mutex::new(None);
+
+/// Returns a proxy to the browser thread, spawning it the first time a
+/// run actually needs a webview. If the thread failed to start (no display,
+/// say), nothing is kept, so a later run tries again.
+fn host_proxy() -> Result<EventLoopProxy<Command>> {
+    let mut host = HOST.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(proxy) = host.as_ref() {
+        return Ok(proxy.clone());
+    }
+
+    // The `tao`/`wry` types involved (`EventLoop`, `WebView`, the GTK
+    // objects underneath them on Linux) are all `!Send`, so none of them
+    // can be built here and then moved into the spawned thread —
+    // `run_event_loop` builds every one of them itself, on the thread that
+    // will actually run the event loop. Only the resulting `EventLoopProxy`
+    // (designed to be usable from other threads) comes back out.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<EventLoopProxy<Command>>();
+    std::thread::Builder::new()
+        .name("fyde-browser".to_string())
+        .spawn(move || run_event_loop(ready_tx))
+        .map_err(|err| ErrorKind::Browser(format!("failed to spawn browser thread: {err}")))?;
+    let proxy = ready_rx.recv().map_err(|_| {
+        ErrorKind::Browser("browser thread exited before it finished starting up".to_string())
+    })?;
+
+    *host = Some(proxy.clone());
+    Ok(proxy)
+}
+
+/// A run's started [`Session`]: the browser thread's proxy, and the id
+/// every [`Command`] this driver sends carries.
+struct Running {
+    proxy: EventLoopProxy<Command>,
+    session: u64,
 }
 
 /// The real [`Service`] implementation: a webview embedded in a `tao`
-/// window (hidden unless `visible`), running entirely on one dedicated OS
-/// thread spawned on first use (see [`ensure_started`](Self::ensure_started)).
-/// Every call is translated into a [`Command`] sent over an
-/// [`EventLoopProxy`]; `wait_for`/`fill`/`click`/`html` send a JS snippet
-/// carrying a unique id that the webview's own `window.ipc` eventually
-/// echoes back — see [`call`](Self::call).
+/// window (hidden unless `visible`), opened on the process-wide browser
+/// thread on first use (see [`ensure_started`](Self::ensure_started)) and
+/// closed when the driver is dropped. Every call is translated into a
+/// [`Command`] sent over an [`EventLoopProxy`]; `wait_for`/`fill`/`click`/
+/// `html` send a JS snippet carrying a unique id that the webview's own
+/// `window.ipc` eventually echoes back — see [`call`](Self::call).
 pub(super) struct BrowserDriver {
     running: Mutex<Option<Running>>,
     allowed_domains: Arc<Vec<String>>,
     visible: bool,
     initial_cookies: Vec<Cookie>,
+    pending: PendingReplies,
+    pending_download: PendingDownload,
+    /// Set by the browser thread once this driver's window is gone (closed
+    /// by the user), so later calls fail at once.
+    closed: Arc<AtomicBool>,
 }
 
 impl BrowserDriver {
@@ -108,6 +205,9 @@ impl BrowserDriver {
             allowed_domains,
             visible,
             initial_cookies,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            pending_download: Arc::new(Mutex::new(None)),
+            closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -122,70 +222,59 @@ impl BrowserDriver {
         rand::rng().random::<u64>() >> 11
     }
 
-    /// Spawns the dedicated OS thread owning this run's `tao` event loop and
-    /// `wry` webview, the first time any [`Service`] method is actually
-    /// called — never at construction. A scraper script that only ever
-    /// calls `fyde.http`/`fyde.html` never pays the cost, or the risk, of
-    /// creating a real window: `wry`'s `WebView` needs a live window-system
-    /// connection (X11/Wayland on Linux) that a headless server or CI
-    /// runner may simply not have, and this way that's only ever a problem
-    /// for a run that actually touches `fyde.browser`.
-    fn ensure_started(&self) -> Result<(EventLoopProxy<Command>, PendingReplies, PendingDownload)> {
-        let mut guard = self.running.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(running) = guard.as_ref() {
-            return Ok((
-                running.proxy.clone(),
-                running.pending.clone(),
-                running.pending_download.clone(),
-            ));
+    /// Opens this run's window and webview on the browser thread, the first
+    /// time any [`Service`] method is actually called — never at
+    /// construction. A scraper script that only ever calls `fyde.http`/
+    /// `fyde.html` never pays the cost, or the risk, of creating a real
+    /// window: `wry`'s `WebView` needs a live window-system connection
+    /// (X11/Wayland on Linux) that a headless server or CI runner may simply
+    /// not have, and this way that's only ever a problem for a run that
+    /// actually touches `fyde.browser`.
+    fn ensure_started(&self) -> Result<(EventLoopProxy<Command>, u64)> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(ErrorKind::Browser("the browser window was closed".to_string()).into());
         }
 
-        let pending: PendingReplies = Arc::new(Mutex::new(HashMap::new()));
-        let pending_for_thread = pending.clone();
-        let pending_download: PendingDownload = Arc::new(Mutex::new(None));
-        let pending_download_for_thread = pending_download.clone();
+        let mut guard = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(running) = guard.as_ref() {
+            return Ok((running.proxy.clone(), running.session));
+        }
 
-        // The `tao`/`wry` types involved (`EventLoop`, `WebView`, the GTK
-        // objects underneath them on Linux) are all `!Send`, so none of
-        // them can be built here and then moved into the spawned thread —
-        // `run_event_loop` builds every one of them itself, from scratch,
-        // on the thread that will actually run the event loop. Only the
-        // resulting `EventLoopProxy` (designed from the start to be usable
-        // from other threads) comes back out, over `ready_tx`.
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<EventLoopProxy<Command>>>();
-
-        let allowed_domains = self.allowed_domains.clone();
-        let visible = self.visible;
-        let initial_cookies = self.initial_cookies.clone();
-        let thread = std::thread::Builder::new()
-            .name("fyde-browser".to_string())
-            .spawn(move || {
-                run_event_loop(
-                    pending_for_thread,
-                    pending_download_for_thread,
-                    ready_tx,
-                    allowed_domains,
-                    visible,
-                    initial_cookies,
-                )
-            })
-            .map_err(|err| ErrorKind::Browser(format!("failed to spawn browser thread: {err}")))?;
+        let proxy = host_proxy()?;
+        let session = rand::rng().random::<u64>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
+        let create = Command::Create {
+            session,
+            setup: SessionSetup {
+                visible: self.visible,
+                allowed_domains: self.allowed_domains.clone(),
+                initial_cookies: self.initial_cookies.clone(),
+                pending: self.pending.clone(),
+                pending_download: self.pending_download.clone(),
+                closed: self.closed.clone(),
+            },
+            ready: ready_tx,
+        };
+        if proxy.send_event(create).is_err() {
+            // The loop is gone; forget it so the next run starts a new one.
+            HOST.lock().unwrap_or_else(|p| p.into_inner()).take();
+            return Err(
+                ErrorKind::Browser("browser thread is no longer running".to_string()).into(),
+            );
+        }
 
         // Block until the webview has actually been created (or failed to
         // be) before handing the proxy back, so a command sent right after
         // `ensure_started` returns can never race the webview's own setup.
-        let proxy = ready_rx.recv().map_err(|_| {
-            ErrorKind::Browser("browser thread exited before it finished starting up".to_string())
+        ready_rx.recv().map_err(|_| {
+            ErrorKind::Browser("browser thread exited before opening a window".to_string())
         })??;
 
         *guard = Some(Running {
             proxy: proxy.clone(),
-            pending: pending.clone(),
-            pending_download: pending_download.clone(),
-            thread: Some(thread),
+            session,
         });
-
-        Ok((proxy, pending, pending_download))
+        Ok((proxy, session))
     }
 
     /// Runs one `Eval` round-trip: allocates an id, registers its reply slot
@@ -196,18 +285,18 @@ impl BrowserDriver {
     /// `click`/`html` — `open` has no reply to wait for, so it bypasses
     /// this.
     fn call(&self, build_js: impl FnOnce(u64) -> String, timeout: Duration) -> Result<Value> {
-        let (proxy, pending, _pending_download) = self.ensure_started()?;
+        let (proxy, session) = self.ensure_started()?;
         let id = self.next_id();
 
         let (tx, rx) = sync_channel(1);
-        pending
+        self.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(id, tx);
 
         let script = build_js(id);
-        if proxy.send_event(Command::Eval(script)).is_err() {
-            pending
+        if proxy.send_event(Command::Eval { session, script }).is_err() {
+            self.pending
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&id);
@@ -218,8 +307,11 @@ impl BrowserDriver {
 
         match rx.recv_timeout(timeout) {
             Ok(value) => Ok(value),
-            Err(_) => {
-                pending
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(ErrorKind::Browser("the browser window was closed".to_string()).into())
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                self.pending
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .remove(&id);
@@ -239,11 +331,8 @@ impl Drop for BrowserDriver {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take();
-        if let Some(mut running) = running {
-            let _ = running.proxy.send_event(Command::Shutdown);
-            if let Some(thread) = running.thread.take() {
-                let _ = thread.join();
-            }
+        if let Some(running) = running {
+            let _ = running.proxy.send_event(Command::Close(running.session));
         }
     }
 }
@@ -251,9 +340,12 @@ impl Drop for BrowserDriver {
 #[async_trait]
 impl Service for BrowserDriver {
     async fn open(&self, url: &str) -> Result<()> {
-        let (proxy, _pending, _pending_download) = self.ensure_started()?;
+        let (proxy, session) = self.ensure_started()?;
         proxy
-            .send_event(Command::Open(url.to_string()))
+            .send_event(Command::Open {
+                session,
+                url: url.to_string(),
+            })
             .map_err(|_| {
                 ErrorKind::Browser("browser thread is no longer running".to_string()).into()
             })
@@ -290,19 +382,19 @@ impl Service for BrowserDriver {
         // Deliberately not `ensure_started`: a run that never touched
         // `fyde.browser` has no cookies here, and mustn't open a window
         // just to find that out.
-        let proxy = match self
+        let (proxy, session) = match self
             .running
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .as_ref()
         {
-            Some(running) => running.proxy.clone(),
+            Some(running) => (running.proxy.clone(), running.session),
             None => return Ok(Vec::new()),
         };
 
         let (tx, rx) = sync_channel(1);
         proxy
-            .send_event(Command::Cookies(tx))
+            .send_event(Command::Cookies { session, reply: tx })
             .map_err(|_| ErrorKind::Browser("browser thread is no longer running".to_string()))?;
         rx.recv_timeout(Duration::from_secs(10))
             .map_err(|_| ErrorKind::Browser("timed out reading the browser's cookies".to_string()))?
@@ -313,20 +405,29 @@ impl Service for BrowserDriver {
 
     async fn download(&self, selector: &str, timeout: Duration) -> Result<Vec<u8>> {
         let deadline = Instant::now() + timeout;
-        let (_proxy, _pending, pending_download) = self.ensure_started()?;
+        self.ensure_started()?;
 
         let (tx, rx) = sync_channel(1);
-        *pending_download.lock().unwrap_or_else(|p| p.into_inner()) = Some(tx);
+        *self
+            .pending_download
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(tx);
 
         // Reuses the same click path `Service::click` does — the download
         // is a side effect of this click, not a separate webview command.
         if let Err(err) = self.click(selector).await {
-            *pending_download.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            *self
+                .pending_download
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
             return Err(err);
         }
 
         let Ok(url) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
-            *pending_download.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            *self
+                .pending_download
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
             return Err(ErrorKind::Browser(format!(
                 "timed out after {timeout:?} waiting for a download to start"
             ))
@@ -347,22 +448,14 @@ impl Service for BrowserDriver {
     }
 }
 
-/// Builds the `tao` event loop and `wry` webview and owns them for as long
-/// as this run's [`BrowserDriver`] is alive, entirely on the thread
-/// [`ensure_started`](BrowserDriver::ensure_started) spawned to call this —
-/// `WebView`/`EventLoop` are both `!Send`, so neither can be built anywhere
-/// else and moved in; only the resulting [`EventLoopProxy`] (sent back over
-/// `ready_tx` once setup finishes, successfully or not) is designed to
-/// cross threads. Processes [`Command`]s until `Command::Shutdown` (or the
-/// window's own close button) exits the loop.
-fn run_event_loop(
-    pending: PendingReplies,
-    pending_download: PendingDownload,
-    ready_tx: Sender<Result<EventLoopProxy<Command>>>,
-    allowed_domains: Arc<Vec<String>>,
-    visible: bool,
-    initial_cookies: Vec<Cookie>,
-) {
+/// Builds the `tao` event loop on the process-wide browser thread
+/// [`host_proxy`] spawned to call this, and runs it for the rest of the
+/// process — `EventLoop`/`WebView` are both `!Send`, so neither can be
+/// built anywhere else and moved in; only the resulting [`EventLoopProxy`]
+/// (sent back over `ready_tx`) is designed to cross threads. Each run's
+/// [`Session`] lives in `sessions` from its `Command::Create` until its
+/// `Command::Close` (or its window's own close button).
+fn run_event_loop(ready_tx: Sender<EventLoopProxy<Command>>) {
     let mut builder = EventLoopBuilder::<Command>::with_user_event();
     #[cfg(target_os = "linux")]
     {
@@ -370,23 +463,53 @@ fn run_event_loop(
         builder.with_any_thread(true);
     }
     let mut event_loop = builder.build();
-    let proxy = event_loop.create_proxy();
+    if ready_tx.send(event_loop.create_proxy()).is_err() {
+        return;
+    }
 
-    let setup = build_window(&event_loop, visible).and_then(|window| {
-        let webview = build_webview(&window, pending, pending_download, allowed_domains.clone())?;
-        Ok((window, webview))
-    });
-    // `_window` (not `_`) keeps the window alive for as long as the loop
-    // below runs: dropping it would close the webview's window under it.
-    let (_window, webview) = match setup {
-        Ok(setup) => setup,
-        Err(err) => {
-            let _ = ready_tx.send(Err(err));
-            return;
+    let mut sessions: HashMap<u64, Session> = HashMap::new();
+    event_loop.run_return(move |event, target, control_flow| {
+        *control_flow = ControlFlow::Wait;
+        match event {
+            Event::UserEvent(command) => handle_command(&mut sessions, target, command),
+            Event::WindowEvent {
+                window_id,
+                event: WindowEvent::CloseRequested,
+                ..
+            } => {
+                let closed = sessions
+                    .iter()
+                    .find(|(_, session)| session.window.id() == window_id)
+                    .map(|(id, _)| *id);
+                if let Some(session) = closed.and_then(|id| sessions.remove(&id)) {
+                    session.close();
+                }
+            }
+            _ => {}
         }
-    };
+    });
+}
 
-    // Seeded before `ready_tx` fires, so no `open` can race ahead of them.
+/// Opens one run's window and webview, seeded with its saved cookies.
+fn open_session(target: &EventLoopWindowTarget<Command>, setup: SessionSetup) -> Result<Session> {
+    let SessionSetup {
+        visible,
+        allowed_domains,
+        initial_cookies,
+        pending,
+        pending_download,
+        closed,
+    } = setup;
+
+    let window = build_window(target, visible)?;
+    let webview = build_webview(
+        &window,
+        pending.clone(),
+        pending_download.clone(),
+        allowed_domains.clone(),
+    )?;
+
+    // Seeded before `ready` fires, so no `open` can race ahead of them.
     for saved in &initial_cookies {
         let Some(cookie) = to_webview_cookie(saved) else {
             tracing::warn!(origin = %saved.origin, "fyde.browser: skipping an unparseable saved cookie");
@@ -397,29 +520,18 @@ fn run_event_loop(
         }
     }
 
-    if ready_tx.send(Ok(proxy)).is_err() {
-        return;
-    }
-
-    event_loop.run_return(move |event, _target, control_flow| {
-        *control_flow = ControlFlow::Wait;
-        match event {
-            Event::UserEvent(command) => {
-                handle_command(&webview, command, &allowed_domains, control_flow);
-            }
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => {
-                *control_flow = ControlFlow::Exit;
-            }
-            _ => {}
-        }
-    });
+    Ok(Session {
+        window,
+        webview,
+        allowed_domains,
+        pending,
+        pending_download,
+        closed,
+    })
 }
 
 /// Builds the (hidden unless `visible`) window the webview attaches to.
-fn build_window(event_loop: &EventLoop<Command>, visible: bool) -> Result<Window> {
+fn build_window(target: &EventLoopWindowTarget<Command>, visible: bool) -> Result<Window> {
     let mut window_builder = WindowBuilder::new().with_visible(visible);
     if visible {
         window_builder = window_builder
@@ -442,7 +554,7 @@ fn build_window(event_loop: &EventLoop<Command>, visible: bool) -> Result<Window
         window_builder = window_builder.with_default_vbox(false);
     }
     window_builder
-        .build(event_loop)
+        .build(target)
         .map_err(|err| ErrorKind::Browser(format!("failed to create browser window: {err}")).into())
 }
 
@@ -547,39 +659,66 @@ fn build_webview(
     webview.map_err(|err| ErrorKind::Browser(format!("failed to create webview: {err}")).into())
 }
 
-/// Carries out one [`Command`] sent from [`BrowserDriver`] on the webview's
-/// own thread.
+/// Carries out one [`Command`] sent from a [`BrowserDriver`], on the browser
+/// thread, against the [`Session`] it names. A command for a session that
+/// no longer exists (its window was closed) is dropped: the driver already
+/// knows, through the session's `closed` flag and its dropped reply slots.
 fn handle_command(
-    webview: &WebView,
+    sessions: &mut HashMap<u64, Session>,
+    target: &EventLoopWindowTarget<Command>,
     command: Command,
-    allowed_domains: &[String],
-    control_flow: &mut ControlFlow,
 ) {
     match command {
-        Command::Open(url) => {
-            if let Err(err) = webview.load_url(&url) {
+        Command::Create {
+            session,
+            setup,
+            ready,
+        } => match open_session(target, setup) {
+            Ok(opened) => {
+                sessions.insert(session, opened);
+                let _ = ready.send(Ok(()));
+            }
+            Err(err) => {
+                let _ = ready.send(Err(err));
+            }
+        },
+        Command::Open { session, url } => {
+            let Some(session) = sessions.get(&session) else {
+                return;
+            };
+            if let Err(err) = session.webview.load_url(&url) {
                 tracing::error!("fyde.browser: load_url({url:?}) failed: {err}");
             }
         }
-        Command::Eval(script) => {
-            if let Err(err) = webview.evaluate_script(&script) {
+        Command::Eval { session, script } => {
+            let Some(session) = sessions.get(&session) else {
+                return;
+            };
+            if let Err(err) = session.webview.evaluate_script(&script) {
                 tracing::error!("fyde.browser: evaluate_script failed: {err}");
             }
         }
-        Command::Cookies(reply) => {
-            let cookies = webview
+        Command::Cookies { session, reply } => {
+            let Some(session) = sessions.get(&session) else {
+                let _ = reply.send(Err("the browser window was closed".to_string()));
+                return;
+            };
+            let cookies = session
+                .webview
                 .cookies()
                 .map(|cookies| {
                     cookies
                         .iter()
-                        .filter_map(|cookie| from_webview_cookie(cookie, allowed_domains))
+                        .filter_map(|cookie| from_webview_cookie(cookie, &session.allowed_domains))
                         .collect()
                 })
                 .map_err(|err| err.to_string());
             let _ = reply.send(cookies);
         }
-        Command::Shutdown => {
-            *control_flow = ControlFlow::Exit;
+        Command::Close(session) => {
+            if let Some(session) = sessions.remove(&session) {
+                session.close();
+            }
         }
     }
 }
@@ -881,6 +1020,59 @@ fn parse_fetched(value: Value) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domains::scrapers::cookies::FakeCookie;
+
+    /// A driver allowed on `example.com`, seeded with one `session` cookie
+    /// for it holding `value`.
+    fn driver_with_session(value: &str) -> BrowserDriver {
+        BrowserDriver::new(
+            Arc::new(vec!["example.com".to_string()]),
+            false,
+            vec![
+                FakeCookie::new()
+                    .with_origin("https://example.com")
+                    .with_set_cookie(format!("session={value}; Path=/"))
+                    .build(),
+            ],
+        )
+    }
+
+    fn session_cookies(driver: &BrowserDriver) -> Vec<String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(driver.open("about:blank")).unwrap();
+        runtime
+            .block_on(driver.wait_for("body", Duration::from_secs(5)))
+            .unwrap();
+        runtime
+            .block_on(driver.cookies())
+            .unwrap()
+            .into_iter()
+            .map(|cookie| cookie.set_cookie)
+            .collect()
+    }
+
+    /// Needs a display (X11/Wayland), so it only runs on demand:
+    /// `cargo test -- --ignored concurrent_drivers`.
+    #[test]
+    #[ignore]
+    fn concurrent_drivers_get_isolated_webviews_on_one_browser_thread() {
+        let first = std::thread::spawn(|| session_cookies(&driver_with_session("first")));
+        let second = std::thread::spawn(|| session_cookies(&driver_with_session("second")));
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(first[0].starts_with("session=first"), "{first:?}");
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert!(second[0].starts_with("session=second"), "{second:?}");
+
+        // Both are closed by now; a later run reuses the same thread
+        // (GTK can't be initialized again from a new one).
+        let third = session_cookies(&driver_with_session("third"));
+        assert!(third[0].starts_with("session=third"), "{third:?}");
+    }
 
     #[test]
     fn is_navigation_allowed_accepts_an_allowed_host_and_its_subdomains() {

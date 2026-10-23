@@ -32,9 +32,12 @@ use crate::Result;
 /// sub-domain (see [`init`]/[`Service::cookies`]) rather than any storage of
 /// this module's own — a fresh [`driver::BrowserDriver`] is built
 /// per scraper run (see `service.rs::run_script`), lives only for that
-/// run, and is torn down (its window closed, its dedicated OS thread
-/// joined) once the run's `Arc<dyn Service>` is dropped — see
-/// `driver::BrowserDriver`'s `Drop` impl.
+/// run, and has its window and webview closed once the run's
+/// `Arc<dyn Service>` is dropped — see `driver::BrowserDriver`'s `Drop`
+/// impl. Every run's webview lives on one process-wide browser thread (GTK
+/// can only ever be used from the thread that initialized it), but each is
+/// incognito with a data store of its own, so concurrent runs never share
+/// cookies, storage or cache.
 ///
 /// **Caveat verified only on Linux/WebKitGTK**: a real webview needs a live
 /// window-system connection (X11/Wayland on Linux; the OS-native webview
