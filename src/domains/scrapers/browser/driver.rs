@@ -293,6 +293,15 @@ impl BrowserDriver {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(id, tx);
+        // The window may have closed since `ensure_started` checked, clearing
+        // `pending` before this slot went in: nothing would ever answer it.
+        if self.closed.load(Ordering::SeqCst) {
+            self.pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
+            return Err(ErrorKind::Browser("the browser window was closed".to_string()).into());
+        }
 
         let script = build_js(id);
         if proxy.send_event(Command::Eval { session, script }).is_err() {

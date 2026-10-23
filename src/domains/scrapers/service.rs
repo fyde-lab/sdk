@@ -44,7 +44,7 @@ pub(super) struct ScrapersClient {
     documents: Arc<dyn DocumentsService>,
     on_progress: Option<OnScraperProgress>,
     on_question: Option<OnScraperQuestion>,
-    running: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    running: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl ScrapersClient {
@@ -63,15 +63,17 @@ impl ScrapersClient {
             documents,
             on_progress,
             on_question,
-            running: Mutex::new(HashMap::new()),
+            running: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Waits until no other run holds `name`, then holds it until the
     /// returned guard drops — across the whole load, run and save of
     /// `Service::run`, so a waiting run starts from what the previous one
-    /// saved. Runs under different names never wait on each other.
-    async fn lock_name(&self, name: &str) -> NameGuard<'_> {
+    /// saved. Runs under different names never wait on each other. The
+    /// guard is `'static` so it can travel into the run's blocking job: see
+    /// `Service::run` for why.
+    async fn lock_name(&self, name: &str) -> NameGuard {
         let lock = self
             .running
             .lock()
@@ -81,7 +83,7 @@ impl ScrapersClient {
             .clone();
         let guard = lock.clone().lock_owned().await;
         NameGuard {
-            client: self,
+            running: self.running.clone(),
             name: name.to_string(),
             lock,
             _guard: Some(guard),
@@ -92,21 +94,17 @@ impl ScrapersClient {
 /// Held by a run for as long as it owns its name — see
 /// [`ScrapersClient::lock_name`]. Dropping it lets the next run under that
 /// name start, and forgets the name once no run holds or awaits it.
-struct NameGuard<'a> {
-    client: &'a ScrapersClient,
+struct NameGuard {
+    running: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     name: String,
     lock: Arc<tokio::sync::Mutex<()>>,
     _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
-impl Drop for NameGuard<'_> {
+impl Drop for NameGuard {
     fn drop(&mut self) {
         self._guard.take();
-        let mut running = self
-            .client
-            .running
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut running = self.running.lock().unwrap_or_else(|p| p.into_inner());
         // Two references left: the map's and this guard's own, so no other
         // run holds or waits for this name.
         if Arc::strong_count(&self.lock) == 2 {
@@ -145,7 +143,7 @@ impl Service for ScrapersClient {
         allowed_domains: Vec<String>,
         browser_visible: bool,
     ) -> Result<()> {
-        let _name = self.lock_name(name).await;
+        let name_guard = self.lock_name(name).await;
 
         let cookies = self
             .cookies
@@ -180,10 +178,18 @@ impl Service for ScrapersClient {
             },
         };
 
-        let (session_data, cookies, run_result) =
-            tokio::task::spawn_blocking(move || run_script(job))
-                .await
-                .with_context(|| format!("scraper {name:?} task panicked"))??;
+        // The guard rides along with the job and comes back with its result:
+        // if this future is dropped mid-run, the blocking job (which can't be
+        // cancelled) keeps the name until the script has really stopped, so
+        // no other run of it starts alongside. Otherwise it's held here
+        // through the saves below.
+        let (_name_guard, outcome) = tokio::task::spawn_blocking(move || {
+            let outcome = run_script(job);
+            (name_guard, outcome)
+        })
+        .await
+        .with_context(|| format!("scraper {name:?} task panicked"))?;
+        let (session_data, cookies, run_result) = outcome?;
 
         match &run_result {
             Ok(()) => recorder.record("run_finished", json!({ "status": "ok" })),
@@ -852,6 +858,36 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn run_keeps_the_name_until_a_cancelled_runs_script_has_stopped() {
+        let active = Arc::new(Mutex::new((0, 0)));
+        let for_callback = active.clone();
+        let (asking_tx, asking_rx) = tokio::sync::oneshot::channel::<()>();
+        let asking_tx = Mutex::new(Some(asking_tx));
+        let client = asking_client(Arc::new(move |_name: &str, _question| {
+            {
+                let mut active = for_callback.lock().unwrap();
+                active.0 += 1;
+                active.1 = active.1.max(active.0);
+            }
+            if let Some(tx) = asking_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            for_callback.lock().unwrap().0 -= 1;
+            "ok".to_string()
+        }));
+
+        // Cancel the first run while its script is still going.
+        let first = tokio::spawn(run_asking(client.clone(), "didaxis"));
+        asking_rx.await.unwrap();
+        first.abort();
+
+        run_asking(client.clone(), "didaxis").await.unwrap();
+
+        assert_eq!(active.lock().unwrap().1, 1, "runs overlapped");
     }
 
     #[test]
