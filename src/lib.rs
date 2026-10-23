@@ -16,7 +16,8 @@ pub use domains::documents::{
 };
 pub use domains::icons::{Icon, Service as IconsService};
 pub use domains::scrapers::{
-    HELPERS_LUA as SCRAPER_HELPERS_LUA, ProgressEvent, ProgressStep, Service as ScrapersService,
+    HELPERS_LUA as SCRAPER_HELPERS_LUA, OnScraperProgress, OnScraperQuestion, ProgressEvent,
+    ProgressStep, Service as ScrapersService,
 };
 pub use domains::scripts::{
     InMemoryScriptStorage, InstallScriptRequest, InstalledScript, Script, ScriptMetadata,
@@ -84,17 +85,23 @@ pub struct ClientConfig {
     /// call made by a scraper script running via `ScrapersService::run`, so
     /// the caller can render its own progress bar. Steps are a fixed set of
     /// [`ProgressStep`]s, never free text: word one for the user with
-    /// [`ProgressStep::user_message`]. `None` if the caller
-    /// doesn't need to observe scraper progress.
-    pub on_scraper_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
+    /// [`ProgressStep::user_message`]. Scrapers can run in parallel, so it
+    /// also gets the name the run was started under (`ScrapersService::run`'s
+    /// `name`, or the script id for `run_installed`), which tells concurrent
+    /// runs' events apart. `None` if the caller doesn't need to observe
+    /// scraper progress.
+    pub on_scraper_progress: Option<OnScraperProgress>,
     /// Called once for every `fyde.input.ask(question)` call made by a
     /// running scraper script, and must return the answer to show for it —
     /// the call blocks until it does, so the caller should ask directly on
-    /// screen rather than return immediately with a placeholder. `None`
+    /// screen rather than return immediately with a placeholder. Like
+    /// `on_scraper_progress`, it gets the asking run's name first, so a
+    /// caller running several scrapers at once can say which one is asking;
+    /// the answer always goes back to that run alone. `None`
     /// means a scraper script calling `fyde.input.ask` fails immediately
     /// instead of blocking forever waiting for an answer that can never
     /// come.
-    pub on_scraper_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
+    pub on_scraper_question: Option<OnScraperQuestion>,
 }
 
 /// A connection to a fyde server.
@@ -556,8 +563,8 @@ pub async fn init_dev_scrapers(
     storage_dir: std::path::PathBuf,
     documents_dir: std::path::PathBuf,
     scraper_name: impl Into<String>,
-    on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
-    on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
+    on_progress: Option<OnScraperProgress>,
+    on_question: Option<OnScraperQuestion>,
 ) -> Result<Arc<dyn ScrapersService>> {
     let documents = domains::documents::init_dev(documents_dir, scraper_name);
 

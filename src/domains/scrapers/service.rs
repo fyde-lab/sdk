@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use mlua::{Function, Lua, LuaSerdeExt as _, StdLib, Table};
@@ -14,7 +15,7 @@ use super::host::{self, HostConfig};
 use super::models::RunOptions;
 use super::reports::{Recorder, Service as ReportsService};
 use super::session::Service as SessionService;
-use super::{ProgressEvent, Service};
+use super::{OnScraperProgress, OnScraperQuestion, ProgressEvent, Service};
 
 /// The `wreq_emulation`/`follow_redirects` an installed script runs with.
 /// Each scraper's `manifest.json` (in `../scripts`) chooses these for a dev
@@ -30,13 +31,20 @@ const INSTALLED_FOLLOW_REDIRECTS: bool = true;
 /// injected [`SessionService`]/[`CookiesService`] implementations, this
 /// run's debug report to an injected [`ReportsService`], and document
 /// uploads to an injected [`DocumentsService`].
+///
+/// Runs share nothing but these injected services, so any number can run
+/// at once — except two under the same name, which would load the same
+/// session and cookies and then overwrite each other's saves (a failed run
+/// even deleting the cookies a successful one just saved): `running`
+/// serializes those, see [`ScrapersClient::lock_name`].
 pub(super) struct ScrapersClient {
     cookies: Arc<dyn CookiesService>,
     session: Arc<dyn SessionService>,
     reports: Arc<dyn ReportsService>,
     documents: Arc<dyn DocumentsService>,
-    on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
-    on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
+    on_progress: Option<OnScraperProgress>,
+    on_question: Option<OnScraperQuestion>,
+    running: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl ScrapersClient {
@@ -45,8 +53,8 @@ impl ScrapersClient {
         session: Arc<dyn SessionService>,
         reports: Arc<dyn ReportsService>,
         documents: Arc<dyn DocumentsService>,
-        on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
-        on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
+        on_progress: Option<OnScraperProgress>,
+        on_question: Option<OnScraperQuestion>,
     ) -> Self {
         Self {
             cookies,
@@ -55,6 +63,54 @@ impl ScrapersClient {
             documents,
             on_progress,
             on_question,
+            running: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Waits until no other run holds `name`, then holds it until the
+    /// returned guard drops — across the whole load, run and save of
+    /// `Service::run`, so a waiting run starts from what the previous one
+    /// saved. Runs under different names never wait on each other.
+    async fn lock_name(&self, name: &str) -> NameGuard<'_> {
+        let lock = self
+            .running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(name.to_string())
+            .or_default()
+            .clone();
+        let guard = lock.clone().lock_owned().await;
+        NameGuard {
+            client: self,
+            name: name.to_string(),
+            lock,
+            _guard: Some(guard),
+        }
+    }
+}
+
+/// Held by a run for as long as it owns its name — see
+/// [`ScrapersClient::lock_name`]. Dropping it lets the next run under that
+/// name start, and forgets the name once no run holds or awaits it.
+struct NameGuard<'a> {
+    client: &'a ScrapersClient,
+    name: String,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for NameGuard<'_> {
+    fn drop(&mut self) {
+        self._guard.take();
+        let mut running = self
+            .client
+            .running
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // Two references left: the map's and this guard's own, so no other
+        // run holds or waits for this name.
+        if Arc::strong_count(&self.lock) == 2 {
+            running.remove(&self.name);
         }
     }
 }
@@ -89,6 +145,8 @@ impl Service for ScrapersClient {
         allowed_domains: Vec<String>,
         browser_visible: bool,
     ) -> Result<()> {
+        let _name = self.lock_name(name).await;
+
         let cookies = self
             .cookies
             .load(name)
@@ -166,8 +224,8 @@ struct ScraperJob {
     session_data: Value,
     cookies: Vec<Cookie>,
     documents: Arc<dyn DocumentsService>,
-    on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
-    on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
+    on_progress: Option<OnScraperProgress>,
+    on_question: Option<OnScraperQuestion>,
     recorder: Arc<Recorder>,
     runtime: Handle,
     options: RunOptions,
@@ -196,9 +254,21 @@ fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
         options,
     } = job;
 
+    // Bound to this run's name, so the caller can tell its events and
+    // questions apart from those of any other run going on at the same time.
+    let on_progress = on_progress.map(|callback| -> Arc<dyn Fn(ProgressEvent) + Send + Sync> {
+        let name = name.clone();
+        Arc::new(move |event| callback(&name, event))
+    });
+    let on_question = on_question.map(|callback| -> Arc<dyn Fn(String) -> String + Send + Sync> {
+        let name = name.clone();
+        Arc::new(move |question| callback(&name, question))
+    });
+
     let lua = sandboxed_lua().context("building sandboxed lua vm")?;
-    // Built fresh per run, same as the Lua VM itself: the webview it lazily
-    // spawns (see `browser::driver::BrowserDriver`) lives only as long as
+    // Built fresh per run, same as the Lua VM itself: the window and webview
+    // it lazily opens on the shared browser thread (see
+    // `browser::driver::BrowserDriver`) live only as long as
     // this run does, closed via its `Drop` impl once every `Arc` clone
     // (`host::install`'s for `fyde.browser`'s closures, and this function's
     // own for reading its cookies back below) goes out of scope at the end
@@ -332,7 +402,7 @@ fn evaluate_and_run(lua: &Lua, name: &str, script: &str, parameters: Value) -> R
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::time::Duration;
 
     use mockall::predicate::eq;
     use serde_json::json;
@@ -597,8 +667,9 @@ mod tests {
 
         let received = Arc::new(Mutex::new(Vec::new()));
         let callback = received.clone();
-        let on_progress: Arc<dyn Fn(ProgressEvent) + Send + Sync> =
-            Arc::new(move |event| callback.lock().unwrap().push(event));
+        let on_progress: OnScraperProgress = Arc::new(move |name: &str, event| {
+            callback.lock().unwrap().push((name.to_string(), event))
+        });
 
         let client = ScrapersClient::new(
             Arc::new(cookies),
@@ -635,14 +706,124 @@ mod tests {
         assert_eq!(
             *received.lock().unwrap(),
             vec![
-                ProgressEvent::Step {
-                    step: ProgressStep::LoggingIn
-                },
-                ProgressEvent::Update {
-                    current: 1,
-                    total: 2
-                },
+                (
+                    "didaxis".to_string(),
+                    ProgressEvent::Step {
+                        step: ProgressStep::LoggingIn
+                    }
+                ),
+                (
+                    "didaxis".to_string(),
+                    ProgressEvent::Update {
+                        current: 1,
+                        total: 2
+                    }
+                ),
             ]
+        );
+    }
+
+    /// Script whose `run` asks one question, so a test's `on_question`
+    /// callback runs inside the run, on its blocking thread.
+    const ASKING_SCRIPT: &str = r#"
+        local M = {}
+        function M.run(parameters)
+            fyde.session.answer = fyde.input.ask("code?")
+        end
+        return M
+    "#;
+
+    /// A client whose session/cookie storage accepts any load or save, with
+    /// `on_question` as its question handler.
+    fn asking_client(on_question: OnScraperQuestion) -> Arc<ScrapersClient> {
+        let mut cookies = MockCookiesService::new();
+        cookies.expect_load().returning(|_| Ok(Vec::new()));
+        cookies.expect_save().returning(|_, _| Ok(()));
+        let mut session = MockSessionService::new();
+        session.expect_load().returning(|_| Ok(json!({})));
+        session.expect_save().returning(|_, _| Ok(()));
+        let mut reports = MockReportsService::new();
+        reports.expect_save().returning(|_| Ok(()));
+
+        Arc::new(ScrapersClient::new(
+            Arc::new(cookies),
+            Arc::new(session),
+            Arc::new(reports),
+            Arc::new(MockDocumentsService::new()),
+            None,
+            Some(on_question),
+        ))
+    }
+
+    async fn run_asking(client: Arc<ScrapersClient>, name: &'static str) -> Result<()> {
+        client
+            .run(
+                name,
+                ASKING_SCRIPT,
+                json!({}),
+                false,
+                true,
+                true,
+                Vec::new(),
+                false,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn run_runs_scrapers_with_different_names_in_parallel() {
+        // Both questions only get answered once both runs are asking at
+        // the same time: run one after the other, they'd time out.
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let for_callback = asked.clone();
+        let client = asking_client(Arc::new(move |name: &str, _question| {
+            for_callback.lock().unwrap().push(name.to_string());
+            barrier.wait();
+            format!("answer for {name}")
+        }));
+
+        let both = async {
+            tokio::try_join!(
+                run_asking(client.clone(), "didaxis"),
+                run_asking(client.clone(), "impots"),
+            )
+        };
+        tokio::time::timeout(Duration::from_secs(10), both)
+            .await
+            .expect("the two runs should not wait on each other")
+            .unwrap();
+
+        let mut asked = asked.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(asked, vec!["didaxis", "impots"]);
+    }
+
+    #[tokio::test]
+    async fn run_serializes_two_runs_of_the_same_scraper() {
+        let active = Arc::new(Mutex::new((0, 0)));
+        let for_callback = active.clone();
+        let client = asking_client(Arc::new(move |_name: &str, _question| {
+            {
+                let mut active = for_callback.lock().unwrap();
+                active.0 += 1;
+                active.1 = active.1.max(active.0);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            for_callback.lock().unwrap().0 -= 1;
+            "ok".to_string()
+        }));
+
+        tokio::try_join!(
+            run_asking(client.clone(), "didaxis"),
+            run_asking(client.clone(), "didaxis"),
+        )
+        .unwrap();
+
+        assert_eq!(active.lock().unwrap().1, 1, "runs overlapped");
+        assert!(
+            client.running.lock().unwrap().is_empty(),
+            "the name should be forgotten once no run holds it"
         );
     }
 

@@ -20,6 +20,14 @@ use crate::Result;
 use crate::domains::documents::Service as DocumentsService;
 use crate::domains::scripts::InstalledScript;
 
+/// [`crate::ClientConfig::on_scraper_progress`]'s callback: the name of the
+/// run reporting progress (see [`Service::run`]), then the event.
+pub type OnScraperProgress = Arc<dyn Fn(&str, ProgressEvent) + Send + Sync>;
+
+/// [`crate::ClientConfig::on_scraper_question`]'s callback: the name of the
+/// run asking (see [`Service::run`]), then the question; returns the answer.
+pub type OnScraperQuestion = Arc<dyn Fn(&str, String) -> String + Send + Sync>;
+
 /// Runs Lua scraper scripts: a sandboxed Lua 5.4 VM with host capabilities
 /// exposed under a single `fyde` global table (`fyde.http`, `fyde.html`,
 /// `fyde.json`, `fyde.log`, `fyde.progress`, `fyde.input`,
@@ -31,6 +39,13 @@ use crate::domains::scripts::InstalledScript;
 /// `demo-rust-fyde`'s: return a table with a single `run(parameters)`
 /// function, calling only into `fyde`. Trait methods take `&self` (not
 /// `&mut self`) so implementations can be shared behind `Arc<dyn Service>`.
+///
+/// Several scripts can run at once, each fully isolated from the others:
+/// its own Lua VM, cookie jar, session table, debug report and, if it
+/// uses `fyde.browser`, its own window and incognito webview (no shared
+/// cookies or storage). Runs under the same `name` share persisted state,
+/// so they take turns instead: a second one waits for the first to finish
+/// and save, then starts from what it saved.
 #[async_trait]
 pub trait Service: Send + Sync {
     /// Runs `script` (Lua source) as the scraper named `name`. `name` scopes
@@ -136,8 +151,8 @@ pub(crate) enum StorageConfig {
 pub(crate) fn init(
     storage: StorageConfig,
     documents: Arc<dyn DocumentsService>,
-    on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
-    on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
+    on_progress: Option<OnScraperProgress>,
+    on_question: Option<OnScraperQuestion>,
 ) -> Arc<dyn Service> {
     let (cookies_storage, session_storage, reports_storage) = match storage {
         // Each sub-domain already names its files distinctly

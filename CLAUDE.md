@@ -180,6 +180,11 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
   of inlining — `../scripts` relies on their names and behaviour).
   - `mlua::Lua` is `!Send`: `run` builds the VM inside `spawn_blocking` and host functions use
     a captured runtime `Handle::block_on`. Never move a `Lua` across threads.
+  - Runs are parallel and isolated: each gets its own VM, cookie jar, session table, recorder
+    and webview. Runs sharing a `name` share persisted state, so `ScrapersClient` serializes
+    them (`lock_name`). `on_scraper_progress`/`on_scraper_question` get the run's name first
+    so callers can tell concurrent runs apart. Never add process-wide mutable state a script
+    can reach.
   - `fyde.progress` carries no free text, so the UI can word it in the user's language:
     `step(name)` only accepts a `ProgressStep` name (`"logging_in"`, ...; anything else raises),
     each also exposed as a constant scripts use instead (`fyde.progress.LOGGING_IN`),
@@ -195,8 +200,10 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
     on failure; cookies only on success (a failed run deletes them).
   - `allowed_domains` fails closed: an empty list allows no host; an IP literal only matches
     exactly.
-  - `browser/` — `wry`/`tao` webview, started lazily on a dedicated thread (all its objects are
-    `!Send`; calls cross over via `EventLoopProxy` commands and IPC replies). Only verified on
+  - `browser/` — `wry`/`tao` webviews on one process-wide thread, started lazily (GTK panics if
+    initialized from a second thread; all its objects are `!Send`). Each run gets its own window
+    and incognito webview, addressed by a session id in every `EventLoopProxy` command; IPC
+    replies go to per-run slots. Only verified on
     Linux/WebKitGTK. Webview cookies are merged into the saved jar (browser wins) and restored
     as domain cookies (`driver::to_webview_cookie`). Forms are submitted with `click`, never
     an in-page `fetch` (it bypasses bot-mitigation hooks); `download` cancels the native
