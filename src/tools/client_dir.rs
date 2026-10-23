@@ -101,11 +101,11 @@ mod tests {
         std::fs::write(dir.join("cache").join("nested").join("icon.png"), b"png").unwrap();
         std::fs::write(dir.join("stray.json"), b"{}").unwrap();
         std::fs::write(dir.join("fyde.db"), b"db").unwrap();
-        std::fs::write(dir.join("fyde.db.consume.lock"), b"").unwrap();
+        std::fs::write(dir.join("fyde.db.lock"), b"").unwrap();
 
         ClientDirectory::Disk {
             dir: dir.clone(),
-            keep: vec![dir.join("fyde.db"), dir.join("fyde.db.consume.lock")],
+            keep: vec![dir.join("fyde.db"), dir.join("fyde.db.lock")],
         }
         .clear()
         .await
@@ -116,7 +116,7 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         left.sort();
-        assert_eq!(left, ["fyde.db", "fyde.db.consume.lock"]);
+        assert_eq!(left, ["fyde.db", "fyde.db.lock"]);
         assert_eq!(std::fs::read(dir.join("fyde.db")).unwrap(), b"db");
     }
 

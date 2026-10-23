@@ -51,6 +51,9 @@ macro_rules! for_each_error_code {
             /// The client name a `Client` was configured with isn't usable
             /// as the name of its local data directory.
             InvalidClientName = 1011,
+            /// Another instance of this client is already running on the
+            /// same local data directory: only one may use it at a time.
+            ClientAlreadyRunning = 1012,
             /// Encrypting or decrypting data failed.
             Encryption = 1101,
             /// The OS credential store (Keychain, Secret Service, ...) failed.
@@ -213,6 +216,8 @@ pub(crate) enum ErrorKind {
         "invalid client name {0:?}: expected 1 to 64 ASCII letters, digits, '-', '_' or '.', not starting with '.'"
     )]
     InvalidClientName(String),
+    #[error("another instance of this client already holds the lock {0:?}")]
+    ClientAlreadyRunning(std::path::PathBuf),
     #[error("invalid uuid: {0}")]
     InvalidUuid(#[from] uuid::Error),
     #[error("invalid integer: {0}")]
@@ -300,6 +305,7 @@ impl ErrorKind {
             ErrorKind::Grpc(status) => grpc_code(status.code()),
             ErrorKind::InvalidEndpoint(_) => ErrorCode::InvalidServerUrl,
             ErrorKind::InvalidClientName(_) => ErrorCode::InvalidClientName,
+            ErrorKind::ClientAlreadyRunning(_) => ErrorCode::ClientAlreadyRunning,
             ErrorKind::InvalidUuid(_) => ErrorCode::InvalidUuid,
             ErrorKind::InvalidInteger(_) => ErrorCode::InvalidInteger,
             ErrorKind::Io(_) => ErrorCode::Io,
