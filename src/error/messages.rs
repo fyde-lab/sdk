@@ -72,6 +72,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "The application is misconfigured: its name is invalid.",
             "L'application est mal configurée : son nom est invalide.",
         ),
+        ErrorCode::ClientAlreadyRunning => (
+            "Fyde is already running on this device. Close the other window first.",
+            "Fyde est déjà ouvert sur cet appareil. Fermez d'abord l'autre fenêtre.",
+        ),
         ErrorCode::Encryption => (
             "Your data couldn't be encrypted or decrypted.",
             "Vos données n'ont pas pu être chiffrées ou déchiffrées.",

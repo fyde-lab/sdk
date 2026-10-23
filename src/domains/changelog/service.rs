@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -111,30 +110,6 @@ pub(super) struct ChangelogClient<D: DocumentStorage, S: ScriptStorage, O: Curso
     /// `stop_consume_job()` call is never lost even if it lands before the
     /// task starts watching it or between two of its passes.
     stop: watch::Sender<bool>,
-    /// Path to this client's advisory write lock file, arbitrating write
-    /// access to one local database between the processes sharing it: only
-    /// the process holding it persists documents, installed scripts and the
-    /// cursor in [`Self::consume_once`]. One per database (see
-    /// `changelog::init`'s `lock_path`), never one per machine — processes
-    /// with separate databases (the app, `fyde-scripts`, a second account's
-    /// app) have nothing to arbitrate, and a shared lock left all but one of
-    /// them read-only, so they never stored what they consumed. Under test,
-    /// a unique per-instance path (see `tests::test_lock_path`).
-    lock_path: std::path::PathBuf,
-    /// Holds the open, OS-locked handle to [`Self::lock_path`] for as long
-    /// as this process has exclusive write permission over the local
-    /// document cache, acquired by [`Service::start_consume_job`] and
-    /// released by [`Service::stop_consume_job`]. `None` whenever another
-    /// process already holds it — in which case [`Self::consume_once`]
-    /// still consumes every event and still invokes the caller's callback,
-    /// but skips persisting the document/metadata locally, since only the
-    /// lock holder is allowed to write. The OS releases the underlying
-    /// `flock` automatically if the process exits without calling
-    /// [`Service::stop_consume_job`] (e.g. a crash), so the lock can never
-    /// outlive the process holding it. Poisoning is ignored on every access:
-    /// the guarded `Option<File>` can't be left half-updated by a panic, so
-    /// one panicking consume pass must not make every later sync panic too.
-    write_lock: Mutex<Option<File>>,
 }
 
 impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, S, O> {
@@ -144,8 +119,9 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
     /// materializes, `cursor_storage` to track its progress through the
     /// changelog, `server_state` to wait for the server to be reachable
     /// before opening a changelog stream, `secrets` to read the account
-    /// master key [`crypto`] derives every event's KEK from, and `lock_path`
-    /// as its write lock (see [`Self::lock_path`]).
+    /// master key [`crypto`] derives every event's KEK from. Assumes it's
+    /// the only one writing that local storage: `Client::init`'s instance
+    /// lock guarantees no other client uses the same database.
     pub(super) fn new(
         grpc: impl FydeClient + 'static,
         document_storage: D,
@@ -153,7 +129,6 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
         cursor_storage: O,
         server_state: Arc<dyn ServerStateService>,
         secrets: Arc<dyn SecretsService>,
-        lock_path: std::path::PathBuf,
     ) -> Self {
         Self {
             grpc: Box::new(grpc),
@@ -163,63 +138,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
             server_state,
             secrets,
             stop: watch::Sender::new(false),
-            lock_path,
-            write_lock: Mutex::new(None),
         }
-    }
-
-    /// Attempts to take exclusive ownership of [`Self::lock_path`], storing
-    /// the locked handle in `self.write_lock` on success. Never fails the
-    /// caller: if the file can't be opened or is already locked by another
-    /// process, this just leaves `self.write_lock` as `None` and logs why,
-    /// so [`Self::consume_once`] falls back to read-only consumption
-    /// instead of erroring out of [`Service::start_consume_job`] entirely.
-    fn acquire_write_lock(&self) {
-        let path = &self.lock_path;
-
-        let file = match File::create(path) {
-            Ok(file) => file,
-            Err(err) => {
-                tracing::warn!(
-                    "failed to open changelog write lock file {path:?}, \
-                     falling back to read-only consumption: {err:?}"
-                );
-                return;
-            }
-        };
-
-        match file.try_lock() {
-            Ok(()) => {
-                *self.write_lock_guard() = Some(file);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "changelog write lock {path:?} already held by another process, \
-                     falling back to read-only consumption: {err:?}"
-                );
-            }
-        }
-    }
-
-    /// Locks [`Self::write_lock`], ignoring poisoning (see its doc comment).
-    fn write_lock_guard(&self) -> MutexGuard<'_, Option<File>> {
-        self.write_lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Releases the write lock taken by [`Self::acquire_write_lock`], if
-    /// this process is holding it. Idempotent, and safe to call whether or
-    /// not the lock was ever successfully acquired.
-    fn release_write_lock(&self) {
-        self.write_lock_guard().take();
-    }
-
-    /// Whether this process currently holds [`Self::lock_path`], and is
-    /// therefore allowed to persist documents/metadata locally in
-    /// [`Self::consume_once`].
-    fn has_write_permission(&self) -> bool {
-        self.write_lock_guard().is_some()
     }
 
     /// One pass of the consume loop spawned by [`Service::start_consume_job`]:
@@ -253,8 +172,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
             .with_context(|| format!("failed to open changelog stream from id {since:?}"))?;
 
         // The last event this pass went through, starting from the persisted
-        // cursor. Kept here rather than re-read from `cursor_storage`, which
-        // only advances while this process holds the write lock.
+        // cursor.
         let mut offset = since;
 
         while let Some(proto_event) = stream.next().await {
@@ -285,14 +203,10 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
                     "skipping changelog event {}: it replays an event already applied",
                     event.id
                 );
-                if self.has_write_permission() {
-                    self.cursor_storage
-                        .save_cursor(event.id)
-                        .await
-                        .with_context(|| {
-                            format!("failed to persist changelog cursor {}", event.id)
-                        })?;
-                }
+                self.cursor_storage
+                    .save_cursor(event.id)
+                    .await
+                    .with_context(|| format!("failed to persist changelog cursor {}", event.id))?;
                 offset = Some(event.id);
                 continue;
             }
@@ -307,45 +221,43 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
                         .into());
                     };
 
-                    if self.has_write_permission() {
-                        // `upload` only rejects a duplicate already cached
-                        // here, so two uploads of the same content that
-                        // haven't synced yet (or from two devices) both get
-                        // published: keep the first one cached, skip the
-                        // rest. Documents from before checksums existed
-                        // have an empty one, which matches nothing.
-                        let duplicate_of = if metadata.checksum.is_empty() {
-                            None
-                        } else {
-                            self.document_storage
-                                .find_document_by_checksum(&metadata.checksum)
-                                .await
-                                .with_context(|| {
-                                    format!(
-                                        "failed to look up local documents with the same content as document {}",
-                                        event.subject_id
-                                    )
-                                })?
-                        };
+                    // `upload` only rejects a duplicate already cached
+                    // here, so two uploads of the same content that
+                    // haven't synced yet (or from two devices) both get
+                    // published: keep the first one cached, skip the
+                    // rest. Documents from before checksums existed
+                    // have an empty one, which matches nothing.
+                    let duplicate_of = if metadata.checksum.is_empty() {
+                        None
+                    } else {
+                        self.document_storage
+                            .find_document_by_checksum(&metadata.checksum)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "failed to look up local documents with the same content as document {}",
+                                    event.subject_id
+                                )
+                            })?
+                    };
 
-                        if let Some(existing) = duplicate_of {
-                            tracing::warn!(
-                                event_id = %event.id,
-                                document_id = %event.subject_id,
-                                existing_document_id = %existing,
-                                "skipping caching document {}: a document with the same content is already cached locally as {existing}",
-                                event.subject_id
-                            );
-                        } else {
-                            let document =
-                                Document::new(event.subject_id, content.clone(), metadata.clone());
-                            self.document_storage
-                                .save_document(&document)
-                                .await
-                                .with_context(|| {
-                                    format!("failed to cache document {} locally", event.subject_id)
-                                })?;
-                        }
+                    if let Some(existing) = duplicate_of {
+                        tracing::warn!(
+                            event_id = %event.id,
+                            document_id = %event.subject_id,
+                            existing_document_id = %existing,
+                            "skipping caching document {}: a document with the same content is already cached locally as {existing}",
+                            event.subject_id
+                        );
+                    } else {
+                        let document =
+                            Document::new(event.subject_id, content.clone(), metadata.clone());
+                        self.document_storage
+                            .save_document(&document)
+                            .await
+                            .with_context(|| {
+                                format!("failed to cache document {} locally", event.subject_id)
+                            })?;
                     }
                 }
                 EventType::UpdateMetadata => {
@@ -357,17 +269,15 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
                         .into());
                     };
 
-                    if self.has_write_permission() {
-                        self.document_storage
-                            .update_metadata(event.subject_id, metadata)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "failed to update cached document {} locally",
-                                    event.subject_id
-                                )
-                            })?;
-                    }
+                    self.document_storage
+                        .update_metadata(event.subject_id, metadata)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to update cached document {} locally",
+                                event.subject_id
+                            )
+                        })?;
                 }
                 EventType::Deleted => {}
                 EventType::InstallScript => {
@@ -387,37 +297,28 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
                             ))
                         })?;
 
-                    if self.has_write_permission() {
-                        self.script_storage
-                            .save_installed_script(&installed)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "failed to save installed script {} locally",
-                                    event.subject_id
-                                )
-                            })?;
-                    }
+                    self.script_storage
+                        .save_installed_script(&installed)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to save installed script {} locally",
+                                event.subject_id
+                            )
+                        })?;
                 }
             }
 
-            // Only alongside what the event stored: a read-only pass that
-            // advanced the cursor would skip, for good, every event it saw
-            // without storing it — e.g. an installation the next run of
-            // that script then can't find. The lock holder (or this
-            // process, once it holds the lock) stores them instead.
-            if self.has_write_permission() {
-                self.cursor_storage
-                    .mark_applied(&digest)
-                    .await
-                    .with_context(|| {
-                        format!("failed to record changelog event {} as applied", event.id)
-                    })?;
-                self.cursor_storage
-                    .save_cursor(event.id)
-                    .await
-                    .with_context(|| format!("failed to persist changelog cursor {}", event.id))?;
-            }
+            self.cursor_storage
+                .mark_applied(&digest)
+                .await
+                .with_context(|| {
+                    format!("failed to record changelog event {} as applied", event.id)
+                })?;
+            self.cursor_storage
+                .save_cursor(event.id)
+                .await
+                .with_context(|| format!("failed to persist changelog cursor {}", event.id))?;
 
             offset = Some(event.id);
             callback(event);
@@ -498,10 +399,6 @@ impl<D: DocumentStorage + 'static, S: ScriptStorage + 'static, O: CursorStorage 
         // return immediately without ever streaming.
         self.stop.send_replace(false);
 
-        // Re-acquired on every start, since a prior `stop_consume_job` call
-        // released it (see `write_lock`'s doc comment).
-        self.acquire_write_lock();
-
         tokio::spawn(async move { self.run_consume_loop(&mut *callback).await });
 
         Ok(())
@@ -515,7 +412,6 @@ impl<D: DocumentStorage + 'static, S: ScriptStorage + 'static, O: CursorStorage 
         // updates the value unconditionally, so a task that starts
         // afterwards still sees it immediately via `subscribe`.
         self.stop.send_replace(true);
-        self.release_write_lock();
     }
 }
 
@@ -530,12 +426,6 @@ mod tests {
     use crate::domains::scripts::{FakeInstalledScript, MockStorage as MockScriptStorage};
     use crate::domains::secrets::MockService as MockSecretsService;
     use crate::domains::server_state::MockService as MockServerState;
-
-    /// A unique lock file path per client, so concurrently running tests
-    /// never contend for the same write lock.
-    fn test_lock_path() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("fyde-changelog-consume-{}.lock", Uuid::new_v4()))
-    }
 
     /// A [`ServerStateService`] mock reporting the server as always
     /// reachable, for tests where reachability isn't under test.
@@ -630,9 +520,7 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         );
-        client.acquire_write_lock();
 
         let received = std::sync::Arc::new(Mutex::new(Vec::new()));
         let received_in_callback = received.clone();
@@ -689,9 +577,7 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         );
-        client.acquire_write_lock();
 
         client.consume_once(&mut |_| {}).await.unwrap();
     }
@@ -730,9 +616,7 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         );
-        client.acquire_write_lock();
 
         let calls = Arc::new(Mutex::new(0));
         let calls_in_callback = calls.clone();
@@ -790,9 +674,7 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         );
-        client.acquire_write_lock();
 
         let received = std::sync::Arc::new(Mutex::new(Vec::new()));
         let received_in_callback = received.clone();
@@ -802,127 +684,6 @@ mod tests {
         let received = received.lock().unwrap();
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].subject_id, document_id);
-    }
-
-    #[tokio::test]
-    async fn consume_still_invokes_the_callback_but_saves_nothing_without_the_write_lock() {
-        let document_id = Uuid::now_v7();
-        let event_id = Uuid::now_v7();
-
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc.expect_consume_since().returning(move |_| {
-            Ok(futures::stream::iter(vec![Ok(proto_event(event_id, document_id))]).boxed())
-        });
-
-        // No `expect_save_document()` set up: the mock panics if it's
-        // called, which is how this test proves the document is never
-        // persisted locally when this client doesn't hold the write lock.
-        let document_storage = MockStorage::new();
-
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_is_applied()
-            .times(1)
-            .returning(|_| Ok(false));
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
-        // No `expect_save_cursor()` either: the cursor only advances
-        // alongside what was stored, so the lock holder still stores it.
-
-        let client = ChangelogClient::new(
-            mock_grpc,
-            document_storage,
-            MockScriptStorage::new(),
-            cursor_storage,
-            reachable_server_state(),
-            fake_secrets(),
-            test_lock_path(),
-        );
-        // No `acquire_write_lock()` call: this client never holds the lock.
-
-        let received = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let received_in_callback = received.clone();
-        let mut callback = move |event| received_in_callback.lock().unwrap().push(event);
-        client.consume_once(&mut callback).await.unwrap();
-
-        let received = received.lock().unwrap();
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].subject_id, document_id);
-    }
-
-    #[tokio::test]
-    async fn a_second_client_holding_the_same_lock_path_fails_to_acquire_it() {
-        let mock_grpc = MockFydeClient::new();
-        let document_storage = MockStorage::new();
-        let cursor_storage = MockCursorStorage::new();
-
-        let first = ChangelogClient::new(
-            mock_grpc,
-            document_storage,
-            MockScriptStorage::new(),
-            cursor_storage,
-            reachable_server_state(),
-            fake_secrets(),
-            test_lock_path(),
-        );
-        first.acquire_write_lock();
-        assert!(first.has_write_permission());
-
-        // Build a second client pointed at the same lock file as `first`,
-        // simulating a second process/client instance racing for it.
-        let mut second = ChangelogClient::new(
-            MockFydeClient::new(),
-            MockStorage::new(),
-            MockScriptStorage::new(),
-            MockCursorStorage::new(),
-            reachable_server_state(),
-            fake_secrets(),
-            test_lock_path(),
-        );
-        second.lock_path = first.lock_path.clone();
-
-        second.acquire_write_lock();
-        assert!(!second.has_write_permission());
-
-        first.release_write_lock();
-        second.acquire_write_lock();
-        assert!(second.has_write_permission());
-    }
-
-    #[tokio::test]
-    async fn start_consume_job_acquires_the_write_lock_and_stop_consume_job_releases_it() {
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc
-            .expect_consume_since()
-            .returning(|_| Ok(futures::stream::pending().boxed()));
-
-        let document_storage = MockStorage::new();
-
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
-
-        let client = Arc::new(ChangelogClient::new(
-            mock_grpc,
-            document_storage,
-            MockScriptStorage::new(),
-            cursor_storage,
-            reachable_server_state(),
-            fake_secrets(),
-            test_lock_path(),
-        ));
-
-        client
-            .clone()
-            .start_consume_job(Box::new(|_| {}))
-            .await
-            .unwrap();
-        assert!(client.has_write_permission());
-
-        client.stop_consume_job();
-        assert!(!client.has_write_permission());
     }
 
     #[tokio::test(start_paused = true)]
@@ -953,6 +714,7 @@ mod tests {
         cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
+        cursor_storage.expect_mark_applied().returning(|_| Ok(()));
         cursor_storage.expect_save_cursor().returning(|_| Ok(()));
 
         let reachability_checks = Arc::new(AtomicU32::new(0));
@@ -972,7 +734,6 @@ mod tests {
             cursor_storage,
             Arc::new(server_state),
             fake_secrets(),
-            test_lock_path(),
         );
 
         let mut callback = |_| {};
@@ -1075,9 +836,7 @@ mod tests {
             cursor_storage_consuming(event_id),
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         );
-        client.acquire_write_lock();
 
         let received = std::sync::Arc::new(Mutex::new(Vec::new()));
         let received_in_callback = received.clone();
@@ -1088,45 +847,6 @@ mod tests {
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].event_type, EventType::InstallScript);
         assert_eq!(received[0].subject_id, script_id);
-    }
-
-    #[tokio::test]
-    async fn consume_skips_saving_the_installed_script_without_the_write_lock() {
-        let installed = FakeInstalledScript::new().build();
-        let script_id = installed.script().id();
-        let event_id = Uuid::now_v7();
-        let content = serde_json::to_vec(&installed).unwrap();
-
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc.expect_consume_since().returning(move |_| {
-            Ok(futures::stream::iter(vec![Ok(install_script_proto_event(
-                event_id, script_id, &content,
-            ))])
-            .boxed())
-        });
-
-        // No `expect_save_installed_script()` nor `expect_save_cursor()`:
-        // the mocks panic if called, proving neither the installation nor
-        // the cursor past it is persisted without the write lock.
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_is_applied()
-            .times(1)
-            .returning(|_| Ok(false));
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
-        let client = ChangelogClient::new(
-            mock_grpc,
-            MockStorage::new(),
-            MockScriptStorage::new(),
-            cursor_storage,
-            reachable_server_state(),
-            fake_secrets(),
-            test_lock_path(),
-        );
-
-        client.consume_once(&mut |_| {}).await.unwrap();
     }
 
     #[tokio::test]
@@ -1161,9 +881,7 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         );
-        client.acquire_write_lock();
 
         let err = client.consume_once(&mut |_| {}).await.unwrap_err();
 
@@ -1218,10 +936,8 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         );
 
-        client.acquire_write_lock();
         client.consume_once(&mut |_| {}).await.unwrap();
     }
 
@@ -1272,9 +988,7 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         );
-        client.acquire_write_lock();
 
         client.consume_once(&mut |_| {}).await.unwrap();
     }
@@ -1323,7 +1037,6 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         );
 
         let result = client.consume_once(&mut |_| {}).await;
@@ -1385,17 +1098,14 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         );
 
-        client.acquire_write_lock();
         client.consume_once(&mut |_| {}).await.unwrap();
     }
 
-    /// A client streaming `events` from the beginning (nil cursor), in a
-    /// read-only process — nothing is stored, so only `is_applied` is
-    /// reached for each event that gets that far.
-    fn read_only_client_streaming(
+    /// A client streaming `events` from the beginning (nil cursor), caching
+    /// every `SaveDocument` event that gets that far as a new document.
+    fn client_streaming(
         events: Vec<ProtoChangelogEvent>,
     ) -> ChangelogClient<MockStorage, MockScriptStorage, MockCursorStorage> {
         let mut mock_grpc = MockFydeClient::new();
@@ -1403,20 +1113,29 @@ mod tests {
             Ok(futures::stream::iter(events.clone().into_iter().map(Ok)).boxed())
         });
 
+        let mut document_storage = MockStorage::new();
+        document_storage
+            .expect_find_document_by_checksum()
+            .returning(|_| Ok(None));
+        document_storage
+            .expect_save_document()
+            .returning(|_| Ok(()));
+
         let mut cursor_storage = MockCursorStorage::new();
         cursor_storage
             .expect_get_cursor()
             .returning(|| Ok(Uuid::nil()));
         cursor_storage.expect_is_applied().returning(|_| Ok(false));
+        cursor_storage.expect_mark_applied().returning(|_| Ok(()));
+        cursor_storage.expect_save_cursor().returning(|_| Ok(()));
 
         ChangelogClient::new(
             mock_grpc,
-            MockStorage::new(),
+            document_storage,
             MockScriptStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         )
     }
 
@@ -1428,9 +1147,10 @@ mod tests {
             previous_id: first_id.to_string(),
             ..proto_event(second_id, Uuid::now_v7())
         };
-        // Read-only: the persisted cursor never moves, so the second event
-        // is checked against the first one's id, not the cursor.
-        let client = read_only_client_streaming(vec![first, second]);
+        // The persisted cursor is only read once per pass (and is mocked to
+        // stay nil), so the second event is checked against the first one's
+        // id, as this pass saw it.
+        let client = client_streaming(vec![first, second]);
 
         let mut consumed = Vec::new();
         client
@@ -1452,7 +1172,7 @@ mod tests {
             encrypted_content: vec![0; 128],
             previous_id: Uuid::now_v7().to_string(),
         };
-        let client = read_only_client_streaming(vec![first, gap]);
+        let client = client_streaming(vec![first, gap]);
 
         let mut consumed = Vec::new();
         let err = client
@@ -1470,7 +1190,7 @@ mod tests {
             previous_id: Uuid::now_v7().to_string(),
             ..proto_event(Uuid::now_v7(), Uuid::now_v7())
         };
-        let client = read_only_client_streaming(vec![event]);
+        let client = client_streaming(vec![event]);
 
         let err = client.consume_once(&mut |_| {}).await.unwrap_err();
 
@@ -1511,7 +1231,6 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         );
 
         let mut callback = |_| {};
@@ -1556,7 +1275,6 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         )
     }
 
@@ -1643,7 +1361,6 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         ));
 
         let loop_client = client.clone();
@@ -1678,7 +1395,6 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         );
 
         client.stop_consume_job();
@@ -1715,7 +1431,6 @@ mod tests {
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         ));
 
         tokio::time::timeout(
@@ -1759,7 +1474,6 @@ mod tests {
             MockCursorStorage::new(),
             reachable_server_state(),
             fake_secrets(),
-            test_lock_path(),
         );
 
         client

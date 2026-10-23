@@ -80,29 +80,18 @@ pub(crate) trait Service: Send + Sync {
     /// naturally paces the retries if the failure was caused by the server
     /// being unreachable. If a pass ends cleanly (the server closes the
     /// stream), it's also retried immediately.
-    ///
-    /// Also attempts to take an exclusive, `flock`-backed lock on a file in
-    /// the OS default temporary directory, shared by every process on the
-    /// machine consuming this changelog. Only the process holding that lock
-    /// has permission to persist consumed documents/metadata into local
-    /// storage; every other process still consumes every event and still
-    /// invokes `callback` for it, but skips the local write. The lock is
-    /// released by [`Self::stop_consume_job`], or automatically by the OS
-    /// if this process exits without calling it.
     async fn start_consume_job(
         self: Arc<Self>,
         callback: Box<dyn FnMut(ChangelogEvent) + Send>,
     ) -> Result<()>;
 
-    /// Signals a running [`Self::start_consume_job`] task to return, and
-    /// releases the write lock it took (if any) — see
-    /// [`Self::start_consume_job`]'s doc comment. Idempotent, and safe to
-    /// call before [`Self::start_consume_job`] has started its task (in
-    /// which case that task returns immediately without ever opening a
-    /// stream) or after it has already returned (a no-op). Interrupts the
-    /// consume loop promptly even while it's parked awaiting the next event
-    /// on an otherwise idle stream, rather than only being checked between
-    /// passes.
+    /// Signals a running [`Self::start_consume_job`] task to return.
+    /// Idempotent, and safe to call before [`Self::start_consume_job`] has
+    /// started its task (in which case that task returns immediately
+    /// without ever opening a stream) or after it has already returned (a
+    /// no-op). Interrupts the consume loop promptly even while it's parked
+    /// awaiting the next event on an otherwise idle stream, rather than
+    /// only being checked between passes.
     fn stop_consume_job(&self);
 }
 
@@ -115,9 +104,9 @@ pub(crate) trait Service: Send + Sync {
 /// account master key `crypto` derives every event's KEK from, and `sessions` to
 /// attach the session token as a bearer `authorization` header on every
 /// outgoing call once a session is opened (see
-/// [`crate::domains::sessions::Service::authenticated_request`]), and
-/// `lock_path` to arbitrate, among processes sharing the database `pool`
-/// opens, which one stores what it consumes — unique to that database.
+/// [`crate::domains::sessions::Service::authenticated_request`]). The
+/// caller must make sure no other client writes the database `pool` opens
+/// (see `Client::init`'s instance lock).
 pub(crate) async fn init(
     channel: Channel,
     pool: SqlitePool,
@@ -125,7 +114,6 @@ pub(crate) async fn init(
     secrets: Arc<dyn SecretsService>,
     sessions: Arc<SessionsClient>,
     server_state: Arc<dyn ServerStateService>,
-    lock_path: std::path::PathBuf,
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool.clone());
     let script_storage = scripts::SqliteStorage::new(pool.clone());
@@ -137,7 +125,6 @@ pub(crate) async fn init(
         cursor_storage,
         server_state,
         secrets,
-        lock_path,
     );
 
     Ok(Arc::new(client))

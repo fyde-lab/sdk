@@ -109,13 +109,25 @@ pub struct Client {
     settings: Arc<dyn SettingsService>,
     usage: Arc<dyn UsageService>,
     users: Arc<dyn UsersService>,
+    /// The locked handle to [`instance_lock_path`] (see [`lock_instance`]),
+    /// held for as long as this `Client` lives. Never read: it only exists
+    /// so dropping the `Client` releases the lock.
+    _instance_lock: Option<std::fs::File>,
 }
 
 impl Client {
     /// Connects to a fyde server per `config`.
+    ///
+    /// Only one `Client` at a time may use a given [`Storage::Disk`] data
+    /// directory and client name: this fails with
+    /// [`ErrorCode::ClientAlreadyRunning`] while another one, in this
+    /// process or any other, is still alive on them.
     pub async fn init(config: ClientConfig) -> Result<Self> {
         install_tracing(config.log_level, config.on_log.clone());
         let location = DatabaseLocation::resolve(&config.storage, &config.client_name)?;
+        // Before touching the database at all, so a second instance never
+        // migrates, reads or syncs into the one the first is using.
+        let instance_lock = lock_instance(&location)?;
         let sqlite = open_database(&location).await?;
         let secrets = open_secrets(&location, &sqlite)?;
         let channel = lazy_channel(config.url)?;
@@ -133,7 +145,6 @@ impl Client {
             secrets.clone(),
             sessions.clone(),
             server_state.clone(),
-            changelog_lock_path(&location),
         )
         .await
         .context("failed to initialize changelog service")?;
@@ -193,6 +204,7 @@ impl Client {
             settings,
             usage,
             users,
+            _instance_lock: instance_lock,
         })
     }
 
@@ -401,35 +413,52 @@ async fn open_database(location: &DatabaseLocation) -> Result<Arc<SqliteClient>>
     Ok(Arc::new(sqlite))
 }
 
-/// The changelog write lock for the database at `location` (see
-/// `ChangelogClient::lock_path`): beside an on-disk database, so every
-/// process opening that file arbitrates over the same lock and no other
-/// process does; unique to the process for an in-memory one, which no
-/// other process can open.
-fn changelog_lock_path(location: &DatabaseLocation) -> std::path::PathBuf {
-    match location {
-        DatabaseLocation::Disk(path) => {
-            let mut lock = path.clone().into_os_string();
-            lock.push(".consume.lock");
-            lock.into()
+/// The lock file making a client the only one using the database at
+/// `path`: `fyde.db.lock`, beside the database itself.
+fn instance_lock_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    lock.into()
+}
+
+/// Takes an exclusive, `flock`-backed lock on [`instance_lock_path`] for the
+/// database at `location`, failing with [`ErrorKind::ClientAlreadyRunning`]
+/// if another `Client` — in another process, or this one — already holds
+/// it. Returns the locked handle, which keeps the lock until it's dropped;
+/// the OS releases it as well if the process exits without dropping it
+/// (e.g. a crash), so it can never outlive the client holding it. Nothing
+/// for an in-memory database, which no other client can open.
+fn lock_instance(location: &DatabaseLocation) -> Result<Option<std::fs::File>> {
+    let DatabaseLocation::Disk(path) = location else {
+        return Ok(None);
+    };
+    let lock_path = instance_lock_path(path);
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open instance lock file {}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err(ErrorKind::ClientAlreadyRunning(lock_path).into())
         }
-        DatabaseLocation::Memory => std::env::temp_dir().join(format!(
-            "fyde-changelog-consume-{}.lock",
-            uuid::Uuid::new_v4()
-        )),
+        Err(std::fs::TryLockError::Error(err)) => Err(err)
+            .with_context(|| format!("failed to lock instance lock file {}", lock_path.display())),
     }
 }
 
 /// The directory holding the database at `location`, which `logout` empties
 /// of everything but the database itself (wiped in place instead, since the
-/// `Client` keeps it open) and its changelog lock (see
-/// [`changelog_lock_path`]), which other processes may hold. Nothing for an
+/// `Client` keeps it open) and its instance lock (see
+/// [`instance_lock_path`]), which the `Client` holds. Nothing for an
 /// in-memory database, which keeps no files.
 fn client_directory(location: &DatabaseLocation) -> ClientDirectory {
     match location {
         DatabaseLocation::Disk(path) => {
             let mut keep = sql::database_files(path);
-            keep.push(changelog_lock_path(location));
+            keep.push(instance_lock_path(path));
             ClientDirectory::Disk {
                 dir: path
                     .parent()
@@ -637,7 +666,7 @@ mod tests {
                 "fyde.db-journal",
                 "fyde.db-shm",
                 "fyde.db-wal",
-                "fyde.db.consume.lock",
+                "fyde.db.lock",
             ]
             .map(|name| client_dir.join(name))
         );
@@ -651,5 +680,54 @@ mod tests {
         };
 
         assert_eq!(err.code(), ErrorCode::InvalidClientName);
+    }
+
+    #[test]
+    fn lock_instance_admits_a_single_holder_at_a_time() {
+        let data_dir = std::env::temp_dir().join(format!("fyde-sdk-test-{}", uuid::Uuid::now_v7()));
+        let location = DatabaseLocation::resolve(&Storage::Disk(data_dir.clone()), "desktop")
+            .expect("a valid client name must resolve");
+
+        let first = lock_instance(&location).expect("the first lock must succeed");
+        assert!(data_dir.join("desktop").join("fyde.db.lock").is_file());
+        let err = lock_instance(&location).expect_err("a second lock must fail");
+        assert_eq!(err.code(), ErrorCode::ClientAlreadyRunning);
+
+        drop(first);
+        lock_instance(&location).expect("the lock must be free once released");
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[test]
+    fn lock_instance_never_locks_an_in_memory_database() {
+        assert!(lock_instance(&DatabaseLocation::Memory).unwrap().is_none());
+        assert!(lock_instance(&DatabaseLocation::Memory).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn init_fails_while_another_client_uses_the_same_data_directory() {
+        use_in_process_keystore_for_tests().unwrap();
+        let data_dir = std::env::temp_dir().join(format!("fyde-sdk-test-{}", uuid::Uuid::now_v7()));
+        let config = || ClientConfig {
+            url: "http://127.0.0.1:1".to_string(),
+            client_name: "desktop".to_string(),
+            storage: Storage::Disk(data_dir.clone()),
+            log_level: LogLevel::Off,
+            on_log: None,
+            on_document_change: None,
+            on_scraper_progress: None,
+            on_scraper_question: None,
+        };
+
+        let first = Client::init(config()).await.unwrap();
+        let err = match Client::init(config()).await {
+            Ok(_) => panic!("a second client on the same data directory must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), ErrorCode::ClientAlreadyRunning);
+
+        drop(first);
+        Client::init(config()).await.unwrap();
+        std::fs::remove_dir_all(&data_dir).unwrap();
     }
 }
