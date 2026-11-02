@@ -208,6 +208,12 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
     as domain cookies (`driver::to_webview_cookie`). Forms are submitted with `click`, never
     an in-page `fetch` (it bypasses bot-mitigation hooks); `download` cancels the native
     download and re-fetches its URL in-page, so its bytes never touch the disk.
+  - A failed run keeps a code the UI can act on (`error::lua_code`): a host error keeps its own
+    (e.g. `QuotaExceeded` from `save_document`), even rethrown by the script; a connect or
+    timeout failure is `ScraperSiteUnreachable`; the login contract's `error("INVALID_CREDENTIALS", 0)`
+    / `error("MFA_FAILED", 0)` are `ScraperCredentialsRejected` / `ScraperVerificationFailed`;
+    the sandbox's memory, instruction and body-size limits are `ScriptLimitExceeded`; anything
+    else is `ScriptFailed`.
   - `run_installed` runs an installed script (`wreq_emulation`/`follow_redirects` default on).
   - `crate::init_dev_scrapers` builds a scrapers service without a `Client` (file storage +
     `DevDocumentsClient`); `../scripts` is its caller.

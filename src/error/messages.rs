@@ -133,9 +133,9 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "This can't be done right now. Please try again.",
             "Cette action est impossible pour le moment. Veuillez réessayer.",
         ),
-        ErrorCode::RateLimited => (
-            "Too many attempts. Please wait a moment and try again.",
-            "Trop de tentatives. Veuillez patienter un instant puis réessayer.",
+        ErrorCode::QuotaExceeded => (
+            "Your plan's limit is reached.",
+            "La limite de votre offre est atteinte.",
         ),
         ErrorCode::NotSupportedByServer => (
             "The server doesn't support this feature yet.",
@@ -228,6 +228,22 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
         ErrorCode::ScriptNotInstalled => (
             "This add-on isn't installed on this device yet.",
             "Cette extension n'est pas encore installée sur cet appareil.",
+        ),
+        ErrorCode::ScraperCredentialsRejected => (
+            "The site refused the username or password.",
+            "Le site a refusé l'identifiant ou le mot de passe.",
+        ),
+        ErrorCode::ScraperVerificationFailed => (
+            "The verification code was refused, expired or not entered.",
+            "Le code de vérification a été refusé, a expiré ou n'a pas été saisi.",
+        ),
+        ErrorCode::ScriptLimitExceeded => (
+            "The add-on used more memory or time than it's allowed.",
+            "L'extension a utilisé plus de mémoire ou de temps qu'elle n'y est autorisée.",
+        ),
+        ErrorCode::ScraperSiteUnreachable => (
+            "The site couldn't be reached. Please try again later.",
+            "Le site est injoignable. Veuillez réessayer plus tard.",
         ),
     };
 

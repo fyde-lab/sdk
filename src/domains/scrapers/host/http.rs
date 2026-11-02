@@ -377,16 +377,19 @@ fn read_body(
     runtime: &Handle,
     resp: wreq::Response,
     max_bytes: usize,
-) -> std::result::Result<Vec<u8>, String> {
+) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     runtime.block_on(async {
         let mut stream = resp.bytes_stream();
         let mut body = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|err| err.to_string())?;
+            let chunk = chunk?;
             if body.len() + chunk.len() > max_bytes {
-                return Err(format!(
-                    "response body is larger than the {max_bytes} byte limit"
-                ));
+                return Err(
+                    crate::Error::from(crate::ErrorKind::ScriptLimitExceeded(format!(
+                        "response body is larger than the {max_bytes} byte limit"
+                    )))
+                    .into(),
+                );
             }
             body.extend_from_slice(&chunk);
         }
@@ -696,7 +699,9 @@ mod tests {
 
         let err = read_body(runtime.handle(), resp, 4).unwrap_err();
 
-        assert!(err.contains("4 byte limit"), "{err}");
+        assert!(err.to_string().contains("4 byte limit"), "{err}");
+        let err = err.downcast_ref::<crate::Error>().expect("a crate error");
+        assert_eq!(err.code(), crate::ErrorCode::ScriptLimitExceeded);
     }
 
     #[test]

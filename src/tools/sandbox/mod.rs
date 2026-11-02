@@ -3,7 +3,7 @@ use std::cell::Cell;
 use mlua::chunk::{Chunk, ChunkMode};
 use mlua::{HookTriggers, Lua, LuaOptions, StdLib, VmState};
 
-use crate::{ErrorContext as _, Result};
+use crate::{ErrorContext as _, ErrorKind, Result};
 
 /// How many Lua VM instructions run between two checks of a VM's
 /// instruction budget (see [`Limits::max_instructions`]). Low enough that a
@@ -60,8 +60,10 @@ pub(crate) fn new_vm(libs: StdLib, limits: Limits) -> Result<Lua> {
         move |_, _| {
             executed.set(executed.get() + u64::from(HOOK_INTERVAL));
             if executed.get() > max_instructions {
-                Err(mlua::Error::runtime(format!(
-                    "script exceeded its budget of {max_instructions} Lua instructions"
+                Err(mlua::Error::external(crate::Error::from(
+                    ErrorKind::ScriptLimitExceeded(format!(
+                        "over its budget of {max_instructions} Lua instructions"
+                    )),
                 )))
             } else {
                 Ok(VmState::Continue)
@@ -110,6 +112,10 @@ mod tests {
         let err = load_source(&lua, "while true do end").exec().unwrap_err();
 
         assert!(err.to_string().contains("instruction"), "{err}");
+        assert_eq!(
+            crate::Error::from(err).code(),
+            crate::ErrorCode::ScriptLimitExceeded
+        );
     }
 
     #[test]
@@ -121,6 +127,10 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, mlua::Error::MemoryError(_)), "{err}");
+        assert_eq!(
+            crate::Error::from(err).code(),
+            crate::ErrorCode::ScriptLimitExceeded
+        );
     }
 
     #[test]

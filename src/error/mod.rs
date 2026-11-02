@@ -92,12 +92,15 @@ macro_rules! for_each_error_code {
             /// The server refused the request in its current state (gRPC
             /// `FAILED_PRECONDITION`/`ABORTED`).
             FailedPrecondition = 2012,
-            /// Too many requests (gRPC `RESOURCE_EXHAUSTED`).
-            RateLimited = 2013,
+            // 2013 (RateLimited) is retired: never reuse it. The server only
+            // answers `RESOURCE_EXHAUSTED` for a plan limit: see QuotaExceeded.
             /// The server doesn't support this operation (gRPC `UNIMPLEMENTED`).
             NotSupportedByServer = 2014,
             /// The server failed internally (gRPC `INTERNAL`/`UNKNOWN`/`DATA_LOSS`).
             ServerError = 2015,
+            /// The account's plan doesn't allow this: too many sources
+            /// enabled, storage full, ... (gRPC `RESOURCE_EXHAUSTED`).
+            QuotaExceeded = 2016,
             /// Wrong username or password.
             InvalidCredentials = 3001,
             /// A session is already open on this device.
@@ -149,6 +152,19 @@ macro_rules! for_each_error_code {
             BrowserFailed = 5005,
             /// No installation of this script has synced to this device.
             ScriptNotInstalled = 5006,
+            /// The site a scraper logs into refused its username or
+            /// password (the script failed with `INVALID_CREDENTIALS`).
+            ScraperCredentialsRejected = 5007,
+            /// A scraper's one-time code or other verification step was
+            /// refused, expired or left unanswered (the script failed with
+            /// `MFA_FAILED`).
+            ScraperVerificationFailed = 5008,
+            /// A script went over its sandbox's limits: memory, instruction
+            /// budget or the size of a response it read.
+            ScriptLimitExceeded = 5009,
+            /// The site a scraper fetches from couldn't be reached or
+            /// didn't answer in time.
+            ScraperSiteUnreachable = 5010,
         }
     };
 }
@@ -296,6 +312,8 @@ pub(crate) enum ErrorKind {
     TaskJoin(#[from] tokio::task::JoinError),
     #[error("browser error: {0}")]
     Browser(String),
+    #[error("script exceeded its sandbox limits: {0}")]
+    ScriptLimitExceeded(String),
 }
 
 impl ErrorKind {
@@ -314,7 +332,7 @@ impl ErrorKind {
             ErrorKind::Xdg(_) => ErrorCode::DataDirectory,
             ErrorKind::Json(_) => ErrorCode::Json,
             ErrorKind::Pdf(_) => ErrorCode::UnreadablePdf,
-            ErrorKind::Lua(_) => ErrorCode::ScriptFailed,
+            ErrorKind::Lua(err) => lua_code(err),
             ErrorKind::UnsupportedDocumentExtension(_) => ErrorCode::UnsupportedDocumentExtension,
             ErrorKind::DuplicateDocument(_) => ErrorCode::DuplicateDocument,
             ErrorKind::ScriptNotFound(_) => ErrorCode::ScriptNotFound,
@@ -342,7 +360,43 @@ impl ErrorKind {
             ErrorKind::MessagePackDecode(_) => ErrorCode::MessagePackDecode,
             ErrorKind::TaskJoin(_) => ErrorCode::TaskFailed,
             ErrorKind::Browser(_) => ErrorCode::BrowserFailed,
+            ErrorKind::ScriptLimitExceeded(_) => ErrorCode::ScriptLimitExceeded,
         }
+    }
+}
+
+/// Why a Lua script failed: the code of the SDK error a host function raised
+/// inside it (an upload over the storage quota stays `QuotaExceeded`), the
+/// helpers' login error contract (`helpers.lua`'s `INVALID_CREDENTIALS` and
+/// `MFA_FAILED`), a sandbox limit or an unreachable site, and only otherwise
+/// [`ErrorCode::ScriptFailed`].
+fn lua_code(err: &mlua::Error) -> ErrorCode {
+    match err {
+        mlua::Error::MemoryError(_) => ErrorCode::ScriptLimitExceeded,
+        mlua::Error::CallbackError { cause, .. } | mlua::Error::WithContext { cause, .. } => {
+            lua_code(cause)
+        }
+        // mlua appends a stack traceback after the error's own message.
+        mlua::Error::RuntimeError(message) => match message.lines().next().unwrap_or_default() {
+            "INVALID_CREDENTIALS" => ErrorCode::ScraperCredentialsRejected,
+            "MFA_FAILED" => ErrorCode::ScraperVerificationFailed,
+            _ => ErrorCode::ScriptFailed,
+        },
+        mlua::Error::ExternalError(source) => {
+            if let Some(err) = source.downcast_ref::<Error>() {
+                err.code()
+            } else if let Some(err) = source.downcast_ref::<mlua::Error>() {
+                lua_code(err)
+            } else if source
+                .downcast_ref::<wreq::Error>()
+                .is_some_and(|err| err.is_connect() || err.is_timeout())
+            {
+                ErrorCode::ScraperSiteUnreachable
+            } else {
+                ErrorCode::ScriptFailed
+            }
+        }
+        _ => ErrorCode::ScriptFailed,
     }
 }
 
@@ -359,7 +413,7 @@ fn grpc_code(code: tonic::Code) -> ErrorCode {
         Code::AlreadyExists => ErrorCode::AlreadyExists,
         Code::InvalidArgument | Code::OutOfRange => ErrorCode::InvalidRequest,
         Code::FailedPrecondition | Code::Aborted => ErrorCode::FailedPrecondition,
-        Code::ResourceExhausted => ErrorCode::RateLimited,
+        Code::ResourceExhausted => ErrorCode::QuotaExceeded,
         Code::Unimplemented => ErrorCode::NotSupportedByServer,
         Code::Ok | Code::Unknown | Code::Internal | Code::DataLoss => ErrorCode::ServerError,
     }
@@ -593,6 +647,74 @@ mod tests {
         assert_eq!(unavailable.code(), ErrorCode::ServerUnavailable);
         assert_eq!(unauthenticated.code(), ErrorCode::Unauthenticated);
         assert_eq!(already_exists.code(), ErrorCode::AlreadyExists);
+    }
+
+    #[test]
+    fn resource_exhausted_is_a_quota_not_a_rate_limit() {
+        let err: Error = tonic::Status::resource_exhausted("plan full").into();
+
+        assert_eq!(err.code(), ErrorCode::QuotaExceeded);
+    }
+
+    fn run_lua(script: &str) -> Error {
+        use crate::tools::sandbox::{Limits, load_source, new_vm};
+
+        let lua = new_vm(
+            mlua::StdLib::STRING,
+            Limits {
+                memory_bytes: 16 * 1024 * 1024,
+                max_instructions: 1_000_000,
+            },
+        )
+        .unwrap();
+        let over_quota = lua
+            .create_function(|_, ()| -> mlua::Result<()> {
+                let err: Error = tonic::Status::resource_exhausted("storage full").into();
+                Err(mlua::Error::external(err))
+            })
+            .unwrap();
+        lua.globals().set("over_quota", over_quota).unwrap();
+
+        load_source(&lua, script)
+            .exec()
+            .context("running script")
+            .unwrap_err()
+    }
+
+    #[test]
+    fn a_script_failing_on_a_host_error_keeps_that_errors_code() {
+        assert_eq!(run_lua("over_quota()").code(), ErrorCode::QuotaExceeded);
+    }
+
+    #[test]
+    fn a_script_rethrowing_a_host_error_keeps_that_errors_code() {
+        let err = run_lua("local ok, err = pcall(over_quota) error(err)");
+
+        assert_eq!(err.code(), ErrorCode::QuotaExceeded);
+    }
+
+    #[test]
+    fn a_script_failing_with_the_login_contract_codes_maps_to_them() {
+        assert_eq!(
+            run_lua(r#"error("INVALID_CREDENTIALS", 0)"#).code(),
+            ErrorCode::ScraperCredentialsRejected
+        );
+        assert_eq!(
+            run_lua(r#"error("MFA_FAILED", 0)"#).code(),
+            ErrorCode::ScraperVerificationFailed
+        );
+    }
+
+    #[test]
+    fn any_other_script_failure_is_script_failed() {
+        assert_eq!(
+            run_lua(r#"error("no form on the page")"#).code(),
+            ErrorCode::ScriptFailed
+        );
+        assert_eq!(
+            run_lua(r#"error("INVALID_CREDENTIALS")"#).code(),
+            ErrorCode::ScriptFailed
+        );
     }
 
     #[test]
