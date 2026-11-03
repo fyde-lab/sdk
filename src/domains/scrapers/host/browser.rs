@@ -7,6 +7,7 @@ use tokio::runtime::Handle;
 
 use super::super::browser::Service as BrowserService;
 use super::super::reports::Recorder;
+use super::super::stop::StopSignal;
 
 const DEFAULT_WAIT_FOR_TIMEOUT: Duration = Duration::from_secs(10);
 // A real file download (even a small PDF) routinely takes longer than a DOM
@@ -43,6 +44,7 @@ pub(super) fn table(
     browser: Arc<dyn BrowserService>,
     recorder: Arc<Recorder>,
     runtime: Handle,
+    stop: StopSignal,
     debug_http_dump: bool,
     allowed_domains: Arc<Vec<String>>,
 ) -> LuaResult<Table> {
@@ -50,6 +52,7 @@ pub(super) fn table(
 
     let open_browser = browser.clone();
     let open_runtime = runtime.clone();
+    let open_stop = stop.clone();
     let open_recorder = recorder.clone();
     out.set(
         "open",
@@ -61,7 +64,7 @@ pub(super) fn table(
                 );
                 return Err(mlua::Error::RuntimeError(message));
             }
-            let result = open_runtime.block_on(open_browser.open(&url));
+            let result = open_stop.block_on(&open_runtime, open_browser.open(&url))?;
             match &result {
                 Ok(()) => {
                     let mut entry = json!({ "url": url });
@@ -70,7 +73,7 @@ pub(super) fn table(
                     // for a trusted local debugging run, since a page's
                     // HTML can carry session-bound content.
                     if debug_http_dump {
-                        let html = open_runtime.block_on(open_browser.html());
+                        let html = open_stop.block_on(&open_runtime, open_browser.html())?;
                         if let Ok(html) = html
                             && let Value::Object(fields) = &mut entry
                         {
@@ -90,6 +93,7 @@ pub(super) fn table(
 
     let wait_for_browser = browser.clone();
     let wait_for_runtime = runtime.clone();
+    let wait_for_stop = stop.clone();
     let wait_for_recorder = recorder.clone();
     out.set(
         "wait_for",
@@ -98,8 +102,10 @@ pub(super) fn table(
                 let timeout = timeout_ms
                     .map(Duration::from_millis)
                     .unwrap_or(DEFAULT_WAIT_FOR_TIMEOUT);
-                let result =
-                    wait_for_runtime.block_on(wait_for_browser.wait_for(&selector, timeout));
+                let result = wait_for_stop.block_on(
+                    &wait_for_runtime,
+                    wait_for_browser.wait_for(&selector, timeout),
+                )?;
                 match &result {
                     Ok(()) => wait_for_recorder
                         .record("browser_wait_for", json!({ "selector": selector })),
@@ -119,12 +125,14 @@ pub(super) fn table(
 
     let fill_browser = browser.clone();
     let fill_runtime = runtime.clone();
+    let fill_stop = stop.clone();
     let fill_recorder = recorder.clone();
     out.set(
         "fill",
         lua.create_function(
             move |_, (_self, selector, value): (Table, String, String)| {
-                let result = fill_runtime.block_on(fill_browser.fill(&selector, &value));
+                let result =
+                    fill_stop.block_on(&fill_runtime, fill_browser.fill(&selector, &value))?;
                 // Never records the filled-in value itself: a script's second
                 // `fill` call is routinely a password (see `fyde.http`'s own
                 // `host::http::table` doc comment for the same rule applied to
@@ -147,11 +155,12 @@ pub(super) fn table(
 
     let click_browser = browser.clone();
     let click_runtime = runtime.clone();
+    let click_stop = stop.clone();
     let click_recorder = recorder.clone();
     out.set(
         "click",
         lua.create_function(move |_, (_self, selector): (Table, String)| {
-            let result = click_runtime.block_on(click_browser.click(&selector));
+            let result = click_stop.block_on(&click_runtime, click_browser.click(&selector))?;
             match &result {
                 Ok(()) => click_recorder.record("browser_click", json!({ "selector": selector })),
                 Err(err) => click_recorder.record(
@@ -169,11 +178,12 @@ pub(super) fn table(
 
     let html_browser = browser.clone();
     let html_runtime = runtime.clone();
+    let html_stop = stop.clone();
     let html_recorder = recorder.clone();
     out.set(
         "html",
         lua.create_function(move |_, _self: Table| {
-            let result = html_runtime.block_on(html_browser.html());
+            let result = html_stop.block_on(&html_runtime, html_browser.html())?;
             match &result {
                 Ok(_) => html_recorder.record("browser_html", json!({})),
                 Err(err) => html_recorder.record(
@@ -192,7 +202,7 @@ pub(super) fn table(
                 let timeout = timeout_ms
                     .map(Duration::from_millis)
                     .unwrap_or(DEFAULT_DOWNLOAD_TIMEOUT);
-                let result = runtime.block_on(browser.download(&selector, timeout));
+                let result = stop.block_on(&runtime, browser.download(&selector, timeout))?;
                 match &result {
                     Ok(bytes) => recorder.record(
                         "browser_download",
@@ -253,6 +263,7 @@ mod tests {
             Arc::new(browser),
             recorder.clone(),
             runtime.handle().clone(),
+            StopSignal::new(),
             false,
             allowed_domains(),
         )
@@ -290,6 +301,7 @@ mod tests {
             Arc::new(browser),
             recorder.clone(),
             runtime.handle().clone(),
+            StopSignal::new(),
             true,
             allowed_domains(),
         )
@@ -322,6 +334,7 @@ mod tests {
             Arc::new(browser),
             recorder.clone(),
             runtime.handle().clone(),
+            StopSignal::new(),
             false,
             allowed_domains(),
         )
@@ -355,6 +368,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            StopSignal::new(),
             false,
             allowed_domains(),
         )
@@ -385,6 +399,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            StopSignal::new(),
             false,
             allowed_domains(),
         )
@@ -413,6 +428,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            StopSignal::new(),
             false,
             allowed_domains(),
         )
@@ -437,6 +453,7 @@ mod tests {
             Arc::new(browser),
             recorder.clone(),
             runtime.handle().clone(),
+            StopSignal::new(),
             false,
             allowed_domains(),
         )
@@ -469,6 +486,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            StopSignal::new(),
             false,
             allowed_domains(),
         )
@@ -495,6 +513,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            StopSignal::new(),
             false,
             allowed_domains(),
         )
@@ -521,6 +540,7 @@ mod tests {
             Arc::new(browser),
             recorder.clone(),
             runtime.handle().clone(),
+            StopSignal::new(),
             false,
             allowed_domains(),
         )
@@ -550,6 +570,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            StopSignal::new(),
             false,
             allowed_domains(),
         )
@@ -580,6 +601,7 @@ mod tests {
             Arc::new(browser),
             recorder.clone(),
             runtime.handle().clone(),
+            StopSignal::new(),
             false,
             allowed_domains(),
         )
@@ -623,6 +645,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            StopSignal::new(),
             false,
             allowed_domains(),
         )
@@ -649,6 +672,7 @@ mod tests {
             Arc::new(browser),
             recorder,
             runtime.handle().clone(),
+            StopSignal::new(),
             false,
             allowed_domains(),
         )

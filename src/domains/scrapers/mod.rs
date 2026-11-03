@@ -5,6 +5,7 @@ mod models;
 mod reports;
 mod service;
 mod session;
+mod stop;
 
 pub use host::helpers::SOURCE as HELPERS_LUA;
 pub use models::{ProgressEvent, ProgressStep};
@@ -49,6 +50,8 @@ pub type OnScraperQuestion = Arc<dyn Fn(&str, String) -> String + Send + Sync>;
 /// cookies or storage). Runs under the same `name` share persisted state,
 /// so they take turns instead: a second one waits for the first to finish
 /// and save, then starts from what it saved.
+///
+/// A run can be stopped from outside with [`Self::stop`].
 #[async_trait]
 pub trait Service: Send + Sync {
     /// Runs `script` (Lua source) as the scraper named `name`. `name` scopes
@@ -106,6 +109,12 @@ pub trait Service: Send + Sync {
     /// watching, or manually intervening in, a script's browser-driven login
     /// flow. Has no effect on a script that never calls `fyde.browser`,
     /// since the window is only ever created lazily on first use.
+    ///
+    /// A run stopped with [`Self::stop`] fails with
+    /// [`crate::ErrorCode::ScraperRunStopped`] (unless its script managed to
+    /// finish first). Its session is saved as on any other end, and so are
+    /// its cookies: being stopped says nothing against the session it holds,
+    /// so the next run can reuse it instead of signing in again.
     #[allow(clippy::too_many_arguments)]
     async fn run(
         &self,
@@ -124,6 +133,19 @@ pub trait Service: Send + Sync {
     /// allowed domains, and its id as the name its session/cookies are
     /// kept under. The browser stays hidden and no HTTP bodies are dumped.
     async fn run_installed(&self, installed: &InstalledScript) -> Result<()>;
+
+    /// Stops the run going on under `name` (an installed script's id, for
+    /// [`Self::run_installed`]), and any run of it waiting for its turn;
+    /// returns whether there was one. Returns at once: the stopped `run`
+    /// call itself returns once its script has really stopped, which takes
+    /// the script's next check — within a few thousand Lua instructions,
+    /// or at once if it's blocked in a `fyde.http`/`fyde.browser` call or
+    /// waiting for a `fyde.input.ask` answer (that question's handler keeps
+    /// running, and its answer is dropped: the caller should dismiss it).
+    /// A `fyde.save_document` upload already under way is let finish, so a
+    /// document is never half-published. A run started under `name` after
+    /// this call isn't affected.
+    fn stop(&self, name: &str) -> bool;
 }
 
 /// Selects which storage backend [`init`] builds the `session`/`cookies`/

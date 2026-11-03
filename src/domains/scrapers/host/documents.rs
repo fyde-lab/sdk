@@ -5,6 +5,8 @@ use mlua::{Function, Lua, Table, Value};
 use tokio::runtime::Handle;
 
 use crate::ErrorCode;
+
+use super::super::stop::StopSignal;
 use crate::domains::documents::attributes::lua::attributes_from_table;
 use crate::domains::documents::{
     Category, DocumentType, Service as DocumentsService, Subcategory, UploadRequest,
@@ -30,6 +32,7 @@ pub(super) fn save_document_fn(
     documents: Arc<dyn DocumentsService>,
     scraper_name: &str,
     runtime: Handle,
+    stop: StopSignal,
 ) -> mlua::Result<Function> {
     let scraper_name = scraper_name.to_string();
 
@@ -50,6 +53,10 @@ pub(super) fn save_document_fn(
             if let Some(fields) = fields {
                 apply_upload_fields(&mut request, &fields)?;
             }
+
+            // An upload isn't cut short halfway (it publishes an event), but
+            // a stopped run doesn't start one.
+            stop.check()?;
 
             // A scraper re-run typically finds documents it already saved:
             // that's not a failure, just nothing to do.
@@ -169,6 +176,7 @@ mod tests {
             Arc::new(documents),
             "didaxis",
             runtime.handle().clone(),
+            StopSignal::new(),
         )
         .unwrap();
         lua.globals().set("save_document", f).unwrap();
@@ -205,6 +213,7 @@ mod tests {
             Arc::new(documents),
             "didaxis",
             runtime.handle().clone(),
+            StopSignal::new(),
         )
         .unwrap();
         lua.globals().set("save_document", f).unwrap();
@@ -237,6 +246,7 @@ mod tests {
             Arc::new(documents),
             "didaxis",
             runtime.handle().clone(),
+            StopSignal::new(),
         )
         .unwrap();
         lua.globals().set("save_document", f).unwrap();
@@ -260,6 +270,7 @@ mod tests {
             Arc::new(documents),
             "didaxis",
             runtime.handle().clone(),
+            StopSignal::new(),
         )
         .unwrap();
         lua.globals().set("save_document", f).unwrap();
@@ -282,6 +293,7 @@ mod tests {
             Arc::new(documents),
             "didaxis",
             runtime.handle().clone(),
+            StopSignal::new(),
         )
         .unwrap();
         lua.globals().set("save_document", f).unwrap();
@@ -304,6 +316,7 @@ mod tests {
             Arc::new(documents),
             "didaxis",
             runtime.handle().clone(),
+            StopSignal::new(),
         )
         .unwrap();
         lua.globals().set("save_document", f).unwrap();
@@ -326,6 +339,7 @@ mod tests {
             Arc::new(documents),
             "didaxis",
             runtime.handle().clone(),
+            StopSignal::new(),
         )
         .unwrap();
         lua.globals().set("save_document", f).unwrap();

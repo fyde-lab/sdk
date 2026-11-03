@@ -26,6 +26,7 @@ use super::browser::Service as BrowserService;
 use super::cookies::Cookie;
 use super::models::RunOptions;
 use super::reports::Recorder;
+use super::stop::StopSignal;
 
 /// Handle returned by [`install`], letting `service.rs` read back
 /// `fyde.session`'s final contents and every cookie this run's `fyde.http`
@@ -140,6 +141,9 @@ pub(super) struct HostConfig {
     pub(super) on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
     pub(super) recorder: Arc<Recorder>,
     pub(super) runtime: Handle,
+    /// This run's stop flag: every host function that can block gives up as
+    /// soon as it's set (see [`StopSignal`]).
+    pub(super) stop: StopSignal,
     pub(super) options: RunOptions,
 }
 
@@ -183,6 +187,7 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
         on_question,
         recorder,
         runtime,
+        stop,
         options,
     } = config;
     let scraper_name = scraper_name.as_str();
@@ -202,6 +207,7 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
             visited_origins.clone(),
             recorder.clone(),
             runtime.clone(),
+            stop.clone(),
             &options,
         )?,
     )
@@ -215,11 +221,20 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
         progress::table(lua, on_progress, recorder.clone())?,
     )
     .context("installing fyde.progress")?;
-    fyde.set("input", input::table(lua, on_question, recorder.clone())?)
-        .context("installing fyde.input")?;
+    fyde.set(
+        "input",
+        input::table(
+            lua,
+            on_question,
+            recorder.clone(),
+            runtime.clone(),
+            stop.clone(),
+        )?,
+    )
+    .context("installing fyde.input")?;
     fyde.set(
         "save_document",
-        documents::save_document_fn(lua, documents, scraper_name, runtime.clone())?,
+        documents::save_document_fn(lua, documents, scraper_name, runtime.clone(), stop.clone())?,
     )
     .context("installing fyde.save_document")?;
     fyde.set(
@@ -229,6 +244,7 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
             browser,
             recorder,
             runtime,
+            stop,
             options.debug_http_dump,
             allowed_domains,
         )?,

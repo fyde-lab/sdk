@@ -200,7 +200,13 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
     a new script version clears the session, so its next run fetches everything again.
   - `session/`, `cookies/`, `reports/` persist per scraper through a `StorageConfig`
     (`Sqlite` for a `Client`, `File` for `init_dev_scrapers`). `fyde.session` is saved even
-    on failure; cookies only on success (a failed run deletes them).
+    on failure; cookies only on success or stop (a failed run deletes them).
+  - `stop(name)` stops the run under `name` (and one queued behind it) through its
+    `StopSignal` (`stop.rs`): the sandbox's instruction hook (`new_vm`'s `interrupt`), every
+    blocking host call (`StopSignal::block_on` instead of a bare `Handle::block_on` — keep it
+    that way in new host functions), a pending `fyde.input.ask` (its handler runs on the
+    blocking pool and is abandoned) and before each upload (`check`; an upload under way
+    finishes). The run ends with `ScraperRunStopped` unless its script finished first.
   - `allowed_domains` fails closed: an empty list allows no host; an IP literal only matches
     exactly.
   - `browser/` — `wry`/`tao` webviews on one process-wide thread, started lazily (GTK panics if
@@ -215,8 +221,8 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
     (e.g. `QuotaExceeded` from `save_document`), even rethrown by the script; a connect or
     timeout failure is `ScraperSiteUnreachable`; the login contract's `error("INVALID_CREDENTIALS", 0)`
     / `error("MFA_FAILED", 0)` are `ScraperCredentialsRejected` / `ScraperVerificationFailed`;
-    the sandbox's memory, instruction and body-size limits are `ScriptLimitExceeded`; anything
-    else is `ScriptFailed`.
+    the sandbox's memory, instruction and body-size limits are `ScriptLimitExceeded`; a stopped
+    run is `ScraperRunStopped`; anything else is `ScriptFailed`.
   - `run_installed` runs an installed script (`wreq_emulation`/`follow_redirects` default on).
   - `crate::init_dev_scrapers` builds a scrapers service without a `Client` (file storage +
     `DevDocumentsClient`); `../scripts` is its caller.

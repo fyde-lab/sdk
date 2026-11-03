@@ -14,6 +14,7 @@ use wreq_util::Profile;
 use super::super::cookies::Cookie;
 use super::super::models::RunOptions;
 use super::super::reports::Recorder;
+use super::super::stop::StopSignal;
 
 /// Builds a fresh cookie jar pre-populated from `cookies` (as previously
 /// saved by `cookies::Service` for this scraper), so this run's `fyde.http`
@@ -108,7 +109,12 @@ fn table_to_string_map(table: &Table) -> LuaResult<HashMap<String, String>> {
     Ok(map)
 }
 
-fn response_to_table(lua: &Lua, runtime: &Handle, resp: wreq::Response) -> LuaResult<Table> {
+fn response_to_table(
+    lua: &Lua,
+    runtime: &Handle,
+    stop: &StopSignal,
+    resp: wreq::Response,
+) -> LuaResult<Table> {
     let status = resp.status().as_u16();
     // The final URL after following any redirects - scripts need this to
     // know where they actually landed (e.g. to use as a Referer on a later
@@ -121,7 +127,8 @@ fn response_to_table(lua: &Lua, runtime: &Handle, resp: wreq::Response) -> LuaRe
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let body = read_body(runtime, resp, super::MAX_BODY_BYTES).map_err(mlua::Error::external)?;
+    let body =
+        read_body(runtime, stop, resp, super::MAX_BODY_BYTES).map_err(mlua::Error::external)?;
     let body = decode_text(&content_type, &body);
 
     let out = lua.create_table()?;
@@ -238,6 +245,7 @@ pub(super) fn table(
     visited_origins: Arc<Mutex<HashSet<String>>>,
     recorder: Arc<Recorder>,
     runtime: Handle,
+    stop: StopSignal,
     options: &RunOptions,
 ) -> LuaResult<Table> {
     let allowed_domains = Arc::new(options.allowed_domains.clone());
@@ -247,6 +255,7 @@ pub(super) fn table(
         visited_origins,
         recorder,
         runtime,
+        stop,
         allowed_domains,
         debug_http_dump: options.debug_http_dump,
     });
@@ -340,8 +349,13 @@ pub(super) fn table(
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
-            let bytes = read_body(&download.runtime, resp, super::MAX_BODY_BYTES)
-                .map_err(|err| download.record_error("http.download", &url, err))?;
+            let bytes = read_body(
+                &download.runtime,
+                &download.stop,
+                resp,
+                super::MAX_BODY_BYTES,
+            )
+            .map_err(|err| download.record_error("http.download", &url, err))?;
 
             // The body is never dumped here, even under `debug_http_dump`:
             // downloads are routinely binary (PDFs, images), which wouldn't
@@ -372,13 +386,15 @@ pub(super) fn table(
 
 /// Reads `resp`'s whole body, failing as soon as it grows past `max_bytes`
 /// ([`super::MAX_BODY_BYTES`] outside tests; counted after decompression)
-/// instead of buffering it all first.
+/// instead of buffering it all first, or as soon as `stop` is set (a large
+/// download is where a stopped run would otherwise linger longest).
 fn read_body(
     runtime: &Handle,
+    stop: &StopSignal,
     resp: wreq::Response,
     max_bytes: usize,
 ) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    runtime.block_on(async {
+    stop.block_on(runtime, async {
         let mut stream = resp.bytes_stream();
         let mut body = Vec::new();
         while let Some(chunk) = stream.next().await {
@@ -394,7 +410,7 @@ fn read_body(
             body.extend_from_slice(&chunk);
         }
         Ok(body)
-    })
+    })?
 }
 
 /// Decodes `body` the way `wreq::Response::text` does: in the `charset` of
@@ -455,6 +471,7 @@ struct HttpHost {
     visited_origins: Arc<Mutex<HashSet<String>>>,
     recorder: Arc<Recorder>,
     runtime: Handle,
+    stop: StopSignal,
     allowed_domains: Arc<Vec<String>>,
     debug_http_dump: bool,
 }
@@ -469,15 +486,16 @@ impl HttpHost {
         Ok(())
     }
 
-    /// Sends `request`, recording an `error` entry if it fails.
+    /// Sends `request`, recording an `error` entry if it fails; gives up on
+    /// it as soon as the run is stopped.
     fn send(
         &self,
         action: &str,
         url: &str,
         request: wreq::RequestBuilder,
     ) -> LuaResult<wreq::Response> {
-        self.runtime
-            .block_on(request.send())
+        self.stop
+            .block_on(&self.runtime, request.send())?
             .map_err(|err| self.record_error(action, url, err))
     }
 
@@ -498,7 +516,7 @@ impl HttpHost {
         let resp = self.send(action, url, request)?;
         let status = resp.status().as_u16();
         record_redirects(&self.recorder, method, &resp);
-        let out = response_to_table(lua, &self.runtime, resp)?;
+        let out = response_to_table(lua, &self.runtime, &self.stop, resp)?;
 
         let mut entry = json!({
             "method": method,
@@ -554,6 +572,7 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             recorder.clone(),
             runtime.handle().clone(),
+            StopSignal::new(),
             &RunOptions {
                 debug_http_dump: false,
                 wreq_emulation: true,
@@ -623,6 +642,7 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             recorder.clone(),
             runtime.handle().clone(),
+            StopSignal::new(),
             &RunOptions {
                 debug_http_dump: false,
                 wreq_emulation: false,
@@ -686,7 +706,7 @@ mod tests {
         let url = spawn_ok_server(&runtime, "hello");
         let resp = runtime.block_on(Client::new().get(&url).send()).unwrap();
 
-        let body = read_body(runtime.handle(), resp, 5).unwrap();
+        let body = read_body(runtime.handle(), &StopSignal::new(), resp, 5).unwrap();
 
         assert_eq!(body, b"hello");
     }
@@ -697,7 +717,7 @@ mod tests {
         let url = spawn_ok_server(&runtime, "hello");
         let resp = runtime.block_on(Client::new().get(&url).send()).unwrap();
 
-        let err = read_body(runtime.handle(), resp, 4).unwrap_err();
+        let err = read_body(runtime.handle(), &StopSignal::new(), resp, 4).unwrap_err();
 
         assert!(err.to_string().contains("4 byte limit"), "{err}");
         let err = err.downcast_ref::<crate::Error>().expect("a crate error");
@@ -736,6 +756,7 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             recorder.clone(),
             runtime.handle().clone(),
+            StopSignal::new(),
             &RunOptions {
                 debug_http_dump: false,
                 wreq_emulation: false,
@@ -784,6 +805,7 @@ mod tests {
             Arc::new(Mutex::new(HashSet::new())),
             recorder,
             runtime.handle().clone(),
+            StopSignal::new(),
             &RunOptions {
                 debug_http_dump: false,
                 wreq_emulation: true,
