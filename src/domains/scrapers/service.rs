@@ -122,7 +122,6 @@ impl Service for ScrapersClient {
         self.run(
             &script.id().to_string(),
             script.script(),
-            script.version(),
             parameters,
             false,
             INSTALLED_WREQ_EMULATION,
@@ -137,7 +136,6 @@ impl Service for ScrapersClient {
         &self,
         name: &str,
         script: &str,
-        script_version: u64,
         parameters: Value,
         debug_http_dump: bool,
         wreq_emulation: bool,
@@ -158,15 +156,11 @@ impl Service for ScrapersClient {
             .await
             .with_context(|| format!("failed to load session for scraper {name:?}"))?;
         let recorder = Arc::new(Recorder::new(name));
-        recorder.record(
-            "run_started",
-            json!({ "script": name, "script_version": script_version }),
-        );
+        recorder.record("run_started", json!({ "script": name }));
 
         let job = ScraperJob {
             name: name.to_string(),
             script: script.to_string(),
-            script_version,
             parameters,
             session_data,
             cookies,
@@ -232,7 +226,6 @@ impl Service for ScrapersClient {
 struct ScraperJob {
     name: String,
     script: String,
-    script_version: u64,
     parameters: Value,
     session_data: Value,
     cookies: Vec<Cookie>,
@@ -256,7 +249,6 @@ fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
     let ScraperJob {
         name,
         script,
-        script_version,
         parameters,
         session_data,
         cookies,
@@ -300,7 +292,6 @@ fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
         &lua,
         HostConfig {
             scraper_name: name.clone(),
-            script_version,
             session_data,
             cookies,
             documents,
@@ -540,7 +531,6 @@ mod tests {
             .run(
                 "didaxis",
                 TRIVIAL_SCRIPT,
-                1,
                 json!({}),
                 false,
                 true,
@@ -575,7 +565,6 @@ mod tests {
             .run(
                 "didaxis",
                 script,
-                1,
                 json!({"username": "alice"}),
                 false,
                 true,
@@ -661,7 +650,6 @@ mod tests {
             .run(
                 "didaxis",
                 script,
-                1,
                 json!({}),
                 false,
                 true,
@@ -711,7 +699,6 @@ mod tests {
             .run(
                 "didaxis",
                 script,
-                1,
                 json!({}),
                 false,
                 true,
@@ -779,7 +766,6 @@ mod tests {
             .run(
                 name,
                 ASKING_SCRIPT,
-                1,
                 json!({}),
                 false,
                 true,
@@ -862,7 +848,6 @@ mod tests {
             .run(
                 "didaxis",
                 "return {}",
-                1,
                 json!({}),
                 false,
                 true,
@@ -959,7 +944,6 @@ mod tests {
             .run(
                 "didaxis",
                 script,
-                1,
                 json!({}),
                 false,
                 true,
@@ -995,7 +979,6 @@ mod tests {
             .run(
                 "didaxis",
                 script,
-                1,
                 json!({}),
                 false,
                 true,

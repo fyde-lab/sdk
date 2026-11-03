@@ -167,34 +167,15 @@ end
 
 -- Saved-URL tracking: every URL a document was saved from is recorded in
 -- `fyde.session.saved_urls` (persisted with the rest of the session, even when the run fails
--- later), so the next run can skip downloading it again. Each key is prefixed with the running
--- script's version (`fyde.script_version`), so a new version of a script fetches every
--- document again instead of trusting what an older (possibly buggy) one saved; the first
--- `mark_saved` of a run drops every key an older version recorded.
-local function saved_key(url)
-  return "v" .. tostring(fyde.script_version or 0) .. ":" .. url
-end
-
+-- later), so the next run can skip downloading it again.
 local function already_saved(url)
   local saved = fyde.session.saved_urls
-  return saved ~= nil and saved[saved_key(url)] == true
+  return saved ~= nil and saved[url] == true
 end
 
-local pruned = false
-
 local function mark_saved(url)
-  local saved = fyde.session.saved_urls or {}
-  if not pruned then
-    local prefix = saved_key("")
-    for key in pairs(saved) do
-      if type(key) ~= "string" or key:sub(1, #prefix) ~= prefix then
-        saved[key] = nil
-      end
-    end
-    pruned = true
-  end
-  saved[saved_key(url)] = true
-  fyde.session.saved_urls = saved
+  fyde.session.saved_urls = fyde.session.saved_urls or {}
+  fyde.session.saved_urls[url] = true
 end
 
 -- Downloads `url` and saves it as `filename` when it really is a PDF; returns true on success.

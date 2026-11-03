@@ -58,13 +58,6 @@ pub trait Service: Send + Sync {
     /// never looks inside it, so a script is free to read whatever fields it
     /// needs (conventionally `username`/`password`) back out of it.
     ///
-    /// `script_version` is the version of `script` being run (an installed
-    /// script's [`crate::Script::version`]), exposed to it as
-    /// `fyde.script_version`. `fyde.helpers` prefixes every URL it records in
-    /// `fyde.session.saved_urls` with it, so a new version of a script
-    /// fetches again every document an older one already saved (the
-    /// documents domain still skips one whose content didn't change).
-    ///
     /// Loads this scraper's previously saved session data and cookies before
     /// running, and persists their final state back once the script's `run`
     /// function returns. `fyde.session`'s contents are saved whether it
@@ -115,7 +108,6 @@ pub trait Service: Send + Sync {
         &self,
         name: &str,
         script: &str,
-        script_version: u64,
         parameters: Value,
         debug_http_dump: bool,
         wreq_emulation: bool,
@@ -126,8 +118,8 @@ pub trait Service: Send + Sync {
 
     /// Runs an installed script (see `scripts::Service::fetch_installed_
     /// script`) with the parameter values it was installed with, its own
-    /// allowed domains, its version as `script_version`, and its id as the
-    /// name its session/cookies are kept under. The browser stays hidden and no HTTP bodies are dumped.
+    /// allowed domains, and its id as the name its session/cookies are
+    /// kept under. The browser stays hidden and no HTTP bodies are dumped.
     async fn run_installed(&self, installed: &InstalledScript) -> Result<()>;
 }
 
