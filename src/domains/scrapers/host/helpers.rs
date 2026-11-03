@@ -314,7 +314,7 @@ mod tests {
             r#"local h = fyde.helpers
                local first = h.save_pdf("https://e/x.pdf", "x.pdf")
                return first, h.save_pdf("https://e/x.pdf", "x.pdf"), downloads, #saved,
-                 fyde.session.saved_urls["v0:https://e/x.pdf"]"#,
+                 fyde.session.saved_urls["https://e/x.pdf"]"#,
         );
 
         assert!(first);
@@ -346,7 +346,7 @@ mod tests {
     fn save_pdf_with_refresh_always_downloads_and_records_nothing() {
         let lua = lua(&format!(
             "{SAVE_STUBS}\n{PDF_DOWNLOAD_STUB}
-             fyde.session.saved_urls = {{ ['v0:https://e/x.pdf'] = true }}"
+             fyde.session.saved_urls = {{ ['https://e/x.pdf'] = true }}"
         ));
 
         let (downloads, count): (i64, i64) = eval(
@@ -379,61 +379,6 @@ mod tests {
 
         assert!(!before);
         assert!(after);
-    }
-
-    #[test]
-    fn saved_urls_are_keyed_by_script_version() {
-        let lua = lua("fyde.session = {} fyde.script_version = 3");
-
-        let (key, other): (bool, Option<bool>) = eval(
-            &lua,
-            r#"fyde.helpers.mark_saved("https://e/x.pdf")
-               return fyde.session.saved_urls["v3:https://e/x.pdf"],
-                 fyde.session.saved_urls["https://e/x.pdf"]"#,
-        );
-
-        assert!(key);
-        assert_eq!(other, None);
-    }
-
-    #[test]
-    fn save_pdf_downloads_again_a_url_an_older_script_version_saved() {
-        let lua = lua(&format!(
-            "{SAVE_STUBS}\n{PDF_DOWNLOAD_STUB}
-             fyde.script_version = 2
-             fyde.session.saved_urls = {{ ['v1:https://e/x.pdf'] = true, ['https://e/y.pdf'] = true }}"
-        ));
-
-        let (downloads, count): (i64, i64) = eval(
-            &lua,
-            r#"local h = fyde.helpers
-               h.save_pdf("https://e/x.pdf", "x.pdf")
-               h.save_pdf("https://e/x.pdf", "x.pdf")
-               return downloads, #saved"#,
-        );
-
-        assert_eq!(downloads, 1);
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn mark_saved_drops_the_urls_older_script_versions_recorded() {
-        let lua = lua(
-            "fyde.session = { saved_urls = { ['v1:https://e/a.pdf'] = true, \
-             ['https://e/b.pdf'] = true, ['v2:https://e/c.pdf'] = true } } \
-             fyde.script_version = 2",
-        );
-
-        let keys: Vec<String> = eval(
-            &lua,
-            r#"fyde.helpers.mark_saved("https://e/d.pdf")
-               local keys = {}
-               for key in pairs(fyde.session.saved_urls) do keys[#keys + 1] = key end
-               table.sort(keys)
-               return keys"#,
-        );
-
-        assert_eq!(keys, ["v2:https://e/c.pdf", "v2:https://e/d.pdf"]);
     }
 
     #[test]
