@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -15,6 +16,7 @@ use super::host::{self, HostConfig};
 use super::models::RunOptions;
 use super::reports::{Recorder, Service as ReportsService};
 use super::session::Service as SessionService;
+use super::stop::{self, StopSignal};
 use super::{OnScraperProgress, OnScraperQuestion, ProgressEvent, Service};
 
 /// The `wreq_emulation`/`follow_redirects` an installed script runs with.
@@ -37,6 +39,10 @@ const INSTALLED_FOLLOW_REDIRECTS: bool = true;
 /// session and cookies and then overwrite each other's saves (a failed run
 /// even deleting the cookies a successful one just saved): `running`
 /// serializes those, see [`ScrapersClient::lock_name`].
+///
+/// `stops` holds the stop signal of every name with a run going on or
+/// waiting for its turn, for [`Service::stop`]: see
+/// [`ScrapersClient::register_stop`].
 pub(super) struct ScrapersClient {
     cookies: Arc<dyn CookiesService>,
     session: Arc<dyn SessionService>,
@@ -45,6 +51,21 @@ pub(super) struct ScrapersClient {
     on_progress: Option<OnScraperProgress>,
     on_question: Option<OnScraperQuestion>,
     running: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    stops: StopRegistry,
+    next_stop_id: AtomicU64,
+}
+
+/// Every name with a run registered (see [`ScrapersClient::register_stop`]),
+/// with the stop signal its runs share.
+type StopRegistry = Arc<Mutex<HashMap<String, NameStops>>>;
+
+struct NameStops {
+    /// Tells this entry apart from a later one under the same name, so a
+    /// registration outliving a [`Service::stop`] doesn't touch the next.
+    id: u64,
+    signal: StopSignal,
+    /// How many [`StopRegistration`]s point at this entry.
+    runs: usize,
 }
 
 impl ScrapersClient {
@@ -64,6 +85,28 @@ impl ScrapersClient {
             on_progress,
             on_question,
             running: Arc::new(Mutex::new(HashMap::new())),
+            stops: Arc::new(Mutex::new(HashMap::new())),
+            next_stop_id: AtomicU64::new(0),
+        }
+    }
+
+    /// Registers a run under `name` for [`Service::stop`], sharing the stop
+    /// signal of the runs already registered under it, until the returned
+    /// registration drops. Taken before the run waits for its turn, so a
+    /// run still waiting can be stopped too.
+    fn register_stop(&self, name: &str) -> StopRegistration {
+        let mut stops = self.stops.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = stops.entry(name.to_string()).or_insert_with(|| NameStops {
+            id: self.next_stop_id.fetch_add(1, Ordering::Relaxed),
+            signal: StopSignal::new(),
+            runs: 0,
+        });
+        entry.runs += 1;
+        StopRegistration {
+            stops: self.stops.clone(),
+            name: name.to_string(),
+            id: entry.id,
+            signal: entry.signal.clone(),
         }
     }
 
@@ -87,6 +130,30 @@ impl ScrapersClient {
             name: name.to_string(),
             lock,
             _guard: Some(guard),
+        }
+    }
+}
+
+/// A run's entry in [`ScrapersClient::stops`]: see
+/// [`ScrapersClient::register_stop`]. Dropping it forgets the name once no
+/// run is registered under it any more.
+struct StopRegistration {
+    stops: StopRegistry,
+    name: String,
+    id: u64,
+    signal: StopSignal,
+}
+
+impl Drop for StopRegistration {
+    fn drop(&mut self) {
+        let mut stops = self.stops.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = stops.get_mut(&self.name)
+            && entry.id == self.id
+        {
+            entry.runs -= 1;
+            if entry.runs == 0 {
+                stops.remove(&self.name);
+            }
         }
     }
 }
@@ -115,6 +182,23 @@ impl Drop for NameGuard {
 
 #[async_trait]
 impl Service for ScrapersClient {
+    fn stop(&self, name: &str) -> bool {
+        // Removed rather than flagged: the runs registered so far keep the
+        // signal they hold, while one started from now on gets a fresh one.
+        let removed = self
+            .stops
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(name);
+        match removed {
+            Some(entry) => {
+                entry.signal.stop();
+                true
+            }
+            None => false,
+        }
+    }
+
     async fn run_installed(&self, installed: &InstalledScript) -> Result<()> {
         let script = installed.script();
         let parameters = serde_json::to_value(installed.parameters())
@@ -143,7 +227,15 @@ impl Service for ScrapersClient {
         allowed_domains: Vec<String>,
         browser_visible: bool,
     ) -> Result<()> {
-        let name_guard = self.lock_name(name).await;
+        let stop_registration = self.register_stop(name);
+        let signal = stop_registration.signal.clone();
+        // Stopped while waiting for its turn: nothing was loaded, so there's
+        // nothing to save either.
+        let name_guard = tokio::select! {
+            biased;
+            () = signal.stopped() => return Err(stop::stopped()),
+            guard = self.lock_name(name) => guard,
+        };
 
         let cookies = self
             .cookies
@@ -169,6 +261,7 @@ impl Service for ScrapersClient {
             on_question: self.on_question.clone(),
             recorder: recorder.clone(),
             runtime: Handle::current(),
+            stop: signal.clone(),
             options: RunOptions {
                 debug_http_dump,
                 wreq_emulation,
@@ -178,21 +271,32 @@ impl Service for ScrapersClient {
             },
         };
 
-        // The guard rides along with the job and comes back with its result:
-        // if this future is dropped mid-run, the blocking job (which can't be
-        // cancelled) keeps the name until the script has really stopped, so
-        // no other run of it starts alongside. Otherwise it's held here
-        // through the saves below.
-        let (_name_guard, outcome) = tokio::task::spawn_blocking(move || {
+        // The guards ride along with the job and come back with its result:
+        // if this future is dropped mid-run, the blocking job (which only a
+        // `stop` can cut short) keeps the name until the script has really
+        // stopped, so no other run of it starts alongside, and can still be
+        // stopped. Otherwise they're held here through the saves below.
+        let (_name_guard, _stop_registration, outcome) = tokio::task::spawn_blocking(move || {
             let outcome = run_script(job);
-            (name_guard, outcome)
+            (name_guard, stop_registration, outcome)
         })
         .await
         .with_context(|| format!("scraper {name:?} task panicked"))?;
         let (session_data, cookies, run_result) = outcome?;
 
+        // However the script ended once stopped (the stop itself, or another
+        // error a script that caught it ran into next), it ends as stopped;
+        // a script that finished despite the stop keeps its success.
+        let stopped = run_result.is_err() && signal.is_stopped();
+        let run_result = if stopped {
+            Err(stop::stopped())
+        } else {
+            run_result
+        };
+
         match &run_result {
             Ok(()) => recorder.record("run_finished", json!({ "status": "ok" })),
+            Err(_) if stopped => recorder.record("run_stopped", json!({})),
             Err(err) => recorder.record(
                 "error",
                 json!({ "action": "run", "message": err.to_string() }),
@@ -203,7 +307,7 @@ impl Service for ScrapersClient {
             .save(name, session_data)
             .await
             .with_context(|| format!("failed to save session for scraper {name:?}"))?;
-        let cookies = if run_result.is_ok() {
+        let cookies = if run_result.is_ok() || stopped {
             cookies
         } else {
             Vec::new()
@@ -234,6 +338,7 @@ struct ScraperJob {
     on_question: Option<OnScraperQuestion>,
     recorder: Arc<Recorder>,
     runtime: Handle,
+    stop: StopSignal,
     options: RunOptions,
 }
 
@@ -257,6 +362,7 @@ fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
         on_question,
         recorder,
         runtime,
+        stop,
         options,
     } = job;
 
@@ -271,7 +377,7 @@ fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
         Arc::new(move |question| callback(&name, question))
     });
 
-    let lua = sandboxed_lua().context("building sandboxed lua vm")?;
+    let lua = sandboxed_lua(stop.clone()).context("building sandboxed lua vm")?;
     // Built fresh per run, same as the Lua VM itself: the window and webview
     // it lazily opens on the shared browser thread (see
     // `browser::driver::BrowserDriver`) live only as long as
@@ -300,6 +406,7 @@ fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
             on_question,
             recorder,
             runtime,
+            stop,
             options,
         },
     )
@@ -375,13 +482,16 @@ fn merge_cookies(http_cookies: Vec<Cookie>, browser_cookies: Vec<Cookie>) -> Vec
 /// live on the VM's heap as Lua strings until `fyde.save_document` takes
 /// them; the instruction budget only counts Lua code actually executing, not
 /// time spent blocked in host functions (network calls, `fyde.input.ask`).
-fn sandboxed_lua() -> Result<Lua> {
+/// `stop` interrupts the script's Lua code once set (the host functions check
+/// it themselves, see `host::HostConfig::stop`).
+fn sandboxed_lua(stop: StopSignal) -> Result<Lua> {
     crate::tools::sandbox::new_vm(
         StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
         crate::tools::sandbox::Limits {
             memory_bytes: 512 * 1024 * 1024,
             max_instructions: 5_000_000_000,
         },
+        move || stop.is_stopped().then(stop::stopped),
     )
 }
 
@@ -890,9 +1000,151 @@ mod tests {
         assert_eq!(active.lock().unwrap().1, 1, "runs overlapped");
     }
 
+    /// An `on_question` handler that waits for each answer on the returned
+    /// sender, and tells the returned receiver each time it's asked.
+    fn held_question() -> (
+        OnScraperQuestion,
+        std::sync::mpsc::Sender<String>,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel::<String>();
+        let answer_rx = Mutex::new(answer_rx);
+        let (asked_tx, asked_rx) = tokio::sync::mpsc::unbounded_channel();
+        let on_question: OnScraperQuestion = Arc::new(move |_name: &str, _question| {
+            let _ = asked_tx.send(());
+            answer_rx.lock().unwrap().recv().unwrap_or_default()
+        });
+        (on_question, answer_tx, asked_rx)
+    }
+
+    fn assert_stopped(result: Result<()>) {
+        assert_eq!(
+            result.unwrap_err().code(),
+            crate::ErrorCode::ScraperRunStopped
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_returns_false_when_no_run_goes_on_under_the_name() {
+        let client = ScrapersClient::new(
+            Arc::new(MockCookiesService::new()),
+            Arc::new(MockSessionService::new()),
+            Arc::new(MockReportsService::new()),
+            Arc::new(MockDocumentsService::new()),
+            None,
+            None,
+        );
+
+        assert!(!client.stop("didaxis"));
+    }
+
+    #[tokio::test]
+    async fn stop_interrupts_a_script_running_lua_and_keeps_its_session_and_cookies() {
+        let mut cookies = MockCookiesService::new();
+        cookies.expect_load().returning(|_| Ok(Vec::new()));
+        // Unlike a failed run's, a stopped run's cookies are kept.
+        cookies
+            .expect_save()
+            .withf(|_, saved| saved.len() == 1 && saved[0].set_cookie.starts_with("sid=1"))
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let mut session = MockSessionService::new();
+        session.expect_load().returning(|_| Ok(json!({})));
+        session
+            .expect_save()
+            .withf(|_, data| *data == json!({"reached": true}))
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let on_progress: OnScraperProgress = Arc::new(move |_name: &str, _event| {
+            let _ = started_tx.send(());
+        });
+        let client = Arc::new(ScrapersClient::new(
+            Arc::new(cookies),
+            Arc::new(session),
+            Arc::new(any_reports()),
+            Arc::new(MockDocumentsService::new()),
+            Some(on_progress),
+            None,
+        ));
+
+        let script = r#"
+            local M = {}
+            function M.run(parameters)
+                fyde.http.set_cookie("https://example.com/", "sid=1; Path=/")
+                fyde.session.reached = true
+                fyde.progress.step("logging_in")
+                while true do end
+            end
+            return M
+        "#;
+        let running = client.clone();
+        let run = tokio::spawn(async move {
+            running
+                .run(
+                    "didaxis",
+                    script,
+                    json!({}),
+                    false,
+                    true,
+                    true,
+                    vec!["example.com".to_string()],
+                    false,
+                )
+                .await
+        });
+        started_rx.recv().await.unwrap();
+
+        assert!(client.stop("didaxis"));
+
+        let result = tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("the stopped script should end")
+            .unwrap();
+        assert_stopped(result);
+        assert!(client.stops.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stop_ends_a_run_waiting_for_an_answer_and_the_run_queued_behind_it() {
+        let (on_question, answers, mut asked) = held_question();
+        let client = asking_client(on_question);
+
+        let first = tokio::spawn(run_asking(client.clone(), "didaxis"));
+        asked.recv().await.unwrap();
+        let queued = tokio::spawn(run_asking(client.clone(), "didaxis"));
+        // Lets the queued run register and start waiting for its turn.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(client.stop("didaxis"));
+
+        let both = async { (first.await.unwrap(), queued.await.unwrap()) };
+        let (first, queued) = tokio::time::timeout(Duration::from_secs(10), both)
+            .await
+            .expect("a stop shouldn't wait for the question's answer");
+        assert_stopped(first);
+        assert_stopped(queued);
+
+        // A run started after the stop isn't affected by it. The first
+        // run's abandoned handler takes the first answer.
+        let later = tokio::spawn(run_asking(client.clone(), "didaxis"));
+        asked.recv().await.unwrap();
+        answers.send("late".to_string()).unwrap();
+        answers.send("ok".to_string()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), later)
+            .await
+            .expect("the later run should finish")
+            .unwrap()
+            .unwrap();
+
+        assert!(!client.stop("didaxis"));
+        assert!(client.stops.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn sandboxed_lua_has_no_filesystem_process_or_module_loading_access() {
-        let lua = sandboxed_lua().unwrap();
+        let lua = sandboxed_lua(StopSignal::new()).unwrap();
 
         for global in [
             "os", "io", "require", "dofile", "loadfile", "load", "package", "debug",
@@ -909,7 +1161,7 @@ mod tests {
 
     #[test]
     fn sandboxed_lua_can_still_run_safe_lua() {
-        let lua = sandboxed_lua().unwrap();
+        let lua = sandboxed_lua(StopSignal::new()).unwrap();
 
         let sum: i64 = lua.load("return 1 + 41").eval().unwrap();
         assert_eq!(sum, 42);

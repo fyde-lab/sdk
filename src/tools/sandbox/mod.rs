@@ -32,6 +32,14 @@ pub(crate) struct Limits {
 
 /// Builds a sandboxed Lua VM loading only `libs`, with `limits` enforced.
 ///
+/// `interrupt` is asked alongside the instruction budget every
+/// [`HOOK_INTERVAL`] instructions: once it returns an error, the script fails
+/// with it at that point (and at every later check, should the script catch
+/// it with `pcall` and carry on). That's how a running script is stopped from
+/// outside (see `scrapers::Service::stop`); it only covers time spent running
+/// Lua code, so the host functions a script blocks in must check for
+/// themselves. Pass `|| None` for a VM nothing stops.
+///
 /// `Lua::new_with` always loads the base library (`_G`) regardless of the
 /// requested [`StdLib`] flags — it unconditionally calls `luaopen_base`
 /// internally, with no `StdLib` flag to opt out — so `dofile`/`loadfile`
@@ -39,7 +47,11 @@ pub(crate) struct Limits {
 /// are stripped from the globals table by hand afterwards to close that
 /// gap. Scripts themselves must be loaded through [`load_source`], never
 /// `lua.load` directly, so they can't smuggle in precompiled bytecode.
-pub(crate) fn new_vm(libs: StdLib, limits: Limits) -> Result<Lua> {
+pub(crate) fn new_vm(
+    libs: StdLib,
+    limits: Limits,
+    interrupt: impl Fn() -> Option<crate::Error> + 'static,
+) -> Result<Lua> {
     let lua =
         Lua::new_with(libs, LuaOptions::new()).context("failed to create sandboxed lua vm")?;
 
@@ -65,6 +77,8 @@ pub(crate) fn new_vm(libs: StdLib, limits: Limits) -> Result<Lua> {
                         "over its budget of {max_instructions} Lua instructions"
                     )),
                 )))
+            } else if let Some(err) = interrupt() {
+                Err(mlua::Error::external(err))
             } else {
                 Ok(VmState::Continue)
             }
@@ -97,7 +111,7 @@ mod tests {
 
     #[test]
     fn new_vm_strips_filesystem_and_chunk_loading_globals() {
-        let lua = new_vm(StdLib::TABLE | StdLib::STRING, limits()).unwrap();
+        let lua = new_vm(StdLib::TABLE | StdLib::STRING, limits(), || None).unwrap();
 
         for global in ["dofile", "loadfile", "load", "io", "os", "require"] {
             let value: mlua::Value = lua.globals().get(global).unwrap();
@@ -107,7 +121,7 @@ mod tests {
 
     #[test]
     fn new_vm_stops_a_script_that_never_terminates() {
-        let lua = new_vm(StdLib::TABLE, limits()).unwrap();
+        let lua = new_vm(StdLib::TABLE, limits(), || None).unwrap();
 
         let err = load_source(&lua, "while true do end").exec().unwrap_err();
 
@@ -120,7 +134,7 @@ mod tests {
 
     #[test]
     fn new_vm_stops_a_script_that_allocates_without_bound() {
-        let lua = new_vm(StdLib::STRING, limits()).unwrap();
+        let lua = new_vm(StdLib::STRING, limits(), || None).unwrap();
 
         let err = load_source(&lua, r#"local s = string.rep("x", 64 * 1024 * 1024)"#)
             .exec()
@@ -134,8 +148,43 @@ mod tests {
     }
 
     #[test]
+    fn new_vm_stops_a_running_script_once_interrupted() {
+        let interrupted = std::rc::Rc::new(Cell::new(false));
+        let flag = interrupted.clone();
+        let lua = new_vm(StdLib::TABLE, limits(), move || {
+            flag.get().then(|| ErrorKind::ScraperRunStopped.into())
+        })
+        .unwrap();
+        let interrupt = interrupted.clone();
+        lua.globals()
+            .set(
+                "interrupt",
+                lua.create_function(move |_, ()| {
+                    interrupt.set(true);
+                    Ok(())
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        // Catching the first interruption doesn't buy the script anything:
+        // the next check fails it again.
+        let err = load_source(
+            &lua,
+            "interrupt() pcall(function() while true do end end) while true do end",
+        )
+        .exec()
+        .unwrap_err();
+
+        assert_eq!(
+            crate::Error::from(err).code(),
+            crate::ErrorCode::ScraperRunStopped
+        );
+    }
+
+    #[test]
     fn new_vm_still_runs_a_script_within_its_limits() {
-        let lua = new_vm(StdLib::TABLE | StdLib::STRING, limits()).unwrap();
+        let lua = new_vm(StdLib::TABLE | StdLib::STRING, limits(), || None).unwrap();
 
         let sum: i64 = load_source(
             &lua,
@@ -149,7 +198,7 @@ mod tests {
 
     #[test]
     fn load_source_never_treats_a_script_as_precompiled_bytecode() {
-        let lua = new_vm(StdLib::STRING, limits()).unwrap();
+        let lua = new_vm(StdLib::STRING, limits(), || None).unwrap();
         // Starts with the `\x1bLua` signature `mlua` would otherwise
         // auto-detect and run as unverified bytecode.
         let disguised = "\x1bLua\x54\x00 not really bytecode";

@@ -245,6 +245,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "The site couldn't be reached. Please try again later.",
             "Le site est injoignable. Veuillez réessayer plus tard.",
         ),
+        ErrorCode::ScraperRunStopped => (
+            "The add-on was stopped before it finished.",
+            "L'extension a été arrêtée avant la fin.",
+        ),
     };
 
     match language {

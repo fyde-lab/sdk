@@ -165,6 +165,10 @@ macro_rules! for_each_error_code {
             /// The site a scraper fetches from couldn't be reached or
             /// didn't answer in time.
             ScraperSiteUnreachable = 5010,
+            /// A scraper run was stopped on request (`scrapers::Service::
+            /// stop`) before it finished. Not a failure of the source:
+            /// what it saved stays, and the next run starts as usual.
+            ScraperRunStopped = 5011,
         }
     };
 }
@@ -314,6 +318,8 @@ pub(crate) enum ErrorKind {
     Browser(String),
     #[error("script exceeded its sandbox limits: {0}")]
     ScriptLimitExceeded(String),
+    #[error("scraper run stopped on request")]
+    ScraperRunStopped,
 }
 
 impl ErrorKind {
@@ -361,6 +367,7 @@ impl ErrorKind {
             ErrorKind::TaskJoin(_) => ErrorCode::TaskFailed,
             ErrorKind::Browser(_) => ErrorCode::BrowserFailed,
             ErrorKind::ScriptLimitExceeded(_) => ErrorCode::ScriptLimitExceeded,
+            ErrorKind::ScraperRunStopped => ErrorCode::ScraperRunStopped,
         }
     }
 }
@@ -665,6 +672,7 @@ mod tests {
                 memory_bytes: 16 * 1024 * 1024,
                 max_instructions: 1_000_000,
             },
+            || None,
         )
         .unwrap();
         let over_quota = lua
