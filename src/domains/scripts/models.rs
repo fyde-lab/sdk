@@ -331,6 +331,16 @@ impl FakeScript {
         self
     }
 
+    pub fn with_id(mut self, id: Uuid) -> Self {
+        self.script.id = id;
+        self
+    }
+
+    pub fn with_version(mut self, version: u64) -> Self {
+        self.script.version = version;
+        self
+    }
+
     pub fn with_script(mut self, script: &str) -> Self {
         self.script.script = script.to_string();
         self

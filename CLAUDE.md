@@ -130,7 +130,9 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
   (`SaveDocument`, `UpdateMetadata`, `InstallScript`). `crypto.rs`: AES-256-GCM, per-event DEK
   wrapped by a KEK derived from the master key. The consume job replays from the persisted
-  cursor then tails live, materializing documents and installed scripts. Each event's
+  cursor then tails live, materializing documents and installed scripts (an `InstallScript`
+  whose script version differs from the installed one first deletes that scraper's saved
+  `scraper_sessions` row, keyed by script id, so the new version refetches everything). Each event's
   `previous_id` (the server chains a user's events, empty for their first) must equal the last
   event the pass went through (starting at the cursor), checked before decrypting: otherwise
   the pass fails rather than skip past a gap or apply another account's event. A failed pass is
@@ -194,7 +196,8 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
   - `save_document` uploads via `documents::Service::upload`; `DuplicateDocument` is skipped.
     `helpers.save_pdf` records each URL it saved from in `fyde.session.saved_urls`
     (`helpers.already_saved`/`mark_saved`) and skips it on later runs without downloading,
-    unless called with `{ refresh = true }` (a fixed URL whose document changes).
+    unless called with `{ refresh = true }` (a fixed URL whose document changes). Installing
+    a new script version clears the session, so its next run fetches everything again.
   - `session/`, `cookies/`, `reports/` persist per scraper through a `StorageConfig`
     (`Sqlite` for a `Client`, `File` for `init_dev_scrapers`). `fyde.session` is saved even
     on failure; cookies only on success (a failed run deletes them).

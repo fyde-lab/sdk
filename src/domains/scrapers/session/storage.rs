@@ -16,4 +16,8 @@ pub(crate) trait Storage: Send + Sync {
 
     /// Replaces the session data saved for `scraper_name`.
     async fn set(&self, scraper_name: &str, data: Value) -> Result<()>;
+
+    /// Forgets the session data saved for `scraper_name`, so its next run
+    /// starts from an empty `fyde.session`. A no-op if none was saved.
+    async fn delete(&self, scraper_name: &str) -> Result<()>;
 }
