@@ -6,6 +6,7 @@ mod http;
 mod input;
 mod json;
 mod log;
+mod pdf;
 mod progress;
 
 pub(super) use http::{build_jar, export_cookies};
@@ -145,7 +146,7 @@ pub(super) struct HostConfig {
 
 /// Wires every host capability a scraper script is allowed to use into a
 /// single `fyde` global table: `fyde.log`, `fyde.http`, `fyde.html`,
-/// `fyde.json`, `fyde.progress`, `fyde.input`, `fyde.save_document`,
+/// `fyde.json`, `fyde.pdf`, `fyde.progress`, `fyde.input`, `fyde.save_document`,
 /// `fyde.session`, `fyde.browser`, plus `fyde.helpers` (Lua helpers built
 /// on top of the others, see `helpers.lua`). Scripts never reach outside this table —
 /// no raw `io`/`os`/socket access from script code, enforced by the VM
@@ -210,6 +211,8 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
         .context("installing fyde.html")?;
     fyde.set("json", json::table(lua)?)
         .context("installing fyde.json")?;
+    fyde.set("pdf", pdf::table(lua)?)
+        .context("installing fyde.pdf")?;
     fyde.set(
         "progress",
         progress::table(lua, on_progress, recorder.clone())?,
