@@ -132,6 +132,9 @@ pub(super) fn is_host_allowed(host: &str, allowed_domains: &[String]) -> bool {
 /// driver itself reads).
 pub(super) struct HostConfig {
     pub(super) scraper_name: String,
+    /// The running script's version, exposed as `fyde.script_version` (see
+    /// `super::super::Service::run`).
+    pub(super) script_version: u64,
     pub(super) session_data: JsonValue,
     pub(super) cookies: Vec<Cookie>,
     pub(super) documents: Arc<dyn DocumentsService>,
@@ -146,7 +149,7 @@ pub(super) struct HostConfig {
 /// Wires every host capability a scraper script is allowed to use into a
 /// single `fyde` global table: `fyde.log`, `fyde.http`, `fyde.html`,
 /// `fyde.json`, `fyde.progress`, `fyde.input`, `fyde.save_document`,
-/// `fyde.session`, `fyde.browser`, plus `fyde.helpers` (Lua helpers built
+/// `fyde.session`, `fyde.browser`, `fyde.script_version`, plus `fyde.helpers` (Lua helpers built
 /// on top of the others, see `helpers.lua`). Scripts never reach outside this table —
 /// no raw `io`/`os`/socket access from script code, enforced by the VM
 /// itself: `service.rs`'s `sandboxed_lua` builds the `Lua` instance this is
@@ -175,6 +178,7 @@ pub(super) struct HostConfig {
 pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
     let HostConfig {
         scraper_name,
+        script_version,
         session_data,
         cookies,
         documents,
@@ -234,6 +238,8 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
         )?,
     )
     .context("installing fyde.browser")?;
+    fyde.set("script_version", script_version)
+        .context("installing fyde.script_version")?;
     fyde.set("helpers", helpers::table(lua)?)
         .context("installing fyde.helpers")?;
 
