@@ -8,6 +8,9 @@ mod session;
 
 pub use host::helpers::SOURCE as HELPERS_LUA;
 pub use models::{ProgressEvent, ProgressStep};
+#[cfg(test)]
+pub(crate) use session::MockStorage as MockSessionStorage;
+pub(crate) use session::{SqliteStorage as SessionSqliteStorage, Storage as SessionStorage};
 
 use std::path::PathBuf;
 use std::sync::Arc;

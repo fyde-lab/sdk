@@ -1,5 +1,7 @@
 use async_trait::async_trait;
+use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
+use uuid::Uuid;
 
 use crate::{ErrorContext as _, Result};
 
@@ -56,23 +58,37 @@ impl Storage for SqliteStorage {
         .await
         .context("failed to list installed scripts from local database")?;
 
-        rows.into_iter()
-            .map(|row| {
-                let script_id: String = row.get("script_id");
-                let script: String = row.get("script");
-                let parameters: String = row.get("parameters");
-
-                Ok(InstalledScript {
-                    script: serde_json::from_str(&script).with_context(|| {
-                        format!("invalid script json in local database for script {script_id}")
-                    })?,
-                    parameters: serde_json::from_str(&parameters).with_context(|| {
-                        format!("invalid parameters json in local database for script {script_id}")
-                    })?,
-                })
-            })
-            .collect()
+        rows.iter().map(installed_script_from_row).collect()
     }
+
+    async fn find_installed_script(&self, script_id: Uuid) -> Result<Option<InstalledScript>> {
+        let row = sqlx::query(
+            "SELECT script_id, script, parameters FROM installed_scripts WHERE script_id = ?1",
+        )
+        .bind(script_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| {
+            format!("failed to fetch installed script {script_id} from local database")
+        })?;
+
+        row.as_ref().map(installed_script_from_row).transpose()
+    }
+}
+
+fn installed_script_from_row(row: &SqliteRow) -> Result<InstalledScript> {
+    let script_id: String = row.get("script_id");
+    let script: String = row.get("script");
+    let parameters: String = row.get("parameters");
+
+    Ok(InstalledScript {
+        script: serde_json::from_str(&script).with_context(|| {
+            format!("invalid script json in local database for script {script_id}")
+        })?,
+        parameters: serde_json::from_str(&parameters).with_context(|| {
+            format!("invalid parameters json in local database for script {script_id}")
+        })?,
+    })
 }
 
 #[cfg(test)]
@@ -104,6 +120,29 @@ mod tests {
         let storage = setup().await;
 
         assert_eq!(storage.list_installed_scripts().await.unwrap(), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn find_installed_script_returns_only_that_scripts_installation() {
+        let storage = setup().await;
+        let wanted = FakeInstalledScript::new().build();
+        storage.save_installed_script(&wanted).await.unwrap();
+        storage
+            .save_installed_script(&FakeInstalledScript::new().build())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .find_installed_script(wanted.script().id())
+                .await
+                .unwrap(),
+            Some(wanted)
+        );
+        assert_eq!(
+            storage.find_installed_script(Uuid::new_v4()).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

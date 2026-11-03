@@ -7,6 +7,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::domains::documents::{Document, Metadata, Storage as DocumentStorage};
+use crate::domains::scrapers::SessionStorage as ScraperSessionStorage;
 use crate::domains::scripts::{InstalledScript, Storage as ScriptStorage};
 use crate::domains::secrets::Service as SecretsService;
 use crate::domains::server_state::Service as ServerStateService;
@@ -95,12 +96,20 @@ const CONSUME_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_s
 /// A client for the fyde server's changelog service. Generic over the
 /// [`DocumentStorage`] implementation used by [`Service::consume`] to cache
 /// documents materialized from consumed events, the [`ScriptStorage`]
-/// implementation it saves installed scripts to, and the [`CursorStorage`]
+/// implementation it saves installed scripts to, the
+/// [`ScraperSessionStorage`] it clears a scraper's session in when a new
+/// version of its script is installed, and the [`CursorStorage`]
 /// implementation used to track how far the changelog has been consumed.
-pub(super) struct ChangelogClient<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> {
+pub(super) struct ChangelogClient<
+    D: DocumentStorage,
+    S: ScriptStorage,
+    P: ScraperSessionStorage,
+    O: CursorStorage,
+> {
     grpc: Box<dyn FydeClient>,
     document_storage: D,
     script_storage: S,
+    scraper_session_storage: P,
     cursor_storage: O,
     server_state: Arc<dyn ServerStateService>,
     secrets: Arc<dyn SecretsService>,
@@ -112,11 +121,14 @@ pub(super) struct ChangelogClient<D: DocumentStorage, S: ScriptStorage, O: Curso
     stop: watch::Sender<bool>,
 }
 
-impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, S, O> {
+impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorStorage>
+    ChangelogClient<D, S, P, O>
+{
     /// Creates a client for the changelog service over `grpc`, using
     /// `document_storage` to cache documents materialized by
     /// [`Service::consume`], `script_storage` to save the scripts it
-    /// materializes, `cursor_storage` to track its progress through the
+    /// materializes, `scraper_session_storage` to clear the saved session
+    /// of a scraper whose script changes version, `cursor_storage` to track its progress through the
     /// changelog, `server_state` to wait for the server to be reachable
     /// before opening a changelog stream, `secrets` to read the account
     /// master key [`crypto`] derives every event's KEK from. Assumes it's
@@ -126,6 +138,7 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
         grpc: impl FydeClient + 'static,
         document_storage: D,
         script_storage: S,
+        scraper_session_storage: P,
         cursor_storage: O,
         server_state: Arc<dyn ServerStateService>,
         secrets: Arc<dyn SecretsService>,
@@ -134,11 +147,50 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
             grpc: Box::new(grpc),
             document_storage,
             script_storage,
+            scraper_session_storage,
             cursor_storage,
             server_state,
             secrets,
             stop: watch::Sender::new(false),
         }
+    }
+
+    /// Forgets the scraper session saved under `installed`'s script id (the
+    /// name [`crate::domains::scrapers::Service::run_installed`] keeps it
+    /// under) unless the installation it replaces has the same script
+    /// version: a new version must not trust what an older one recorded
+    /// there, such as the URLs `fyde.helpers.save_pdf` skips as already
+    /// saved, so its next run fetches every document again. Reinstalling the
+    /// same version (e.g. with new credentials) keeps the session.
+    async fn reset_scraper_session_on_new_version(
+        &self,
+        installed: &InstalledScript,
+    ) -> Result<()> {
+        let script = installed.script();
+        let previous = self
+            .script_storage
+            .find_installed_script(script.id())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to look up the installed version of script {}",
+                    script.id()
+                )
+            })?;
+        if previous.is_some_and(|previous| previous.script().version() == script.version()) {
+            return Ok(());
+        }
+
+        self.scraper_session_storage
+            .delete(&script.id().to_string())
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to clear the scraper session of script {} for its version {}",
+                    script.id(),
+                    script.version()
+                )
+            })
     }
 
     /// One pass of the consume loop spawned by [`Service::start_consume_job`]:
@@ -297,6 +349,8 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
                             ))
                         })?;
 
+                    self.reset_scraper_session_on_new_version(&installed)
+                        .await?;
                     self.script_storage
                         .save_installed_script(&installed)
                         .await
@@ -362,8 +416,12 @@ impl<D: DocumentStorage, S: ScriptStorage, O: CursorStorage> ChangelogClient<D, 
 }
 
 #[async_trait]
-impl<D: DocumentStorage + 'static, S: ScriptStorage + 'static, O: CursorStorage + 'static> Service
-    for ChangelogClient<D, S, O>
+impl<
+    D: DocumentStorage + 'static,
+    S: ScriptStorage + 'static,
+    P: ScraperSessionStorage + 'static,
+    O: CursorStorage + 'static,
+> Service for ChangelogClient<D, S, P, O>
 {
     async fn ensure_master_key(&self) -> Result<()> {
         crypto::ensure_master_key(&*self.secrets).await
@@ -423,7 +481,10 @@ mod tests {
     use super::super::storage::MockCursorStorage;
     use super::*;
     use crate::domains::documents::{FakeMetadata, MockStorage};
-    use crate::domains::scripts::{FakeInstalledScript, MockStorage as MockScriptStorage};
+    use crate::domains::scrapers::MockSessionStorage;
+    use crate::domains::scripts::{
+        FakeInstalledScript, FakeScript, MockStorage as MockScriptStorage,
+    };
     use crate::domains::secrets::MockService as MockSecretsService;
     use crate::domains::server_state::MockService as MockServerState;
 
@@ -517,6 +578,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -574,6 +636,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -613,6 +676,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -671,6 +735,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -731,6 +796,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             Arc::new(server_state),
             fake_secrets(),
@@ -804,6 +870,82 @@ mod tests {
         cursor_storage
     }
 
+    /// Consumes one `InstallScript` event installing `new` over the locally
+    /// saved `previous`, with `session_storage` as the scraper sessions.
+    async fn consume_reinstall(
+        previous: InstalledScript,
+        new: InstalledScript,
+        session_storage: MockSessionStorage,
+    ) {
+        let script_id = new.script().id();
+        let event_id = Uuid::now_v7();
+        let content = serde_json::to_vec(&new).unwrap();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(vec![Ok(install_script_proto_event(
+                event_id, script_id, &content,
+            ))])
+            .boxed())
+        });
+
+        let mut script_storage = MockScriptStorage::new();
+        script_storage
+            .expect_find_installed_script()
+            .withf(move |id| *id == script_id)
+            .times(1)
+            .returning(move |_| Ok(Some(previous.clone())));
+        script_storage
+            .expect_save_installed_script()
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let client = ChangelogClient::new(
+            mock_grpc,
+            MockStorage::new(),
+            script_storage,
+            session_storage,
+            cursor_storage_consuming(event_id),
+            reachable_server_state(),
+            fake_secrets(),
+        );
+
+        client.consume_once(&mut |_| {}).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn consume_clears_the_scraper_session_when_a_new_script_version_is_installed() {
+        let script = FakeScript::new().with_version(1).build();
+        let script_id = script.id();
+        let previous = FakeInstalledScript::new()
+            .with_script(script.clone())
+            .build();
+        let new = FakeInstalledScript::new()
+            .with_script(FakeScript::new().with_id(script_id).with_version(2).build())
+            .build();
+
+        let mut session_storage = MockSessionStorage::new();
+        session_storage
+            .expect_delete()
+            .withf(move |name| name == script_id.to_string())
+            .times(1)
+            .returning(|_| Ok(()));
+
+        consume_reinstall(previous, new, session_storage).await;
+    }
+
+    #[tokio::test]
+    async fn consume_keeps_the_scraper_session_when_the_same_script_version_is_reinstalled() {
+        let script = FakeScript::new().with_version(3).build();
+        let previous = FakeInstalledScript::new()
+            .with_script(script.clone())
+            .build();
+        let new = FakeInstalledScript::new().with_script(script).build();
+
+        // No `expect_delete`: clearing the session would panic.
+        consume_reinstall(previous, new, MockSessionStorage::new()).await;
+    }
+
     #[tokio::test]
     async fn consume_saves_the_installed_script_for_an_install_script_event() {
         let installed = FakeInstalledScript::new().build();
@@ -820,10 +962,20 @@ mod tests {
         });
 
         let mut script_storage = MockScriptStorage::new();
+        script_storage
+            .expect_find_installed_script()
+            .returning(|_| Ok(None));
         let expected = installed.clone();
         script_storage
             .expect_save_installed_script()
             .withf(move |saved| *saved == expected)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let mut session_storage = MockSessionStorage::new();
+        session_storage
+            .expect_delete()
+            .withf(move |name| name == script_id.to_string())
             .times(1)
             .returning(|_| Ok(()));
 
@@ -833,6 +985,7 @@ mod tests {
             mock_grpc,
             MockStorage::new(),
             script_storage,
+            session_storage,
             cursor_storage_consuming(event_id),
             reachable_server_state(),
             fake_secrets(),
@@ -878,6 +1031,7 @@ mod tests {
             mock_grpc,
             MockStorage::new(),
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -933,6 +1087,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -985,6 +1140,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1034,6 +1190,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1095,6 +1252,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1107,7 +1265,8 @@ mod tests {
     /// every `SaveDocument` event that gets that far as a new document.
     fn client_streaming(
         events: Vec<ProtoChangelogEvent>,
-    ) -> ChangelogClient<MockStorage, MockScriptStorage, MockCursorStorage> {
+    ) -> ChangelogClient<MockStorage, MockScriptStorage, MockSessionStorage, MockCursorStorage>
+    {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc.expect_consume_since().returning(move |_| {
             Ok(futures::stream::iter(events.clone().into_iter().map(Ok)).boxed())
@@ -1133,6 +1292,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1228,6 +1388,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1256,7 +1417,8 @@ mod tests {
     /// `attempts`.
     fn always_failing_client(
         attempts: Arc<std::sync::atomic::AtomicU32>,
-    ) -> ChangelogClient<MockStorage, MockScriptStorage, MockCursorStorage> {
+    ) -> ChangelogClient<MockStorage, MockScriptStorage, MockSessionStorage, MockCursorStorage>
+    {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc.expect_consume_since().returning(move |_| {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1272,6 +1434,7 @@ mod tests {
             mock_grpc,
             MockStorage::new(),
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1358,6 +1521,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1392,6 +1556,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1428,6 +1593,7 @@ mod tests {
             mock_grpc,
             document_storage,
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1471,6 +1637,7 @@ mod tests {
             mock_grpc,
             MockStorage::new(),
             MockScriptStorage::new(),
+            MockSessionStorage::new(),
             MockCursorStorage::new(),
             reachable_server_state(),
             fake_secrets(),

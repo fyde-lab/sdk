@@ -17,11 +17,11 @@ use tonic::transport::Channel;
 
 use crate::Result;
 use crate::domains::documents::{self, Metadata};
-use crate::domains::scripts;
 use crate::domains::secrets::Service as SecretsService;
 use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
+use crate::domains::{scrapers, scripts};
 
 /// Publishes and consumes the fyde server's changelog: a blind relay for
 /// opaque, client-encrypted write events — document writes, plus script
@@ -64,7 +64,9 @@ pub(crate) trait Service: Send + Sync {
     /// never been consumed before). For each `SaveDocument` event, caches the
     /// resulting document in local storage before invoking `callback` (and
     /// likewise saves the installed script for a `InstallScript` event,
-    /// via the `scripts` domain's local storage); the
+    /// via the `scripts` domain's local storage, first clearing that
+    /// scraper's saved session if the event installs another version of the
+    /// script than the one installed so far); the
     /// cursor is persisted as each event is processed, so a later call
     /// resumes right after the last event seen.
     ///
@@ -98,7 +100,8 @@ pub(crate) trait Service: Send + Sync {
 /// Initializes the changelog service: connects to the fyde server over the
 /// shared `channel`, and uses `pool` to cache documents materialized from
 /// consumed events directly into the local `documents` table (and installed
-/// scripts into the `scripts` domain's `installed_scripts` table), `settings`
+/// scripts into the `scripts` domain's `installed_scripts` table, clearing
+/// a scraper's `scraper_sessions` row when its script changes version), `settings`
 /// to persist the changelog cursor consumed so far (see
 /// [`storage_settings::LocalCursorStorage`]), `secrets` to read the
 /// account master key `crypto` derives every event's KEK from, and `sessions` to
@@ -117,11 +120,13 @@ pub(crate) async fn init(
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool.clone());
     let script_storage = scripts::SqliteStorage::new(pool.clone());
+    let scraper_session_storage = scrapers::SessionSqliteStorage::new(pool.clone());
     let cursor_storage = storage_settings::LocalCursorStorage::new(settings, pool);
     let client = service::ChangelogClient::new(
         grpc_client::GrpcClient::new(channel, sessions),
         document_storage,
         script_storage,
+        scraper_session_storage,
         cursor_storage,
         server_state,
         secrets,

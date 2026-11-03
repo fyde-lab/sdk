@@ -59,6 +59,20 @@ impl Storage for SqliteStorage {
 
         Ok(())
     }
+
+    async fn delete(&self, scraper_name: &str) -> Result<()> {
+        sqlx::query("DELETE FROM scraper_sessions WHERE scraper_name = ?1")
+            .bind(scraper_name)
+            .execute(&self.pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to delete session data for scraper {scraper_name:?} from local database"
+                )
+            })?;
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -85,6 +99,19 @@ mod tests {
         let storage = setup().await;
 
         assert_eq!(storage.get("didaxis").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn delete_forgets_only_that_scrapers_data() {
+        let storage = setup().await;
+        storage.set("didaxis", json!({"a": 1})).await.unwrap();
+        storage.set("impots", json!({"b": 2})).await.unwrap();
+
+        storage.delete("didaxis").await.unwrap();
+        storage.delete("never-saved").await.unwrap();
+
+        assert_eq!(storage.get("didaxis").await.unwrap(), None);
+        assert_eq!(storage.get("impots").await.unwrap(), Some(json!({"b": 2})));
     }
 
     #[tokio::test]

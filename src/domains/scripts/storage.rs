@@ -2,6 +2,8 @@ use async_trait::async_trait;
 #[cfg(test)]
 use mockall::automock;
 
+use uuid::Uuid;
+
 use crate::Result;
 
 use super::InstalledScript;
@@ -20,4 +22,7 @@ pub(crate) trait Storage: Send + Sync {
     /// Lists every script previously saved by
     /// [`Self::save_installed_script`], oldest installation first.
     async fn list_installed_scripts(&self) -> Result<Vec<InstalledScript>>;
+
+    /// Returns the saved installation of `script_id`, if any.
+    async fn find_installed_script(&self, script_id: Uuid) -> Result<Option<InstalledScript>>;
 }
