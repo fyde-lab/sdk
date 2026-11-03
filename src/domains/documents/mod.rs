@@ -4,7 +4,7 @@ mod models;
 mod service;
 mod storage;
 mod storage_sqlite;
-mod transcript;
+pub(crate) mod transcript;
 
 #[cfg(any(test, feature = "testing"))]
 pub use crate::domains::changelog::FakeChangelogEvent;

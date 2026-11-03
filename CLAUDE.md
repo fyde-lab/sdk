@@ -125,7 +125,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
     (`AttributesService::list`/`set`/`check`). Checks (`check_values`, then defined types) run on
     upload and `update_metadata`. Promote anything that needs filtering/sorting to a real
     `Metadata` field instead of querying attributes JSON.
-  - `transcript.rs` — extracts a PDF's text into `Metadata::transcript` on upload.
+  - `transcript.rs` — extracts a PDF's text into `Metadata::transcript` on upload (and for `fyde.pdf`, whole or within a rectangle).
   - `dev.rs` — `DevDocumentsClient`, plain-file writes for `init_dev_scrapers`.
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
   (`SaveDocument`, `UpdateMetadata`, `InstallScript`). `crypto.rs`: AES-256-GCM, per-event DEK
@@ -177,7 +177,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
   **usage** (`get_usage`, plan limits + current usage; never cached).
 - **scrapers** — runs Lua scripts that log into third-party sites. Contract: the script
   returns `{ run = function(parameters) ... }` and only calls the `fyde` table built in
-  `host/` (`http`, `html`, `json`, `log`, `progress`, `input`, `save_document`, `session`,
+  `host/` (`http`, `html`, `json`, `pdf`, `log`, `progress`, `input`, `save_document`, `session`,
   `browser`, plus `helpers`: shared Lua helpers in `host/helpers.lua` that scripts alias instead
   of inlining — `../scripts` relies on their names and behaviour).
   - `mlua::Lua` is `!Send`: `run` builds the VM inside `spawn_blocking` and host functions use
@@ -193,6 +193,8 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
     `update(current, total)` has no message. New steps need wording in every language in
     `ProgressStep::user_message`, plus a matching variant in the application's bindings
     (`../application/sdkBridge/rust`).
+  - `pdf.text(content)` / `pdf.text_in_rect(content, page, {x, y, width, height})` read a PDF's
+    text through `documents::transcript` (`page` from 1; points from the bottom-left corner).
   - `save_document` uploads via `documents::Service::upload`; `DuplicateDocument` is skipped.
     `helpers.save_pdf` records each URL it saved from in `fyde.session.saved_urls`
     (`helpers.already_saved`/`mark_saved`) and skips it on later runs without downloading,
