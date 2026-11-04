@@ -165,6 +165,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "This recovery key is incorrect. Check every word, in order, or use your account's latest recovery key.",
             "Cette clé de récupération est incorrecte. Vérifiez chaque mot, dans l'ordre, ou utilisez la dernière clé de récupération de votre compte.",
         ),
+        ErrorCode::UsernameUnknown => (
+            "This device doesn't know your username yet. Log out and sign in again to change your password.",
+            "Cet appareil ne connaît pas encore votre nom d'utilisateur. Déconnectez-vous puis reconnectez-vous pour changer votre mot de passe.",
+        ),
         ErrorCode::UnsupportedDocumentExtension => (
             "This file type isn't supported. Only PDF files can be added.",
             "Ce type de fichier n'est pas pris en charge. Seuls les fichiers PDF peuvent être ajoutés.",

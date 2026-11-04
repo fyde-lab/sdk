@@ -20,7 +20,7 @@ use super::crypto::{
 use super::grpc_client::{FinishedLogin, FydeClient, GrpcClient};
 use super::{
     LANGUAGE_SETTING, LoginOutcome, OpenSession, PasswordAnalysis, PasswordStrength, ROLE_SETTING,
-    Role, Service, decode_master_key, encode_master_key,
+    Role, Service, USERNAME_SETTING, decode_master_key, encode_master_key,
 };
 
 /// Rates `password` with `passwd-strength`. Only its score and label are
@@ -242,6 +242,7 @@ impl UsersClient {
     /// that looks open but has no master key to decrypt anything with.
     async fn open_session(
         &self,
+        username: &str,
         token: &str,
         raw_master_key: &[u8],
         role: Role,
@@ -260,6 +261,11 @@ impl UsersClient {
             .set(ROLE_SETTING, &role.to_string())
             .await
             .context("failed to persist role")?;
+
+        self.settings
+            .set(USERNAME_SETTING, username)
+            .await
+            .context("failed to persist username")?;
 
         self.sessions.save_new_session(token, location).await?;
 
@@ -314,7 +320,7 @@ impl Service for UsersClient {
             .await
             .context("failed to finish registration")?;
 
-        self.open_session(&token, &raw_master_key, role, location)
+        self.open_session(username, &token, &raw_master_key, role, location)
             .await?;
 
         Ok(token)
@@ -376,7 +382,7 @@ impl Service for UsersClient {
         let raw_master_key = unwrap_master_key(&export_key, &wrapped_master_key)
             .context("failed to unwrap master key returned by the server")?;
 
-        self.open_session(&token, &raw_master_key, role, location)
+        self.open_session(username, &token, &raw_master_key, role, location)
             .await?;
 
         Ok(LoginOutcome::LoggedIn {
@@ -407,13 +413,14 @@ impl Service for UsersClient {
         self.clear_local_state().await
     }
 
-    async fn change_password(
-        &self,
-        username: &str,
-        old_password: &str,
-        new_password: &str,
-    ) -> Result<()> {
+    async fn change_password(&self, old_password: &str, new_password: &str) -> Result<()> {
         ensure_strong_enough(new_password).context("refused the new password")?;
+        let username = self
+            .settings
+            .get(USERNAME_SETTING)
+            .await
+            .context("failed to read cached username")?
+            .ok_or_else(|| Error::from(ErrorKind::UsernameUnknown))?;
         // Verifying `old_password` only needs the local half of an OPAQUE
         // login exchange: `finish_login` fails with
         // `ErrorKind::InvalidCredentials` if it can't open the account's
@@ -428,7 +435,7 @@ impl Service for UsersClient {
             .context("failed to start OPAQUE login")?;
         let (_login_id, login_response) = self
             .grpc
-            .start_login(username, &login_request)
+            .start_login(&username, &login_request)
             .await
             .context("failed to start login")?;
         self.opaque
@@ -547,7 +554,7 @@ impl Service for UsersClient {
             .map_err(recovery_key_rejected)
             .context("failed to finish recovery")?;
 
-        self.open_session(&token, &raw_master_key, role, location)
+        self.open_session(username, &token, &raw_master_key, role, location)
             .await?;
 
         Ok(token)
@@ -829,6 +836,11 @@ mod tests {
             .withf(|key, _| key == ROLE_SETTING)
             .times(1)
             .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, value| key == USERNAME_SETTING && value == "alice")
+            .times(1)
+            .returning(|_, _| Ok(()));
 
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
@@ -891,6 +903,11 @@ mod tests {
         settings
             .expect_set()
             .withf(|key, _| key == ROLE_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, value| key == USERNAME_SETTING && value == "alice")
             .times(1)
             .returning(|_, _| Ok(()));
 
@@ -960,6 +977,11 @@ mod tests {
             .withf(|key, _| key == ROLE_SETTING)
             .times(1)
             .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, value| key == USERNAME_SETTING && value == "alice")
+            .times(1)
+            .returning(|_, _| Ok(()));
 
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
@@ -1026,6 +1048,11 @@ mod tests {
             .withf(|key, _| key == ROLE_SETTING)
             .times(1)
             .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, value| key == USERNAME_SETTING && value == "alice")
+            .times(1)
+            .returning(|_, _| Ok(()));
 
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
@@ -1086,6 +1113,11 @@ mod tests {
         settings
             .expect_set()
             .withf(|key, _| key == ROLE_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, value| key == USERNAME_SETTING && value == "alice")
             .times(1)
             .returning(|_, _| Ok(()));
 
@@ -1190,7 +1222,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(None));
         secrets.expect_set().times(2).returning(|_, _, _| Ok(()));
-        settings.expect_set().times(1).returning(|_, _| Ok(()));
+        settings.expect_set().times(2).returning(|_, _| Ok(()));
 
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
@@ -1255,6 +1287,11 @@ mod tests {
             .withf(|key, _| key == ROLE_SETTING)
             .times(1)
             .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, value| key == USERNAME_SETTING && value == "alice")
+            .times(1)
+            .returning(|_, _| Ok(()));
 
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
@@ -1316,6 +1353,11 @@ mod tests {
         settings
             .expect_set()
             .withf(|key, _| key == ROLE_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, value| key == USERNAME_SETTING && value == "alice")
             .times(1)
             .returning(|_, _| Ok(()));
 
@@ -1406,7 +1448,7 @@ mod tests {
         );
 
         let err = client
-            .change_password("alice", "correct horse battery staple", "qwerty")
+            .change_password("correct horse battery staple", "qwerty")
             .await
             .unwrap_err();
 
@@ -1990,6 +2032,18 @@ mod tests {
     const OLD_EXPORT_KEY: &[u8] = b"the-old-export-key";
     const NEW_EXPORT_KEY: &[u8] = b"the-new-export-key";
 
+    /// A [`MockSettingsService`] whose cached username (see
+    /// [`USERNAME_SETTING`]) is `alice`, read once by `change_password()`.
+    fn settings_with_username() -> MockSettingsService {
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == USERNAME_SETTING)
+            .times(1)
+            .returning(|_| Ok(Some("alice".to_string())));
+        settings
+    }
+
     /// A [`MockOpaqueClient`] wired up for a successful `change_password()`
     /// call: verifying the old password locally (`start_login`/
     /// `finish_login`, never reaching the server's `FinishLogin`) and
@@ -2049,7 +2103,7 @@ mod tests {
         let raw_master_key = b"the-raw-master-key--------------".to_vec();
         let encoded_master_key = encode_master_key(&raw_master_key).unwrap();
 
-        let settings = MockSettingsService::new();
+        let settings = settings_with_username();
         let mut secrets = MockSecretsService::new();
         secrets
             .expect_get()
@@ -2064,7 +2118,7 @@ mod tests {
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         client
-            .change_password("alice", "old password", "new password")
+            .change_password("old password", "new password")
             .await
             .unwrap();
 
@@ -2093,17 +2147,18 @@ mod tests {
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_start_login()
+            .withf(|username, _| username == "alice")
             .times(1)
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-login-response".to_vec())));
         // No `expect_start_change_password()`/`expect_finish_change_password()`
         // set up either: the mock panics if either is called.
 
-        let settings = MockSettingsService::new();
+        let settings = settings_with_username();
         let secrets = MockSecretsService::new();
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         let err = client
-            .change_password("alice", "wrong password", "new password")
+            .change_password("wrong password", "new password")
             .await
             .unwrap_err();
 
@@ -2126,7 +2181,7 @@ mod tests {
         // it's called, proving a missing local master key is caught before
         // ever sending the new registration record to the server.
 
-        let settings = MockSettingsService::new();
+        let settings = settings_with_username();
         let mut secrets = MockSecretsService::new();
         secrets
             .expect_get()
@@ -2137,11 +2192,38 @@ mod tests {
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
         let err = client
-            .change_password("alice", "old password", "new password")
+            .change_password("old password", "new password")
             .await
             .unwrap_err();
 
         assert!(matches!(err.kind(), ErrorKind::Encryption(_)));
+    }
+
+    #[tokio::test]
+    async fn change_password_fails_without_a_cached_username_before_any_server_call() {
+        // No `MockFydeClient`/`MockOpaqueClient` expectations: the mocks
+        // panic if called, proving nothing is verified or sent without a
+        // username to verify the current password against.
+        let mut settings = MockSettingsService::new();
+        settings
+            .expect_get()
+            .withf(|key| key == USERNAME_SETTING)
+            .times(1)
+            .returning(|_| Ok(None));
+        let client = client_with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            settings,
+            MockSecretsService::new(),
+        );
+
+        let err = client
+            .change_password("old password", "new password")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err.kind(), ErrorKind::UsernameUnknown));
+        assert_eq!(err.code(), ErrorCode::UsernameUnknown);
     }
 
     #[tokio::test]
@@ -2436,6 +2518,11 @@ mod tests {
         settings
             .expect_set()
             .withf(|key, value| key == ROLE_SETTING && value == "user")
+            .times(1)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, value| key == USERNAME_SETTING && value == "alice")
             .times(1)
             .returning(|_, _| Ok(()));
 
