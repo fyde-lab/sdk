@@ -116,6 +116,10 @@ macro_rules! for_each_error_code {
             /// A recovery key (at `UsersService::recover_account`) isn't a
             /// valid one, or isn't the account's current one.
             InvalidRecoveryKey = 3005,
+            /// This device has no username cached for the open session
+            /// (opened before the SDK cached it), so `change_password` can't
+            /// verify the current password: the user must sign in again.
+            UsernameUnknown = 3006,
             /// The document's file type isn't supported.
             UnsupportedDocumentExtension = 4001,
             /// A PDF document couldn't be read.
@@ -299,6 +303,8 @@ pub(crate) enum ErrorKind {
     WeakPassword(u8),
     #[error("invalid recovery key: {0}")]
     InvalidRecoveryKey(String),
+    #[error("no username cached for the open session; log out and sign in again")]
+    UsernameUnknown,
     /// Not `#[from]`: a plain [`tonic::Status`] converts to
     /// [`ErrorKind::Grpc`]; only `sessions::Service::check_response` decides
     /// a rejection means the session itself is gone.
@@ -359,6 +365,7 @@ impl ErrorKind {
             ErrorKind::AlreadyLoggedIn => ErrorCode::AlreadyLoggedIn,
             ErrorKind::WeakPassword(_) => ErrorCode::WeakPassword,
             ErrorKind::InvalidRecoveryKey(_) => ErrorCode::InvalidRecoveryKey,
+            ErrorKind::UsernameUnknown => ErrorCode::UsernameUnknown,
             ErrorKind::SessionExpired(_) => ErrorCode::SessionExpired,
             ErrorKind::Keystore(_) => ErrorCode::CredentialStore,
             ErrorKind::SecureStorageUnavailable => ErrorCode::SecureStorageUnavailable,

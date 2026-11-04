@@ -143,13 +143,16 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
   `../server`'s. `crypto.rs`'s `OpaqueClient` trait exists so service tests skip real KSF cost.
   The master-key wrapping key is HKDF'd from the OPAQUE export key. A wrong password usually
   fails locally (`InvalidCredentials`). One account per local database (`AlreadyLoggedIn`).
+  `create`/`login`/`recover_account` cache the username (`USERNAME_SETTING`) and role locally;
   `login` persists the session token last. `login` returns `LoginOutcome::LoggedIn` or
   `SessionLimitReached { sessions, .. }`; the caller re-runs the whole login with
   `replace_session_id` (the server's `login_id` is single-use). `list_sessions`/`revoke_session`
   manage open sessions (never cached). `analyze_password` rates a password with the
   `passwd-strength` crate (score, `PasswordStrength`, length in chars; the crate's English-only
   tips are dropped); `create`/`change_password` refuse a `Weak` new password first
-  (`WeakPassword`, 3004), before any other check or server call.
+  (`WeakPassword`, 3004), before any other check or server call. `change_password` takes only
+  the old and new passwords, verifying the old one against the cached username
+  (`UsernameUnknown`, 3006, for a session opened before it was cached: sign in again).
   Recovery keys (`crypto.rs`): a 24-word English BIP39 mnemonic (256-bit entropy, `bip39`
   crate), never stored. HKDF-SHA256 over its entropy derives an auth key (sent to the server,
   which keeps a digest) and a wrapping key for the master key. `generate_recovery_key`

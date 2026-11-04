@@ -33,6 +33,11 @@ pub(crate) const LANGUAGE_SETTING: &str = "language";
 /// without a server round trip.
 pub(crate) const ROLE_SETTING: &str = "role";
 
+/// The settings key under which the signed-in account's username is cached
+/// locally by `create`/`login`/`recover_account`, so
+/// [`Service::change_password`] needn't be told it.
+pub(crate) const USERNAME_SETTING: &str = "username";
+
 /// A user account's privilege level, mirroring `users.v1.Role` in
 /// `../server/protos`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,9 +339,11 @@ pub trait Service: Send + Sync {
     async fn logout(&self) -> Result<()>;
 
     /// Changes the password of the account behind the current session,
-    /// identified by `username` (needed to verify `old_password`; the
+    /// identified by the username `create`/`login`/`recover_account` cached
+    /// under [`USERNAME_SETTING`] (needed to verify `old_password`; the
     /// session itself is what authenticates the change server-side — see
-    /// below). Verifies `old_password` the same way `login` verifies a
+    /// below), failing with [`crate::ErrorCode::UsernameUnknown`] if none is
+    /// cached (a session opened before the SDK cached it). Verifies `old_password` the same way `login` verifies a
     /// password: the local half of an OPAQUE login exchange, which fails
     /// with [`crate::ErrorCode::InvalidCredentials`] on a mismatch without ever
     /// calling the server's `FinishLogin` (so, unlike a real `login()`
@@ -352,14 +359,9 @@ pub trait Service: Send + Sync {
     /// place of its previous wrapped copy — so every document encrypted
     /// under the old password stays decryptable, and there is nothing to
     /// update locally once the server confirms the change. Fails with
-    /// [`crate::ErrorCode::WeakPassword`], before verifying `old_password`,
-    /// if `new_password` isn't [`PasswordAnalysis::is_accepted`].
-    async fn change_password(
-        &self,
-        username: &str,
-        old_password: &str,
-        new_password: &str,
-    ) -> Result<()>;
+    /// [`crate::ErrorCode::WeakPassword`], before anything else, if
+    /// `new_password` isn't [`PasswordAnalysis::is_accepted`].
+    async fn change_password(&self, old_password: &str, new_password: &str) -> Result<()>;
 
     /// Generates a new recovery key for the signed-in account and returns
     /// it, for the UI to show the user once, to write down: 24 English
