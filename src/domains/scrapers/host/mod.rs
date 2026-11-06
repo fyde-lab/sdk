@@ -27,6 +27,7 @@ use super::browser::Service as BrowserService;
 use super::cookies::Cookie;
 use super::models::RunOptions;
 use super::reports::Recorder;
+use super::reports::redact_url;
 use super::stop::StopSignal;
 
 /// Handle returned by [`install`], letting `service.rs` read back
@@ -91,14 +92,18 @@ fn ensure_domain_allowed(url: &str, allowed_domains: &[String]) -> std::result::
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_string));
     let Some(host) = host else {
-        return Err(format!("could not determine the host of url {url:?}"));
+        return Err(format!(
+            "could not determine the host of url {:?}",
+            redact_url(url)
+        ));
     };
 
     if is_host_allowed(&host, allowed_domains) {
         Ok(())
     } else {
         Err(format!(
-            "host {host:?} (from url {url:?}) is not in this scraper's allowed_domains list {allowed_domains:?}"
+            "host {host:?} (from url {:?}) is not in this scraper's allowed_domains list {allowed_domains:?}",
+            redact_url(url)
         ))
     }
 }

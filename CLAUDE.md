@@ -63,8 +63,10 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   in that directory, or logout leaves it behind.
 - Every Lua VM is built with `tools::sandbox::new_vm` and scripts loaded with
   `sandbox::load_source` — never `Lua::new*` / `lua.load` (that would run precompiled bytecode).
-- Scraper debug reports never record request headers, request/download bodies or form values;
-  response bodies only with `debug_http_dump`.
+- Scraper debug reports never record request headers, request/download bodies, form values or
+  `fyde.input.ask` answers; response bodies only with `debug_http_dump`. Every URL a report or
+  log line carries goes through `reports::redact_url` (no query, fragment or userinfo), and
+  `wreq` errors are recorded `without_uri()`.
 - On-device model files (`tools::models`) live in `ClientConfig::models_dir`, never the client
   directory, and only ever land there through `ModelStore::ensure` (size + SHA-256 checked, then
   renamed into place). Pin a new model to a fixed revision, never a branch. `Client::init`
