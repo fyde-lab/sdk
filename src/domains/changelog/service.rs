@@ -525,7 +525,9 @@ mod tests {
     /// exercising real `crypto::encrypt_event`/`decrypt_event` calls.
     fn fake_secrets() -> Arc<dyn SecretsService> {
         let mut mock = MockSecretsService::new();
-        let encoded = crate::domains::users::encode_master_key(b"the-account-master-key").unwrap();
+        let encoded = crate::domains::users::encode_master_key(b"the-account-master-key")
+            .unwrap()
+            .to_string();
         mock.expect_get()
             .withf(|key| key == crate::domains::secrets::MASTER_KEY_SECRET)
             .returning(move |_| Ok(Some(encoded.clone())));

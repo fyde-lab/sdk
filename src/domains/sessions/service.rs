@@ -1,6 +1,7 @@
 use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
+use zeroize::Zeroizing;
 
 use crate::domains::secrets::{SESSION_TOKEN_SECRET, SecretLocation, Service as SecretsService};
 use crate::{ErrorContext as _, ErrorKind, Result};
@@ -63,8 +64,10 @@ impl Service for SessionsClient {
             .get(SESSION_TOKEN_SECRET)
             .await
             .context("failed to read session token")?
+            .map(Zeroizing::new)
         {
-            let value = format!("Bearer {token}").parse().map_err(|_| {
+            let header = Zeroizing::new(format!("Bearer {}", token.as_str()));
+            let value = header.parse().map_err(|_| {
                 ErrorKind::InvalidResponse("session token is not a valid header value".to_string())
             })?;
             request.metadata_mut().insert("authorization", value);

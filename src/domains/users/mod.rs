@@ -73,8 +73,9 @@ impl std::str::FromStr for Role {
     }
 }
 
-/// The outcome of a [`Service::login`] whose credentials checked out.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The outcome of a [`Service::login`] whose credentials checked out. Its
+/// `Debug` output never shows the session token.
+#[derive(Clone, PartialEq, Eq)]
 pub enum LoginOutcome {
     /// A session was opened; carries its token.
     LoggedIn { session_token: String },
@@ -87,6 +88,25 @@ pub enum LoginOutcome {
         max_sessions: u32,
         sessions: Vec<OpenSession>,
     },
+}
+
+impl std::fmt::Debug for LoginOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoginOutcome::LoggedIn { .. } => f
+                .debug_struct("LoggedIn")
+                .field("session_token", &"[redacted]")
+                .finish(),
+            LoginOutcome::SessionLimitReached {
+                max_sessions,
+                sessions,
+            } => f
+                .debug_struct("SessionLimitReached")
+                .field("max_sessions", max_sessions)
+                .field("sessions", sessions)
+                .finish(),
+        }
+    }
 }
 
 /// One of an account's open sessions (a device logged into it), as listed
@@ -222,13 +242,17 @@ impl PasswordAnalysis {
 
 /// JSON-encodes `master_key`'s raw bytes for storage under
 /// [`crate::domains::secrets::MASTER_KEY_SECRET`].
-pub(crate) fn encode_master_key(master_key: &[u8]) -> Result<String> {
-    serde_json::to_string(master_key).context("failed to serialize master key")
+pub(crate) fn encode_master_key(master_key: &[u8]) -> Result<zeroize::Zeroizing<String>> {
+    serde_json::to_string(master_key)
+        .map(zeroize::Zeroizing::new)
+        .context("failed to serialize master key")
 }
 
 /// Decodes a value previously stored by [`encode_master_key`].
-pub(crate) fn decode_master_key(encoded: &str) -> Result<Vec<u8>> {
-    serde_json::from_str(encoded).context("failed to parse master key")
+pub(crate) fn decode_master_key(encoded: &str) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    serde_json::from_str(encoded)
+        .map(zeroize::Zeroizing::new)
+        .context("failed to parse master key")
 }
 
 /// Manages account creation and session lifecycle against the fyde

@@ -127,6 +127,9 @@ wreq-util = "0.2.0"
 # `fyde.browser` (see the `tao` entry above) — the actual webview.
 wry = "0.57"
 xdg = "2.5.2"
+# Wipes key material (master key, DEKs, KEKs, export and recovery keys) and
+# cached secrets from memory once dropped.
+zeroize = "1.9.0"
 
 [features]
 # Serves the runtime's tasks to `tokio-console` (on `127.0.0.1:6669`). Task data

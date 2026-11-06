@@ -4,6 +4,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::domains::documents::Metadata;
 use crate::domains::secrets::{MASTER_KEY_SECRET, Service as SecretsService};
@@ -40,9 +41,9 @@ struct EventPayload {
 
 /// Generates a fresh random 256-bit data encryption key (DEK) using the OS
 /// CSPRNG, as recommended by OWASP for symmetric key generation.
-fn generate_dek() -> [u8; KEY_LEN] {
-    let mut dek = [0u8; KEY_LEN];
-    rand::rng().fill_bytes(&mut dek);
+fn generate_dek() -> Zeroizing<[u8; KEY_LEN]> {
+    let mut dek = Zeroizing::new([0u8; KEY_LEN]);
+    rand::rng().fill_bytes(dek.as_mut_slice());
     dek
 }
 
@@ -51,11 +52,12 @@ fn generate_dek() -> [u8; KEY_LEN] {
 /// key is on hand yet — i.e. before any account has been created or logged
 /// into on this device. Shared by [`derive_kek`] (which also decodes it)
 /// and [`ensure_master_key`] (which just needs to know one is present).
-async fn encoded_master_key(secrets: &dyn SecretsService) -> Result<String> {
+async fn encoded_master_key(secrets: &dyn SecretsService) -> Result<Zeroizing<String>> {
     secrets
         .get(MASTER_KEY_SECRET)
         .await
         .context("failed to read master key from the credential store")?
+        .map(Zeroizing::new)
         .ok_or_else(|| {
             ErrorKind::Encryption(
                 "no master key found in the credential store; log in or create an account first"
@@ -84,14 +86,14 @@ pub(super) async fn ensure_master_key(secrets: &dyn SecretsService) -> Result<()
 /// changes, only what protects it server-side). Fails with
 /// [`crate::ErrorCode::Encryption`] if no master key is on hand yet — i.e. before any
 /// account has been created or logged into on this device.
-async fn derive_kek(secrets: &dyn SecretsService) -> Result<[u8; KEY_LEN]> {
+async fn derive_kek(secrets: &dyn SecretsService) -> Result<Zeroizing<[u8; KEY_LEN]>> {
     let encoded_master_key = encoded_master_key(secrets).await?;
     let master_key = decode_master_key(&encoded_master_key)
         .context("failed to decode master key from the credential store")?;
 
     let mut hasher = Sha256::new();
-    hasher.update(&master_key);
-    Ok(hasher.finalize().into())
+    hasher.update(master_key.as_slice());
+    Ok(Zeroizing::new(hasher.finalize().into()))
 }
 
 /// Encrypts `plaintext` under `key` with AES-256-GCM using a random nonce,
@@ -115,7 +117,7 @@ fn aead_encrypt(key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
 
 /// Decrypts a `nonce || ciphertext_with_tag` blob produced by
 /// [`aead_encrypt`] under `key`.
-fn aead_decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>> {
+fn aead_decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     if blob.len() < NONCE_LEN {
         return Err(ErrorKind::Encryption("ciphertext too short".into()).into());
     }
@@ -128,6 +130,7 @@ fn aead_decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(key.into());
     cipher
         .decrypt(&nonce, ciphertext)
+        .map(Zeroizing::new)
         .map_err(|_| ErrorKind::Encryption("failed to decrypt data".into()).into())
 }
 
@@ -156,14 +159,17 @@ pub(super) async fn encrypt_event(
         content: content.map(<[u8]>::to_vec),
         metadata: metadata.cloned(),
     };
-    let bytes = rmp_serde::to_vec(&payload).context("failed to serialize changelog event")?;
+    // The plaintext event (a document's content, a script's credentials).
+    let bytes =
+        Zeroizing::new(rmp_serde::to_vec(&payload).context("failed to serialize changelog event")?);
 
     let dek = generate_dek();
     let encrypted_payload =
         aead_encrypt(&dek, &bytes).context("failed to encrypt changelog event")?;
 
     let kek = derive_kek(secrets).await?;
-    let wrapped_dek = aead_encrypt(&kek, &dek).context("failed to wrap changelog event DEK")?;
+    let wrapped_dek =
+        aead_encrypt(&kek, dek.as_slice()).context("failed to wrap changelog event DEK")?;
 
     let mut encrypted_content = Vec::with_capacity(wrapped_dek.len() + encrypted_payload.len());
     encrypted_content.extend_from_slice(&wrapped_dek);
@@ -187,9 +193,11 @@ pub(super) async fn decrypt_event(
 
     let kek = derive_kek(secrets).await?;
     let dek = aead_decrypt(&kek, wrapped_dek).context("failed to unwrap changelog event DEK")?;
-    let dek: [u8; KEY_LEN] = dek
-        .try_into()
-        .map_err(|_| ErrorKind::Encryption("unwrapped DEK has an invalid length".into()))?;
+    let dek: Zeroizing<[u8; KEY_LEN]> = Zeroizing::new(
+        dek.as_slice()
+            .try_into()
+            .map_err(|_| ErrorKind::Encryption("unwrapped DEK has an invalid length".into()))?,
+    );
 
     let bytes =
         aead_decrypt(&dek, encrypted_payload).context("failed to decrypt changelog event")?;
@@ -216,7 +224,9 @@ mod tests {
     /// without depending on `users::Service::create`/`login`.
     fn secrets_with_master_key() -> MockSecretsService {
         let mut secrets = MockSecretsService::new();
-        let encoded = encode_master_key(b"the-account-master-key").unwrap();
+        let encoded = encode_master_key(b"the-account-master-key")
+            .unwrap()
+            .to_string();
         secrets
             .expect_get()
             .withf(|key| key == MASTER_KEY_SECRET)
