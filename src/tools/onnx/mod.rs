@@ -17,7 +17,8 @@ use crate::error::{ErrorContext, ErrorKind, Result};
 
 /// Loads the ONNX model at `path` into a session running on `threads` threads.
 pub(crate) fn session(path: &Path, threads: usize) -> Result<Session> {
-    load_runtime()?;
+    load_runtime()
+        .with_context(|| format!("failed to prepare ONNX Runtime for {}", path.display()))?;
 
     Session::builder()
         .context("failed to create an ONNX Runtime session builder")?
@@ -310,6 +311,7 @@ mod tests {
 
         assert_eq!(err.code(), ErrorCode::ModelLoadFailed);
         assert!(err.to_string().contains("ONNX Runtime library"), "{err}");
+        assert!(err.to_string().contains("identity.onnx"), "{err}");
     }
 
     /// Downloads multilingual-e5-small from its pinned registry entries (into
@@ -326,7 +328,7 @@ mod tests {
         let dir = std::env::var_os("FYDE_TEST_MODELS_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| temp.path().to_path_buf());
-        let store = ModelStore::new(dir).unwrap();
+        let store = ModelStore::new(dir);
         let model_path = store.ensure(&MULTILINGUAL_E5_SMALL).await.unwrap();
         let tokenizer_path = store
             .ensure(&MULTILINGUAL_E5_SMALL_TOKENIZER)

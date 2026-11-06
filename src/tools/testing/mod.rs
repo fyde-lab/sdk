@@ -34,10 +34,7 @@ pub(crate) fn random_bytes(len: usize) -> Vec<u8> {
 
 /// A random lowercase hex string encoding `len` random bytes.
 pub(crate) fn random_hex(len: usize) -> String {
-    random_bytes(len)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    crate::tools::hex::encode(&random_bytes(len))
 }
 
 /// A random non-negative integer in `0..max`.

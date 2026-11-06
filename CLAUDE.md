@@ -110,16 +110,17 @@ held by the `Client` until dropped: a second client on the same directory fails 
 Public accessors: `documents()`, `attributes()`, `users()`, `settings()`, `server_state()`,
 `scripts()`, `icons()`, `scrapers()`, `usage()`, `user_message(&err)`, `language()`, plus
 `save_new_session(token)`/`is_connected()` over the crate-private `sessions` domain.
-`ClientConfig::models_dir` is where on-device models are downloaded (see `tools::models`): it
-must not be inside the client directory, and `init` doesn't touch it. `ClientConfig` carries the
+`ClientConfig::models_dir` is where on-device models are downloaded (see `tools::models`): `init`
+doesn't touch it, but rejects one inside a disk client directory (`InvalidModelsDirectory`,
+1013; lexical comparison of absolute paths). `ClientConfig` carries the
 caller's callbacks (`on_log`, `on_document_change`,
 `on_scraper_progress`, `on_scraper_question`).
 
 New server services follow the same pattern: a module under `src/domains/` with `mod.rs`
 (the `Service` trait, methods take `&self` so it can live behind `Arc<dyn Service>`),
 `models.rs` (plain structs), `service.rs`, and adapters; wired into `Client::init`.
-Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `models`, `onnx`, `sandbox`, `sql`,
-`testing`).
+Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `onnx`, `sandbox`,
+`sql`, `testing`).
 
 ### Domains (`src/domains/`)
 
@@ -249,11 +250,16 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `models`, `onnx`, 
 
 Not used by any domain yet. `tools::models` is the registry: each `Model` is one file (name, URL
 at a fixed Hugging Face revision, size, SHA-256); today `MULTILINGUAL_E5_SMALL` (int8 ONNX) and
-its `_TOKENIZER`. `ModelStore::ensure` returns `<models_dir>/<sha256[..16]>-<name>`, downloading
-it over `wreq` first (redirects followed) unless a file of the right size is there: into a
-`.<file>.<uuid>.part` beside it, removed on any failure or cancellation (and swept once stale,
-after 10 min untouched), then renamed. Errors: `ModelDownloadFailed` (1201, transport or HTTP
-status), `ModelCorrupted` (1202, wrong size/hash), `ModelLoadFailed` (1203, `tools::onnx`).
+its `_TOKENIZER`. `ModelStore::ensure` returns `<models_dir>/<sha256[..16]>-<name>`. A file
+already there is SHA-256-checked the first time the store sees it (replaced on mismatch), then
+trusted by size. Otherwise it's downloaded over `wreq` (client built on the first download;
+redirects followed) into a `.<file>.<uuid>.part` beside it, removed on any failure or
+cancellation, then renamed. A per-file lock makes concurrent `ensure`s download once. Before
+downloading, `ensure` removes the model's other revisions (`<other hash>-<name>`) and its stale
+partials of any revision (10 min untouched; vanished files are fine). Errors:
+`ModelDownloadFailed` (1201, transport, 408/429/5xx), `ModelUnavailable` (1204, any other HTTP
+status: only an update helps), `ModelCorrupted` (1202, wrong size/hash), `ModelLoadFailed`
+(1203, `tools::onnx`).
 `tools::onnx` is a thin port of `doc-ai-poc`'s loaders: `session(path, threads)` (Level3
 optimizations) and `tokenizer(path)` (`tokenizers`, `onig` regexes).
 
