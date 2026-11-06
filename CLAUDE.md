@@ -182,7 +182,9 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   `initializeNdkContext(context)` before the first `Client::init`.
 - **sessions** (crate-private) — `authenticated_request`, `check_response` (see rules above;
   the `ExpiredSessionHandler` wipe runs on its own spawned task), `is_connected`.
-- **scripts** — server-side script CRUD and per-user enabling; `install_script` publishes an
+- **scripts** — server-side script CRUD and per-user enabling; a script is created private and
+  `update_script` makes it private again: only an admin publishes one, through
+  `set_script_visibility` (admin API's `SetScriptVisibility`, the one admin proto compiled here); `install_script` publishes an
   encrypted `InstallScript` event, and installed scripts are read from the local
   `installed_scripts` table. A script carries only its `icon_id`: `create_script`/
   `update_script` still take the icon's bytes and save them through `icons` first.

@@ -40,7 +40,6 @@ impl Service for InMemoryScriptStorage {
     async fn create_script(
         &self,
         name: &str,
-        is_public: bool,
         _icon: Vec<u8>,
         script: &str,
         description: &str,
@@ -54,7 +53,7 @@ impl Service for InMemoryScriptStorage {
             name: name.to_string(),
             description: description.to_string(),
             short_description: short_description.to_string(),
-            is_public,
+            is_public: false,
             icon_id: None,
             allowed_domains,
             version: 1,
@@ -85,7 +84,6 @@ impl Service for InMemoryScriptStorage {
         &self,
         id: Uuid,
         name: &str,
-        is_public: bool,
         _icon: Vec<u8>,
         script: &str,
         description: &str,
@@ -103,7 +101,7 @@ impl Service for InMemoryScriptStorage {
             name: name.to_string(),
             description: description.to_string(),
             short_description: short_description.to_string(),
-            is_public,
+            is_public: false,
             icon_id: None,
             allowed_domains,
             version: existing.version + 1,
@@ -142,6 +140,16 @@ impl Service for InMemoryScriptStorage {
             .iter()
             .filter_map(|id| scripts.get(id).cloned().map(ScriptMetadata::from))
             .collect())
+    }
+
+    async fn set_script_visibility(&self, script_id: Uuid, is_public: bool) -> Result<()> {
+        self.scripts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&script_id)
+            .ok_or(ErrorKind::ScriptNotFound(script_id))?
+            .is_public = is_public;
+        Ok(())
     }
 
     async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>> {
@@ -209,7 +217,6 @@ mod tests {
         let created = storage
             .create_script(
                 "example",
-                true,
                 vec![1, 2, 3],
                 "return 1 + 1",
                 "",
@@ -232,7 +239,6 @@ mod tests {
         let created = storage
             .create_script(
                 "example",
-                true,
                 Vec::new(),
                 "return 1",
                 "",
@@ -264,7 +270,6 @@ mod tests {
         let created = storage
             .create_script(
                 "example",
-                false,
                 Vec::new(),
                 "return 1",
                 "",
@@ -280,7 +285,6 @@ mod tests {
             .update_script(
                 created.id,
                 "renamed",
-                true,
                 vec![9],
                 "return 2",
                 "",
@@ -305,7 +309,6 @@ mod tests {
             .update_script(
                 Uuid::now_v7(),
                 "renamed",
-                true,
                 Vec::new(),
                 "return 2",
                 "",
@@ -326,7 +329,6 @@ mod tests {
         let enabled = storage
             .create_script(
                 "enabled",
-                true,
                 Vec::new(),
                 "return 1",
                 "",
@@ -340,7 +342,6 @@ mod tests {
         let disabled = storage
             .create_script(
                 "disabled",
-                true,
                 Vec::new(),
                 "return 2",
                 "",
@@ -366,7 +367,6 @@ mod tests {
         let public = storage
             .create_script(
                 "public",
-                true,
                 Vec::new(),
                 "return 1",
                 "",
@@ -380,7 +380,55 @@ mod tests {
         let private = storage
             .create_script(
                 "private",
-                false,
+                Vec::new(),
+                "return 2",
+                "",
+                "",
+                Vec::new(),
+                ScriptType::Scraper,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(storage.list_public_scripts().await.unwrap().is_empty());
+
+        storage
+            .set_script_visibility(public.id, true)
+            .await
+            .unwrap();
+        let listed = storage.list_public_scripts().await.unwrap();
+
+        let published = storage.fetch_script(public.id).await.unwrap();
+        assert!(published.is_public);
+        assert_eq!(listed, vec![ScriptMetadata::from(published)]);
+        assert!(!listed.contains(&ScriptMetadata::from(private)));
+    }
+
+    #[tokio::test]
+    async fn updating_a_published_script_makes_it_private_again() {
+        let storage = InMemoryScriptStorage::new();
+        let script = storage
+            .create_script(
+                "example",
+                Vec::new(),
+                "return 1",
+                "",
+                "",
+                Vec::new(),
+                ScriptType::Scraper,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        storage
+            .set_script_visibility(script.id, true)
+            .await
+            .unwrap();
+
+        let updated = storage
+            .update_script(
+                script.id,
+                "example",
                 Vec::new(),
                 "return 2",
                 "",
@@ -392,10 +440,8 @@ mod tests {
             .await
             .unwrap();
 
-        let listed = storage.list_public_scripts().await.unwrap();
-
-        assert_eq!(listed, vec![ScriptMetadata::from(public)]);
-        assert!(!listed.contains(&ScriptMetadata::from(private)));
+        assert!(!updated.is_public);
+        assert!(storage.list_public_scripts().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -404,7 +450,6 @@ mod tests {
         let script = storage
             .create_script(
                 "example",
-                false,
                 Vec::new(),
                 "return 1",
                 "",
@@ -445,7 +490,6 @@ mod tests {
         let script = storage
             .create_script(
                 "example",
-                true,
                 Vec::new(),
                 "return 1",
                 "",

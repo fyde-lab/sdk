@@ -23,6 +23,14 @@ mod proto {
     tonic::include_proto!("scripts.v1");
 }
 
+/// The admin API, for [`FydeClient::set_script_visibility`] only.
+mod admin_proto {
+    tonic::include_proto!("admin.v1");
+}
+
+use admin_proto::{
+    SetScriptVisibilityRequest, admin_service_client::AdminServiceClient as GeneratedAdminClient,
+};
 use proto::{
     CreateScriptRequest, DisableScriptRequest, EnableScriptRequest, FetchScriptRequest,
     ListPublicScriptsRequest, ListUserScriptsRequest, UpdateScriptRequest,
@@ -42,7 +50,6 @@ const LISTING_PAGE_SIZE: u32 = 200;
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ScriptDraft {
     pub(super) name: String,
-    pub(super) is_public: bool,
     /// An icon created beforehand with [`crate::IconsService::create_icon`].
     pub(super) icon_id: Option<Uuid>,
     pub(super) script: String,
@@ -96,6 +103,10 @@ pub(super) trait FydeClient: Send + Sync {
     /// regardless of who owns it or whether the authenticated user has it
     /// enabled — see [`Self::list_user_scripts`] for `page_token`.
     async fn list_public_scripts(&self, page_token: Option<String>) -> Result<ScriptMetadataPage>;
+
+    /// Publishes or unpublishes `script_id` through the admin API's
+    /// `SetScriptVisibility`, which only an admin may call.
+    async fn set_script_visibility(&self, script_id: Uuid, is_public: bool) -> Result<()>;
 }
 
 /// The production [`FydeClient`] implementation, backed by a tonic
@@ -134,7 +145,6 @@ impl FydeClient for GrpcClient {
             .sessions
             .authenticated_request(CreateScriptRequest {
                 name: draft.name,
-                is_public: draft.is_public,
                 icon_id: icon_id_into_proto(draft.icon_id),
                 script: draft.script,
                 description: draft.description,
@@ -181,7 +191,6 @@ impl FydeClient for GrpcClient {
             .authenticated_request(UpdateScriptRequest {
                 id: id.to_string(),
                 name: draft.name,
-                is_public: draft.is_public,
                 icon_id: icon_id_into_proto(draft.icon_id),
                 script: draft.script,
                 description: draft.description,
@@ -253,6 +262,26 @@ impl FydeClient for GrpcClient {
             .into_inner();
 
         page_into_domain(response.scripts, response.next_page_token)
+    }
+
+    async fn set_script_visibility(&self, script_id: Uuid, is_public: bool) -> Result<()> {
+        let request = self
+            .sessions
+            .authenticated_request(SetScriptVisibilityRequest {
+                script_id: script_id.to_string(),
+                is_public,
+            })
+            .await?;
+
+        self.sessions
+            .check_response(
+                GeneratedAdminClient::new(self.channel.clone())
+                    .set_script_visibility(request)
+                    .await,
+            )
+            .await
+            .with_context(|| format!("failed to set the visibility of script {script_id}"))?;
+        Ok(())
     }
 
     async fn list_public_scripts(&self, page_token: Option<String>) -> Result<ScriptMetadataPage> {
