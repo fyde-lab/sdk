@@ -54,7 +54,6 @@ pub trait Service: Send + Sync {
     async fn create_script(
         &self,
         name: &str,
-        is_public: bool,
         icon: Vec<u8>,
         script: &str,
         description: &str,
@@ -75,7 +74,6 @@ pub trait Service: Send + Sync {
         &self,
         id: Uuid,
         name: &str,
-        is_public: bool,
         icon: Vec<u8>,
         script: &str,
         description: &str,
@@ -107,6 +105,14 @@ pub trait Service: Send + Sync {
     /// content, and its icon (by [`ScriptMetadata::icon_id`]) with
     /// [`crate::IconsService::fetch_icon`].
     async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>>;
+
+    /// Publishes (`is_public`) or unpublishes `script_id`, whoever owns it.
+    /// Admin only: anyone else fails with
+    /// [`crate::ErrorCode::PermissionDenied`]. A script is always created
+    /// private, and [`Self::update_script`] makes it private again, so a
+    /// published script's content only changes when an admin publishes it
+    /// again.
+    async fn set_script_visibility(&self, script_id: Uuid, is_public: bool) -> Result<()>;
 
     /// Installs the script `request.script_id` for the authenticated user,
     /// to be run with `request.parameters`: fetches the script (see

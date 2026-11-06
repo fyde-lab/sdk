@@ -84,7 +84,6 @@ impl<S: Storage> Service for ScriptsClient<S> {
     async fn create_script(
         &self,
         name: &str,
-        is_public: bool,
         icon: Vec<u8>,
         script: &str,
         description: &str,
@@ -97,7 +96,6 @@ impl<S: Storage> Service for ScriptsClient<S> {
         let icon_id = self.save_icon(icon).await?;
         let draft = ScriptDraft {
             name: name.to_string(),
-            is_public,
             icon_id,
             script: script.to_string(),
             description: description.to_string(),
@@ -117,7 +115,6 @@ impl<S: Storage> Service for ScriptsClient<S> {
         &self,
         id: Uuid,
         name: &str,
-        is_public: bool,
         icon: Vec<u8>,
         script: &str,
         description: &str,
@@ -130,7 +127,6 @@ impl<S: Storage> Service for ScriptsClient<S> {
         let icon_id = self.save_icon(icon).await?;
         let draft = ScriptDraft {
             name: name.to_string(),
-            is_public,
             icon_id,
             script: script.to_string(),
             description: description.to_string(),
@@ -156,6 +152,10 @@ impl<S: Storage> Service for ScriptsClient<S> {
 
     async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>> {
         all_pages(|page_token| self.grpc.list_public_scripts(page_token)).await
+    }
+
+    async fn set_script_visibility(&self, script_id: Uuid, is_public: bool) -> Result<()> {
+        self.grpc.set_script_visibility(script_id, is_public).await
     }
 
     async fn install_script(&self, request: InstallScriptRequest) -> Result<()> {
@@ -517,7 +517,6 @@ mod tests {
     fn expected_draft(icon_id: Option<Uuid>) -> ScriptDraft {
         ScriptDraft {
             name: "my-script".to_string(),
-            is_public: true,
             icon_id,
             script: "return 1".to_string(),
             description: "does something".to_string(),
@@ -551,7 +550,6 @@ mod tests {
         let script = client
             .create_script(
                 "my-script",
-                true,
                 b"icon-bytes".to_vec(),
                 "return 1",
                 "does something",
@@ -587,7 +585,6 @@ mod tests {
         let script = client
             .create_script(
                 "my-script",
-                true,
                 Vec::new(),
                 "return 1",
                 "does something",
@@ -620,7 +617,6 @@ mod tests {
         let err = client
             .create_script(
                 "my-script",
-                true,
                 b"icon-bytes".to_vec(),
                 "return 1",
                 "does something",
@@ -684,7 +680,6 @@ mod tests {
             .update_script(
                 id,
                 "my-script",
-                true,
                 b"icon-bytes".to_vec(),
                 "return 1",
                 "does something",
@@ -839,5 +834,25 @@ mod tests {
         );
 
         client.list_public_scripts().await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn set_script_visibility_goes_through_the_admin_api() {
+        let script_id = Uuid::now_v7();
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_set_script_visibility()
+            .withf(move |id, is_public| *id == script_id && *is_public)
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let client = ScriptsClient::new(
+            mock_grpc,
+            MockStorage::new(),
+            unused_changelog(),
+            unused_icons(),
+        );
+
+        client.set_script_visibility(script_id, true).await.unwrap();
     }
 }
