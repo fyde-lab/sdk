@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -6,12 +6,12 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
 use uuid::Uuid;
 
-use crate::domains::documents::{Document, Metadata, Storage as DocumentStorage};
+use crate::domains::documents::{Document, Indexer, Metadata, Storage as DocumentStorage};
 use crate::domains::scrapers::SessionStorage as ScraperSessionStorage;
 use crate::domains::scripts::{InstalledScript, Storage as ScriptStorage};
 use crate::domains::secrets::Service as SecretsService;
 use crate::domains::server_state::Service as ServerStateService;
-use crate::{ErrorContext as _, ErrorKind, Result};
+use crate::{Error, ErrorContext as _, ErrorKind, Result};
 
 use super::Service;
 use super::crypto;
@@ -100,9 +100,14 @@ const CONSUME_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_s
 /// device reconnect as fast as it answers.
 const CONSUME_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// After failing this many passes in a row, an event is reported as
+/// blocking sync. It's still retried, never skipped: the cursor never moves
+/// past an event that wasn't applied.
+const POISON_PILL_PASSES: u32 = 5;
+
 /// A client for the fyde server's changelog service. Generic over the
-/// [`DocumentStorage`] implementation used by [`Service::consume`] to cache
-/// documents materialized from consumed events, the [`ScriptStorage`]
+/// [`DocumentStorage`] implementation used by [`Service::consume`] to spot
+/// documents already cached, the [`ScriptStorage`]
 /// implementation it saves installed scripts to, the
 /// [`ScraperSessionStorage`] it clears a scraper's session in when a new
 /// version of its script is installed, and the [`CursorStorage`]
@@ -115,6 +120,7 @@ pub(super) struct ChangelogClient<
 > {
     grpc: Box<dyn FydeClient>,
     document_storage: D,
+    indexer: Arc<dyn Indexer>,
     script_storage: S,
     scraper_session_storage: P,
     cursor_storage: O,
@@ -126,14 +132,18 @@ pub(super) struct ChangelogClient<
     /// `stop_consume_job()` call is never lost even if it lands before the
     /// task starts watching it or between two of its passes.
     stop: watch::Sender<bool>,
+    /// The event the last passes failed on (by its id as the server sent
+    /// it), and how many passes in a row did.
+    failure_streak: Mutex<Option<(String, u32)>>,
 }
 
 impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorStorage>
     ChangelogClient<D, S, P, O>
 {
     /// Creates a client for the changelog service over `grpc`, using
-    /// `document_storage` to cache documents materialized by
-    /// [`Service::consume`], `script_storage` to save the scripts it
+    /// `document_storage` to spot documents [`Service::consume`] already
+    /// cached, `indexer` to cache (and index) the ones it materializes,
+    /// `script_storage` to save the scripts it
     /// materializes, `scraper_session_storage` to clear the saved session
     /// of a scraper whose script changes version, `cursor_storage` to track its progress through the
     /// changelog, `server_state` to wait for the server to be reachable
@@ -141,9 +151,11 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
     /// master key [`crypto`] derives every event's KEK from. Assumes it's
     /// the only one writing that local storage: `Client::init`'s instance
     /// lock guarantees no other client uses the same database.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         grpc: impl FydeClient + 'static,
         document_storage: D,
+        indexer: Arc<dyn Indexer>,
         script_storage: S,
         scraper_session_storage: P,
         cursor_storage: O,
@@ -153,12 +165,162 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
         Self {
             grpc: Box::new(grpc),
             document_storage,
+            indexer,
             script_storage,
             scraper_session_storage,
             cursor_storage,
             server_state,
             secrets,
             stop: watch::Sender::new(false),
+            failure_streak: Mutex::new(None),
+        }
+    }
+
+    /// Counts `err` as one more pass failing on the event `event_id`,
+    /// reporting the event as blocking sync once it has failed
+    /// [`POISON_PILL_PASSES`] in a row, and returns `err`.
+    fn event_failed(&self, event_id: &str, err: Error) -> Error {
+        let mut streak = self
+            .failure_streak
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let passes = match streak.as_mut() {
+            Some((id, passes)) if id == event_id => {
+                *passes += 1;
+                *passes
+            }
+            _ => {
+                *streak = Some((event_id.to_string(), 1));
+                1
+            }
+        };
+        if passes >= POISON_PILL_PASSES {
+            tracing::error!(
+                event_id,
+                passes,
+                "changelog event {event_id} has failed {passes} passes in a row, blocking sync \
+                 behind it: {err}"
+            );
+        }
+
+        err
+    }
+
+    fn event_applied(&self) {
+        *self
+            .failure_streak
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Checks that `proto` follows `offset` (see [`check_follows`]) and
+    /// decrypts it, along with the digest of its ciphertext.
+    async fn decode(
+        &self,
+        proto: ProtoChangelogEvent,
+        offset: Option<Uuid>,
+    ) -> Result<(ChangelogEvent, [u8; 32])> {
+        check_follows(&proto, offset)?;
+        let digest: [u8; 32] = Sha256::digest(&proto.encrypted_content).into();
+        let event = ChangelogEvent::from_proto(proto, &*self.secrets).await?;
+
+        Ok((event, digest))
+    }
+
+    /// Applies `event` to local storage: caches (and indexes) the document
+    /// it saves or updates, or saves the script it installs.
+    async fn apply(&self, event: &ChangelogEvent) -> Result<()> {
+        match event.event_type {
+            EventType::SaveDocument => {
+                let (Some(content), Some(metadata)) = (&event.content, &event.metadata) else {
+                    return Err(ErrorKind::InvalidChangelogEvent(format!(
+                        "created event {} for document {} is missing content or metadata",
+                        event.id, event.subject_id
+                    ))
+                    .into());
+                };
+
+                // `upload` only rejects a duplicate already cached
+                // here, so two uploads of the same content that
+                // haven't synced yet (or from two devices) both get
+                // published: keep the first one cached, skip the
+                // rest. Documents from before checksums existed
+                // have an empty one, which matches nothing.
+                let duplicate_of = if metadata.checksum.is_empty() {
+                    None
+                } else {
+                    self.document_storage
+                        .find_document_by_checksum(&metadata.checksum)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to look up local documents with the same content as document {}",
+                                event.subject_id
+                            )
+                        })?
+                };
+
+                if let Some(existing) = duplicate_of {
+                    tracing::warn!(
+                        event_id = %event.id,
+                        document_id = %event.subject_id,
+                        existing_document_id = %existing,
+                        "skipping caching document {}: a document with the same content is already cached locally as {existing}",
+                        event.subject_id
+                    );
+                    return Ok(());
+                }
+
+                let document = Document::new(event.subject_id, content.clone(), metadata.clone());
+                self.indexer
+                    .save_document(&document)
+                    .await
+                    .with_context(|| format!("failed to apply changelog event {}", event.id))
+            }
+            EventType::UpdateMetadata => {
+                let Some(metadata) = &event.metadata else {
+                    return Err(ErrorKind::InvalidChangelogEvent(format!(
+                        "update metadata event {} for document {} is missing metadata",
+                        event.id, event.subject_id
+                    ))
+                    .into());
+                };
+
+                self.indexer
+                    .update_metadata(event.subject_id, metadata)
+                    .await
+                    .with_context(|| format!("failed to apply changelog event {}", event.id))
+            }
+            EventType::Deleted => Ok(()),
+            EventType::InstallScript => {
+                let Some(content) = &event.content else {
+                    return Err(ErrorKind::InvalidChangelogEvent(format!(
+                        "script installed event {} for script {} is missing content",
+                        event.id, event.subject_id
+                    ))
+                    .into());
+                };
+                let installed: InstalledScript =
+                    serde_json::from_slice(content).map_err(|err| {
+                        ErrorKind::InvalidChangelogEvent(format!(
+                            "script installed event {} for script {} carries an invalid \
+                         installed script: {err}",
+                            event.id, event.subject_id
+                        ))
+                    })?;
+
+                self.reset_scraper_session_on_new_version(&installed)
+                    .await?;
+                self.script_storage
+                    .save_installed_script(&installed)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to save installed script {} locally",
+                            event.subject_id
+                        )
+                    })
+            }
         }
     }
 
@@ -234,11 +396,17 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
         // cursor.
         let mut offset = since;
 
+        // Whether the indexing model is loaded: documents are indexed as
+        // they're cached, so none is applied until it is.
+        let mut indexing_ready = false;
+
         while let Some(proto_event) = stream.next().await {
             let proto_event = proto_event.context("failed to read next changelog event")?;
-            check_follows(&proto_event, offset)?;
-            let digest: [u8; 32] = Sha256::digest(&proto_event.encrypted_content).into();
-            let event = ChangelogEvent::from_proto(proto_event, &*self.secrets).await?;
+            let proto_id = proto_event.id.clone();
+            let (event, digest) = self
+                .decode(proto_event, offset)
+                .await
+                .map_err(|err| self.event_failed(&proto_id, err))?;
 
             // The server can't forge or re-encrypt an event, but it can serve
             // an old one again under a new id, e.g. to roll an installed
@@ -266,109 +434,32 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
                     .save_cursor(event.id)
                     .await
                     .with_context(|| format!("failed to persist changelog cursor {}", event.id))?;
+                self.event_applied();
                 offset = Some(event.id);
                 continue;
             }
 
-            match event.event_type {
-                EventType::SaveDocument => {
-                    let (Some(content), Some(metadata)) = (&event.content, &event.metadata) else {
-                        return Err(ErrorKind::InvalidChangelogEvent(format!(
-                            "created event {} for document {} is missing content or metadata",
-                            event.id, event.subject_id
-                        ))
-                        .into());
-                    };
-
-                    // `upload` only rejects a duplicate already cached
-                    // here, so two uploads of the same content that
-                    // haven't synced yet (or from two devices) both get
-                    // published: keep the first one cached, skip the
-                    // rest. Documents from before checksums existed
-                    // have an empty one, which matches nothing.
-                    let duplicate_of = if metadata.checksum.is_empty() {
-                        None
-                    } else {
-                        self.document_storage
-                            .find_document_by_checksum(&metadata.checksum)
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "failed to look up local documents with the same content as document {}",
-                                    event.subject_id
-                                )
-                            })?
-                    };
-
-                    if let Some(existing) = duplicate_of {
-                        tracing::warn!(
-                            event_id = %event.id,
-                            document_id = %event.subject_id,
-                            existing_document_id = %existing,
-                            "skipping caching document {}: a document with the same content is already cached locally as {existing}",
-                            event.subject_id
-                        );
-                    } else {
-                        let document =
-                            Document::new(event.subject_id, content.clone(), metadata.clone());
-                        self.document_storage
-                            .save_document(&document)
-                            .await
-                            .with_context(|| {
-                                format!("failed to cache document {} locally", event.subject_id)
-                            })?;
-                    }
-                }
-                EventType::UpdateMetadata => {
-                    let Some(metadata) = &event.metadata else {
-                        return Err(ErrorKind::InvalidChangelogEvent(format!(
-                            "update metadata event {} for document {} is missing metadata",
-                            event.id, event.subject_id
-                        ))
-                        .into());
-                    };
-
-                    self.document_storage
-                        .update_metadata(event.subject_id, metadata)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to update cached document {} locally",
-                                event.subject_id
-                            )
-                        })?;
-                }
-                EventType::Deleted => {}
-                EventType::InstallScript => {
-                    let Some(content) = &event.content else {
-                        return Err(ErrorKind::InvalidChangelogEvent(format!(
-                            "script installed event {} for script {} is missing content",
-                            event.id, event.subject_id
-                        ))
-                        .into());
-                    };
-                    let installed: InstalledScript =
-                        serde_json::from_slice(content).map_err(|err| {
-                            ErrorKind::InvalidChangelogEvent(format!(
-                                "script installed event {} for script {} carries an invalid \
-                                 installed script: {err}",
-                                event.id, event.subject_id
-                            ))
-                        })?;
-
-                    self.reset_scraper_session_on_new_version(&installed)
-                        .await?;
-                    self.script_storage
-                        .save_installed_script(&installed)
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to save installed script {} locally",
-                                event.subject_id
-                            )
-                        })?;
-                }
+            // A model that can't be fetched isn't the event's fault, so isn't
+            // counted against it.
+            if !indexing_ready
+                && matches!(
+                    event.event_type,
+                    EventType::SaveDocument | EventType::UpdateMetadata
+                )
+            {
+                self.indexer.prepare().await.with_context(|| {
+                    format!(
+                        "cannot apply changelog event {} before the indexing model is available",
+                        event.id
+                    )
+                })?;
+                indexing_ready = true;
             }
+
+            self.apply(&event)
+                .await
+                .map_err(|err| self.event_failed(&proto_id, err))?;
+            self.event_applied();
 
             self.cursor_storage
                 .mark_applied(&digest)
@@ -504,7 +595,7 @@ mod tests {
     use super::super::grpc_client::MockFydeClient;
     use super::super::storage::MockCursorStorage;
     use super::*;
-    use crate::domains::documents::{FakeMetadata, MockStorage};
+    use crate::domains::documents::{FakeMetadata, MockIndexer, MockStorage};
     use crate::domains::scrapers::MockSessionStorage;
     use crate::domains::scripts::{
         FakeInstalledScript, FakeScript, MockStorage as MockScriptStorage,
@@ -532,6 +623,18 @@ mod tests {
             .withf(|key| key == crate::domains::secrets::MASTER_KEY_SECRET)
             .returning(move |_| Ok(Some(encoded.clone())));
         Arc::new(mock)
+    }
+
+    /// An indexer with the model loaded, expected to cache nothing.
+    fn ready_indexer() -> MockIndexer {
+        let mut indexer = MockIndexer::new();
+        indexer.expect_prepare().returning(|| Ok(()));
+        indexer
+    }
+
+    /// An indexer expected to never be called.
+    fn idle_indexer() -> Arc<dyn Indexer> {
+        Arc::new(MockIndexer::new())
     }
 
     fn proto_event(id: Uuid, document_id: Uuid) -> ProtoChangelogEvent {
@@ -576,7 +679,8 @@ mod tests {
             .expect_find_document_by_checksum()
             .times(1)
             .returning(|_| Ok(None));
-        document_storage
+        let mut indexer = ready_indexer();
+        indexer
             .expect_save_document()
             .withf(move |document| document.id() == document_id && document.content() == b"content")
             .times(1)
@@ -603,6 +707,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
+            Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -638,9 +743,8 @@ mod tests {
         document_storage
             .expect_find_document_by_checksum()
             .returning(|_| Ok(None));
-        document_storage
-            .expect_save_document()
-            .returning(|_| Ok(()));
+        let mut indexer = ready_indexer();
+        indexer.expect_save_document().returning(|_| Ok(()));
 
         let mut cursor_storage = MockCursorStorage::new();
         cursor_storage
@@ -661,6 +765,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
+            Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -701,6 +806,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
+            idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -760,6 +866,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
+            Arc::new(ready_indexer()),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -793,9 +900,8 @@ mod tests {
         document_storage
             .expect_find_document_by_checksum()
             .returning(|_| Ok(None));
-        document_storage
-            .expect_save_document()
-            .returning(|_| Ok(()));
+        let mut indexer = ready_indexer();
+        indexer.expect_save_document().returning(|_| Ok(()));
 
         let mut cursor_storage = MockCursorStorage::new();
         cursor_storage
@@ -821,6 +927,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
+            Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -929,6 +1036,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             MockStorage::new(),
+            idle_indexer(),
             script_storage,
             session_storage,
             cursor_storage_consuming(event_id),
@@ -1010,6 +1118,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             MockStorage::new(),
+            idle_indexer(),
             script_storage,
             session_storage,
             cursor_storage_consuming(event_id),
@@ -1056,6 +1165,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             MockStorage::new(),
+            idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1112,6 +1222,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
+            idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1137,8 +1248,9 @@ mod tests {
             .boxed())
         });
 
-        let mut document_storage = MockStorage::new();
-        document_storage
+        let document_storage = MockStorage::new();
+        let mut indexer = ready_indexer();
+        indexer
             .expect_update_metadata()
             .withf(move |id, _metadata| *id == document_id)
             .times(1)
@@ -1165,6 +1277,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
+            Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1215,6 +1328,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
+            Arc::new(ready_indexer()),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1252,9 +1366,8 @@ mod tests {
         document_storage
             .expect_find_document_by_checksum()
             .returning(|_| Ok(None));
-        document_storage
-            .expect_save_document()
-            .returning(|_| Ok(()));
+        let mut indexer = ready_indexer();
+        indexer.expect_save_document().returning(|_| Ok(()));
 
         let mut cursor_storage = MockCursorStorage::new();
         cursor_storage
@@ -1277,6 +1390,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
+            Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1302,9 +1416,8 @@ mod tests {
         document_storage
             .expect_find_document_by_checksum()
             .returning(|_| Ok(None));
-        document_storage
-            .expect_save_document()
-            .returning(|_| Ok(()));
+        let mut indexer = ready_indexer();
+        indexer.expect_save_document().returning(|_| Ok(()));
 
         let mut cursor_storage = MockCursorStorage::new();
         cursor_storage
@@ -1317,6 +1430,7 @@ mod tests {
         ChangelogClient::new(
             mock_grpc,
             document_storage,
+            Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1413,6 +1527,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
+            idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1457,6 +1572,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             MockStorage::new(),
+            idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1508,6 +1624,7 @@ mod tests {
         ChangelogClient::new(
             mock_grpc,
             MockStorage::new(),
+            idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1595,6 +1712,7 @@ mod tests {
         let client = Arc::new(ChangelogClient::new(
             mock_grpc,
             document_storage,
+            idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1630,6 +1748,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
+            idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1667,6 +1786,7 @@ mod tests {
         let client = Arc::new(ChangelogClient::new(
             mock_grpc,
             document_storage,
+            idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1711,6 +1831,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             MockStorage::new(),
+            idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             MockCursorStorage::new(),
@@ -1728,6 +1849,7 @@ mod tests {
             .await
             .unwrap();
     }
+
     #[tokio::test]
     async fn send_refuses_an_event_larger_than_the_server_accepts() {
         // No `expect_record_event()`: the mock panics if it reaches the
@@ -1735,6 +1857,7 @@ mod tests {
         let client = ChangelogClient::new(
             MockFydeClient::new(),
             MockStorage::new(),
+            idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             MockCursorStorage::new(),
@@ -1753,5 +1876,278 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.code(), crate::ErrorCode::DocumentTooLarge);
+    }
+
+    /// A client streaming `events` from the beginning (nil cursor) to
+    /// `indexer`, with no document already cached, which must not apply
+    /// (nor skip) any of them.
+    fn client_applying_nothing(
+        events: Vec<ProtoChangelogEvent>,
+        indexer: MockIndexer,
+    ) -> ChangelogClient<MockStorage, MockScriptStorage, MockSessionStorage, MockCursorStorage>
+    {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(events.clone().into_iter().map(Ok)).boxed())
+        });
+        let mut document_storage = MockStorage::new();
+        document_storage
+            .expect_find_document_by_checksum()
+            .returning(|_| Ok(None));
+
+        // No `mark_applied`/`save_cursor`: the mock panics if the event is
+        // recorded as applied or the cursor moves past it.
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+        cursor_storage.expect_is_applied().returning(|_| Ok(false));
+
+        ChangelogClient::new(
+            mock_grpc,
+            document_storage,
+            Arc::new(indexer),
+            MockScriptStorage::new(),
+            MockSessionStorage::new(),
+            cursor_storage,
+            reachable_server_state(),
+            fake_secrets(),
+        )
+    }
+
+    #[tokio::test]
+    async fn consume_prepares_the_indexing_model_once_per_pass_before_the_first_document() {
+        let (first_id, second_id) = (Uuid::now_v7(), Uuid::now_v7());
+        let first = proto_event_with_type(first_id, Uuid::now_v7(), EventType::UpdateMetadata);
+        let second = ProtoChangelogEvent {
+            previous_id: first_id.to_string(),
+            ..proto_event(second_id, Uuid::now_v7())
+        };
+
+        let mut sequence = mockall::Sequence::new();
+        let mut indexer = MockIndexer::new();
+        indexer
+            .expect_prepare()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|| Ok(()));
+        indexer
+            .expect_update_metadata()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_, _| Ok(()));
+        indexer
+            .expect_save_document()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(()));
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(vec![Ok(first.clone()), Ok(second.clone())]).boxed())
+        });
+        let mut document_storage = MockStorage::new();
+        document_storage
+            .expect_find_document_by_checksum()
+            .returning(|_| Ok(None));
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+        cursor_storage.expect_is_applied().returning(|_| Ok(false));
+        cursor_storage
+            .expect_mark_applied()
+            .times(2)
+            .returning(|_| Ok(()));
+        cursor_storage
+            .expect_save_cursor()
+            .times(2)
+            .returning(|_| Ok(()));
+        let client = ChangelogClient::new(
+            mock_grpc,
+            document_storage,
+            Arc::new(indexer),
+            MockScriptStorage::new(),
+            MockSessionStorage::new(),
+            cursor_storage,
+            reachable_server_state(),
+            fake_secrets(),
+        );
+
+        client.consume_once(&mut |_| {}).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn consume_applies_no_document_until_the_indexing_model_is_available() {
+        let event_id = Uuid::now_v7();
+        // No `save_document`: the mock panics if the document is cached
+        // without its embeddings.
+        let mut indexer = MockIndexer::new();
+        indexer
+            .expect_prepare()
+            .times(1)
+            .returning(|| Err(ErrorKind::ModelDownloadStatus(503).into()));
+        let client = client_applying_nothing(vec![proto_event(event_id, Uuid::now_v7())], indexer);
+
+        let mut called_back = false;
+        let err = client
+            .consume_once(&mut |_| called_back = true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::ModelDownloadFailed);
+        assert!(err.to_string().contains(&event_id.to_string()), "{err}");
+        assert!(!called_back);
+    }
+
+    #[tokio::test]
+    async fn consume_leaves_the_cursor_before_a_document_that_fails_to_index() {
+        let event_id = Uuid::now_v7();
+        let mut indexer = ready_indexer();
+        indexer
+            .expect_save_document()
+            .times(1)
+            .returning(|_| Err(ErrorKind::InvalidModel("boom".to_string()).into()));
+        let client = client_applying_nothing(vec![proto_event(event_id, Uuid::now_v7())], indexer);
+
+        let mut called_back = false;
+        let err = client
+            .consume_once(&mut |_| called_back = true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::ModelLoadFailed);
+        assert!(
+            err.to_string()
+                .contains(&format!("failed to apply changelog event {event_id}")),
+            "{err}"
+        );
+        assert!(!called_back);
+    }
+
+    #[tokio::test]
+    async fn consume_leaves_the_cursor_before_a_metadata_update_that_fails_to_index() {
+        let mut indexer = ready_indexer();
+        indexer
+            .expect_update_metadata()
+            .times(1)
+            .returning(|_, _| Err(ErrorKind::InvalidModel("boom".to_string()).into()));
+        let client = client_applying_nothing(
+            vec![proto_event_with_type(
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                EventType::UpdateMetadata,
+            )],
+            indexer,
+        );
+
+        let err = client.consume_once(&mut |_| {}).await.unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::ModelLoadFailed);
+    }
+
+    /// Runs `consume_once` on `client` `passes` times, each expected to
+    /// fail, returning the error lines logged meanwhile.
+    async fn failing_passes_logs(
+        client: &ChangelogClient<
+            MockStorage,
+            MockScriptStorage,
+            MockSessionStorage,
+            MockCursorStorage,
+        >,
+        passes: u32,
+    ) -> Vec<String> {
+        use tracing_subscriber::prelude::*;
+
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let layer = crate::tools::log::CallbackLayer {
+            callback: Arc::new(move |level, line| {
+                if level == crate::LogLevel::Error {
+                    sink.lock().unwrap().push(line);
+                }
+            }),
+        };
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        for _ in 0..passes {
+            client.consume_once(&mut |_| {}).await.unwrap_err();
+        }
+
+        lines.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn consume_reports_an_event_failing_pass_after_pass_as_blocking_sync() {
+        let event_id = Uuid::now_v7();
+        let mut indexer = ready_indexer();
+        indexer
+            .expect_save_document()
+            .returning(|_| Err(ErrorKind::InvalidModel("boom".to_string()).into()));
+        let client = client_applying_nothing(vec![proto_event(event_id, Uuid::now_v7())], indexer);
+
+        let logs = failing_passes_logs(&client, POISON_PILL_PASSES - 1).await;
+        assert_eq!(logs, Vec::<String>::new());
+
+        let logs = failing_passes_logs(&client, 2).await;
+        assert_eq!(logs.len(), 2, "{logs:?}");
+        assert!(
+            logs.iter()
+                .all(|line| line.contains(&event_id.to_string()) && line.contains("blocking sync")),
+            "{logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_counts_failing_passes_afresh_for_another_event() {
+        let (first_id, second_id) = (Uuid::now_v7(), Uuid::now_v7());
+        let mut indexer = ready_indexer();
+        indexer
+            .expect_save_document()
+            .returning(|_| Err(ErrorKind::InvalidModel("boom".to_string()).into()));
+        let first = client_applying_nothing(vec![proto_event(first_id, Uuid::now_v7())], indexer);
+        let logs = failing_passes_logs(&first, POISON_PILL_PASSES - 1).await;
+        assert_eq!(logs, Vec::<String>::new());
+
+        // The same client state, now failing on another event.
+        let mut indexer = ready_indexer();
+        indexer
+            .expect_save_document()
+            .returning(|_| Err(ErrorKind::InvalidModel("boom".to_string()).into()));
+        let second = client_applying_nothing(vec![proto_event(second_id, Uuid::now_v7())], indexer);
+        *second.failure_streak.lock().unwrap() = first.failure_streak.lock().unwrap().clone();
+        let logs = failing_passes_logs(&second, 1).await;
+
+        assert_eq!(logs, Vec::<String>::new());
+        assert_eq!(
+            *second.failure_streak.lock().unwrap(),
+            Some((second_id.to_string(), 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_forgets_an_events_failing_passes_once_it_applies() {
+        let event_id = Uuid::now_v7();
+        let client = client_streaming(vec![proto_event(event_id, Uuid::now_v7())]);
+        *client.failure_streak.lock().unwrap() =
+            Some((event_id.to_string(), POISON_PILL_PASSES - 1));
+
+        client.consume_once(&mut |_| {}).await.unwrap();
+
+        assert_eq!(*client.failure_streak.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn consume_does_not_count_an_unavailable_model_against_the_event() {
+        let mut indexer = MockIndexer::new();
+        indexer
+            .expect_prepare()
+            .returning(|| Err(ErrorKind::ModelDownloadStatus(503).into()));
+        let client =
+            client_applying_nothing(vec![proto_event(Uuid::now_v7(), Uuid::now_v7())], indexer);
+
+        let logs = failing_passes_logs(&client, POISON_PILL_PASSES + 1).await;
+
+        assert_eq!(logs, Vec::<String>::new());
+        assert_eq!(*client.failure_streak.lock().unwrap(), None);
     }
 }

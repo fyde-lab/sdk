@@ -289,6 +289,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wipe_deletes_every_document_embedding() {
+        let client = SqliteClient::connect_with(IN_MEMORY_DB).await.unwrap();
+        sqlx::query(
+            "INSERT INTO documents (id, name, original_name, content_type, content, created_at)
+             VALUES ('one', 'one.pdf', 'one.pdf', 'application/pdf', x'', 0)",
+        )
+        .execute(client.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO document_embeddings (document_id, chunk, start, \"end\", model, vector)
+             VALUES ('one', 0, 0, 10, 'model.onnx', x'0000803f')",
+        )
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+        client.wipe().await.unwrap();
+
+        let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM document_embeddings")
+            .fetch_one(client.pool())
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[tokio::test]
     async fn wipe_leaves_no_trace_of_documents_in_the_search_index() {
         let client = SqliteClient::connect_with(IN_MEMORY_DB).await.unwrap();
         let insert_document = |id: &'static str, name: &'static str| {

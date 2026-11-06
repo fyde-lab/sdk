@@ -105,8 +105,9 @@ pub(crate) trait Service: Send + Sync {
 }
 
 /// Initializes the changelog service: connects to the fyde server over the
-/// shared `channel`, and uses `pool` to cache documents materialized from
-/// consumed events directly into the local `documents` table (and installed
+/// shared `channel`, and uses `indexer` to cache (and index) the documents
+/// materialized from consumed events, `pool` to spot the ones already
+/// cached (and to save installed
 /// scripts into the `scripts` domain's `installed_scripts` table, clearing
 /// a scraper's `scraper_sessions` row when its script changes version), `settings`
 /// to persist the changelog cursor consumed so far (see
@@ -124,6 +125,7 @@ pub(crate) async fn init(
     secrets: Arc<dyn SecretsService>,
     sessions: Arc<SessionsClient>,
     server_state: Arc<dyn ServerStateService>,
+    indexer: Arc<dyn documents::Indexer>,
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool.clone());
     let script_storage = scripts::SqliteStorage::new(pool.clone());
@@ -132,6 +134,7 @@ pub(crate) async fn init(
     let client = service::ChangelogClient::new(
         grpc_client::GrpcClient::new(channel, sessions),
         document_storage,
+        indexer,
         script_storage,
         scraper_session_storage,
         cursor_storage,

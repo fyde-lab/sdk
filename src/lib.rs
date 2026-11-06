@@ -124,11 +124,6 @@ pub struct Client {
     settings: Arc<dyn SettingsService>,
     usage: Arc<dyn UsageService>,
     users: Arc<dyn UsersService>,
-    #[expect(
-        dead_code,
-        reason = "foundation for the on-device document analysis to come"
-    )]
-    models: Arc<tools::models::ModelStore>,
     /// The locked handle to [`instance_lock_path`] (see [`lock_instance`]),
     /// held for as long as this `Client` lives. Never read: it only exists
     /// so dropping the `Client` releases the lock.
@@ -153,6 +148,7 @@ impl Client {
         let secrets = open_secrets(&location, &sqlite)?;
         let channel = lazy_channel(config.url)?;
         let models = Arc::new(tools::models::ModelStore::new(config.models_dir));
+        let indexer = domains::documents::init_indexer(sqlite.pool().clone(), models);
 
         let settings = domains::settings::init(sqlite.pool().clone());
         let sessions = domains::sessions::init(secrets.clone());
@@ -167,6 +163,7 @@ impl Client {
             secrets.clone(),
             sessions.clone(),
             server_state.clone(),
+            indexer.clone(),
         )
         .await
         .context("failed to initialize changelog service")?;
@@ -184,6 +181,7 @@ impl Client {
             sqlite.pool().clone(),
             changelog,
             attributes.clone(),
+            indexer,
             config.on_document_change,
         );
         let users = domains::users::init(
@@ -226,7 +224,6 @@ impl Client {
             settings,
             usage,
             users,
-            models,
             _instance_lock: instance_lock,
         })
     }

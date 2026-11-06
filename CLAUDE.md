@@ -24,7 +24,7 @@ RUSTFLAGS="--cfg tokio_unstable" cargo build --features tokio-console  # serve t
 - On static-ONNX-Runtime targets (see "ONNX Runtime" below), `ort-sys` downloads pyke's prebuilt
   library on the first build (network, then cached); `ORT_LIB_PATH` points it at a local build.
 - `FYDE_TEST_MODELS_DIR=/some/dir cargo test -- --ignored multilingual_e5` runs the real-model
-  test (downloads ~135 MB from Hugging Face; the directory keeps them for the next run).
+  tests (`tools::onnx` and `documents::embedder`; downloads ~135 MB from Hugging Face; the directory keeps them for the next run).
 
 ## Non-negotiable rules
 
@@ -88,7 +88,8 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   `Arc<Mutex<_>>` capture is fine when a test must read back a generated value.
 - Exceptions, which test real adapters: `grpc_client.rs`, `crypto.rs`, `tools/sql/sqlite.rs`, `tools/client_dir.rs`,
   `tools/models` (a local `TcpListener` HTTP server), `tools/onnx` (a hand-encoded ONNX model; the
-  real-model test is `#[ignore]`),
+  real-model test is `#[ignore]`), `documents/embedder.rs` (pooling on hand-built outputs; the
+  real-model ranking test is `#[ignore]`),
   `storage_sqlite.rs` files, `secrets/storage_keystore.rs` (keyring's in-memory mock),
   `changelog/storage_settings.rs`. `changelog::Service` can't be automocked (its
   `start_consume_job` takes a boxed `FnMut`), so use the hand-written `RecordingChangelog`-style
@@ -148,6 +149,19 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     upload and `update_metadata`. Promote anything that needs filtering/sorting to a real
     `Metadata` field instead of querying attributes JSON.
   - `transcript.rs` — extracts a PDF's text into `Metadata::transcript` on upload (and for `fyde.pdf`, whole or within a rectangle).
+  - Indexing: a document is never cached without its embeddings. The changelog consumer
+    applies `SaveDocument`/`UpdateMetadata` through the `Indexer` trait (`DocumentIndexer` in
+    `service.rs`), which embeds then writes document + embeddings in one transaction. Rules:
+    `chunk.rs` splits the transcript (pages, then paragraphs, then lines; no overlap), each
+    passage is `"{title}\n{chunk}"` (title = name without extension); a blank transcript is
+    indexed with zero chunks; `update_metadata` re-embeds only if the title or transcript
+    changed. `embedder.rs` is the ONNX adapter (multilingual-e5-small, `passage: `/`query: `
+    prefixes, mean pooling, L2-normalized, 384 dims, 512-token truncation, `spawn_blocking`
+    on ≤4 threads, loaded lazily once; a failed load is retried). Table `document_embeddings`
+    (`(document_id, chunk)` key, `vector` = 384 little-endian `f32`, cascades with its
+    document, cleared by `wipe`). `Indexer::prepare` fetches/loads the model; its last failure
+    is `Service::indexing_model_error` (for the UI). No semantic search yet (`embed_query` is
+    test-only).
   - `dev.rs` — `DevDocumentsClient`, plain-file writes for `init_dev_scrapers`.
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
   (`SaveDocument`, `UpdateMetadata`, `InstallScript`). `crypto.rs`: AES-256-GCM, per-event DEK
@@ -161,6 +175,11 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   retried after a backoff (500 ms doubling to 30 s, reset by a clean pass); a stream that ends
   cleanly is reopened after 1 s, never at once. Applied events are
   recorded by ciphertext digest (`applied_changelog_events`), so one the server serves again is skipped.
+  Documents are applied through `documents::Indexer` (a checksum duplicate is skipped, never
+  embedded); before a pass's first document event it calls `prepare`, so a missing model
+  fails the pass (retried) rather than letting the cursor pass an unindexed document. An
+  event failing `POISON_PILL_PASSES` (5) passes in a row is logged at error level on each
+  further failure; it's never skipped (ask before adding any skip mechanism).
 - **users** — OPAQUE (RFC 9807, `opaque-ke`); the password never leaves the SDK.
   `FydeCipherSuite` (ristretto255 + 3DH/SHA-512 + Argon2id 64 MiB/3 iters/4 lanes) must match
   `../server`'s. `crypto.rs`'s `OpaqueClient` trait exists so service tests skip real KSF cost. Its `finish_*`
@@ -266,7 +285,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
 
 ### On-device models (`src/tools/models/`, `src/tools/onnx/`)
 
-Not used by any domain yet. `tools::models` is the registry: each `Model` is one file (name, URL
+Used by `documents::embedder`. `tools::models` is the registry: each `Model` is one file (name, URL
 at a fixed Hugging Face revision, size, SHA-256); today `MULTILINGUAL_E5_SMALL` (int8 ONNX) and
 its `_TOKENIZER`. `ModelStore::ensure` returns `<models_dir>/<sha256[..16]>-<name>`. A file
 already there is SHA-256-checked the first time the store sees it (replaced on mismatch), then
@@ -277,7 +296,7 @@ downloading, `ensure` removes the model's other revisions (`<other hash>-<name>`
 partials of any revision (10 min untouched; vanished files are fine). Errors:
 `ModelDownloadFailed` (1201, transport, 408/429/5xx), `ModelUnavailable` (1204, any other HTTP
 status: only an update helps), `ModelCorrupted` (1202, wrong size/hash), `ModelLoadFailed`
-(1203, `tools::onnx`).
+(1203, `tools::onnx`, and `ErrorKind::InvalidModel` for a model whose inputs/outputs don't match).
 `tools::onnx` is a thin port of `doc-ai-poc`'s loaders: `session(path, threads)` (Level3
 optimizations) and `tokenizer(path)` (`tokenizers`, `onig` regexes).
 

@@ -899,6 +899,99 @@ impl FakeSearchFacets {
     }
 }
 
+/// The embeddings of a document's text, one per chunk, as stored beside
+/// the document (see [`super::Indexer`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DocumentEmbeddings {
+    /// The model the vectors come from (see `Embedder::model`).
+    pub(crate) model: String,
+    pub(crate) chunks: Vec<ChunkEmbedding>,
+}
+
+/// The embedding of one chunk of a document's text.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ChunkEmbedding {
+    /// The chunk's byte range in the document's transcript.
+    pub(crate) range: std::ops::Range<usize>,
+    pub(crate) vector: Vec<f32>,
+}
+
+/// Builds a [`DocumentEmbeddings`] filled with random-but-plausible data,
+/// overridable field by field, for use in tests.
+#[cfg(test)]
+pub(crate) struct FakeDocumentEmbeddings {
+    embeddings: DocumentEmbeddings,
+}
+
+#[cfg(test)]
+impl FakeDocumentEmbeddings {
+    pub(crate) fn new() -> Self {
+        let count = 1 + crate::tools::testing::random_u64(3) as usize;
+        Self {
+            embeddings: DocumentEmbeddings {
+                model: format!("{}.onnx", crate::tools::testing::random_word()),
+                chunks: (0..count)
+                    .map(|i| {
+                        FakeChunkEmbedding::new()
+                            .with_range(i * 100..i * 100 + 90)
+                            .build()
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    pub(crate) fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.embeddings.model = model.into();
+        self
+    }
+
+    pub(crate) fn with_chunks(mut self, chunks: Vec<ChunkEmbedding>) -> Self {
+        self.embeddings.chunks = chunks;
+        self
+    }
+
+    pub(crate) fn build(self) -> DocumentEmbeddings {
+        self.embeddings
+    }
+}
+
+/// Builds a [`ChunkEmbedding`] filled with random-but-plausible data,
+/// overridable field by field, for use in tests.
+#[cfg(test)]
+pub(crate) struct FakeChunkEmbedding {
+    chunk: ChunkEmbedding,
+}
+
+#[cfg(test)]
+impl FakeChunkEmbedding {
+    pub(crate) fn new() -> Self {
+        let start = crate::tools::testing::random_u64(1000) as usize;
+        Self {
+            chunk: ChunkEmbedding {
+                range: start..start + 1 + crate::tools::testing::random_u64(1000) as usize,
+                vector: (0..super::embedder::DIMENSIONS)
+                    .map(|_| crate::tools::testing::random_u64(2001) as f32 / 1000.0 - 1.0)
+                    .collect(),
+            },
+        }
+    }
+
+    pub(crate) fn with_range(mut self, range: std::ops::Range<usize>) -> Self {
+        self.chunk.range = range;
+        self
+    }
+
+    pub(crate) fn with_vector(mut self, vector: Vec<f32>) -> Self {
+        self.chunk.vector = vector;
+        self
+    }
+
+    pub(crate) fn build(self) -> ChunkEmbedding {
+        self.chunk
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

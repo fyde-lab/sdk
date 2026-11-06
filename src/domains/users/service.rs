@@ -815,6 +815,10 @@ mod tests {
             self.stop_sync_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
+
+        fn indexing_model_error(&self) -> Option<crate::ErrorCode> {
+            unimplemented!()
+        }
     }
 
     /// A [`MockOpaqueClient`] wired up for a successful `create()` call:
