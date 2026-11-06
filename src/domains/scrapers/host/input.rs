@@ -42,10 +42,9 @@ pub(super) fn table(
                 let response = stop
                     .block_on(&runtime, answer)?
                     .map_err(mlua::Error::external)?;
-                recorder.record(
-                    "input_ask",
-                    json!({ "question": question, "response": response }),
-                );
+                // Only the question: the answer is typically a one-time
+                // code, which has no place in a report kept on disk.
+                recorder.record("input_ask", json!({ "question": question }));
                 Ok(response)
             }
             None => Err(mlua::Error::RuntimeError(
@@ -116,7 +115,7 @@ mod tests {
     }
 
     #[test]
-    fn ask_records_the_question_and_answer() {
+    fn ask_records_the_question_but_never_the_answer() {
         let on_question: Arc<dyn Fn(String) -> String + Send + Sync> =
             Arc::new(|_| "42".to_string());
 
@@ -140,7 +139,7 @@ mod tests {
         assert_eq!(report.entries[0].event, "input_ask");
         assert_eq!(
             report.entries[0].value,
-            serde_json::json!({ "question": "What is the MFA code?", "response": "42" })
+            serde_json::json!({ "question": "What is the MFA code?" })
         );
     }
 

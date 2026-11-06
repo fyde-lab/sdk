@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tokio::runtime::Handle;
 
 use super::super::browser::Service as BrowserService;
-use super::super::reports::Recorder;
+use super::super::reports::{Recorder, redact_url};
 use super::super::stop::StopSignal;
 
 const DEFAULT_WAIT_FOR_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,14 +60,14 @@ pub(super) fn table(
             if let Err(message) = super::ensure_domain_allowed(&url, &allowed_domains) {
                 open_recorder.record(
                     "error",
-                    json!({ "action": "browser.open", "url": url, "message": message.clone() }),
+                    json!({ "action": "browser.open", "url": redact_url(&url), "message": message.clone() }),
                 );
                 return Err(mlua::Error::RuntimeError(message));
             }
             let result = open_stop.block_on(&open_runtime, open_browser.open(&url))?;
             match &result {
                 Ok(()) => {
-                    let mut entry = json!({ "url": url });
+                    let mut entry = json!({ "url": redact_url(&url) });
                     // Mirrors `fyde.http`'s own `debug_http_dump` dump (see
                     // `host::http::table`'s doc comment): opt-in only,
                     // for a trusted local debugging run, since a page's
@@ -84,7 +84,7 @@ pub(super) fn table(
                 }
                 Err(err) => open_recorder.record(
                     "error",
-                    json!({ "action": "browser.open", "url": url, "message": err.to_string() }),
+                    json!({ "action": "browser.open", "url": redact_url(&url), "message": err.to_string() }),
                 ),
             }
             result.map_err(mlua::Error::external)
