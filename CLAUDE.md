@@ -159,7 +159,9 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   recorded by ciphertext digest (`applied_changelog_events`), so one the server serves again is skipped.
 - **users** — OPAQUE (RFC 9807, `opaque-ke`); the password never leaves the SDK.
   `FydeCipherSuite` (ristretto255 + 3DH/SHA-512 + Argon2id 64 MiB/3 iters/4 lanes) must match
-  `../server`'s. `crypto.rs`'s `OpaqueClient` trait exists so service tests skip real KSF cost.
+  `../server`'s. `crypto.rs`'s `OpaqueClient` trait exists so service tests skip real KSF cost. Its `finish_*`
+  steps run Argon2id, so `service.rs` calls them on the blocking pool (`spawn_blocking`), never
+  inline on an async worker.
   The master-key wrapping key is HKDF'd from the OPAQUE export key. A wrong password usually
   fails locally (`InvalidCredentials`); the SDK then still closes the server's pending exchange
   (`login_id`, single-use) with a decoy finalization that can't verify (`abandon_login`), as

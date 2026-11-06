@@ -13,8 +13,8 @@ use crate::tools::sql::LocalDatabase;
 use crate::{Error, ErrorCode, ErrorContext as _, ErrorKind, Result};
 
 use super::crypto::{
-    DefaultOpaqueClient, OpaqueClient, abandoned_login_finalization, derive_recovery_keys,
-    generate_and_wrap_master_key, generate_recovery_key, unwrap_master_key,
+    DefaultOpaqueClient, LoginState, OpaqueClient, RegistrationState, abandoned_login_finalization,
+    derive_recovery_keys, generate_and_wrap_master_key, generate_recovery_key, unwrap_master_key,
     unwrap_master_key_for_recovery, wrap_master_key, wrap_master_key_for_recovery,
 };
 use super::grpc_client::{FinishedLogin, FydeClient, GrpcClient};
@@ -106,7 +106,7 @@ pub fn system_language() -> String {
 /// passed in.
 pub struct UsersClient {
     grpc: Box<dyn FydeClient>,
-    opaque: Box<dyn OpaqueClient>,
+    opaque: Arc<dyn OpaqueClient>,
     settings: Arc<dyn SettingsService>,
     secrets: Arc<dyn SecretsService>,
     sessions: Arc<SessionsClient>,
@@ -135,7 +135,7 @@ impl UsersClient {
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(channel, sessions.clone())),
-            opaque: Box::new(DefaultOpaqueClient),
+            opaque: Arc::new(DefaultOpaqueClient),
             settings,
             secrets,
             sessions,
@@ -161,7 +161,7 @@ impl UsersClient {
     ) -> Self {
         Self {
             grpc: Box::new(grpc),
-            opaque: Box::new(opaque),
+            opaque: Arc::new(opaque),
             settings,
             sessions: Arc::new(SessionsClient::new(secrets.clone())),
             secrets,
@@ -169,6 +169,38 @@ impl UsersClient {
             local_files,
             documents,
         }
+    }
+
+    /// Runs OPAQUE's `finish_registration` on the blocking pool: it runs the
+    /// Argon2id key-stretching function (64 MiB, ~200 ms in release, seconds
+    /// in debug), which would otherwise stall the async worker thread it
+    /// runs on, and every task scheduled there (changelog sync included).
+    async fn finish_registration(
+        &self,
+        state: RegistrationState,
+        password: &str,
+        response: Vec<u8>,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let opaque = self.opaque.clone();
+        let password = password.to_string();
+        tokio::task::spawn_blocking(move || opaque.finish_registration(state, &password, &response))
+            .await
+            .context("OPAQUE registration task panicked")?
+    }
+
+    /// Runs OPAQUE's `finish_login` on the blocking pool, for the same
+    /// reason as [`Self::finish_registration`].
+    async fn finish_login(
+        &self,
+        state: LoginState,
+        password: &str,
+        response: Vec<u8>,
+    ) -> Result<(Vec<u8>, Vec<u8>)> {
+        let opaque = self.opaque.clone();
+        let password = password.to_string();
+        tokio::task::spawn_blocking(move || opaque.finish_login(state, &password, &response))
+            .await
+            .context("OPAQUE login task panicked")?
     }
 
     /// Clears every trace of the account from this device: its secrets
@@ -332,8 +364,8 @@ impl Service for UsersClient {
             .context("failed to start registration")?;
 
         let (opaque_upload, export_key) = self
-            .opaque
-            .finish_registration(state, password, &opaque_response)
+            .finish_registration(state, password, opaque_response)
+            .await
             .context("failed to finish OPAQUE registration")?;
 
         let (raw_master_key, wrapped_master_key) =
@@ -382,7 +414,7 @@ impl Service for UsersClient {
         // A wrong password usually fails right here, before `FinishLogin`:
         // close the server's side of the exchange before reporting it.
         let (opaque_upload, export_key) =
-            match self.opaque.finish_login(state, password, &opaque_response) {
+            match self.finish_login(state, password, opaque_response).await {
                 Ok(finished) => finished,
                 Err(err) => {
                     self.abandon_login(&login_id, device_name).await;
@@ -477,8 +509,8 @@ impl Service for UsersClient {
             .await
             .context("failed to start login")?;
         let verified = self
-            .opaque
-            .finish_login(login_state, old_password, &login_response);
+            .finish_login(login_state, old_password, login_response)
+            .await;
         // Never finished for real (that would open a session), whether or
         // not `old_password` checked out.
         self.abandon_login(&login_id, PASSWORD_CHECK_DEVICE_NAME)
@@ -497,8 +529,8 @@ impl Service for UsersClient {
             .context("failed to start change password")?;
 
         let (opaque_upload, new_export_key) = self
-            .opaque
-            .finish_registration(state, new_password, &opaque_response)
+            .finish_registration(state, new_password, opaque_response)
+            .await
             .context("failed to finish OPAQUE registration")?;
 
         let raw_master_key = self.read_master_key().await?;
@@ -578,8 +610,8 @@ impl Service for UsersClient {
             .context("failed to unwrap master key under the recovery key")?;
 
         let (opaque_upload, export_key) = self
-            .opaque
-            .finish_registration(state, new_password, &opaque_response)
+            .finish_registration(state, new_password, opaque_response)
+            .await
             .context("failed to finish OPAQUE registration")?;
         let new_wrapped_master_key = wrap_master_key(&raw_master_key, &export_key)
             .context("failed to wrap master key under the new export key")?;
