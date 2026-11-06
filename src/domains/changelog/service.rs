@@ -93,6 +93,13 @@ const CONSUME_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::fr
 /// The longest [`ChangelogClient::run_consume_loop`] waits between retries.
 const CONSUME_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long [`ChangelogClient::run_consume_loop`] waits before reopening a
+/// stream that ended cleanly. The server keeps it open while the session
+/// lasts, so a clean end is rare (a restart, a proxy's idle timeout); without
+/// a pause, a server or proxy that ends every stream at once would have this
+/// device reconnect as fast as it answers.
+const CONSUME_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A client for the fyde server's changelog service. Generic over the
 /// [`DocumentStorage`] implementation used by [`Service::consume`] to cache
 /// documents materialized from consumed events, the [`ScriptStorage`]
@@ -383,8 +390,9 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
 
     /// The retry loop spawned by [`Service::start_consume_job`] onto its own
     /// background task: repeats [`Self::consume_once`] from the persisted
-    /// cursor — straight away after a clean end of stream, after a growing
-    /// delay (see [`CONSUME_RETRY_INITIAL_DELAY`]) after an error, which it
+    /// cursor — after [`CONSUME_RECONNECT_DELAY`] after a clean end of
+    /// stream, after a growing delay (see [`CONSUME_RETRY_INITIAL_DELAY`])
+    /// after an error, which it
     /// logs — until [`Service::stop_consume_job`] signals it to return, even
     /// mid-delay. Split out as its own inherent method (rather than inlined
     /// in `start_consume_job`'s spawned task) so tests can exercise the loop
@@ -395,20 +403,28 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
         let mut retry_delay = CONSUME_RETRY_INITIAL_DELAY;
 
         while !*stop.borrow() {
-            tokio::select! {
+            let delay = tokio::select! {
                 result = self.consume_once(callback) => match result {
-                    Ok(()) => retry_delay = CONSUME_RETRY_INITIAL_DELAY,
+                    Ok(()) => {
+                        retry_delay = CONSUME_RETRY_INITIAL_DELAY;
+                        tracing::debug!(
+                            "changelog stream ended, reopening it in {CONSUME_RECONNECT_DELAY:?}"
+                        );
+                        CONSUME_RECONNECT_DELAY
+                    }
                     Err(err) => {
                         tracing::error!(
                             "changelog consume failed, retrying in {retry_delay:?}: {err:?}"
                         );
-                        tokio::select! {
-                            _ = tokio::time::sleep(retry_delay) => {}
-                            _ = stop.changed() => {}
-                        }
+                        let delay = retry_delay;
                         retry_delay = (retry_delay * 2).min(CONSUME_RETRY_MAX_DELAY);
+                        delay
                     }
                 },
+                _ = stop.changed() => continue,
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
                 _ = stop.changed() => {}
             }
         }
@@ -1415,6 +1431,55 @@ mod tests {
         // Once the delay is over it retries, parking in the second attempt's
         // never-ending stream rather than returning.
         tokio::time::advance(CONSUME_RETRY_INITIAL_DELAY).await;
+        tokio::time::timeout(std::time::Duration::from_millis(0), &mut consume_fut)
+            .await
+            .unwrap_err();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_consume_loop_waits_before_reopening_a_stream_that_ended_cleanly() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_in_mock = attempts.clone();
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            attempts_in_mock.fetch_add(1, Ordering::SeqCst);
+            Ok(futures::stream::empty().boxed())
+        });
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+        let client = ChangelogClient::new(
+            mock_grpc,
+            MockStorage::new(),
+            MockScriptStorage::new(),
+            MockSessionStorage::new(),
+            cursor_storage,
+            reachable_server_state(),
+            fake_secrets(),
+        );
+
+        let mut callback = |_| {};
+        let consume_fut = client.run_consume_loop(&mut callback);
+        tokio::pin!(consume_fut);
+
+        tokio::time::timeout(std::time::Duration::from_millis(0), &mut consume_fut)
+            .await
+            .unwrap_err();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // Not reopened before the delay is over...
+        tokio::time::advance(CONSUME_RECONNECT_DELAY / 2).await;
+        tokio::time::timeout(std::time::Duration::from_millis(0), &mut consume_fut)
+            .await
+            .unwrap_err();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // ...and reopened once it is.
+        tokio::time::advance(CONSUME_RECONNECT_DELAY / 2).await;
         tokio::time::timeout(std::time::Duration::from_millis(0), &mut consume_fut)
             .await
             .unwrap_err();
