@@ -9,6 +9,13 @@ mod storage_settings;
 pub use models::FakeChangelogEvent;
 pub use models::{ChangelogEvent, EventType};
 
+/// The largest encrypted event [`Service::send`] publishes, in bytes. The
+/// server decodes requests with tonic's default 4 MiB message limit, so a
+/// larger `RecordEvent` would only fail on the wire, with a transport error
+/// the user can't make sense of; 1 KiB of that is left for the request's
+/// own framing.
+pub(crate) const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024 - 1024;
+
 use std::sync::Arc;
 
 use async_trait::async_trait;

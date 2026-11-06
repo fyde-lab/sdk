@@ -125,7 +125,9 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
 ### Domains (`src/domains/`)
 
 - **documents** — no gRPC transport: every write is a `changelog` event. `upload` needs a
-  master key, rejects a known checksum (`DuplicateDocument`, before parsing), parses, then
+  master key, rejects content over `changelog::MAX_EVENT_BYTES` (`DocumentTooLarge`, 4014: the
+  server decodes with tonic's 4 MiB default) and a known checksum (`DuplicateDocument`), both
+  before parsing; `changelog::Service::send` re-checks the encrypted event's size, parses, then
   publishes an encrypted `SaveDocument` event; the document reaches the local cache only when
   the sync job consumes it back. `get`/`list`/`search`/`search_facets` are local-only
   (`storage_sqlite.rs`, FTS5 `bm25` ranking over contentless `documents_fts`). `list`/`search`
