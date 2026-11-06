@@ -154,7 +154,8 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   `previous_id` (the server chains a user's events, empty for their first) must equal the last
   event the pass went through (starting at the cursor), checked before decrypting: otherwise
   the pass fails rather than skip past a gap or apply another account's event. A failed pass is
-  retried after a backoff (500 ms doubling to 30 s, reset by a clean pass). Applied events are
+  retried after a backoff (500 ms doubling to 30 s, reset by a clean pass); a stream that ends
+  cleanly is reopened after 1 s, never at once. Applied events are
   recorded by ciphertext digest (`applied_changelog_events`), so one the server serves again is skipped.
 - **users** — OPAQUE (RFC 9807, `opaque-ke`); the password never leaves the SDK.
   `FydeCipherSuite` (ristretto255 + 3DH/SHA-512 + Argon2id 64 MiB/3 iters/4 lanes) must match
