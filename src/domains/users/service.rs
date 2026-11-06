@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tonic::transport::Channel;
+use zeroize::Zeroizing;
 
 use crate::domains::documents::Service as DocumentsService;
 use crate::domains::secrets::{MASTER_KEY_SECRET, SecretLocation, Service as SecretsService};
@@ -283,7 +284,7 @@ impl UsersClient {
 
     /// Reads back the raw master key `create`/`login` cached in the
     /// credential store.
-    async fn read_master_key(&self) -> Result<Vec<u8>> {
+    async fn read_master_key(&self) -> Result<Zeroizing<Vec<u8>>> {
         self.secrets
             .get(MASTER_KEY_SECRET)
             .await
@@ -367,6 +368,7 @@ impl Service for UsersClient {
             .finish_registration(state, password, opaque_response)
             .await
             .context("failed to finish OPAQUE registration")?;
+        let export_key = Zeroizing::new(export_key);
 
         let (raw_master_key, wrapped_master_key) =
             generate_and_wrap_master_key(&export_key).context("failed to generate master key")?;
@@ -421,6 +423,7 @@ impl Service for UsersClient {
                     return Err(err).context("failed to finish OPAQUE login");
                 }
             };
+        let export_key = Zeroizing::new(export_key);
 
         let (token, encrypted_master_key, role) = match self
             .grpc
@@ -515,7 +518,8 @@ impl Service for UsersClient {
         // not `old_password` checked out.
         self.abandon_login(&login_id, PASSWORD_CHECK_DEVICE_NAME)
             .await;
-        verified.context("failed to verify current password")?;
+        let (_, old_export_key) = verified.context("failed to verify current password")?;
+        drop(Zeroizing::new(old_export_key));
 
         let (state, opaque_request) = self
             .opaque
@@ -532,6 +536,7 @@ impl Service for UsersClient {
             .finish_registration(state, new_password, opaque_response)
             .await
             .context("failed to finish OPAQUE registration")?;
+        let new_export_key = Zeroizing::new(new_export_key);
 
         let raw_master_key = self.read_master_key().await?;
 
@@ -613,6 +618,7 @@ impl Service for UsersClient {
             .finish_registration(state, new_password, opaque_response)
             .await
             .context("failed to finish OPAQUE registration")?;
+        let export_key = Zeroizing::new(export_key);
         let new_wrapped_master_key = wrap_master_key(&raw_master_key, &export_key)
             .context("failed to wrap master key under the new export key")?;
 
@@ -2240,7 +2246,7 @@ mod tests {
             });
 
         let raw_master_key = b"the-raw-master-key--------------".to_vec();
-        let encoded_master_key = encode_master_key(&raw_master_key).unwrap();
+        let encoded_master_key = encode_master_key(&raw_master_key).unwrap().to_string();
 
         let settings = settings_with_username();
         let mut secrets = MockSecretsService::new();
@@ -2265,7 +2271,7 @@ mod tests {
         let sent_wrapped = String::from_utf8(sent).unwrap();
         let unwrapped_from_sent =
             super::super::crypto::unwrap_master_key(NEW_EXPORT_KEY, &sent_wrapped).unwrap();
-        assert_eq!(unwrapped_from_sent, raw_master_key);
+        assert_eq!(*unwrapped_from_sent, raw_master_key);
     }
 
     #[tokio::test]
@@ -2470,7 +2476,7 @@ mod tests {
     /// A [`MockSecretsService`] holding `master_key` as the cached master key.
     fn secrets_with_master_key(master_key: Vec<u8>) -> MockSecretsService {
         let mut secrets = MockSecretsService::new();
-        let encoded = encode_master_key(&master_key).unwrap();
+        let encoded = encode_master_key(&master_key).unwrap().to_string();
         secrets
             .expect_get()
             .withf(|key| key == MASTER_KEY_SECRET)
@@ -2510,7 +2516,7 @@ mod tests {
         let wrapped = sent_wrapped.lock().unwrap().clone();
         let unwrapped =
             unwrap_master_key_for_recovery(&keys, &String::from_utf8(wrapped).unwrap()).unwrap();
-        assert_eq!(unwrapped, master_key);
+        assert_eq!(*unwrapped, master_key);
     }
 
     #[tokio::test]
@@ -2521,7 +2527,7 @@ mod tests {
             .times(2)
             .returning(|_, _| Ok(()));
         let mut secrets = MockSecretsService::new();
-        let encoded = encode_master_key(&[42u8; 32]).unwrap();
+        let encoded = encode_master_key(&[42u8; 32]).unwrap().to_string();
         secrets
             .expect_get()
             .withf(|key| key == MASTER_KEY_SECRET)
@@ -2676,10 +2682,10 @@ mod tests {
 
         assert_eq!(token, "a-token");
         let persisted = persisted_master_key.lock().unwrap().clone().unwrap();
-        assert_eq!(decode_master_key(&persisted).unwrap(), master_key);
+        assert_eq!(*decode_master_key(&persisted).unwrap(), master_key);
         let sent = sent_master_key.lock().unwrap().clone().unwrap();
         assert_eq!(
-            unwrap_master_key(NEW_EXPORT_KEY, &String::from_utf8(sent).unwrap()).unwrap(),
+            *unwrap_master_key(NEW_EXPORT_KEY, &String::from_utf8(sent).unwrap()).unwrap(),
             master_key
         );
     }

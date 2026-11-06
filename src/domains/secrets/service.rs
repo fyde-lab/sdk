@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use zeroize::Zeroizing;
 
 use crate::{ErrorContext as _, ErrorKind, Result};
 
@@ -26,8 +27,10 @@ pub(super) struct SecretsClient<S: Storage, D: Storage> {
     secure: Option<S>,
     database: D,
     /// `None` cached for a key means "known absent", so an unauthenticated
-    /// client doesn't hit the store on every call either.
-    cache: Mutex<HashMap<String, Option<String>>>,
+    /// client doesn't hit the store on every call either. Values are wiped
+    /// from memory when replaced, removed or dropped; callers wrap the copy
+    /// `get` hands them in a `Zeroizing` too.
+    cache: Mutex<HashMap<String, Option<Zeroizing<String>>>>,
 }
 
 impl<S: Storage, D: Storage> SecretsClient<S, D> {
@@ -39,7 +42,7 @@ impl<S: Storage, D: Storage> SecretsClient<S, D> {
         }
     }
 
-    fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<String>>> {
+    fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<Zeroizing<String>>>> {
         self.cache.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
@@ -48,7 +51,7 @@ impl<S: Storage, D: Storage> SecretsClient<S, D> {
 impl<S: Storage, D: Storage> Service for SecretsClient<S, D> {
     async fn get(&self, key: &str) -> Result<Option<String>> {
         if let Some(cached) = self.cache().get(key) {
-            return Ok(cached.clone());
+            return Ok(cached.as_deref().cloned());
         }
 
         // A credential store that fails to answer is treated like one that
@@ -58,7 +61,8 @@ impl<S: Storage, D: Storage> Service for SecretsClient<S, D> {
         if let Some(secure) = &self.secure {
             match secure.get(key).await {
                 Ok(Some(value)) => {
-                    self.cache().insert(key.to_string(), Some(value.clone()));
+                    self.cache()
+                        .insert(key.to_string(), Some(Zeroizing::new(value.clone())));
                     return Ok(Some(value));
                 }
                 Ok(None) => {}
@@ -79,7 +83,8 @@ impl<S: Storage, D: Storage> Service for SecretsClient<S, D> {
         // Not cached as absent after a failed credential store read, so a
         // store that comes back later is read again.
         if value.is_some() || !secure_failed {
-            self.cache().insert(key.to_string(), value.clone());
+            self.cache()
+                .insert(key.to_string(), value.clone().map(Zeroizing::new));
         }
         Ok(value)
     }
@@ -96,7 +101,7 @@ impl<S: Storage, D: Storage> Service for SecretsClient<S, D> {
         }
         .with_context(|| format!("failed to store secret {key:?}"))?;
         self.cache()
-            .insert(key.to_string(), Some(value.to_string()));
+            .insert(key.to_string(), Some(Zeroizing::new(value.to_string())));
         Ok(())
     }
 

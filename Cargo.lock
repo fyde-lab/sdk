@@ -2068,6 +2068,7 @@ dependencies = [
  "wreq-util",
  "wry",
  "xdg",
+ "zeroize",
 ]
 
 [[package]]

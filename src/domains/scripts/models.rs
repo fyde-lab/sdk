@@ -261,10 +261,21 @@ impl From<Script> for ScriptMetadata {
 /// What [`super::Service::install_script`] takes: the id of the script to
 /// install, plus the values to run it with, keyed by the same machine names
 /// as [`Script::parameters`] (e.g. `{"username": "alice"}`).
-#[derive(Debug, Clone, PartialEq)]
+/// Its `Debug` output names the parameters but never shows their values,
+/// which include the user's credentials for the script's site.
+#[derive(Clone, PartialEq)]
 pub struct InstallScriptRequest {
     pub script_id: Uuid,
     pub parameters: HashMap<String, Value>,
+}
+
+impl std::fmt::Debug for InstallScriptRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstallScriptRequest")
+            .field("script_id", &self.script_id)
+            .field("parameters", &RedactedValues(&self.parameters))
+            .finish()
+    }
 }
 
 /// A script installed for the authenticated user, as persisted locally once
@@ -272,11 +283,35 @@ pub struct InstallScriptRequest {
 /// [`super::Service::list_installed_scripts`]): the full script, plus the
 /// parameter values it was installed with, so it can be run without asking
 /// for them again. Also the exact JSON payload carried, encrypted, by that
-/// changelog event.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// changelog event. Its `Debug` output never shows the parameters' values
+/// (see [`InstallScriptRequest`]).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstalledScript {
     pub(super) script: Script,
     pub(super) parameters: HashMap<String, Value>,
+}
+
+impl std::fmt::Debug for InstalledScript {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstalledScript")
+            .field("script", &self.script)
+            .field("parameters", &RedactedValues(&self.parameters))
+            .finish()
+    }
+}
+
+/// Debug-formats a parameter map as its names, each with a placeholder for
+/// its value.
+struct RedactedValues<'a>(&'a HashMap<String, Value>);
+
+impl std::fmt::Debug for RedactedValues<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut names: Vec<&String> = self.0.keys().collect();
+        names.sort();
+        f.debug_map()
+            .entries(names.into_iter().map(|name| (name, "[redacted]")))
+            .finish()
+    }
 }
 
 impl InstalledScript {
@@ -441,5 +476,26 @@ mod tests {
             serde_json::from_slice::<InstalledScript>(&json).unwrap(),
             installed
         );
+    }
+
+    #[test]
+    fn debug_output_never_shows_parameter_values() {
+        let parameters = HashMap::from([
+            ("username".to_string(), Value::from("alice")),
+            ("password".to_string(), Value::from("hunter2-secret")),
+        ]);
+        let installed = FakeInstalledScript::new()
+            .with_parameters(parameters.clone())
+            .build();
+        let request = InstallScriptRequest {
+            script_id: Uuid::now_v7(),
+            parameters,
+        };
+
+        for debug in [format!("{installed:?}"), format!("{request:?}")] {
+            assert!(debug.contains("password"), "{debug}");
+            assert!(!debug.contains("hunter2-secret"), "{debug}");
+            assert!(!debug.contains("alice"), "{debug}");
+        }
     }
 }

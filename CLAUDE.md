@@ -55,7 +55,11 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
 - Every authenticated gRPC call goes through `sessions::authenticated_request` **and** passes
   its result through `self.sessions.check_response(...)` (except registration/login steps and
   `logout`). That's what turns a rejected token into `ErrorCode::SessionExpired` + local wipe.
-- A new secret must be added to `secrets::ALL_SECRETS`, or logout leaves it behind. Secrets
+- A new secret must be added to `secrets::ALL_SECRETS`, or logout leaves it behind.
+- Key material (master key, DEKs, KEKs, OPAQUE export keys, recovery keys and entropy) and
+  every value read from `secrets` are held in `zeroize::Zeroizing` (wiped on drop), the
+  `secrets` cache included. A type carrying a secret (session token, script parameters)
+  implements `Debug` by hand and redacts it: never derive it. Secrets
   (master key, session token) never go in the `settings` table.
 - `logout` always clears secrets, wipes the database and deletes every other file in the
   client's directory (`tools::client_dir`; only the open database's files and the changelog
