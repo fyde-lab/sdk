@@ -28,6 +28,18 @@ use super::{OnScraperProgress, OnScraperQuestion, ProgressEvent, Service};
 const INSTALLED_WREQ_EMULATION: bool = true;
 const INSTALLED_FOLLOW_REDIRECTS: bool = true;
 
+/// How many scraper runs may go on at once, across every scraper. Each one
+/// holds a Lua VM (up to [`LUA_MEMORY_BYTES`]), response bodies (up to
+/// `host::MAX_BODY_BYTES` each) and possibly a webview: unbounded, a few
+/// sources connected at once could exhaust a phone's memory. Further runs
+/// wait for a slot, and can be stopped while they wait.
+const MAX_CONCURRENT_RUNS: usize = 3;
+
+/// The memory limit of each run's Lua VM. Scrapers keep little in Lua
+/// (parsing happens host-side); a body bigger than this can't become a Lua
+/// string anyway, so `host::MAX_BODY_BYTES` stays below it.
+const LUA_MEMORY_BYTES: usize = 25 * 1024 * 1024;
+
 /// The default [`Service`] implementation, running scripts in a fresh
 /// `mlua::Lua` VM per call, delegating session/cookie persistence to
 /// injected [`SessionService`]/[`CookiesService`] implementations, this
@@ -51,6 +63,8 @@ pub(super) struct ScrapersClient {
     on_progress: Option<OnScraperProgress>,
     on_question: Option<OnScraperQuestion>,
     running: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// One permit per run going on (see [`MAX_CONCURRENT_RUNS`]).
+    slots: Arc<tokio::sync::Semaphore>,
     stops: StopRegistry,
     next_stop_id: AtomicU64,
 }
@@ -85,6 +99,7 @@ impl ScrapersClient {
             on_progress,
             on_question,
             running: Arc::new(Mutex::new(HashMap::new())),
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RUNS)),
             stops: Arc::new(Mutex::new(HashMap::new())),
             next_stop_id: AtomicU64::new(0),
         }
@@ -236,6 +251,15 @@ impl Service for ScrapersClient {
             () = signal.stopped() => return Err(stop::stopped()),
             guard = self.lock_name(name) => guard,
         };
+        // Taken once the name is this run's, so a run queued behind another
+        // of the same scraper never sits on a slot it can't use yet.
+        let slot = tokio::select! {
+            biased;
+            () = signal.stopped() => return Err(stop::stopped()),
+            slot = self.slots.clone().acquire_owned() => {
+                slot.expect("the scraper run slots are never closed")
+            }
+        };
 
         let cookies = self
             .cookies
@@ -276,12 +300,13 @@ impl Service for ScrapersClient {
         // `stop` can cut short) keeps the name until the script has really
         // stopped, so no other run of it starts alongside, and can still be
         // stopped. Otherwise they're held here through the saves below.
-        let (_name_guard, _stop_registration, outcome) = tokio::task::spawn_blocking(move || {
-            let outcome = run_script(job);
-            (name_guard, stop_registration, outcome)
-        })
-        .await
-        .with_context(|| format!("scraper {name:?} task panicked"))?;
+        let (_name_guard, _stop_registration, _slot, outcome) =
+            tokio::task::spawn_blocking(move || {
+                let outcome = run_script(job);
+                (name_guard, stop_registration, slot, outcome)
+            })
+            .await
+            .with_context(|| format!("scraper {name:?} task panicked"))?;
         let (session_data, cookies, run_result) = outcome?;
 
         // However the script ended once stopped (the stop itself, or another
@@ -488,7 +513,7 @@ fn sandboxed_lua(stop: StopSignal) -> Result<Lua> {
     crate::tools::sandbox::new_vm(
         StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
         crate::tools::sandbox::Limits {
-            memory_bytes: 512 * 1024 * 1024,
+            memory_bytes: LUA_MEMORY_BYTES,
             max_instructions: 5_000_000_000,
         },
         move || stop.is_stopped().then(stop::stopped),
@@ -913,6 +938,35 @@ mod tests {
         let mut asked = asked.lock().unwrap().clone();
         asked.sort();
         assert_eq!(asked, vec!["didaxis", "impots"]);
+    }
+
+    #[tokio::test]
+    async fn run_runs_at_most_max_concurrent_runs_at_once() {
+        let active = Arc::new(Mutex::new((0, 0)));
+        let for_callback = active.clone();
+        let client = asking_client(Arc::new(move |_name: &str, _question| {
+            {
+                let mut active = for_callback.lock().unwrap();
+                active.0 += 1;
+                active.1 = active.1.max(active.0);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            for_callback.lock().unwrap().0 -= 1;
+            "ok".to_string()
+        }));
+
+        let names = ["a", "b", "c", "d", "e"];
+        assert!(names.len() > MAX_CONCURRENT_RUNS);
+        futures::future::try_join_all(names.map(|name| run_asking(client.clone(), name)))
+            .await
+            .unwrap();
+
+        assert_eq!(active.lock().unwrap().1, MAX_CONCURRENT_RUNS);
+        assert_eq!(
+            client.slots.available_permits(),
+            MAX_CONCURRENT_RUNS,
+            "every slot should be given back"
+        );
     }
 
     #[tokio::test]

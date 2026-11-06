@@ -67,8 +67,10 @@ impl Installed {
 /// strings, outside the VM's memory limit, and `fyde.http` transparently
 /// decompresses gzip/brotli/zstd: without a cap, a small compressed
 /// response from a hostile or compromised allowed site could expand until
-/// the host process runs out of memory.
-pub(super) const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
+/// the host process runs out of memory. Kept below the Lua VM's own memory
+/// limit (`service::LUA_MEMORY_BYTES`), which a body must fit in once it
+/// becomes a Lua string.
+pub(super) const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Enforced by every `fyde.http.get/post_form/post_json/download` call and
 /// `fyde.browser:open` — the one network entry point each of those has —

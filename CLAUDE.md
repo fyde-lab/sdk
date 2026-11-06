@@ -210,8 +210,10 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   of inlining — `../scripts` relies on their names and behaviour).
   - `mlua::Lua` is `!Send`: `run` builds the VM inside `spawn_blocking` and host functions use
     a captured runtime `Handle::block_on`. Never move a `Lua` across threads.
-  - Runs are parallel and isolated: each gets its own VM, cookie jar, session table, recorder
-    and webview. Runs sharing a `name` share persisted state, so `ScrapersClient` serializes
+  - Runs are parallel and isolated: each gets its own VM (25 MiB, `LUA_MEMORY_BYTES`; response
+    bodies are capped below it at 16 MiB, `host::MAX_BODY_BYTES`), cookie jar, session table,
+    recorder and webview. At most `MAX_CONCURRENT_RUNS` (3) run at once; the others wait for a
+    slot (stoppable), taken only once the run holds its name. Runs sharing a `name` share persisted state, so `ScrapersClient` serializes
     them (`lock_name`). `on_scraper_progress`/`on_scraper_question` get the run's name first
     so callers can tell concurrent runs apart. Never add process-wide mutable state a script
     can reach.
