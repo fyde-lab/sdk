@@ -88,6 +88,18 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "This device has no secure storage for your account's keys.",
             "Cet appareil ne dispose d'aucun stockage sécurisé pour les clés de votre compte.",
         ),
+        ErrorCode::ModelDownloadFailed => (
+            "The files document analysis needs couldn't be downloaded. Check your connection and try again.",
+            "Les fichiers nécessaires à l'analyse des documents n'ont pas pu être téléchargés. Vérifiez votre connexion et réessayez.",
+        ),
+        ErrorCode::ModelCorrupted => (
+            "A file document analysis needs arrived damaged and was discarded. Try again.",
+            "Un fichier nécessaire à l'analyse des documents est arrivé endommagé et a été supprimé. Réessayez.",
+        ),
+        ErrorCode::ModelLoadFailed => (
+            "Document analysis isn't available on this device.",
+            "L'analyse des documents n'est pas disponible sur cet appareil.",
+        ),
         ErrorCode::InvalidServerUrl => (
             "The server address is invalid.",
             "L'adresse du serveur est invalide.",

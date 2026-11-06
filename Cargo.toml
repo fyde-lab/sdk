@@ -41,6 +41,10 @@ keyring-core = "1.0.0"
 # scrapers domain (`domains/scrapers`) to round-trip JSON through Lua tables.
 mlua = { version = "0.12.1", features = ["lua54", "vendored", "error-send", "serialize"] }
 opaque-ke = { version = "4.0.1", features = ["argon2"] }
+# ONNX Runtime, for the on-device models (`tools::onnx`). Pinned to the exact
+# release `oar-ocr` 0.10.2 depends on, so OCR shares this one runtime. How it's
+# linked depends on the target: see the two `ort` entries further down.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std"] }
 # Scores new passwords (`users::Service::analyze_password`) and backs the
 # minimum strength `create`/`change_password` enforce.
 passwd-strength = "0.1.0"
@@ -77,11 +81,13 @@ sha2 = "0.11.0"
 sha2-opaque = { package = "sha2", version = "0.10.9" }
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "migrate"] }
 thiserror = "2.0.20"
+# Hugging Face tokenizers for the on-device models (`tools::onnx::tokenizer`).
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
 # Only the features this crate's own code uses (a library enabling `full`
-# forces every runtime feature on every app that depends on it). `net`,
-# `io-util` and the multi-thread runtime are only needed by tests — see the
-# dev-dependency below.
-tokio = { version = "1.53.1", features = ["rt", "macros", "sync", "time", "fs"] }
+# forces every runtime feature on every app that depends on it). `io-util`
+# writes model downloads (`tools::models`). `net` and the multi-thread runtime
+# are only needed by tests — see the dev-dependency below.
+tokio = { version = "1.53.1", features = ["rt", "macros", "sync", "time", "fs", "io-util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.20", features = ["registry", "fmt"] }
 # `NormalizeEvent`: recovers the real target of records `tracing-subscriber`
@@ -152,6 +158,24 @@ android-native-keyring-store = "1.0.0"
 # which `wry`/`tao` already need on Linux (see `shell.nix`).
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
 dbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
+
+# ONNX Runtime linking (see `ort` above, and the sdk CLAUDE.md's "ONNX Runtime"
+# section for what the app must bundle). The targets pyke ships a prebuilt
+# static ONNX Runtime for link it in at build time (`download-binaries`, which
+# fetches it from cdn.pyke.io once and caches it; `ORT_LIB_PATH` points at a
+# local build instead). `tls-rustls` is only that build-time fetch's TLS. This
+# cfg must stay in sync with the one below and with `build.rs`'s
+# `ort_links_statically`, which tells the code (`cfg(ort_load_dynamic)`).
+[target.'cfg(any(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "macos", target_arch = "aarch64"), all(target_os = "windows", target_env = "msvc", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "ios", target_arch = "aarch64", not(target_abi = "macabi"))))'.dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["download-binaries", "tls-rustls"] }
+
+# Every other target loads the ONNX Runtime shared library the app ships at
+# runtime instead. That includes every Android ABI, arm64 too although pyke
+# has a static build for it: the app has to ship onnxruntime-android for its
+# other ABIs anyway, and the static build would also need it to ship
+# `libc++_shared.so`.
+[target.'cfg(not(any(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "macos", target_arch = "aarch64"), all(target_os = "windows", target_env = "msvc", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "ios", target_arch = "aarch64", not(target_abi = "macabi")))))'.dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

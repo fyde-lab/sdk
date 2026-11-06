@@ -62,6 +62,14 @@ macro_rules! for_each_error_code {
             /// account's secrets weren't allowed to fall back to the local
             /// database (see `UsersService::create`'s `allow_insecure_storage`).
             SecureStorageUnavailable = 1103,
+            /// An on-device model's files couldn't be downloaded.
+            ModelDownloadFailed = 1201,
+            /// A downloaded model file didn't match its pinned size or
+            /// SHA-256 checksum, so it was discarded.
+            ModelCorrupted = 1202,
+            /// An on-device model couldn't be loaded: its file is unusable,
+            /// or the ONNX Runtime library is missing or incompatible.
+            ModelLoadFailed = 1203,
             /// The configured server URL is malformed.
             InvalidServerUrl = 2001,
             /// No connection could be established with the server.
@@ -326,6 +334,18 @@ pub(crate) enum ErrorKind {
     ScriptLimitExceeded(String),
     #[error("scraper run stopped on request")]
     ScraperRunStopped,
+    /// Not `#[from]`: only model downloads map a [`wreq::Error`] to
+    /// [`ErrorCode::ModelDownloadFailed`].
+    #[error("model download error: {0}")]
+    ModelDownload(#[source] wreq::Error),
+    #[error("model download answered HTTP {0}")]
+    ModelDownloadStatus(u16),
+    #[error("corrupted model file: {0}")]
+    ModelCorrupted(String),
+    #[error("onnx runtime error: {0}")]
+    Onnx(#[from] ort::Error),
+    #[error("tokenizer error: {0}")]
+    Tokenizer(#[source] tokenizers::Error),
 }
 
 impl ErrorKind {
@@ -375,6 +395,11 @@ impl ErrorKind {
             ErrorKind::Browser(_) => ErrorCode::BrowserFailed,
             ErrorKind::ScriptLimitExceeded(_) => ErrorCode::ScriptLimitExceeded,
             ErrorKind::ScraperRunStopped => ErrorCode::ScraperRunStopped,
+            ErrorKind::ModelDownload(_) | ErrorKind::ModelDownloadStatus(_) => {
+                ErrorCode::ModelDownloadFailed
+            }
+            ErrorKind::ModelCorrupted(_) => ErrorCode::ModelCorrupted,
+            ErrorKind::Onnx(_) | ErrorKind::Tokenizer(_) => ErrorCode::ModelLoadFailed,
         }
     }
 }
@@ -553,6 +578,7 @@ impl_from_source!(
     rmp_serde::encode::Error,
     rmp_serde::decode::Error,
     tokio::task::JoinError,
+    ort::Error,
 );
 
 pub type Result<T> = std::result::Result<T, Error>;

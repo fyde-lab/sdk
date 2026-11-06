@@ -9,6 +9,11 @@ const BUF_MODULE: &str = "buf.build/fyde-lab/api";
 const PROTO_DIR_ENV: &str = "FYDE_PROTO_DIR";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo::rustc-check-cfg=cfg(ort_load_dynamic)");
+    if !ort_links_statically() {
+        println!("cargo::rustc-cfg=ort_load_dynamic");
+    }
+
     let proto_dir = match std::env::var_os(PROTO_DIR_ENV) {
         Some(dir) => {
             let dir = PathBuf::from(dir);
@@ -29,6 +34,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::compile_protos(proto_dir.join("icons/v1/icons.proto"))?;
 
     Ok(())
+}
+
+/// Whether the target links pyke's prebuilt static ONNX Runtime, rather than
+/// loading the app's shared library at runtime (`cfg(ort_load_dynamic)`). Must
+/// match the two target-specific `ort` entries in `Cargo.toml`.
+fn ort_links_statically() -> bool {
+    let var = |name: &str| std::env::var(name).unwrap_or_default();
+    let (os, arch, env, abi) = (
+        var("CARGO_CFG_TARGET_OS"),
+        var("CARGO_CFG_TARGET_ARCH"),
+        var("CARGO_CFG_TARGET_ENV"),
+        var("CARGO_CFG_TARGET_ABI"),
+    );
+    let x64_or_arm64 = arch == "x86_64" || arch == "aarch64";
+
+    match os.as_str() {
+        "linux" => env == "gnu" && x64_or_arm64,
+        "macos" => arch == "aarch64",
+        "windows" => env == "msvc" && x64_or_arm64,
+        "ios" => arch == "aarch64" && abi != "macabi",
+        _ => false,
+    }
 }
 
 /// Exports [`BUF_MODULE`] into `OUT_DIR` with `buf` and returns where it went.

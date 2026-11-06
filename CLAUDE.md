@@ -21,6 +21,10 @@ RUSTFLAGS="--cfg tokio_unstable" cargo build --features tokio-console  # serve t
   `go`/`clang` for `wreq`'s vendored BoringSSL; `webkitgtk_4_1`/`gtk3` for `wry`.
 - `build.rs` runs `buf export buf.build/fyde-lab/api` (needs `buf` on `PATH` + network) unless
   `FYDE_PROTO_DIR` is set.
+- On static-ONNX-Runtime targets (see "ONNX Runtime" below), `ort-sys` downloads pyke's prebuilt
+  library on the first build (network, then cached); `ORT_LIB_PATH` points it at a local build.
+- `FYDE_TEST_MODELS_DIR=/some/dir cargo test -- --ignored multilingual_e5` runs the real-model
+  test (downloads ~135 MB from Hugging Face; the directory keeps them for the next run).
 
 ## Non-negotiable rules
 
@@ -61,6 +65,10 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   `sandbox::load_source` — never `Lua::new*` / `lua.load` (that would run precompiled bytecode).
 - Scraper debug reports never record request headers, request/download bodies or form values;
   response bodies only with `debug_http_dump`.
+- On-device model files (`tools::models`) live in `ClientConfig::models_dir`, never the client
+  directory, and only ever land there through `ModelStore::ensure` (size + SHA-256 checked, then
+  renamed into place). Pin a new model to a fixed revision, never a branch. `Client::init`
+  never downloads.
 - Never write to the `documents_fts` FTS5 table directly (triggers maintain it). A new virtual
   table must support `'delete-all'` so `SqliteClient::wipe` can clear it.
 
@@ -73,6 +81,8 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   panicking is often the assertion) — no shared fake-storage builders. A small inline
   `Arc<Mutex<_>>` capture is fine when a test must read back a generated value.
 - Exceptions, which test real adapters: `grpc_client.rs`, `crypto.rs`, `tools/sql/sqlite.rs`, `tools/client_dir.rs`,
+  `tools/models` (a local `TcpListener` HTTP server), `tools/onnx` (a hand-encoded ONNX model; the
+  real-model test is `#[ignore]`),
   `storage_sqlite.rs` files, `secrets/storage_keystore.rs` (keyring's in-memory mock),
   `changelog/storage_settings.rs`. `changelog::Service` can't be automocked (its
   `start_consume_job` takes a boxed `FnMut`), so use the hand-written `RecordingChangelog`-style
@@ -100,13 +110,16 @@ held by the `Client` until dropped: a second client on the same directory fails 
 Public accessors: `documents()`, `attributes()`, `users()`, `settings()`, `server_state()`,
 `scripts()`, `icons()`, `scrapers()`, `usage()`, `user_message(&err)`, `language()`, plus
 `save_new_session(token)`/`is_connected()` over the crate-private `sessions` domain.
-`ClientConfig` carries the caller's callbacks (`on_log`, `on_document_change`,
+`ClientConfig::models_dir` is where on-device models are downloaded (see `tools::models`): it
+must not be inside the client directory, and `init` doesn't touch it. `ClientConfig` carries the
+caller's callbacks (`on_log`, `on_document_change`,
 `on_scraper_progress`, `on_scraper_question`).
 
 New server services follow the same pattern: a module under `src/domains/` with `mod.rs`
 (the `Service` trait, methods take `&self` so it can live behind `Arc<dyn Service>`),
 `models.rs` (plain structs), `service.rs`, and adapters; wired into `Client::init`.
-Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, `testing`).
+Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `models`, `onnx`, `sandbox`, `sql`,
+`testing`).
 
 ### Domains (`src/domains/`)
 
@@ -231,6 +244,45 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `log`, `sandbox`, `sql`, 
   - `run_installed` runs an installed script (`wreq_emulation`/`follow_redirects` default on).
   - `crate::init_dev_scrapers` builds a scrapers service without a `Client` (file storage +
     `DevDocumentsClient`); `../scripts` is its caller.
+
+### On-device models (`src/tools/models/`, `src/tools/onnx/`)
+
+Not used by any domain yet. `tools::models` is the registry: each `Model` is one file (name, URL
+at a fixed Hugging Face revision, size, SHA-256); today `MULTILINGUAL_E5_SMALL` (int8 ONNX) and
+its `_TOKENIZER`. `ModelStore::ensure` returns `<models_dir>/<sha256[..16]>-<name>`, downloading
+it over `wreq` first (redirects followed) unless a file of the right size is there: into a
+`.<file>.<uuid>.part` beside it, removed on any failure or cancellation (and swept once stale,
+after 10 min untouched), then renamed. Errors: `ModelDownloadFailed` (1201, transport or HTTP
+status), `ModelCorrupted` (1202, wrong size/hash), `ModelLoadFailed` (1203, `tools::onnx`).
+`tools::onnx` is a thin port of `doc-ai-poc`'s loaders: `session(path, threads)` (Level3
+optimizations) and `tokenizer(path)` (`tokenizers`, `onig` regexes).
+
+### ONNX Runtime
+
+`ort` is pinned to `=2.0.0-rc.13`, the exact version `oar-ocr` 0.10.2 uses, so a future OCR
+dependency shares the one runtime (add it with `default-features = false`: its defaults enable
+`ort`'s `download-binaries` + `tls-native`). No `api-*` feature, so any ONNX Runtime ≥ 1.17 loads.
+How it's linked depends on the target, chosen by the two target-specific `ort` entries in
+`Cargo.toml` and mirrored by `build.rs`'s `ort_links_statically` (`cfg(ort_load_dynamic)`): keep
+all three in sync.
+
+- **Static** (pyke's prebuilt ONNX Runtime 1.28, linked into `fyde-sdk`): Linux gnu x86_64/arm64,
+  macOS arm64, Windows MSVC x86_64/arm64, iOS arm64 and the arm64 iOS simulator. The app ships
+  nothing extra. iOS/macOS link `c++` and the `Foundation` + `CoreML` frameworks: cargo reports
+  them in the staticlib's `native-static-libs`, which the app's link step must pass on (as it
+  already does for `Security`). Windows builds link DirectML/D3D12/DXGI/DXCore (system DLLs).
+- **`load-dynamic`** (everything else: every Android ABI, Intel macOS, x86_64 iOS simulator, musl,
+  ...): `tools::onnx::session` first loads the shared library, `ORT_DYLIB_PATH` if set, else
+  `libonnxruntime.so` / `libonnxruntime.dylib` / `onnxruntime.dll` from the library search path;
+  missing or older than 1.17 fails with `ModelLoadFailed` (never `ort`'s own panic). Android arm64
+  has a pyke static build, but deliberately isn't static: the app ships `onnxruntime-android` for
+  its other ABIs anyway, and that build would also need `libc++_shared.so`, which the app doesn't
+  ship (its C++ is linked statically).
+- **What the app must bundle**: on Android, the official `com.microsoft.onnxruntime:onnxruntime-android`
+  AAR (keep it on 1.28.x, matching the static targets), whose `jni/<abi>/libonnxruntime.so` covers
+  arm64-v8a, armeabi-v7a, x86 and x86_64 (`../application/sdkBridge/build.gradle.kts` depends on
+  it). A load-dynamic Apple target would need `libonnxruntime.dylib` (the `onnxruntime-c`
+  xcframework) in the bundle, but the app only builds the static ones.
 
 ### Local database (`src/tools/sql/sqlite.rs`, `migrations/`)
 
