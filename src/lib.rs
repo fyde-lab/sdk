@@ -65,6 +65,13 @@ pub struct ClientConfig {
     pub client_name: String,
     /// Which SQLite backend to persist local state to.
     pub storage: Storage,
+    /// Where the on-device models' files are downloaded to, when first
+    /// needed (never by `Client::init`), created if missing. Never inside
+    /// the client's own directory (`<dir>/<client_name>` of a
+    /// [`Storage::Disk`]): logout deletes every file there, and models
+    /// aren't user data. Fit for a cache directory, and shareable by
+    /// several clients.
+    pub models_dir: std::path::PathBuf,
     /// The verbosity of the SDK's internal logs.
     pub log_level: LogLevel,
     /// Called once for every log line emitted by the SDK, in addition to the
@@ -116,6 +123,11 @@ pub struct Client {
     settings: Arc<dyn SettingsService>,
     usage: Arc<dyn UsageService>,
     users: Arc<dyn UsersService>,
+    #[expect(
+        dead_code,
+        reason = "foundation for the on-device document analysis to come"
+    )]
+    models: Arc<tools::models::ModelStore>,
     /// The locked handle to [`instance_lock_path`] (see [`lock_instance`]),
     /// held for as long as this `Client` lives. Never read: it only exists
     /// so dropping the `Client` releases the lock.
@@ -138,6 +150,10 @@ impl Client {
         let sqlite = open_database(&location).await?;
         let secrets = open_secrets(&location, &sqlite)?;
         let channel = lazy_channel(config.url)?;
+        let models = Arc::new(
+            tools::models::ModelStore::new(config.models_dir)
+                .context("failed to set up the models store")?,
+        );
 
         let settings = domains::settings::init(sqlite.pool().clone());
         let sessions = domains::sessions::init(secrets.clone());
@@ -211,6 +227,7 @@ impl Client {
             settings,
             usage,
             users,
+            models,
             _instance_lock: instance_lock,
         })
     }
@@ -586,6 +603,7 @@ mod tests {
             url: "not a valid uri".to_string(),
             client_name: "test".to_string(),
             storage: Storage::Memory,
+            models_dir: std::env::temp_dir().join("fyde-sdk-test-models"),
             log_level: LogLevel::Off,
             on_log: None,
             on_document_change: None,
@@ -719,6 +737,7 @@ mod tests {
             url: "http://127.0.0.1:1".to_string(),
             client_name: "desktop".to_string(),
             storage: Storage::Disk(data_dir.clone()),
+            models_dir: data_dir.join("models"),
             log_level: LogLevel::Off,
             on_log: None,
             on_document_change: None,
@@ -736,5 +755,27 @@ mod tests {
         drop(first);
         Client::init(config()).await.unwrap();
         std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn init_leaves_the_models_dir_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let models_dir = root.path().join("models");
+
+        let _client = Client::init(ClientConfig {
+            url: "http://127.0.0.1:1".to_string(),
+            client_name: "test".to_string(),
+            storage: Storage::Memory,
+            models_dir: models_dir.clone(),
+            log_level: LogLevel::Off,
+            on_log: None,
+            on_document_change: None,
+            on_scraper_progress: None,
+            on_scraper_question: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(!models_dir.exists());
     }
 }
