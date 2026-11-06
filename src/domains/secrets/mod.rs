@@ -143,10 +143,7 @@ fn namespace_for(database_path: &Path) -> Result<String> {
     })?;
 
     let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
-    Ok(digest[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(crate::tools::hex::encode(&digest[..16]))
 }
 
 #[cfg(test)]

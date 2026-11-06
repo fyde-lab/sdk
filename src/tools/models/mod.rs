@@ -6,7 +6,9 @@
 //! there, and models aren't user data. Nothing downloads on `Client::init`:
 //! only [`ModelStore::ensure`] does, when a model is first needed.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use futures::StreamExt as _;
@@ -14,6 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt as _;
 
 use crate::error::{ErrorContext, ErrorKind, Result};
+use crate::tools::hex;
 
 /// One pinned model file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,26 +68,29 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// [`READ_TIMEOUT`].
 const STALE_PARTIAL_AGE: Duration = Duration::from_secs(10 * 60);
 const PARTIAL_SUFFIX: &str = ".part";
+/// The length of the SHA-256 prefix in a model's file name.
+const HASH_PREFIX_LEN: usize = 16;
 
 /// Downloads [`Model`]s into a directory, verified and atomically.
 pub(crate) struct ModelStore {
     dir: PathBuf,
-    http: wreq::Client,
+    /// Built on the first download, so a store that never downloads (most
+    /// `Client`s, most of the time) never sets up TLS.
+    http: tokio::sync::OnceCell<wreq::Client>,
+    /// One lock per model file, held across checking and downloading it so
+    /// concurrent [`ModelStore::ensure`] calls download it once. Holds
+    /// whether this store already checked the file's SHA-256.
+    files: Mutex<HashMap<String, Arc<tokio::sync::Mutex<bool>>>>,
 }
 
 impl ModelStore {
     /// Doesn't touch `dir`: [`ModelStore::ensure`] creates it when needed.
-    pub(crate) fn new(dir: PathBuf) -> Result<Self> {
-        let http = wreq::Client::builder()
-            // Hugging Face redirects every download to its CDN.
-            .redirect(wreq::redirect::Policy::default())
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
-            .build()
-            .map_err(ErrorKind::ModelDownload)
-            .context("failed to build the model download HTTP client")?;
-
-        Ok(Self { dir, http })
+    pub(crate) fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            http: tokio::sync::OnceCell::new(),
+            files: Mutex::default(),
+        }
     }
 
     /// Where `model` lives once downloaded. The SHA-256 prefix keeps a
@@ -93,18 +99,36 @@ impl ModelStore {
         self.dir.join(file_name(model))
     }
 
-    /// Returns `model`'s local path, downloading it first unless a file of
-    /// its size is already there. A download goes to a temporary file in
+    /// Returns `model`'s local path, downloading it first unless it's
+    /// already there. A file already there is checked against the pinned
+    /// SHA-256 the first time this store sees it (replaced if it doesn't
+    /// match), then only by size. A download goes to a temporary file in
     /// the same directory, is checked against the pinned size and SHA-256
     /// (failing with `ModelCorrupted` otherwise), then renamed into place:
     /// a failed, mismatched or cancelled download never leaves a file at
-    /// that path, and removes its temporary one.
+    /// that path, and removes its temporary one. Downloading also removes
+    /// `model`'s previous revisions and abandoned partial downloads.
     pub(crate) async fn ensure(&self, model: &Model) -> Result<PathBuf> {
         let path = self.path(model);
+        let lock = self.file_lock(model);
+        let mut verified = lock.lock().await;
+
         if let Ok(metadata) = tokio::fs::metadata(&path).await
             && metadata.len() == model.size
         {
-            return Ok(path);
+            if *verified {
+                return Ok(path);
+            }
+            let sha256 = sha256_of(&path)
+                .await
+                .with_context(|| format!("failed to check the model {}", model.name))?;
+            if sha256 == model.sha256 {
+                *verified = true;
+                return Ok(path);
+            }
+            remove_if_present(&path)
+                .await
+                .with_context(|| format!("failed to discard the corrupted model {}", model.name))?;
         }
 
         tokio::fs::create_dir_all(&self.dir)
@@ -115,7 +139,7 @@ impl ModelStore {
                     self.dir.display()
                 )
             })?;
-        self.remove_stale_partials(model)
+        self.remove_leftovers(model)
             .await
             .with_context(|| format!("failed to clean up old downloads of {}", model.name))?;
 
@@ -134,13 +158,39 @@ impl ModelStore {
             .await
             .with_context(|| format!("failed to move the model {} into place", model.name))?;
         partial.renamed = true;
+        *verified = true;
 
         Ok(path)
     }
 
+    fn file_lock(&self, model: &Model) -> Arc<tokio::sync::Mutex<bool>> {
+        self.files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(file_name(model))
+            .or_default()
+            .clone()
+    }
+
+    async fn http(&self) -> Result<&wreq::Client> {
+        self.http
+            .get_or_try_init(|| async {
+                wreq::Client::builder()
+                    // Hugging Face redirects every download to its CDN.
+                    .redirect(wreq::redirect::Policy::default())
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .read_timeout(READ_TIMEOUT)
+                    .build()
+                    .map_err(ErrorKind::ModelDownload)
+                    .context("failed to build the model download HTTP client")
+            })
+            .await
+    }
+
     async fn download(&self, model: &Model, to: &Path) -> Result<()> {
         let response = self
-            .http
+            .http()
+            .await?
             .get(model.url)
             .send()
             .await
@@ -185,7 +235,7 @@ impl ModelStore {
             ))
             .into());
         }
-        let sha256 = hex(&hasher.finalize());
+        let sha256 = hex::encode(&hasher.finalize());
         if sha256 != model.sha256 {
             return Err(ErrorKind::ModelCorrupted(format!(
                 "SHA-256 {sha256} instead of {}",
@@ -197,11 +247,13 @@ impl ModelStore {
         Ok(())
     }
 
-    /// Removes `model`'s partial downloads nothing has written to for
-    /// [`STALE_PARTIAL_AGE`], keeping those another download (in this
-    /// process or another sharing the directory) may still be writing.
-    async fn remove_stale_partials(&self, model: &Model) -> Result<()> {
-        let prefix = format!(".{}.", file_name(model));
+    /// Removes what earlier downloads of `model` left behind: the files of
+    /// its previous revisions (re-pinned since), and its partial downloads,
+    /// of any revision, nothing has written to for [`STALE_PARTIAL_AGE`]
+    /// (keeping those another download, in this process or another sharing
+    /// the directory, may still be writing).
+    async fn remove_leftovers(&self, model: &Model) -> Result<()> {
+        let current = file_name(model);
         let mut entries = tokio::fs::read_dir(&self.dir)
             .await
             .context("failed to list the models directory")?;
@@ -212,21 +264,16 @@ impl ModelStore {
         {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if !name.starts_with(&prefix) || !name.ends_with(PARTIAL_SUFFIX) {
-                continue;
-            }
-            let modified = entry
-                .metadata()
-                .await
-                .and_then(|metadata| metadata.modified())
-                .with_context(|| format!("failed to read the age of {name}"))?;
-            let age = SystemTime::now()
-                .duration_since(modified)
-                .unwrap_or_default();
-            if age >= STALE_PARTIAL_AGE {
-                tokio::fs::remove_file(entry.path())
+            if let Some(target) = partial_target(&name)
+                && is_revision_of(target, model)
+            {
+                remove_if_stale(&entry.path())
                     .await
-                    .with_context(|| format!("failed to remove {name}"))?;
+                    .with_context(|| format!("failed to clean up the partial download {name}"))?;
+            } else if is_revision_of(&name, model) && name != current {
+                remove_if_present(&entry.path())
+                    .await
+                    .with_context(|| format!("failed to remove the previous revision {name}"))?;
             }
         }
 
@@ -235,11 +282,89 @@ impl ModelStore {
 }
 
 fn file_name(model: &Model) -> String {
-    format!("{}-{}", &model.sha256[..16], model.name)
+    format!("{}-{}", &model.sha256[..HASH_PREFIX_LEN], model.name)
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// Whether `name` is the file name of `model` at any revision: its name
+/// after any SHA-256 prefix (see [`file_name`]).
+fn is_revision_of(name: &str, model: &Model) -> bool {
+    name.split_once('-').is_some_and(|(prefix, rest)| {
+        rest == model.name
+            && prefix.len() == HASH_PREFIX_LEN
+            && prefix
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// The file name the partial download `name` is to be renamed to, if `name`
+/// is one (`.<file name>.<id>.part`).
+fn partial_target(name: &str) -> Option<&str> {
+    let (target, _id) = name
+        .strip_prefix('.')?
+        .strip_suffix(PARTIAL_SUFFIX)?
+        .rsplit_once('.')?;
+    Some(target)
+}
+
+/// The SHA-256 of the file at `path`, lowercase hex, read off the runtime's
+/// threads (a model is hundreds of megabytes).
+async fn sha256_of(path: &Path) -> Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut file = std::fs::File::open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0; 1 << 16];
+        loop {
+            let read = std::io::Read::read(&mut file, &mut buffer)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hex::encode(&hasher.finalize()))
+    })
+    .await
+    .context("failed to hash a model file")?
+}
+
+/// Removes the file at `path`, if it's still there: another process sharing
+/// the directory may have removed it first.
+async fn remove_if_present(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            Err(err).with_context(|| format!("failed to remove {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Removes the file at `path` if nothing has written to it for
+/// [`STALE_PARTIAL_AGE`], or nothing if it's gone already.
+async fn remove_if_stale(path: &Path) -> Result<()> {
+    let modified = match tokio::fs::metadata(path)
+        .await
+        .and_then(|metadata| metadata.modified())
+    {
+        Ok(modified) => modified,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read the age of {}", path.display()));
+        }
+    };
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_default();
+    if age >= STALE_PARTIAL_AGE {
+        remove_if_present(path)
+            .await
+            .context("failed to remove a stale file")?;
+    }
+
+    Ok(())
 }
 
 /// Deletes the partial download at `path` when dropped (on failure or
@@ -371,7 +496,7 @@ mod tests {
             name: leak(format!("{}.onnx", random_hex(8))),
             url: leak(format!("{}{path}", server.url)),
             size: content.len() as u64,
-            sha256: leak(hex(&Sha256::digest(content))),
+            sha256: leak(hex::encode(&Sha256::digest(content))),
         }
     }
 
@@ -396,7 +521,7 @@ mod tests {
         let server = serve(move |_| Reply::ok(&served)).await;
         let model = model(&server, "/model.onnx", &content);
         let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf()).unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
 
         let path = store.ensure(&model).await.unwrap();
 
@@ -417,7 +542,7 @@ mod tests {
         .await;
         let model = model(&server, "/resolve/model.onnx", &content);
         let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf()).unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
 
         let path = store.ensure(&model).await.unwrap();
 
@@ -433,7 +558,7 @@ mod tests {
         let model = model(&server, "/model.onnx", &content);
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("not").join("there");
-        let store = ModelStore::new(dir.clone()).unwrap();
+        let store = ModelStore::new(dir.clone());
 
         let path = store.ensure(&model).await.unwrap();
 
@@ -448,7 +573,7 @@ mod tests {
         let server = serve(move |_| Reply::ok(&served)).await;
         let model = model(&server, "/model.onnx", &content);
         let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf()).unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
 
         let first = store.ensure(&model).await.unwrap();
         let second = store.ensure(&model).await.unwrap();
@@ -464,7 +589,7 @@ mod tests {
         let server = serve(move |_| Reply::ok(&served)).await;
         let model = model(&server, "/model.onnx", &content);
         let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf()).unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
         std::fs::write(store.path(&model), b"truncated by a crash").unwrap();
 
         let path = store.ensure(&model).await.unwrap();
@@ -481,7 +606,7 @@ mod tests {
         let server = serve(move |_| Reply::ok(&tampered)).await;
         let model = model(&server, "/model.onnx", &content);
         let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf()).unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
 
         let err = store.ensure(&model).await.unwrap_err();
 
@@ -498,7 +623,7 @@ mod tests {
         let server = serve(move |_| Reply::ok(&short)).await;
         let model = model(&server, "/model.onnx", &content);
         let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf()).unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
 
         let err = store.ensure(&model).await.unwrap_err();
 
@@ -516,7 +641,7 @@ mod tests {
             serve(move |_| Reply::claiming(longer.len() * 2, &longer).then(Then::Hang)).await;
         let model = model(&server, "/model.onnx", &content);
         let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf()).unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
 
         let err = store.ensure(&model).await.unwrap_err();
 
@@ -533,7 +658,7 @@ mod tests {
         let server = serve(move |_| Reply::claiming(size, &half)).await;
         let model = model(&server, "/model.onnx", &content);
         let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf()).unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
 
         let err = store.ensure(&model).await.unwrap_err();
 
@@ -550,7 +675,7 @@ mod tests {
         let server = serve(move |_| Reply::claiming(size, &half).then(Then::Hang)).await;
         let model = model(&server, "/model.onnx", &content);
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(ModelStore::new(dir.path().to_path_buf()).unwrap());
+        let store = Arc::new(ModelStore::new(dir.path().to_path_buf()));
 
         let download = tokio::spawn({
             let store = store.clone();
@@ -577,17 +702,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ensure_fails_on_an_http_error_and_leaves_no_file() {
+    async fn ensure_fails_on_a_missing_model_and_leaves_no_file() {
         let server = serve(|_| Reply::status("404 Not Found")).await;
         let model = model(&server, "/model.onnx", &content());
         let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf()).unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
+
+        let err = store.ensure(&model).await.unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::ModelUnavailable);
+        assert!(err.has_context());
+        assert!(err.to_string().contains("404"), "{err}");
+        assert!(files_in(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn ensure_fails_on_a_server_error_and_leaves_no_file() {
+        let server = serve(|_| Reply::status("503 Service Unavailable")).await;
+        let model = model(&server, "/model.onnx", &content());
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
 
         let err = store.ensure(&model).await.unwrap_err();
 
         assert_eq!(err.code(), ErrorCode::ModelDownloadFailed);
         assert!(err.has_context());
-        assert!(err.to_string().contains("404"), "{err}");
+        assert!(err.to_string().contains("503"), "{err}");
         assert!(files_in(dir.path()).is_empty());
     }
 
@@ -601,7 +741,7 @@ mod tests {
         drop(listener);
         let model = model(&unreachable, "/model.onnx", &content());
         let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf()).unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
 
         let err = store.ensure(&model).await.unwrap_err();
 
@@ -615,18 +755,24 @@ mod tests {
         let served = content.clone();
         let server = serve(move |_| Reply::ok(&served)).await;
         let model = model(&server, "/model.onnx", &content);
+        let previous = Model {
+            sha256: leak(random_hex(32)),
+            ..model
+        };
         let other = Model {
             name: "other.onnx",
             ..model
         };
         let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf()).unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
         let partial =
             |model: &Model, id: &str| format!(".{}.{id}{PARTIAL_SUFFIX}", file_name(model));
         let long_ago = SystemTime::now() - STALE_PARTIAL_AGE - Duration::from_secs(1);
         for (name, modified) in [
             (partial(&model, "stale"), Some(long_ago)),
             (partial(&model, "active"), None),
+            (partial(&previous, "stale"), Some(long_ago)),
+            (partial(&previous, "active"), None),
             (partial(&other, "stale"), Some(long_ago)),
         ] {
             let file = std::fs::File::create(dir.path().join(name)).unwrap();
@@ -640,15 +786,215 @@ mod tests {
         let mut expected = vec![
             file_name(&model),
             partial(&model, "active"),
+            partial(&previous, "active"),
             partial(&other, "stale"),
         ];
         expected.sort();
         assert_eq!(files_in(dir.path()), expected);
     }
 
+    #[tokio::test]
+    async fn ensure_removes_the_previous_revisions_of_a_model_it_downloads() {
+        let content = content();
+        let served = content.clone();
+        let server = serve(move |_| Reply::ok(&served)).await;
+        let model = model(&server, "/model.onnx", &content);
+        let previous = Model {
+            sha256: leak(random_hex(32)),
+            ..model
+        };
+        let other = Model {
+            name: "other.onnx",
+            ..model
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
+        let unrelated = [
+            file_name(&other),
+            format!("not-a-hash-{}", model.name),
+            format!("{}-{}", "F".repeat(HASH_PREFIX_LEN), model.name),
+            model.name.to_string(),
+        ];
+        for name in unrelated.iter().chain([&file_name(&previous)]) {
+            std::fs::write(dir.path().join(name), b"kept or not").unwrap();
+        }
+
+        store.ensure(&model).await.unwrap();
+
+        let mut expected = unrelated.to_vec();
+        expected.push(file_name(&model));
+        expected.sort();
+        assert_eq!(files_in(dir.path()), expected);
+    }
+
+    #[tokio::test]
+    async fn ensure_trusts_a_correct_file_already_there_without_downloading() {
+        let content = content();
+        let server = serve(|_| Reply::status("500 Internal Server Error")).await;
+        let model = model(&server, "/model.onnx", &content);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
+        std::fs::write(store.path(&model), &content).unwrap();
+
+        let path = store.ensure(&model).await.unwrap();
+
+        assert_eq!(path, store.path(&model));
+        assert_eq!(server.requests.load(Ordering::SeqCst), 0);
+        assert!(store.http.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_replaces_a_file_of_the_right_size_but_wrong_content() {
+        let content = content();
+        let served = content.clone();
+        let server = serve(move |_| Reply::ok(&served)).await;
+        let model = model(&server, "/model.onnx", &content);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
+        let mut corrupted = content.clone();
+        corrupted[content.len() / 2] ^= 0xff;
+        std::fs::write(store.path(&model), &corrupted).unwrap();
+
+        let path = store.ensure(&model).await.unwrap();
+
+        assert_eq!(std::fs::read(path).unwrap(), content);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_removes_a_corrupted_file_even_when_its_download_fails() {
+        let content = content();
+        let server = serve(|_| Reply::status("503 Service Unavailable")).await;
+        let model = model(&server, "/model.onnx", &content);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
+        std::fs::write(store.path(&model), random_bytes(content.len())).unwrap();
+
+        store.ensure(&model).await.unwrap_err();
+
+        assert!(files_in(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn ensure_checks_a_files_hash_only_once_per_store() {
+        let content = content();
+        let served = content.clone();
+        let server = serve(move |_| Reply::ok(&served)).await;
+        let model = model(&server, "/model.onnx", &content);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
+        let path = store.ensure(&model).await.unwrap();
+        let same_size = random_bytes(content.len());
+        std::fs::write(&path, &same_size).unwrap();
+
+        store.ensure(&model).await.unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), same_size);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_downloads_again_a_model_removed_since() {
+        let content = content();
+        let served = content.clone();
+        let server = serve(move |_| Reply::ok(&served)).await;
+        let model = model(&server, "/model.onnx", &content);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
+        let path = store.ensure(&model).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        store.ensure(&model).await.unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), content);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_ensures_download_a_model_once() {
+        let content = content();
+        let served = content.clone();
+        let server = serve(move |_| Reply::ok(&served)).await;
+        let model = model(&server, "/model.onnx", &content);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
+
+        let (first, second) = tokio::join!(store.ensure(&model), store.ensure(&model));
+
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(files_in(dir.path()), vec![file_name(&model)]);
+    }
+
+    #[tokio::test]
+    async fn new_builds_no_http_client_until_a_download() {
+        let content = content();
+        let served = content.clone();
+        let server = serve(move |_| Reply::ok(&served)).await;
+        let model = model(&server, "/model.onnx", &content);
+        let dir = tempfile::tempdir().unwrap();
+
+        let store = ModelStore::new(dir.path().to_path_buf());
+        assert!(store.http.get().is_none());
+        store.ensure(&model).await.unwrap();
+
+        assert!(store.http.get().is_some());
+    }
+
+    #[tokio::test]
+    async fn remove_if_present_ignores_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        remove_if_present(&dir.path().join("gone")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_if_stale_ignores_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        remove_if_stale(&dir.path().join("gone")).await.unwrap();
+    }
+
+    #[test]
+    fn partial_target_reads_the_file_a_partial_download_becomes() {
+        assert_eq!(
+            partial_target(".0123456789abcdef-model.onnx.some-uuid.part"),
+            Some("0123456789abcdef-model.onnx")
+        );
+        for name in [
+            "0123456789abcdef-model.onnx",
+            ".0123456789abcdef-model.onnx",
+            "0123456789abcdef-model.onnx.some-uuid.part",
+            ".part",
+        ] {
+            assert_eq!(partial_target(name), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn is_revision_of_matches_the_name_after_any_hash_prefix() {
+        let model = MULTILINGUAL_E5_SMALL;
+
+        assert!(is_revision_of(&file_name(&model), &model));
+        assert!(is_revision_of(
+            "0123456789abcdef-multilingual-e5-small.onnx",
+            &model
+        ));
+        for name in [
+            "multilingual-e5-small.onnx",
+            "0123456789ABCDEF-multilingual-e5-small.onnx",
+            "0123456789abcde-multilingual-e5-small.onnx",
+            "0123456789abcdef0-multilingual-e5-small.onnx",
+            "0123456789abcdef-multilingual-e5-small.tokenizer.json",
+            "0123456789abcdef-multilingual-e5-small.onnx.old",
+        ] {
+            assert!(!is_revision_of(name, &model), "{name:?}");
+        }
+    }
+
     #[test]
     fn path_prefixes_the_name_with_the_hash() {
-        let store = ModelStore::new(PathBuf::from("/models")).unwrap();
+        let store = ModelStore::new(PathBuf::from("/models"));
 
         assert_eq!(
             store.path(&MULTILINGUAL_E5_SMALL),

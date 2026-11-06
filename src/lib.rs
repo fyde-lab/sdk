@@ -69,8 +69,9 @@ pub struct ClientConfig {
     /// needed (never by `Client::init`), created if missing. Never inside
     /// the client's own directory (`<dir>/<client_name>` of a
     /// [`Storage::Disk`]): logout deletes every file there, and models
-    /// aren't user data. Fit for a cache directory, and shareable by
-    /// several clients.
+    /// aren't user data, so `init` fails with
+    /// [`ErrorCode::InvalidModelsDirectory`] there. Fit for a cache
+    /// directory, and shareable by several clients.
     pub models_dir: std::path::PathBuf,
     /// The verbosity of the SDK's internal logs.
     pub log_level: LogLevel,
@@ -144,16 +145,14 @@ impl Client {
     pub async fn init(config: ClientConfig) -> Result<Self> {
         install_tracing(config.log_level, config.on_log.clone());
         let location = DatabaseLocation::resolve(&config.storage, &config.client_name)?;
+        check_models_dir(&config.models_dir, &location)?;
         // Before touching the database at all, so a second instance never
         // migrates, reads or syncs into the one the first is using.
         let instance_lock = lock_instance(&location)?;
         let sqlite = open_database(&location).await?;
         let secrets = open_secrets(&location, &sqlite)?;
         let channel = lazy_channel(config.url)?;
-        let models = Arc::new(
-            tools::models::ModelStore::new(config.models_dir)
-                .context("failed to set up the models store")?,
-        );
+        let models = Arc::new(tools::models::ModelStore::new(config.models_dir));
 
         let settings = domains::settings::init(sqlite.pool().clone());
         let sessions = domains::sessions::init(secrets.clone());
@@ -425,6 +424,47 @@ fn client_database_path(
         )
     })?;
     Ok(client_dir.join(DATABASE_FILE_NAME))
+}
+
+/// Rejects a `models_dir` inside the client directory of the database at
+/// `location`, which logout empties. Compares absolute paths with `.` and
+/// `..` resolved lexically, since `models_dir` may not exist yet.
+fn check_models_dir(models_dir: &std::path::Path, location: &DatabaseLocation) -> Result<()> {
+    let DatabaseLocation::Disk(database) = location else {
+        return Ok(());
+    };
+    let client_dir = database
+        .parent()
+        .expect("a client database path is always inside its client directory");
+    let normalized = |path: &std::path::Path| {
+        std::path::absolute(path)
+            .map(|path| lexically_normalized(&path))
+            .with_context(|| format!("failed to resolve the path {}", path.display()))
+    };
+    let models = normalized(models_dir)?;
+    let client = normalized(client_dir)?;
+    if models.starts_with(&client) {
+        return Err(ErrorKind::InvalidModelsDirectory { models, client }.into());
+    }
+    Ok(())
+}
+
+/// `path` with its `.` components dropped and each `..` removing the
+/// component before it.
+fn lexically_normalized(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
 }
 
 /// Opens the local SQLite database at `location`.
@@ -755,6 +795,84 @@ mod tests {
         drop(first);
         Client::init(config()).await.unwrap();
         std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[test]
+    fn check_models_dir_rejects_a_dir_inside_the_client_directory() {
+        let data_dir = std::path::PathBuf::from("/data");
+        let location = DatabaseLocation::Disk(data_dir.join("desktop").join(DATABASE_FILE_NAME));
+
+        for models_dir in [
+            data_dir.join("desktop"),
+            data_dir.join("desktop").join("models"),
+            data_dir.join("desktop").join(".").join("models"),
+            data_dir
+                .join("other")
+                .join("..")
+                .join("desktop")
+                .join("models"),
+        ] {
+            let err = check_models_dir(&models_dir, &location).expect_err("must be rejected");
+            assert_eq!(
+                err.code(),
+                ErrorCode::InvalidModelsDirectory,
+                "{models_dir:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_models_dir_accepts_a_dir_outside_the_client_directory() {
+        let data_dir = std::path::PathBuf::from("/data");
+        let location = DatabaseLocation::Disk(data_dir.join("desktop").join(DATABASE_FILE_NAME));
+
+        for models_dir in [
+            data_dir.clone(),
+            data_dir.join("models"),
+            data_dir.join("desktop-models"),
+            data_dir.join("desktop").join("..").join("models"),
+            std::path::PathBuf::from("/cache/models"),
+        ] {
+            check_models_dir(&models_dir, &location)
+                .unwrap_or_else(|err| panic!("{models_dir:?} must be accepted: {err}"));
+        }
+    }
+
+    #[test]
+    fn check_models_dir_accepts_anything_for_an_in_memory_database() {
+        check_models_dir(std::path::Path::new("/anywhere"), &DatabaseLocation::Memory).unwrap();
+    }
+
+    #[test]
+    fn lexically_normalized_resolves_dot_components() {
+        assert_eq!(
+            lexically_normalized(std::path::Path::new("/a/./b/../c/./d/..")),
+            std::path::Path::new("/a/c")
+        );
+    }
+
+    #[tokio::test]
+    async fn init_rejects_a_models_dir_inside_the_client_directory() {
+        let root = tempfile::tempdir().unwrap();
+
+        let err = match Client::init(ClientConfig {
+            url: "http://127.0.0.1:1".to_string(),
+            client_name: "desktop".to_string(),
+            storage: Storage::Disk(root.path().to_path_buf()),
+            models_dir: root.path().join("desktop").join("models"),
+            log_level: LogLevel::Off,
+            on_log: None,
+            on_document_change: None,
+            on_scraper_progress: None,
+            on_scraper_question: None,
+        })
+        .await
+        {
+            Ok(_) => panic!("a models dir inside the client directory must be rejected"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), ErrorCode::InvalidModelsDirectory);
     }
 
     #[tokio::test]

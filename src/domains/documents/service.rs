@@ -393,10 +393,7 @@ fn check_extension(name: &std::path::Path) -> Result<()> {
 /// its [`Metadata::checksum`].
 #[tracing::instrument(level = "debug", skip_all, fields(size = content.len()))]
 fn checksum(content: &[u8]) -> String {
-    Sha256::digest(content)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::tools::hex::encode(&Sha256::digest(content))
 }
 
 /// Builds the [`Metadata`] of a freshly uploaded PDF `content`, originally

@@ -54,6 +54,9 @@ macro_rules! for_each_error_code {
             /// Another instance of this client is already running on the
             /// same local data directory: only one may use it at a time.
             ClientAlreadyRunning = 1012,
+            /// The models directory a `Client` was configured with is
+            /// inside its own client directory, which logout empties.
+            InvalidModelsDirectory = 1013,
             /// Encrypting or decrypting data failed.
             Encryption = 1101,
             /// The OS credential store (Keychain, Secret Service, ...) failed.
@@ -62,7 +65,8 @@ macro_rules! for_each_error_code {
             /// account's secrets weren't allowed to fall back to the local
             /// database (see `UsersService::create`'s `allow_insecure_storage`).
             SecureStorageUnavailable = 1103,
-            /// An on-device model's files couldn't be downloaded.
+            /// An on-device model's files couldn't be downloaded, for a
+            /// reason worth retrying later (network, timeout, server error).
             ModelDownloadFailed = 1201,
             /// A downloaded model file didn't match its pinned size or
             /// SHA-256 checksum, so it was discarded.
@@ -70,6 +74,10 @@ macro_rules! for_each_error_code {
             /// An on-device model couldn't be loaded: its file is unusable,
             /// or the ONNX Runtime library is missing or incompatible.
             ModelLoadFailed = 1203,
+            /// An on-device model's files are no longer served where this
+            /// version of the SDK expects them: retrying won't help, only
+            /// an update will.
+            ModelUnavailable = 1204,
             /// The configured server URL is malformed.
             InvalidServerUrl = 2001,
             /// No connection could be established with the server.
@@ -250,6 +258,11 @@ pub(crate) enum ErrorKind {
     InvalidClientName(String),
     #[error("another instance of this client already holds the lock {0:?}")]
     ClientAlreadyRunning(std::path::PathBuf),
+    #[error("the models directory {models:?} is inside the client directory {client:?}")]
+    InvalidModelsDirectory {
+        models: std::path::PathBuf,
+        client: std::path::PathBuf,
+    },
     #[error("invalid uuid: {0}")]
     InvalidUuid(#[from] uuid::Error),
     #[error("invalid integer: {0}")]
@@ -361,6 +374,7 @@ impl ErrorKind {
             ErrorKind::InvalidEndpoint(_) => ErrorCode::InvalidServerUrl,
             ErrorKind::InvalidClientName(_) => ErrorCode::InvalidClientName,
             ErrorKind::ClientAlreadyRunning(_) => ErrorCode::ClientAlreadyRunning,
+            ErrorKind::InvalidModelsDirectory { .. } => ErrorCode::InvalidModelsDirectory,
             ErrorKind::InvalidUuid(_) => ErrorCode::InvalidUuid,
             ErrorKind::InvalidInteger(_) => ErrorCode::InvalidInteger,
             ErrorKind::Io(_) => ErrorCode::Io,
@@ -400,9 +414,12 @@ impl ErrorKind {
             ErrorKind::Browser(_) => ErrorCode::BrowserFailed,
             ErrorKind::ScriptLimitExceeded(_) => ErrorCode::ScriptLimitExceeded,
             ErrorKind::ScraperRunStopped => ErrorCode::ScraperRunStopped,
-            ErrorKind::ModelDownload(_) | ErrorKind::ModelDownloadStatus(_) => {
-                ErrorCode::ModelDownloadFailed
-            }
+            ErrorKind::ModelDownload(_) => ErrorCode::ModelDownloadFailed,
+            // Timeouts, rate limiting and server errors are transient; anything else
+            // (a 404 once upstream removed the pinned revision, a 403...)
+            // won't change by retrying the same URL.
+            ErrorKind::ModelDownloadStatus(408 | 429 | 500..=599) => ErrorCode::ModelDownloadFailed,
+            ErrorKind::ModelDownloadStatus(_) => ErrorCode::ModelUnavailable,
             ErrorKind::ModelCorrupted(_) => ErrorCode::ModelCorrupted,
             ErrorKind::Onnx(_) | ErrorKind::Tokenizer(_) => ErrorCode::ModelLoadFailed,
             #[cfg(ort_load_dynamic)]
@@ -694,6 +711,22 @@ mod tests {
         assert_eq!(unavailable.code(), ErrorCode::ServerUnavailable);
         assert_eq!(unauthenticated.code(), ErrorCode::Unauthenticated);
         assert_eq!(already_exists.code(), ErrorCode::AlreadyExists);
+    }
+
+    #[test]
+    fn model_download_statuses_split_transient_from_permanent() {
+        let code = |status| Error::from(ErrorKind::ModelDownloadStatus(status)).code();
+
+        for transient in [408, 429, 500, 502, 503, 504, 599] {
+            assert_eq!(
+                code(transient),
+                ErrorCode::ModelDownloadFailed,
+                "{transient}"
+            );
+        }
+        for permanent in [400, 401, 403, 404, 410, 451, 499, 600] {
+            assert_eq!(code(permanent), ErrorCode::ModelUnavailable, "{permanent}");
+        }
     }
 
     #[test]

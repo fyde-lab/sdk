@@ -76,6 +76,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "Fyde is already running on this device. Close the other window first.",
             "Fyde est déjà ouvert sur cet appareil. Fermez d'abord l'autre fenêtre.",
         ),
+        ErrorCode::InvalidModelsDirectory => (
+            "The application is misconfigured: its models folder is inside its data folder.",
+            "L'application est mal configurée : son dossier de modèles est dans son dossier de données.",
+        ),
         ErrorCode::Encryption => (
             "Your data couldn't be encrypted or decrypted.",
             "Vos données n'ont pas pu être chiffrées ou déchiffrées.",
@@ -99,6 +103,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
         ErrorCode::ModelLoadFailed => (
             "Document analysis isn't available on this device.",
             "L'analyse des documents n'est pas disponible sur cet appareil.",
+        ),
+        ErrorCode::ModelUnavailable => (
+            "The files document analysis needs can no longer be downloaded. Update the application.",
+            "Les fichiers nécessaires à l'analyse des documents ne peuvent plus être téléchargés. Mettez l'application à jour.",
         ),
         ErrorCode::InvalidServerUrl => (
             "The server address is invalid.",
