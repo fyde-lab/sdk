@@ -438,6 +438,14 @@ impl<
             crypto::encrypt_event(&*self.secrets, event_type, subject_id, content, metadata)
                 .await
                 .context("failed to encrypt changelog event")?;
+        if encrypted_content.len() > super::MAX_EVENT_BYTES {
+            return Err(ErrorKind::DocumentTooLarge {
+                what: format!("the encrypted {event_type:?} event for {subject_id}"),
+                size: encrypted_content.len(),
+                max: super::MAX_EVENT_BYTES,
+            }
+            .into());
+        }
 
         self.grpc
             .record_event(encrypted_content)
@@ -1652,5 +1660,31 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+    #[tokio::test]
+    async fn send_refuses_an_event_larger_than_the_server_accepts() {
+        // No `expect_record_event()`: the mock panics if it reaches the
+        // transport layer.
+        let client = ChangelogClient::new(
+            MockFydeClient::new(),
+            MockStorage::new(),
+            MockScriptStorage::new(),
+            MockSessionStorage::new(),
+            MockCursorStorage::new(),
+            reachable_server_state(),
+            fake_secrets(),
+        );
+
+        let err = client
+            .send(
+                EventType::SaveDocument,
+                Uuid::now_v7(),
+                Some(&vec![0; super::super::MAX_EVENT_BYTES]),
+                Some(&FakeMetadata::new().build()),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::DocumentTooLarge);
     }
 }

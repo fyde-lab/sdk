@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::{ErrorContext as _, ErrorKind, Result};
 
-use crate::domains::changelog::{ChangelogEvent, EventType, Service as ChangelogService};
+use crate::domains::changelog::{
+    ChangelogEvent, EventType, MAX_EVENT_BYTES, Service as ChangelogService,
+};
 
 use super::attributes::{self, Service as AttributesService};
 use super::storage::{FacetField, Storage};
@@ -134,6 +136,20 @@ impl<S: Storage> Service for DocumentsClient<S> {
                 (content, name)
             }
         };
+
+        // The document is published whole in one event, so one larger than
+        // the largest event can never be saved: refused before hashing and
+        // parsing it. The event also carries the metadata (transcript
+        // included), so `changelog::Service::send` checks the encrypted
+        // event itself again.
+        if content.len() > MAX_EVENT_BYTES {
+            return Err(ErrorKind::DocumentTooLarge {
+                what: format!("document {original_name:?}"),
+                size: content.len(),
+                max: MAX_EVENT_BYTES,
+            }
+            .into());
+        }
 
         // Checked before extracting the transcript: no point paying for
         // that only to reject the document. This only
@@ -659,6 +675,30 @@ mod tests {
         let result = client.upload(UploadRequest::from_path(file.path())).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn upload_refuses_a_document_larger_than_an_event_before_reading_it() {
+        let changelog = Arc::new(RecordingChangelog::default());
+        // No `expect_find_document_by_checksum()`: the mock panics if the
+        // document gets as far as the duplicate check.
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            changelog.clone(),
+            None,
+            accepting_attributes(),
+        );
+
+        let err = client
+            .upload(UploadRequest::from_raw(
+                "huge.pdf".to_string(),
+                vec![0; MAX_EVENT_BYTES + 1],
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::DocumentTooLarge);
+        assert!(changelog.sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

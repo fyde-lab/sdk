@@ -221,6 +221,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "One of the document's attributes is not valid.",
             "L'un des attributs du document n'est pas valide.",
         ),
+        ErrorCode::DocumentTooLarge => (
+            "This document is too large to be saved.",
+            "Ce document est trop volumineux pour être enregistré.",
+        ),
         ErrorCode::InvalidSearchQuery => (
             "This search isn't valid.",
             "Cette recherche n'est pas valide.",

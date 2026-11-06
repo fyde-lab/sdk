@@ -160,6 +160,9 @@ macro_rules! for_each_error_code {
             /// doesn't match its type, or an invalid name; or a document
             /// has too many of them.
             InvalidAttribute = 4013,
+            /// A document is too large to be saved: its encrypted event
+            /// wouldn't fit in the largest message the server accepts.
+            DocumentTooLarge = 4014,
             /// No such script.
             ScriptNotFound = 5001,
             /// A script was run without one of its required parameters.
@@ -306,6 +309,12 @@ pub(crate) enum ErrorKind {
     MismatchedSubcategory(String),
     #[error("invalid document attribute: {0}")]
     InvalidAttribute(String),
+    #[error("{what} is {size} bytes, over the {max} byte limit")]
+    DocumentTooLarge {
+        what: String,
+        size: usize,
+        max: usize,
+    },
     #[error("invalid search query: {0}")]
     InvalidSearchQuery(String),
     #[error("invalid script type: {0:?}")]
@@ -395,6 +404,7 @@ impl ErrorKind {
             ErrorKind::InvalidDocumentType(_) => ErrorCode::InvalidDocumentType,
             ErrorKind::MismatchedSubcategory(_) => ErrorCode::MismatchedSubcategory,
             ErrorKind::InvalidAttribute(_) => ErrorCode::InvalidAttribute,
+            ErrorKind::DocumentTooLarge { .. } => ErrorCode::DocumentTooLarge,
             ErrorKind::InvalidSearchQuery(_) => ErrorCode::InvalidSearchQuery,
             ErrorKind::InvalidScriptType(_) => ErrorCode::InvalidScriptType,
             ErrorKind::InvalidProgressStep(_) => ErrorCode::ScriptFailed,
