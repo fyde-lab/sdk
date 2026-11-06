@@ -344,6 +344,11 @@ pub(crate) enum ErrorKind {
     ModelCorrupted(String),
     #[error("onnx runtime error: {0}")]
     Onnx(#[from] ort::Error),
+    /// Not an [`ort::Error`]: building one calls into the very runtime that
+    /// failed to load.
+    #[cfg(ort_load_dynamic)]
+    #[error("onnx runtime library error: {0}")]
+    OnnxRuntimeLoad(#[source] ort::LoadDynamicError),
     #[error("tokenizer error: {0}")]
     Tokenizer(#[source] tokenizers::Error),
 }
@@ -400,6 +405,8 @@ impl ErrorKind {
             }
             ErrorKind::ModelCorrupted(_) => ErrorCode::ModelCorrupted,
             ErrorKind::Onnx(_) | ErrorKind::Tokenizer(_) => ErrorCode::ModelLoadFailed,
+            #[cfg(ort_load_dynamic)]
+            ErrorKind::OnnxRuntimeLoad(_) => ErrorCode::ModelLoadFailed,
         }
     }
 }

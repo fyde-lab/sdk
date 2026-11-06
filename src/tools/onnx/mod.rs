@@ -46,7 +46,7 @@ fn load_runtime() -> Result<()> {
 
     // `false` when an earlier call already committed the environment.
     let _committed = ort::init_from(&path)
-        .map_err(|err| ErrorKind::Onnx(ort::Error::new(err.to_string())))
+        .map_err(ErrorKind::OnnxRuntimeLoad)
         .with_context(|| format!("failed to load the ONNX Runtime library {}", path.display()))?
         .commit();
 
