@@ -10,8 +10,8 @@ use crate::{ErrorContext as _, Result};
 
 use super::storage::{FacetField, Storage};
 use super::{
-    Attribute, Category, Document, DocumentType, FacetCount, Metadata, SearchFilters, SearchOrder,
-    Subcategory,
+    Attribute, Category, Document, DocumentEmbeddings, DocumentType, FacetCount, Metadata,
+    SearchFilters, SearchOrder, Subcategory,
 };
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
@@ -28,7 +28,17 @@ impl SqliteStorage {
 
 #[async_trait]
 impl Storage for SqliteStorage {
-    async fn save_document(&self, document: &Document) -> Result<()> {
+    async fn save_document(
+        &self,
+        document: &Document,
+        embeddings: &DocumentEmbeddings,
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .with_context(|| format!("failed to start saving document {}", document.id))?;
+
         sqlx::query(
             "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, attributes)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -47,11 +57,15 @@ impl Storage for SqliteStorage {
             document.metadata.subcategory,
         ))
         .bind(attributes_to_column(&document.metadata.attributes)?)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .with_context(|| format!("failed to save document {} to local database", document.id))?;
 
-        Ok(())
+        insert_embeddings(&mut tx, document.id, embeddings).await?;
+
+        tx.commit()
+            .await
+            .with_context(|| format!("failed to commit saving document {}", document.id))
     }
 
     async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
@@ -231,7 +245,30 @@ impl Storage for SqliteStorage {
         Ok(earliest.zip(latest))
     }
 
-    async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()> {
+    async fn get_metadata(&self, id: Uuid) -> Result<Option<Metadata>> {
+        let row = sqlx::query(
+            "SELECT id, name, original_name, content_type, length(content) AS size, checksum, created_at, transcript, type, category, subcategory, attributes FROM documents WHERE id = ?1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("failed to fetch document {id} metadata from local database"))?;
+
+        row.as_ref().map(metadata_from_row).transpose()
+    }
+
+    async fn update_metadata(
+        &self,
+        id: Uuid,
+        metadata: &Metadata,
+        embeddings: Option<DocumentEmbeddings>,
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .with_context(|| format!("failed to start updating document {id} metadata"))?;
+
         sqlx::query(
             "UPDATE documents
              SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6, type = ?7, category = ?8, subcategory = ?9, attributes = ?10
@@ -250,12 +287,67 @@ impl Storage for SqliteStorage {
         ))
         .bind(attributes_to_column(&metadata.attributes)?)
         .bind(id.to_string())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .with_context(|| format!("failed to update document {id} metadata in local database"))?;
 
-        Ok(())
+        if let Some(embeddings) = embeddings {
+            sqlx::query("DELETE FROM document_embeddings WHERE document_id = ?1")
+                .bind(id.to_string())
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("failed to delete document {id}'s previous embeddings"))?;
+            insert_embeddings(&mut tx, id, &embeddings).await?;
+        }
+
+        tx.commit()
+            .await
+            .with_context(|| format!("failed to commit updating document {id} metadata"))
     }
+}
+
+/// Inserts `embeddings` as the embeddings of the document `id`, chunks
+/// numbered in order.
+async fn insert_embeddings(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    id: Uuid,
+    embeddings: &DocumentEmbeddings,
+) -> Result<()> {
+    for (chunk, embedding) in embeddings.chunks.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO document_embeddings (document_id, chunk, start, \"end\", model, vector)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(id.to_string())
+        .bind(chunk as i64)
+        .bind(embedding.range.start as i64)
+        .bind(embedding.range.end as i64)
+        .bind(&embeddings.model)
+        .bind(vector_to_column(&embedding.vector))
+        .execute(&mut **tx)
+        .await
+        .with_context(|| format!("failed to save embedding {chunk} of document {id}"))?;
+    }
+
+    Ok(())
+}
+
+/// A vector as its `vector` column: each value as a little-endian f32.
+fn vector_to_column(vector: &[f32]) -> Vec<u8> {
+    vector
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+#[cfg(test)]
+fn vector_from_column(column: &[u8]) -> Vec<f32> {
+    column
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
+        .collect()
 }
 
 /// The `category` column has no NULL state (`NOT NULL DEFAULT ''`),
@@ -437,7 +529,8 @@ fn push_matching(query: &mut QueryBuilder<Sqlite>, terms: &[String], filters: &S
 mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use super::super::{FakeDocument, FakeMetadata};
+    use super::super::models::{FakeChunkEmbedding, FakeDocumentEmbeddings};
+    use super::super::{ChunkEmbedding, FakeDocument, FakeMetadata};
     use super::*;
 
     async fn setup() -> SqliteStorage {
@@ -454,13 +547,267 @@ mod tests {
         SqliteStorage::new(pool)
     }
 
+    fn embeddings() -> DocumentEmbeddings {
+        FakeDocumentEmbeddings::new().build()
+    }
+
+    /// The embeddings stored for the document `id`, in chunk order, each
+    /// with the model stored beside it.
+    async fn stored_embeddings(storage: &SqliteStorage, id: Uuid) -> Vec<(String, ChunkEmbedding)> {
+        let rows: Vec<(i64, i64, i64, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT chunk, start, \"end\", model, vector FROM document_embeddings
+             WHERE document_id = ?1 ORDER BY chunk",
+        )
+        .bind(id.to_string())
+        .fetch_all(&storage.pool)
+        .await
+        .unwrap();
+
+        rows.into_iter()
+            .enumerate()
+            .map(|(i, (chunk, start, end, model, vector))| {
+                assert_eq!(chunk, i as i64, "chunks are numbered in order from 0");
+                let chunk = FakeChunkEmbedding::new()
+                    .with_range(start as usize..end as usize)
+                    .with_vector(vector_from_column(&vector))
+                    .build();
+                (model, chunk)
+            })
+            .collect()
+    }
+
+    fn with_model(embeddings: &DocumentEmbeddings) -> Vec<(String, ChunkEmbedding)> {
+        embeddings
+            .chunks
+            .iter()
+            .map(|chunk| (embeddings.model.clone(), chunk.clone()))
+            .collect()
+    }
+
+    /// Makes every insert into `document_embeddings` fail.
+    async fn fail_embedding_inserts(storage: &SqliteStorage) {
+        sqlx::query(
+            "CREATE TRIGGER fail_embedding_inserts BEFORE INSERT ON document_embeddings
+             BEGIN SELECT RAISE(ABORT, 'embedding insert refused'); END",
+        )
+        .execute(&storage.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn save_document_saves_its_embeddings_with_it() {
+        let storage = setup().await;
+        let document = FakeDocument::new().build();
+        let embeddings = FakeDocumentEmbeddings::new()
+            .with_chunks(vec![
+                FakeChunkEmbedding::new().with_range(0..120).build(),
+                FakeChunkEmbedding::new().with_range(122..980).build(),
+            ])
+            .build();
+
+        storage.save_document(&document, &embeddings).await.unwrap();
+
+        assert!(storage.get_document(document.id).await.unwrap().is_some());
+        assert_eq!(
+            stored_embeddings(&storage, document.id).await,
+            with_model(&embeddings)
+        );
+    }
+
+    #[tokio::test]
+    async fn save_document_with_no_chunks_saves_the_document_alone() {
+        let storage = setup().await;
+        let document = FakeDocument::new().build();
+        let embeddings = FakeDocumentEmbeddings::new()
+            .with_chunks(Vec::new())
+            .build();
+
+        storage.save_document(&document, &embeddings).await.unwrap();
+
+        assert!(storage.get_document(document.id).await.unwrap().is_some());
+        assert!(stored_embeddings(&storage, document.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_document_saves_nothing_when_an_embedding_cant_be_saved() {
+        let storage = setup().await;
+        fail_embedding_inserts(&storage).await;
+        let document = FakeDocument::new().build();
+
+        let err = storage
+            .save_document(&document, &embeddings())
+            .await
+            .unwrap_err();
+
+        assert!(err.has_context());
+        assert_eq!(storage.get_document(document.id).await.unwrap(), None);
+        assert!(stored_embeddings(&storage, document.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn embeddings_are_deleted_with_their_document() {
+        let storage = setup().await;
+        let document = FakeDocument::new().build();
+        let other = FakeDocument::new().build();
+        let other_embeddings = embeddings();
+        storage
+            .save_document(&document, &embeddings())
+            .await
+            .unwrap();
+        storage
+            .save_document(&other, &other_embeddings)
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM documents WHERE id = ?1")
+            .bind(document.id.to_string())
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+
+        assert!(stored_embeddings(&storage, document.id).await.is_empty());
+        assert_eq!(
+            stored_embeddings(&storage, other.id).await,
+            with_model(&other_embeddings)
+        );
+    }
+
+    #[tokio::test]
+    async fn get_metadata_returns_a_saved_documents_metadata_without_its_content() {
+        let storage = setup().await;
+        let document = FakeDocument::new().with_content(b"12345".to_vec()).build();
+        storage
+            .save_document(&document, &embeddings())
+            .await
+            .unwrap();
+
+        let metadata = storage.get_metadata(document.id).await.unwrap();
+
+        let expected = Metadata {
+            size: 5,
+            ..document.metadata
+        };
+        assert_eq!(metadata, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn get_metadata_returns_none_when_missing() {
+        let storage = setup().await;
+
+        assert_eq!(storage.get_metadata(Uuid::now_v7()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn update_metadata_replaces_the_embeddings_when_given_some() {
+        let storage = setup().await;
+        let document = FakeDocument::new().build();
+        storage
+            .save_document(&document, &embeddings())
+            .await
+            .unwrap();
+        let metadata = FakeMetadata::new().with_id(document.id).build();
+        let replacement = FakeDocumentEmbeddings::new()
+            .with_chunks(vec![FakeChunkEmbedding::new().build()])
+            .build();
+
+        storage
+            .update_metadata(document.id, &metadata, Some(replacement.clone()))
+            .await
+            .unwrap();
+
+        let saved = storage.get_metadata(document.id).await.unwrap().unwrap();
+        assert_eq!(saved.name, metadata.name);
+        assert_eq!(
+            stored_embeddings(&storage, document.id).await,
+            with_model(&replacement)
+        );
+    }
+
+    #[tokio::test]
+    async fn update_metadata_can_replace_the_embeddings_with_none_at_all() {
+        let storage = setup().await;
+        let document = FakeDocument::new().build();
+        storage
+            .save_document(&document, &embeddings())
+            .await
+            .unwrap();
+        let empty = FakeDocumentEmbeddings::new()
+            .with_chunks(Vec::new())
+            .build();
+
+        storage
+            .update_metadata(document.id, &document.metadata, Some(empty))
+            .await
+            .unwrap();
+
+        assert!(stored_embeddings(&storage, document.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_metadata_keeps_the_embeddings_when_given_none() {
+        let storage = setup().await;
+        let document = FakeDocument::new().build();
+        let embeddings = embeddings();
+        storage.save_document(&document, &embeddings).await.unwrap();
+        let metadata = FakeMetadata::new().with_id(document.id).build();
+
+        storage
+            .update_metadata(document.id, &metadata, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_embeddings(&storage, document.id).await,
+            with_model(&embeddings)
+        );
+    }
+
+    #[tokio::test]
+    async fn update_metadata_changes_nothing_when_the_new_embeddings_cant_be_saved() {
+        let storage = setup().await;
+        let document = FakeDocument::new().build();
+        let embeddings = embeddings();
+        storage.save_document(&document, &embeddings).await.unwrap();
+        fail_embedding_inserts(&storage).await;
+        let metadata = FakeMetadata::new().with_id(document.id).build();
+
+        let err = storage
+            .update_metadata(document.id, &metadata, Some(self::embeddings()))
+            .await
+            .unwrap_err();
+
+        assert!(err.has_context());
+        let saved = storage.get_metadata(document.id).await.unwrap().unwrap();
+        assert_eq!(saved.name, document.metadata.name);
+        assert_eq!(
+            stored_embeddings(&storage, document.id).await,
+            with_model(&embeddings)
+        );
+    }
+
+    #[test]
+    fn vectors_are_stored_as_little_endian_f32() {
+        assert_eq!(
+            vector_to_column(&[1.0, -2.5]),
+            [0, 0, 0x80, 0x3f, 0, 0, 0x20, 0xc0]
+        );
+
+        let vector = FakeChunkEmbedding::new().build().vector;
+        assert_eq!(vector_to_column(&vector).len(), 4 * vector.len());
+        assert_eq!(vector_from_column(&vector_to_column(&vector)), vector);
+    }
+
     #[tokio::test]
     async fn find_document_by_checksum_returns_the_id_of_a_document_with_that_checksum() {
         let storage = setup().await;
         let document = FakeDocument::new()
             .with_metadata(FakeMetadata::new().with_checksum("cafebabe").build())
             .build();
-        storage.save_document(&document).await.unwrap();
+        storage
+            .save_document(&document, &embeddings())
+            .await
+            .unwrap();
 
         let found = storage.find_document_by_checksum("cafebabe").await.unwrap();
 
@@ -473,7 +820,10 @@ mod tests {
         let document = FakeDocument::new()
             .with_metadata(FakeMetadata::new().with_checksum("cafebabe").build())
             .build();
-        storage.save_document(&document).await.unwrap();
+        storage
+            .save_document(&document, &embeddings())
+            .await
+            .unwrap();
 
         let found = storage.find_document_by_checksum("deadbeef").await.unwrap();
 
@@ -495,24 +845,27 @@ mod tests {
         let id = Uuid::now_v7();
 
         storage
-            .save_document(&Document {
-                id,
-                content: b"hello".to_vec(),
-                metadata: Metadata {
+            .save_document(
+                &Document {
                     id,
-                    name: "report.pdf".to_string(),
-                    original_name: "report.pdf".to_string(),
-                    content_type: "application/pdf".to_string(),
-                    created_at: 1_700_000_000,
-                    size: 5,
-                    checksum: "deadbeef".to_string(),
-                    transcript: "hello".to_string(),
-                    r#type: None,
-                    category: None,
-                    subcategory: None,
-                    attributes: BTreeMap::new(),
+                    content: b"hello".to_vec(),
+                    metadata: Metadata {
+                        id,
+                        name: "report.pdf".to_string(),
+                        original_name: "report.pdf".to_string(),
+                        content_type: "application/pdf".to_string(),
+                        created_at: 1_700_000_000,
+                        size: 5,
+                        checksum: "deadbeef".to_string(),
+                        transcript: "hello".to_string(),
+                        r#type: None,
+                        category: None,
+                        subcategory: None,
+                        attributes: BTreeMap::new(),
+                    },
                 },
-            })
+                &embeddings(),
+            )
             .await
             .unwrap();
 
@@ -550,7 +903,10 @@ mod tests {
         let document = FakeDocument::new().with_metadata(metadata).build();
         let id = document.id;
 
-        storage.save_document(&document).await.unwrap();
+        storage
+            .save_document(&document, &embeddings())
+            .await
+            .unwrap();
         let saved = storage.get_document(id).await.unwrap().unwrap();
         assert_eq!(saved.metadata.attributes, document.metadata.attributes);
 
@@ -558,7 +914,7 @@ mod tests {
         updated
             .attributes
             .insert("paid".to_string(), Attribute::Boolean(true));
-        storage.update_metadata(id, &updated).await.unwrap();
+        storage.update_metadata(id, &updated, None).await.unwrap();
 
         let reloaded = storage.get_document(id).await.unwrap().unwrap();
         assert_eq!(reloaded.metadata.attributes, updated.attributes);
@@ -570,45 +926,51 @@ mod tests {
         let (id1, id2) = (Uuid::now_v7(), Uuid::now_v7());
 
         storage
-            .save_document(&Document {
-                id: id1,
-                content: b"one".to_vec(),
-                metadata: Metadata {
+            .save_document(
+                &Document {
                     id: id1,
-                    name: "one.txt".to_string(),
-                    original_name: "one.txt".to_string(),
-                    content_type: "text/plain".to_string(),
-                    created_at: 1_700_000_000,
-                    size: 3,
-                    checksum: "checksum-one".to_string(),
-                    transcript: String::new(),
-                    r#type: None,
-                    category: None,
-                    subcategory: None,
-                    attributes: BTreeMap::new(),
+                    content: b"one".to_vec(),
+                    metadata: Metadata {
+                        id: id1,
+                        name: "one.txt".to_string(),
+                        original_name: "one.txt".to_string(),
+                        content_type: "text/plain".to_string(),
+                        created_at: 1_700_000_000,
+                        size: 3,
+                        checksum: "checksum-one".to_string(),
+                        transcript: String::new(),
+                        r#type: None,
+                        category: None,
+                        subcategory: None,
+                        attributes: BTreeMap::new(),
+                    },
                 },
-            })
+                &embeddings(),
+            )
             .await
             .unwrap();
         storage
-            .save_document(&Document {
-                id: id2,
-                content: b"two".to_vec(),
-                metadata: Metadata {
+            .save_document(
+                &Document {
                     id: id2,
-                    name: "two.txt".to_string(),
-                    original_name: "two.txt".to_string(),
-                    content_type: "text/plain".to_string(),
-                    created_at: 1_700_000_001,
-                    size: 3,
-                    checksum: "checksum-two".to_string(),
-                    transcript: String::new(),
-                    r#type: None,
-                    category: None,
-                    subcategory: None,
-                    attributes: BTreeMap::new(),
+                    content: b"two".to_vec(),
+                    metadata: Metadata {
+                        id: id2,
+                        name: "two.txt".to_string(),
+                        original_name: "two.txt".to_string(),
+                        content_type: "text/plain".to_string(),
+                        created_at: 1_700_000_001,
+                        size: 3,
+                        checksum: "checksum-two".to_string(),
+                        transcript: String::new(),
+                        r#type: None,
+                        category: None,
+                        subcategory: None,
+                        attributes: BTreeMap::new(),
+                    },
                 },
-            })
+                &embeddings(),
+            )
             .await
             .unwrap();
 
@@ -622,24 +984,27 @@ mod tests {
         for (i, name) in names.iter().enumerate() {
             let id = Uuid::now_v7();
             storage
-                .save_document(&Document {
-                    id,
-                    content: Vec::new(),
-                    metadata: Metadata {
+                .save_document(
+                    &Document {
                         id,
-                        name: name.to_string(),
-                        original_name: name.to_string(),
-                        content_type: "text/plain".to_string(),
-                        created_at: 1_700_000_000 + i as i64,
-                        size: 0,
-                        checksum: String::new(),
-                        transcript: String::new(),
-                        r#type: None,
-                        category: None,
-                        subcategory: None,
-                        attributes: BTreeMap::new(),
+                        content: Vec::new(),
+                        metadata: Metadata {
+                            id,
+                            name: name.to_string(),
+                            original_name: name.to_string(),
+                            content_type: "text/plain".to_string(),
+                            created_at: 1_700_000_000 + i as i64,
+                            size: 0,
+                            checksum: String::new(),
+                            transcript: String::new(),
+                            r#type: None,
+                            category: None,
+                            subcategory: None,
+                            attributes: BTreeMap::new(),
+                        },
                     },
-                })
+                    &embeddings(),
+                )
                 .await
                 .unwrap();
         }
@@ -692,6 +1057,7 @@ mod tests {
                     .with_content(b"hello".to_vec())
                     .with_metadata(metadata)
                     .build(),
+                &embeddings(),
             )
             .await
             .unwrap();
@@ -711,24 +1077,27 @@ mod tests {
         let storage = setup().await;
         let id = Uuid::now_v7();
         storage
-            .save_document(&Document {
-                id,
-                content: b"hello".to_vec(),
-                metadata: Metadata {
+            .save_document(
+                &Document {
                     id,
-                    name: "old.pdf".to_string(),
-                    original_name: "old.pdf".to_string(),
-                    content_type: "application/pdf".to_string(),
-                    created_at: 1_700_000_000,
-                    size: 5,
-                    checksum: "deadbeef".to_string(),
-                    transcript: "hello".to_string(),
-                    r#type: None,
-                    category: None,
-                    subcategory: None,
-                    attributes: BTreeMap::new(),
+                    content: b"hello".to_vec(),
+                    metadata: Metadata {
+                        id,
+                        name: "old.pdf".to_string(),
+                        original_name: "old.pdf".to_string(),
+                        content_type: "application/pdf".to_string(),
+                        created_at: 1_700_000_000,
+                        size: 5,
+                        checksum: "deadbeef".to_string(),
+                        transcript: "hello".to_string(),
+                        r#type: None,
+                        category: None,
+                        subcategory: None,
+                        attributes: BTreeMap::new(),
+                    },
                 },
-            })
+                &embeddings(),
+            )
             .await
             .unwrap();
 
@@ -749,6 +1118,7 @@ mod tests {
                     subcategory: None,
                     attributes: BTreeMap::new(),
                 },
+                None,
             )
             .await
             .unwrap();
@@ -779,6 +1149,7 @@ mod tests {
                     subcategory: None,
                     attributes: BTreeMap::new(),
                 },
+                None,
             )
             .await;
 
@@ -809,6 +1180,7 @@ mod tests {
                     .with_id(metadata.id)
                     .with_metadata(metadata)
                     .build(),
+                &embeddings(),
             )
             .await
             .unwrap();
@@ -1147,6 +1519,7 @@ mod tests {
                     .with_id(id)
                     .with_metadata(metadata.clone())
                     .build(),
+                &embeddings(),
             )
             .await
             .unwrap();
@@ -1158,6 +1531,7 @@ mod tests {
                     name: "after".to_string(),
                     ..metadata
                 },
+                None,
             )
             .await
             .unwrap();

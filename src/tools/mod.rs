@@ -6,21 +6,7 @@
 pub(crate) mod client_dir;
 pub(crate) mod hex;
 pub(crate) mod log;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "foundation for the on-device document analysis to come"
-    )
-)]
 pub(crate) mod models;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "foundation for the on-device document analysis to come"
-    )
-)]
 pub(crate) mod onnx;
 pub(crate) mod sandbox;
 pub(crate) mod sql;

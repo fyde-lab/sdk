@@ -1,5 +1,7 @@
 pub(crate) mod attributes;
+mod chunk;
 mod dev;
+mod embedder;
 mod models;
 mod service;
 mod storage;
@@ -19,6 +21,7 @@ pub use models::{
     Category, Document, DocumentType, FacetCount, Metadata, SearchFacets, SearchFilters,
     SearchOrder, SearchQuery, Subcategory, UploadRequest, UploadSource,
 };
+pub(crate) use models::{ChunkEmbedding, DocumentEmbeddings};
 #[cfg(any(test, feature = "testing"))]
 pub use models::{FakeDocument, FakeMetadata};
 #[cfg(test)]
@@ -34,8 +37,9 @@ use mockall::automock;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use crate::Result;
 use crate::domains::changelog;
+use crate::tools::models::ModelStore;
+use crate::{ErrorCode, Result};
 
 /// Uploads documents by publishing them as encrypted changelog events, and
 /// reads back documents materialized locally from consumed events (see
@@ -111,10 +115,13 @@ pub trait Service: Send + Sync {
     /// history, then continuing with the live tail). Resumes from the
     /// cursor persisted locally by a previous call, or from the beginning
     /// of the changelog if it's never been consumed before. For each
-    /// "created"/"update metadata" event, updates local storage before
-    /// invoking the `on_document_change` callback configured on the client
-    /// (see [`crate::ClientConfig`]), so it's already visible via
-    /// [`Self::get`]/[`Self::list`] by the time that callback runs.
+    /// "created"/"update metadata" event, updates local storage, indexing
+    /// the document's text along the way (about a second per document on a
+    /// desktop CPU), before invoking the `on_document_change` callback
+    /// configured on the client (see [`crate::ClientConfig`]), so it's
+    /// already visible via [`Self::get`]/[`Self::list`] by the time that
+    /// callback runs. Until the indexing model can be fetched, syncing
+    /// waits (see [`Self::indexing_model_error`]).
     /// [`crate::domains::users::Service::create`]/`login` call this
     /// automatically once a session is open; most callers never need to
     /// call it directly.
@@ -138,19 +145,61 @@ pub trait Service: Send + Sync {
     /// `stop_consume_job` — see [`Self::start_sync`]'s own doc comment for
     /// why that's the only way to reach it.
     fn stop_sync(&self);
+
+    /// Why documents can't be indexed right now, if they can't: the model
+    /// indexing needs couldn't be fetched or loaded (e.g.
+    /// [`ErrorCode::ModelDownloadFailed`] while offline). Syncing is paused
+    /// meanwhile, since a document is never cached without being indexed,
+    /// and resumes by itself once the model is available, which clears
+    /// this. A UI can poll it to tell the user why new documents don't
+    /// show up.
+    fn indexing_model_error(&self) -> Option<ErrorCode>;
+}
+
+/// Caches the documents consumed changelog events carry, each with the
+/// embeddings of its text (title included), written together: a document
+/// is never cached without being indexed.
+#[cfg_attr(test, automock)]
+#[async_trait]
+pub(crate) trait Indexer: Send + Sync {
+    /// Fetches and loads the indexing model, unless that's already done,
+    /// failing if it can't (see [`Service::indexing_model_error`]).
+    async fn prepare(&self) -> Result<()>;
+
+    /// Caches `document`, unencrypted, with the embeddings of its text.
+    async fn save_document(&self, document: &Document) -> Result<()>;
+
+    /// Replaces the metadata of the cached document `id`, and its
+    /// embeddings too if that changes the text they embed. Does nothing if
+    /// no document `id` is cached.
+    async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()>;
+
+    /// Why the last [`Self::prepare`] failed, if it did.
+    fn model_error(&self) -> Option<ErrorCode>;
+}
+
+/// Initializes the [`Indexer`] the changelog consumer caches documents
+/// through, into the database behind `pool`, embedding them with the
+/// on-device model `models` holds (fetched on the first [`Indexer::prepare`]).
+pub(crate) fn init_indexer(pool: SqlitePool, models: Arc<ModelStore>) -> Arc<dyn Indexer> {
+    Arc::new(service::DocumentIndexer::new(
+        storage_sqlite::SqliteStorage::new(pool),
+        embedder::OnnxEmbedder::new(models),
+    ))
 }
 
 /// Initializes the documents service: publishes new documents through the
 /// shared `changelog` service (which also materializes consumed events
-/// into the local `documents` table — see `changelog::init`), wires up
-/// local SQLite-backed reads (via `pool`) of the documents it cached,
-/// and calls `on_document_change` (see
+/// into the local `documents` table through `indexer` — see
+/// `changelog::init`), wires up local SQLite-backed reads (via `pool`) of
+/// the documents it cached, and calls `on_document_change` (see
 /// [`crate::ClientConfig`]) for every event [`Service::start_sync`]
 /// consumes.
 pub(crate) fn init(
     pool: SqlitePool,
     changelog: Arc<dyn changelog::Service>,
     attributes: Arc<dyn AttributesService>,
+    indexer: Arc<dyn Indexer>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Arc<dyn Service> {
     let storage = storage_sqlite::SqliteStorage::new(pool);
@@ -160,6 +209,7 @@ pub(crate) fn init(
         changelog,
         on_document_change,
         attributes,
+        indexer,
     ))
 }
 

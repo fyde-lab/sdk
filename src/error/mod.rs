@@ -364,6 +364,9 @@ pub(crate) enum ErrorKind {
     ModelDownloadStatus(u16),
     #[error("corrupted model file: {0}")]
     ModelCorrupted(String),
+    /// A model whose inputs or outputs aren't the ones its caller expects.
+    #[error("unexpected model behaviour: {0}")]
+    InvalidModel(String),
     #[error("onnx runtime error: {0}")]
     Onnx(#[from] ort::Error),
     /// Not an [`ort::Error`]: building one calls into the very runtime that
@@ -431,7 +434,9 @@ impl ErrorKind {
             ErrorKind::ModelDownloadStatus(408 | 429 | 500..=599) => ErrorCode::ModelDownloadFailed,
             ErrorKind::ModelDownloadStatus(_) => ErrorCode::ModelUnavailable,
             ErrorKind::ModelCorrupted(_) => ErrorCode::ModelCorrupted,
-            ErrorKind::Onnx(_) | ErrorKind::Tokenizer(_) => ErrorCode::ModelLoadFailed,
+            ErrorKind::Onnx(_) | ErrorKind::Tokenizer(_) | ErrorKind::InvalidModel(_) => {
+                ErrorCode::ModelLoadFailed
+            }
             #[cfg(ort_load_dynamic)]
             ErrorKind::OnnxRuntimeLoad(_) => ErrorCode::ModelLoadFailed,
         }
