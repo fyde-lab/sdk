@@ -367,7 +367,9 @@ pub trait Service: Send + Sync {
     /// under [`USERNAME_SETTING`] (needed to verify `old_password`; the
     /// session itself is what authenticates the change server-side — see
     /// below), failing with [`crate::ErrorCode::UsernameUnknown`] if none is
-    /// cached (a session opened before the SDK cached it). Verifies `old_password` the same way `login` verifies a
+    /// cached (a session opened before the SDK cached it).
+    ///
+    /// Verifies `old_password` the same way `login` verifies a
     /// password: the local half of an OPAQUE login exchange, which fails
     /// with [`crate::ErrorCode::InvalidCredentials`] on a mismatch without ever
     /// calling the server's `FinishLogin` (so, unlike a real `login()`
