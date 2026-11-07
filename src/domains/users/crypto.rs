@@ -13,6 +13,7 @@ use opaque_ke::{
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sha2_opaque::Digest as _;
 
 use crate::{ErrorContext as _, ErrorKind, Result};
 
@@ -212,6 +213,21 @@ impl OpaqueClient for DefaultOpaqueClient {
             result.export_key.to_vec(),
         ))
     }
+}
+
+/// A well-formed OPAQUE `CredentialFinalization` (a random key-confirmation
+/// MAC of the key-exchange hash's length) that can never verify, for the
+/// SDK to close a login exchange it won't finish for real — because the
+/// password failed locally ([`OpaqueClient::finish_login`]), or because
+/// only the password check was wanted (`change_password`). `FinishLogin`
+/// consumes its `login_id` whatever the outcome, so sending this rejects it
+/// with UNAUTHENTICATED and frees the server's pending exchange instead of
+/// leaving it behind. Random rather than all zeros so it can't be told apart
+/// from a real wrong-password attempt on the wire.
+pub(super) fn abandoned_login_finalization() -> Vec<u8> {
+    let mut mac = vec![0u8; sha2_opaque::Sha512::output_size()];
+    rand::rng().fill_bytes(&mut mac);
+    mac
 }
 
 /// Produces a placeholder [`RegistrationState`]/[`LoginState`] for tests
@@ -427,6 +443,15 @@ pub(super) fn unwrap_master_key_for_recovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abandoned_login_finalization_is_a_well_formed_fresh_finalization() {
+        let first = abandoned_login_finalization();
+        let second = abandoned_login_finalization();
+
+        opaque_ke::CredentialFinalization::<FydeCipherSuite>::deserialize(&first).unwrap();
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn generate_recovery_key_produces_24_fresh_valid_words() {

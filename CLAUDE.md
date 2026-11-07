@@ -156,7 +156,9 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   `FydeCipherSuite` (ristretto255 + 3DH/SHA-512 + Argon2id 64 MiB/3 iters/4 lanes) must match
   `../server`'s. `crypto.rs`'s `OpaqueClient` trait exists so service tests skip real KSF cost.
   The master-key wrapping key is HKDF'd from the OPAQUE export key. A wrong password usually
-  fails locally (`InvalidCredentials`). One account per local database (`AlreadyLoggedIn`).
+  fails locally (`InvalidCredentials`); the SDK then still closes the server's pending exchange
+  (`login_id`, single-use) with a decoy finalization that can't verify (`abandon_login`), as
+  `change_password` always does after checking the old password, so none is left behind. One account per local database (`AlreadyLoggedIn`).
   `create`/`login`/`recover_account` cache the username (`USERNAME_SETTING`) and role locally;
   `login` persists the session token last. `login` returns `LoginOutcome::LoggedIn` or
   `SessionLimitReached { sessions, .. }`; the caller re-runs the whole login with
