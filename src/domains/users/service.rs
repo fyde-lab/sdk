@@ -13,9 +13,9 @@ use crate::tools::sql::LocalDatabase;
 use crate::{Error, ErrorCode, ErrorContext as _, ErrorKind, Result};
 
 use super::crypto::{
-    DefaultOpaqueClient, OpaqueClient, derive_recovery_keys, generate_and_wrap_master_key,
-    generate_recovery_key, unwrap_master_key, unwrap_master_key_for_recovery, wrap_master_key,
-    wrap_master_key_for_recovery,
+    DefaultOpaqueClient, OpaqueClient, abandoned_login_finalization, derive_recovery_keys,
+    generate_and_wrap_master_key, generate_recovery_key, unwrap_master_key,
+    unwrap_master_key_for_recovery, wrap_master_key, wrap_master_key_for_recovery,
 };
 use super::grpc_client::{FinishedLogin, FydeClient, GrpcClient};
 use super::{
@@ -68,6 +68,15 @@ fn recovery_key_rejected(err: Error) -> Error {
 /// unreachable server must not leave `logout` (and the account's keys on
 /// this device) hanging on a TCP connect timeout.
 const SERVER_LOGOUT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long closing an abandoned login exchange (see
+/// [`UsersClient::abandon_login`]) may hold up the call that abandoned it.
+const ABANDON_LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The device name sent with the decoy `FinishLogin` that closes
+/// `change_password`'s verification exchange: it never opens a session, but
+/// the field is required.
+const PASSWORD_CHECK_DEVICE_NAME: &str = "password check";
 
 /// The device's preferred interface language as a short code (e.g. "en",
 /// "fr"), read from the `LC_ALL`/`LC_MESSAGES`/`LANG` environment variables
@@ -192,6 +201,28 @@ impl UsersClient {
     /// local cache isn't partitioned per account, so opening a second
     /// account's session on top of the first would hand it the first
     /// account's cached documents, changelog cursor and scraper cookies.
+    /// Closes the server's pending exchange for `login_id`, which this
+    /// client won't finish for real, by sending it a finalization that can
+    /// never verify ([`abandoned_login_finalization`]): `login_id` is
+    /// single-use, so the server rejects it and forgets the exchange rather
+    /// than keep it in its pending logins. Best effort, bounded by
+    /// [`ABANDON_LOGIN_TIMEOUT`], and never fails: the caller's own outcome
+    /// (usually `InvalidCredentials`) is what matters.
+    async fn abandon_login(&self, login_id: &str, device_name: &str) {
+        let upload = abandoned_login_finalization();
+        let finish = self.grpc.finish_login(login_id, &upload, device_name, None);
+        match tokio::time::timeout(ABANDON_LOGIN_TIMEOUT, finish).await {
+            // The expected outcome: UNAUTHENTICATED.
+            Ok(Err(_)) => {}
+            Ok(Ok(_)) => {
+                tracing::warn!("the server accepted an abandoned login's decoy finalization")
+            }
+            Err(_) => tracing::warn!(
+                "closing an abandoned login timed out after {ABANDON_LOGIN_TIMEOUT:?}"
+            ),
+        }
+    }
+
     async fn ensure_no_open_session(&self) -> Result<()> {
         if self.sessions.is_connected().await? {
             return Err(ErrorKind::AlreadyLoggedIn.into());
@@ -348,10 +379,16 @@ impl Service for UsersClient {
             .await
             .context("failed to start login")?;
 
-        let (opaque_upload, export_key) = self
-            .opaque
-            .finish_login(state, password, &opaque_response)
-            .context("failed to finish OPAQUE login")?;
+        // A wrong password usually fails right here, before `FinishLogin`:
+        // close the server's side of the exchange before reporting it.
+        let (opaque_upload, export_key) =
+            match self.opaque.finish_login(state, password, &opaque_response) {
+                Ok(finished) => finished,
+                Err(err) => {
+                    self.abandon_login(&login_id, device_name).await;
+                    return Err(err).context("failed to finish OPAQUE login");
+                }
+            };
 
         let (token, encrypted_master_key, role) = match self
             .grpc
@@ -424,8 +461,9 @@ impl Service for UsersClient {
         // Verifying `old_password` only needs the local half of an OPAQUE
         // login exchange: `finish_login` fails with
         // `ErrorKind::InvalidCredentials` if it can't open the account's
-        // envelope, without a round trip to the server's `FinishLogin` —
-        // so this never opens a session, unlike a real `login()` call. The
+        // envelope, so the real finalization never goes to the server's
+        // `FinishLogin` and this never opens a session, unlike a real
+        // `login()` call (only a decoy closing the exchange does). The
         // resulting export key isn't needed for anything else: the master
         // key is read back raw from the credential store below, not
         // decrypted from a wrapped form that would need it.
@@ -433,14 +471,19 @@ impl Service for UsersClient {
             .opaque
             .start_login(old_password)
             .context("failed to start OPAQUE login")?;
-        let (_login_id, login_response) = self
+        let (login_id, login_response) = self
             .grpc
             .start_login(&username, &login_request)
             .await
             .context("failed to start login")?;
-        self.opaque
-            .finish_login(login_state, old_password, &login_response)
-            .context("failed to verify current password")?;
+        let verified = self
+            .opaque
+            .finish_login(login_state, old_password, &login_response);
+        // Never finished for real (that would open a session), whether or
+        // not `old_password` checked out.
+        self.abandon_login(&login_id, PASSWORD_CHECK_DEVICE_NAME)
+            .await;
+        verified.context("failed to verify current password")?;
 
         let (state, opaque_request) = self
             .opaque
@@ -776,6 +819,29 @@ mod tests {
         opaque
     }
 
+    /// Expects exactly one decoy `FinishLogin` closing the exchange
+    /// `login_id` for `device_name` ([`UsersClient::abandon_login`]),
+    /// answered the way the server answers a finalization that doesn't
+    /// verify.
+    fn expect_abandoned_login(
+        grpc: &mut MockFydeClient,
+        login_id: &'static str,
+        device_name: &'static str,
+    ) {
+        let decoy_len = abandoned_login_finalization().len();
+        grpc.expect_finish_login()
+            .withf(move |id, upload, name, replace_session_id| {
+                id == login_id
+                    && upload.len() == decoy_len
+                    && name == device_name
+                    && replace_session_id.is_none()
+            })
+            .times(1)
+            .returning(|_, _, _, _| {
+                Err(tonic::Status::unauthenticated("invalid credentials").into())
+            });
+    }
+
     /// A master key wrapped under [`LOGIN_EXPORT_KEY`], for `MockFydeClient`
     /// `finish_login` expectations to return as `encrypted_master_key` —
     /// what a real server would send back, and what `login()` must be able
@@ -1070,6 +1136,44 @@ mod tests {
             persisted_token.lock().unwrap().clone(),
             Some("a-token".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn login_closes_the_server_exchange_when_the_password_fails_locally() {
+        let mut opaque = MockOpaqueClient::new();
+        opaque
+            .expect_start_login()
+            .times(1)
+            .returning(|_| Ok((fake_login_state(), b"the-request".to_vec())));
+        opaque
+            .expect_finish_login()
+            .times(1)
+            .returning(|_, _, _| Err(ErrorKind::InvalidCredentials.into()));
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_login()
+            .times(1)
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        expect_abandoned_login(&mut mock_grpc, "a-login-id", "Pierre's iPhone");
+
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .returning(|_| Ok(None));
+        // No `expect_set()`: nothing is persisted.
+        let client = client_with_deps(mock_grpc, opaque, MockSettingsService::new(), secrets);
+
+        let err = client
+            .login("alice", "wrong password", "Pierre's iPhone", false, None)
+            .await
+            .unwrap_err();
+
+        // The decoy's UNAUTHENTICATED doesn't replace the local verdict.
+        assert_eq!(err.code(), ErrorCode::InvalidCredentials);
     }
 
     #[tokio::test]
@@ -2080,6 +2184,9 @@ mod tests {
             .withf(|username, request| username == "alice" && request == b"the-login-request")
             .times(1)
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-login-response".to_vec())));
+        // Closed with a decoy even though the old password checked out: the
+        // real finalization would open a session.
+        expect_abandoned_login(&mut mock_grpc, "a-login-id", PASSWORD_CHECK_DEVICE_NAME);
         mock_grpc
             .expect_start_change_password()
             .withf(|request| request == b"the-new-request")
@@ -2150,6 +2257,7 @@ mod tests {
             .withf(|username, _| username == "alice")
             .times(1)
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-login-response".to_vec())));
+        expect_abandoned_login(&mut mock_grpc, "a-login-id", PASSWORD_CHECK_DEVICE_NAME);
         // No `expect_start_change_password()`/`expect_finish_change_password()`
         // set up either: the mock panics if either is called.
 
@@ -2173,6 +2281,7 @@ mod tests {
             .expect_start_login()
             .times(1)
             .returning(|_, _| Ok(("a-login-id".to_string(), b"the-login-response".to_vec())));
+        expect_abandoned_login(&mut mock_grpc, "a-login-id", PASSWORD_CHECK_DEVICE_NAME);
         mock_grpc
             .expect_start_change_password()
             .times(1)
