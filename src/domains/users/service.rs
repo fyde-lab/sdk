@@ -1364,7 +1364,16 @@ mod tests {
             .times(1)
             .returning(|_| Ok(None));
         secrets.expect_set().times(2).returning(|_, _, _| Ok(()));
-        settings.expect_set().times(2).returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, _| key == ROLE_SETTING)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        settings
+            .expect_set()
+            .withf(|key, value| key == USERNAME_SETTING && value == "alice")
+            .times(1)
+            .returning(|_, _| Ok(()));
 
         let client = client_with_deps(mock_grpc, opaque, settings, secrets);
 
