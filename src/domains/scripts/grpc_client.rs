@@ -141,19 +141,23 @@ impl GrpcClient {
 #[async_trait]
 impl FydeClient for GrpcClient {
     async fn create_script(&self, draft: ScriptDraft) -> Result<Script> {
-        let request = self
-            .sessions
-            .authenticated_request(CreateScriptRequest {
-                name: draft.name,
-                icon_id: icon_id_into_proto(draft.icon_id),
-                script: draft.script,
-                description: draft.description,
-                short_description: draft.short_description,
-                allowed_domains: draft.allowed_domains,
-                r#type: draft.script_type.to_string(),
-                parameters: parameters_into_proto(draft.parameters),
-            })
-            .await?;
+        #[allow(clippy::needless_update)]
+        let message = CreateScriptRequest {
+            name: draft.name,
+            icon_id: icon_id_into_proto(draft.icon_id),
+            script: draft.script,
+            description: draft.description,
+            short_description: draft.short_description,
+            allowed_domains: draft.allowed_domains,
+            r#type: draft.script_type.to_string(),
+            parameters: parameters_into_proto(draft.parameters),
+            // Sets `is_public` to false while the BSR protos still have it
+            // (fyde-lab/server#17 removes it), so this builds against both:
+            // either way the server stores the script private. Remove it,
+            // and the allow, once the new protos are published.
+            ..Default::default()
+        };
+        let request = self.sessions.authenticated_request(message).await?;
 
         let response = self
             .sessions
@@ -186,20 +190,24 @@ impl FydeClient for GrpcClient {
     }
 
     async fn update_script(&self, id: Uuid, draft: ScriptDraft) -> Result<Script> {
-        let request = self
-            .sessions
-            .authenticated_request(UpdateScriptRequest {
-                id: id.to_string(),
-                name: draft.name,
-                icon_id: icon_id_into_proto(draft.icon_id),
-                script: draft.script,
-                description: draft.description,
-                short_description: draft.short_description,
-                allowed_domains: draft.allowed_domains,
-                r#type: draft.script_type.to_string(),
-                parameters: parameters_into_proto(draft.parameters),
-            })
-            .await?;
+        #[allow(clippy::needless_update)]
+        let message = UpdateScriptRequest {
+            id: id.to_string(),
+            name: draft.name,
+            icon_id: icon_id_into_proto(draft.icon_id),
+            script: draft.script,
+            description: draft.description,
+            short_description: draft.short_description,
+            allowed_domains: draft.allowed_domains,
+            r#type: draft.script_type.to_string(),
+            parameters: parameters_into_proto(draft.parameters),
+            // Sets `is_public` to false while the BSR protos still have it
+            // (fyde-lab/server#17 removes it), so this builds against both:
+            // either way the server stores the script private. Remove it,
+            // and the allow, once the new protos are published.
+            ..Default::default()
+        };
+        let request = self.sessions.authenticated_request(message).await?;
 
         let response = self
             .sessions
