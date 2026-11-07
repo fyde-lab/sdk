@@ -23,18 +23,19 @@ mod proto {
     tonic::include_proto!("scripts.v1");
 }
 
-/// The admin API, for [`FydeClient::set_script_visibility`] only.
+/// The admin API, for the admin-only writes: [`FydeClient::create_script`],
+/// [`FydeClient::update_script`] and [`FydeClient::set_script_visibility`].
 mod admin_proto {
     tonic::include_proto!("admin.v1");
 }
 
 use admin_proto::{
-    SetScriptVisibilityRequest, admin_service_client::AdminServiceClient as GeneratedAdminClient,
+    CreateScriptRequest, ScriptContent, SetScriptVisibilityRequest, UpdateScriptRequest,
+    admin_service_client::AdminServiceClient as GeneratedAdminClient,
 };
 use proto::{
-    CreateScriptRequest, DisableScriptRequest, EnableScriptRequest, FetchScriptRequest,
-    ListPublicScriptsRequest, ListUserScriptsRequest, UpdateScriptRequest,
-    scripts_service_client::ScriptsServiceClient as GeneratedScriptsClient,
+    DisableScriptRequest, EnableScriptRequest, FetchScriptRequest, ListPublicScriptsRequest,
+    ListUserScriptsRequest, scripts_service_client::ScriptsServiceClient as GeneratedScriptsClient,
 };
 
 /// How many scripts [`FydeClient::list_user_scripts`] and
@@ -77,15 +78,20 @@ pub(super) struct ScriptMetadataPage {
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(super) trait FydeClient: Send + Sync {
-    /// Creates a new script owned by the authenticated user, at version 1.
-    async fn create_script(&self, draft: ScriptDraft) -> Result<Script>;
+    /// Creates a new, private script owned by the authenticated user, at
+    /// version 1, through the admin API's `CreateScript`, which only an
+    /// admin may call. Returns its id: the admin API answers with a summary
+    /// only, so fetch the script for the rest.
+    async fn create_script(&self, draft: ScriptDraft) -> Result<Uuid>;
 
     /// Fetches the script matching `id`.
     async fn fetch_script(&self, id: Uuid) -> Result<Script>;
 
-    /// Updates a script owned by the authenticated user, incrementing its
-    /// version.
-    async fn update_script(&self, id: Uuid, draft: ScriptDraft) -> Result<Script>;
+    /// Replaces a script's content, whoever owns it, making it private and
+    /// incrementing its version, through the admin API's `UpdateScript`,
+    /// which only an admin may call. Like [`Self::create_script`], fetch the
+    /// script for its new state.
+    async fn update_script(&self, id: Uuid, draft: ScriptDraft) -> Result<()>;
 
     /// Enables `script_id` for the authenticated user.
     async fn enable_script(&self, script_id: Uuid) -> Result<()>;
@@ -136,39 +142,35 @@ impl GrpcClient {
     fn client(&self) -> GeneratedScriptsClient<Channel> {
         GeneratedScriptsClient::new(self.channel.clone())
     }
+
+    /// Returns a generated admin API client wrapping the shared connection.
+    fn admin_client(&self) -> GeneratedAdminClient<Channel> {
+        GeneratedAdminClient::new(self.channel.clone())
+    }
 }
 
 #[async_trait]
 impl FydeClient for GrpcClient {
-    async fn create_script(&self, draft: ScriptDraft) -> Result<Script> {
-        #[allow(clippy::needless_update)]
+    async fn create_script(&self, draft: ScriptDraft) -> Result<Uuid> {
         let message = CreateScriptRequest {
-            name: draft.name,
-            icon_id: icon_id_into_proto(draft.icon_id),
-            script: draft.script,
-            description: draft.description,
-            short_description: draft.short_description,
-            allowed_domains: draft.allowed_domains,
-            r#type: draft.script_type.to_string(),
-            parameters: parameters_into_proto(draft.parameters),
-            // Sets `is_public` to false while the BSR protos still have it
-            // (fyde-lab/server#17 removes it), so this builds against both:
-            // either way the server stores the script private. Remove it,
-            // and the allow, once the new protos are published.
-            ..Default::default()
+            content: Some(content_into_proto(draft)),
         };
         let request = self.sessions.authenticated_request(message).await?;
 
         let response = self
             .sessions
-            .check_response(self.client().create_script(request).await)
+            .check_response(self.admin_client().create_script(request).await)
             .await
             .context("failed to create script")?
             .into_inner();
 
-        into_domain(response.script.ok_or_else(|| {
+        let script = response.script.ok_or_else(|| {
             crate::ErrorKind::InvalidResponse("create script response had no script".to_string())
-        })?)
+        })?;
+        script
+            .id
+            .parse()
+            .context("failed to parse created script id returned by the server")
     }
 
     async fn fetch_script(&self, id: Uuid) -> Result<Script> {
@@ -189,36 +191,19 @@ impl FydeClient for GrpcClient {
         })?)
     }
 
-    async fn update_script(&self, id: Uuid, draft: ScriptDraft) -> Result<Script> {
-        #[allow(clippy::needless_update)]
+    async fn update_script(&self, id: Uuid, draft: ScriptDraft) -> Result<()> {
         let message = UpdateScriptRequest {
-            id: id.to_string(),
-            name: draft.name,
-            icon_id: icon_id_into_proto(draft.icon_id),
-            script: draft.script,
-            description: draft.description,
-            short_description: draft.short_description,
-            allowed_domains: draft.allowed_domains,
-            r#type: draft.script_type.to_string(),
-            parameters: parameters_into_proto(draft.parameters),
-            // Sets `is_public` to false while the BSR protos still have it
-            // (fyde-lab/server#17 removes it), so this builds against both:
-            // either way the server stores the script private. Remove it,
-            // and the allow, once the new protos are published.
-            ..Default::default()
+            script_id: id.to_string(),
+            content: Some(content_into_proto(draft)),
         };
         let request = self.sessions.authenticated_request(message).await?;
 
-        let response = self
-            .sessions
-            .check_response(self.client().update_script(request).await)
+        self.sessions
+            .check_response(self.admin_client().update_script(request).await)
             .await
-            .context("failed to update script")?
-            .into_inner();
+            .with_context(|| format!("failed to update script {id}"))?;
 
-        into_domain(response.script.ok_or_else(|| {
-            crate::ErrorKind::InvalidResponse("update script response had no script".to_string())
-        })?)
+        Ok(())
     }
 
     async fn enable_script(&self, script_id: Uuid) -> Result<()> {
@@ -282,11 +267,7 @@ impl FydeClient for GrpcClient {
             .await?;
 
         self.sessions
-            .check_response(
-                GeneratedAdminClient::new(self.channel.clone())
-                    .set_script_visibility(request)
-                    .await,
-            )
+            .check_response(self.admin_client().set_script_visibility(request).await)
             .await
             .with_context(|| format!("failed to set the visibility of script {script_id}"))?;
         Ok(())
@@ -325,10 +306,11 @@ fn parameter_type_into_domain(parameter_type: i32) -> ScriptParameterType {
 }
 
 fn parameter_type_into_proto(parameter_type: ScriptParameterType) -> i32 {
+    use admin_proto::script_parameter::Type;
     match parameter_type {
-        ScriptParameterType::String => proto::script_parameter::Type::String as i32,
-        ScriptParameterType::Number => proto::script_parameter::Type::Number as i32,
-        ScriptParameterType::Boolean => proto::script_parameter::Type::Boolean as i32,
+        ScriptParameterType::String => Type::String as i32,
+        ScriptParameterType::Number => Type::Number as i32,
+        ScriptParameterType::Boolean => Type::Boolean as i32,
     }
 }
 
@@ -354,13 +336,13 @@ fn parameters_into_domain(
 
 fn parameters_into_proto(
     parameters: HashMap<String, ScriptParameter>,
-) -> HashMap<String, proto::ScriptParameter> {
+) -> HashMap<String, admin_proto::ScriptParameter> {
     parameters
         .into_iter()
         .map(|(key, parameter)| {
             (
                 key,
-                proto::ScriptParameter {
+                admin_proto::ScriptParameter {
                     label: parameter.label,
                     placeholder: parameter.placeholder,
                     r#type: parameter_type_into_proto(parameter.parameter_type),
@@ -370,6 +352,22 @@ fn parameters_into_proto(
             )
         })
         .collect()
+}
+
+/// Converts a [`ScriptDraft`] into the admin API's `ScriptContent`, always
+/// private: only [`FydeClient::set_script_visibility`] publishes a script.
+fn content_into_proto(draft: ScriptDraft) -> ScriptContent {
+    ScriptContent {
+        name: draft.name,
+        is_public: false,
+        script: draft.script,
+        description: draft.description,
+        short_description: draft.short_description,
+        allowed_domains: draft.allowed_domains,
+        r#type: draft.script_type.to_string(),
+        parameters: parameters_into_proto(draft.parameters),
+        icon_id: icon_id_into_proto(draft.icon_id),
+    }
 }
 
 /// An optional icon id as a request carries it: empty for none.

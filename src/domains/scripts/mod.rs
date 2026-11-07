@@ -46,8 +46,9 @@ use crate::domains::sessions::SessionsClient;
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Service: Send + Sync {
-    /// Creates a new script owned by the authenticated user, at version 1.
-    /// A non-empty `icon` (an encoded image) is first saved through
+    /// Creates a new, private script owned by the authenticated user, at
+    /// version 1. Admin only: anyone else fails with
+    /// [`crate::ErrorCode::PermissionDenied`]. A non-empty `icon` (an encoded image) is first saved through
     /// [`crate::IconsService::create_icon`], and the script created with
     /// its id (see [`Script::icon_id`]); an empty one means no icon.
     #[allow(clippy::too_many_arguments)]
@@ -66,9 +67,10 @@ pub trait Service: Send + Sync {
     /// Fetches the script matching `id`.
     async fn fetch_script(&self, id: Uuid) -> Result<Script>;
 
-    /// Updates a script owned by the authenticated user, incrementing its
-    /// version. Fails if the script doesn't exist or the authenticated user
-    /// isn't its owner. `icon` is saved like [`Self::create_script`] does.
+    /// Replaces a script's content, whoever owns it, making it private
+    /// again and incrementing its version. Admin only, like
+    /// [`Self::create_script`]; fails if the script doesn't exist. `icon` is
+    /// saved like [`Self::create_script`] does.
     #[allow(clippy::too_many_arguments)]
     async fn update_script(
         &self,

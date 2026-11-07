@@ -104,7 +104,12 @@ impl<S: Storage> Service for ScriptsClient<S> {
             script_type,
             parameters,
         };
-        self.grpc.create_script(draft).await
+        let id = self.grpc.create_script(draft).await?;
+        // The admin API only answers with a summary: fetch the whole script.
+        self.grpc
+            .fetch_script(id)
+            .await
+            .with_context(|| format!("failed to fetch created script {id}"))
     }
 
     async fn fetch_script(&self, id: Uuid) -> Result<Script> {
@@ -135,7 +140,12 @@ impl<S: Storage> Service for ScriptsClient<S> {
             script_type,
             parameters,
         };
-        self.grpc.update_script(id, draft).await
+        self.grpc.update_script(id, draft).await?;
+        // Like `create_script`: the update's answer isn't the whole script.
+        self.grpc
+            .fetch_script(id)
+            .await
+            .with_context(|| format!("failed to fetch updated script {id}"))
     }
 
     async fn enable_script(&self, script_id: Uuid) -> Result<()> {
@@ -527,18 +537,33 @@ mod tests {
         }
     }
 
+    /// A gRPC mock expecting `draft` to be created, then the created script
+    /// fetched back by id and returned as `created`.
+    fn grpc_creating(draft: ScriptDraft, created: Script) -> MockFydeClient {
+        let id = created.id();
+        let mut sequence = mockall::Sequence::new();
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_create_script()
+            .withf(move |requested| *requested == draft)
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(move |_| Ok(id));
+        mock_grpc
+            .expect_fetch_script()
+            .withf(move |requested_id| *requested_id == id)
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(move |_| Ok(created.clone()));
+        mock_grpc
+    }
+
     #[tokio::test]
     async fn create_script_saves_the_icon_first_then_the_script_with_its_id() {
         let icon = FakeIcon::new().build();
         let icon_id = icon.id();
         let expected = FakeScript::new().with_icon_id(Some(icon_id)).build();
-        let returned = expected.clone();
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc
-            .expect_create_script()
-            .withf(move |draft| *draft == expected_draft(Some(icon_id)))
-            .times(1)
-            .returning(move |_| Ok(returned.clone()));
+        let mock_grpc = grpc_creating(expected_draft(Some(icon_id)), expected.clone());
 
         let client = ScriptsClient::new(
             mock_grpc,
@@ -567,13 +592,7 @@ mod tests {
     #[tokio::test]
     async fn create_script_without_an_icon_saves_none() {
         let expected = FakeScript::new().with_icon_id(None).build();
-        let returned = expected.clone();
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc
-            .expect_create_script()
-            .withf(|draft| *draft == expected_draft(None))
-            .times(1)
-            .returning(move |_| Ok(returned.clone()));
+        let mock_grpc = grpc_creating(expected_draft(None), expected.clone());
 
         let client = ScriptsClient::new(
             mock_grpc,
@@ -660,6 +679,7 @@ mod tests {
         let expected = FakeScript::new().with_icon_id(Some(icon_id)).build();
         let id = expected.id();
         let returned = expected.clone();
+        let mut sequence = mockall::Sequence::new();
         let mut mock_grpc = MockFydeClient::new();
         mock_grpc
             .expect_update_script()
@@ -667,7 +687,14 @@ mod tests {
                 *requested_id == id && *draft == expected_draft(Some(icon_id))
             })
             .times(1)
-            .returning(move |_, _| Ok(returned.clone()));
+            .in_sequence(&mut sequence)
+            .returning(|_, _| Ok(()));
+        mock_grpc
+            .expect_fetch_script()
+            .withf(move |requested_id| *requested_id == id)
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(move |_| Ok(returned.clone()));
 
         let client = ScriptsClient::new(
             mock_grpc,

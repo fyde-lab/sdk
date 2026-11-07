@@ -339,6 +339,9 @@ impl FydeClient for GrpcClient {
                 opaque_upload: opaque_upload.to_vec(),
                 device_name: device_name.to_string(),
                 replace_session_id: replace_session_id.unwrap_or_default().to_string(),
+                // Always a regular session: an app device counts toward the
+                // plan's session limit.
+                admin_session: false,
             })
             .await?;
 

@@ -195,16 +195,17 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   `initializeNdkContext(context)` before the first `Client::init`.
 - **sessions** (crate-private) — `authenticated_request`, `check_response` (see rules above;
   the `ExpiredSessionHandler` wipe runs on its own spawned task), `is_connected`.
-- **scripts** — server-side script CRUD and per-user enabling; a script is created private and
-  `update_script` makes it private again: only an admin publishes one, through
-  `set_script_visibility` (admin API's `SetScriptVisibility`, the one admin proto compiled here); `install_script` publishes an
+- **scripts** — server-side script CRUD and per-user enabling. Writes are admin-only, through
+  the admin API (`admin.v1`): `create_script`/`update_script` (`CreateScript`/`UpdateScript`,
+  answered with a summary, so the service fetches the script back through `scripts.v1`) always
+  write it private, and `set_script_visibility` (`SetScriptVisibility`) publishes it; `install_script` publishes an
   encrypted `InstallScript` event, and installed scripts are read from the local
   `installed_scripts` table. A script carries only its `icon_id`: `create_script`/
   `update_script` still take the icon's bytes and save them through `icons` first.
   `InMemoryScriptStorage` is a server-less `Service` for tooling (it drops icons).
 - **icons** — read-through cache over the server's `icons.v1.IconsService`: `fetch_icon(id)`
   serves the local `icons` table, else fetches and caches (icons never change, so never
-  revalidated); `create_icon` uploads then caches.
+  revalidated); `create_icon` uploads (admin API's `CreateIcon`, admin-only) then caches.
 - **settings** (public key/value, non-secret), **server_state** (gRPC health; never fails),
   **usage** (`get_usage`, plan limits + current usage; never cached).
 - **scrapers** — runs Lua scripts that log into third-party sites. Contract: the script
