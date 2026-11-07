@@ -18,10 +18,16 @@ mod proto {
     tonic::include_proto!("icons.v1");
 }
 
-use proto::{
-    CreateIconRequest, FetchIconRequest,
-    icons_service_client::IconsServiceClient as GeneratedIconsClient,
+/// The admin API, for [`FydeClient::create_icon`] only: creating an icon is
+/// admin-only.
+mod admin_proto {
+    tonic::include_proto!("admin.v1");
+}
+
+use admin_proto::{
+    CreateIconRequest, admin_service_client::AdminServiceClient as GeneratedAdminClient,
 };
+use proto::{FetchIconRequest, icons_service_client::IconsServiceClient as GeneratedIconsClient};
 
 /// A gRPC transport for the fyde server's icons service. Knows nothing
 /// beyond translating between raw proto messages and the domain [`Icon`].
@@ -30,9 +36,10 @@ use proto::{
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(super) trait FydeClient: Send + Sync {
-    /// Stores `content` as an icon, or returns the existing icon with the
-    /// same content.
-    async fn create_icon(&self, content: Vec<u8>) -> Result<Icon>;
+    /// Stores `content` as an icon through the admin API's `CreateIcon`,
+    /// which only an admin may call, returning its id: the existing icon's
+    /// for content the server already has.
+    async fn create_icon(&self, content: Vec<u8>) -> Result<Uuid>;
 
     /// Fetches the icon matching `id`.
     async fn fetch_icon(&self, id: Uuid) -> Result<Icon>;
@@ -66,7 +73,7 @@ impl GrpcClient {
 
 #[async_trait]
 impl FydeClient for GrpcClient {
-    async fn create_icon(&self, content: Vec<u8>) -> Result<Icon> {
+    async fn create_icon(&self, content: Vec<u8>) -> Result<Uuid> {
         let request = self
             .sessions
             .authenticated_request(CreateIconRequest { content })
@@ -74,14 +81,19 @@ impl FydeClient for GrpcClient {
 
         let response = self
             .sessions
-            .check_response(self.client().create_icon(request).await)
+            .check_response(
+                GeneratedAdminClient::new(self.channel.clone())
+                    .create_icon(request)
+                    .await,
+            )
             .await
             .context("failed to create icon")?
             .into_inner();
 
-        into_domain(response.icon.ok_or_else(|| {
-            ErrorKind::InvalidResponse("create icon response had no icon".to_string())
-        })?)
+        response
+            .icon_id
+            .parse()
+            .context("failed to parse created icon id returned by the server")
     }
 
     async fn fetch_icon(&self, id: Uuid) -> Result<Icon> {

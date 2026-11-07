@@ -28,7 +28,9 @@ impl<S: Storage> IconsClient<S> {
 #[async_trait]
 impl<S: Storage> Service for IconsClient<S> {
     async fn create_icon(&self, content: Vec<u8>) -> Result<Icon> {
-        let icon = self.grpc.create_icon(content).await?;
+        let id = self.grpc.create_icon(content.clone()).await?;
+        // The server only answers with the id: the content is what was sent.
+        let icon = Icon { id, content };
 
         // The creator is the first to show it: cache it right away rather
         // than downloading back what was just uploaded.
@@ -73,11 +75,11 @@ mod tests {
     async fn create_icon_uploads_then_caches_the_icon() {
         let icon = FakeIcon::new().with_content(vec![1, 2, 3]).build();
         let mut grpc = MockFydeClient::new();
-        let returned = icon.clone();
+        let id = icon.id();
         grpc.expect_create_icon()
             .with(eq(vec![1, 2, 3]))
             .times(1)
-            .return_once(move |_| Ok(returned));
+            .return_once(move |_| Ok(id));
         let mut storage = MockStorage::new();
         let cached = icon.clone();
         storage
