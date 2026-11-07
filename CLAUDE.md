@@ -225,8 +225,9 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
 - **icons** — read-through cache over the server's `icons.v1.IconsService`: `fetch_icon(id)`
   serves the local `icons` table, else fetches and caches (icons never change, so never
   revalidated); `create_icon` uploads (admin API's `CreateIcon`, admin-only) then caches.
-- **settings** (public key/value, non-secret), **server_state** (gRPC health; never fails),
-  **usage** (`get_usage`, plan limits + current usage; never cached).
+- **settings** (key/value, non-secret; `Client::settings` hands callers `settings::public`,
+  which stores their keys under `app.` so they never reach the SDK's own), **server_state**
+  (gRPC health; never fails), **usage** (`get_usage`, plan limits + current usage; never cached).
 - **scrapers** — runs Lua scripts that log into third-party sites. Contract: the script
   returns `{ run = function(parameters) ... }` and only calls the `fyde` table built in
   `host/` (`http`, `html`, `json`, `pdf`, `log`, `progress`, `input`, `save_document`, `session`,

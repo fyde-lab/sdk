@@ -221,7 +221,7 @@ impl Client {
             scripts,
             server_state,
             sessions,
-            settings,
+            settings: domains::settings::public(settings),
             usage,
             users,
             _instance_lock: instance_lock,
@@ -244,7 +244,10 @@ impl Client {
         self.users.as_ref()
     }
 
-    /// Returns a reference to the client's settings service.
+    /// Returns a reference to the client's settings service, for the
+    /// caller's own key/value settings. Its keys are kept apart from the
+    /// ones the SDK stores in the same table, so none can read or change
+    /// SDK state.
     pub fn settings(&self) -> &dyn SettingsService {
         self.settings.as_ref()
     }
