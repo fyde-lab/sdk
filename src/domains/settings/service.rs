@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 use crate::Result;
 
-use super::Service;
 use super::storage::Storage;
+use super::{PUBLIC_KEY_PREFIX, Service};
 
 /// The default [`Service`] implementation, delegating persistence to an
 /// injected [`Storage`].
@@ -32,12 +34,83 @@ impl<S: Storage> Service for SettingsClient<S> {
     }
 }
 
+/// The [`Service`] handed to callers (see [`super::public`]): delegates to
+/// the SDK's own settings, with every key under [`PUBLIC_KEY_PREFIX`].
+pub(super) struct PublicSettings {
+    internal: Arc<dyn Service>,
+}
+
+impl PublicSettings {
+    pub(super) fn new(internal: Arc<dyn Service>) -> Self {
+        Self { internal }
+    }
+}
+
+fn public_key(key: &str) -> String {
+    format!("{PUBLIC_KEY_PREFIX}{key}")
+}
+
+#[async_trait]
+impl Service for PublicSettings {
+    async fn get(&self, key: &str) -> Result<Option<String>> {
+        self.internal.get(&public_key(key)).await
+    }
+
+    async fn set(&self, key: &str, value: &str) -> Result<()> {
+        self.internal.set(&public_key(key), value).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.internal.delete(&public_key(key)).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use mockall::predicate::eq;
 
+    use super::super::MockService;
     use super::super::storage::MockStorage;
     use super::*;
+
+    #[tokio::test]
+    async fn public_get_reads_the_prefixed_key() {
+        let mut internal = MockService::new();
+        internal
+            .expect_get()
+            .with(eq("app.username"))
+            .return_once(|_| Ok(Some("theirs".to_string())));
+        let client = PublicSettings::new(Arc::new(internal));
+
+        assert_eq!(
+            client.get("username").await.unwrap(),
+            Some("theirs".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn public_set_never_reaches_an_internal_key() {
+        let mut internal = MockService::new();
+        internal
+            .expect_set()
+            .with(eq("app.username"), eq("mallory"))
+            .return_once(|_, _| Ok(()));
+        let client = PublicSettings::new(Arc::new(internal));
+
+        client.set("username", "mallory").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_delete_removes_the_prefixed_key() {
+        let mut internal = MockService::new();
+        internal
+            .expect_delete()
+            .with(eq("app.role"))
+            .return_once(|_| Ok(()));
+        let client = PublicSettings::new(Arc::new(internal));
+
+        client.delete("role").await.unwrap();
+    }
 
     #[tokio::test]
     async fn get_returns_none_when_never_set() {
