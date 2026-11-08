@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -9,8 +8,6 @@ use crate::{ErrorKind, Result};
 
 use super::Script;
 use super::ScriptMetadata;
-use super::ScriptParameter;
-use super::ScriptType;
 use super::Service;
 use super::{InstallScriptRequest, InstalledScript};
 
@@ -19,9 +16,8 @@ use super::{InstallScriptRequest, InstalledScript};
 /// server. State doesn't survive past the process's lifetime.
 /// With no changelog to publish through, [`Service::install_script`] saves
 /// the installation directly, so it shows up in
-/// [`Service::list_installed_scripts`] immediately. With no icons service
-/// either, it keeps no icons: every script it holds has no
-/// [`Script::icon_id`], whatever `icon` it was created or updated with.
+/// [`Service::list_installed_scripts`] immediately. [`Service`] has no way to
+/// author scripts, so they're added with [`InMemoryScriptStorage::insert`].
 #[derive(Default)]
 pub struct InMemoryScriptStorage {
     scripts: Mutex<HashMap<Uuid, Script>>,
@@ -33,44 +29,19 @@ impl InMemoryScriptStorage {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Adds `script`, or replaces the one with the same id, as the server
+    /// would serve it (public or not, as `script` says).
+    pub fn insert(&self, script: Script) {
+        self.scripts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(script.id, script);
+    }
 }
 
 #[async_trait]
 impl Service for InMemoryScriptStorage {
-    async fn create_script(
-        &self,
-        name: &str,
-        _icon: Vec<u8>,
-        script: &str,
-        description: &str,
-        short_description: &str,
-        allowed_domains: Vec<String>,
-        script_type: ScriptType,
-        parameters: HashMap<String, ScriptParameter>,
-    ) -> Result<Script> {
-        let created = Script {
-            id: Uuid::now_v7(),
-            name: name.to_string(),
-            description: description.to_string(),
-            short_description: short_description.to_string(),
-            is_public: false,
-            icon_id: None,
-            allowed_domains,
-            version: 1,
-            script: script.to_string(),
-            last_updated: now(),
-            script_type,
-            parameters,
-        };
-
-        self.scripts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(created.id, created.clone());
-
-        Ok(created)
-    }
-
     async fn fetch_script(&self, id: Uuid) -> Result<Script> {
         self.scripts
             .lock()
@@ -78,42 +49,6 @@ impl Service for InMemoryScriptStorage {
             .get(&id)
             .cloned()
             .ok_or(ErrorKind::ScriptNotFound(id).into())
-    }
-
-    async fn update_script(
-        &self,
-        id: Uuid,
-        name: &str,
-        _icon: Vec<u8>,
-        script: &str,
-        description: &str,
-        short_description: &str,
-        allowed_domains: Vec<String>,
-        script_type: ScriptType,
-        parameters: HashMap<String, ScriptParameter>,
-    ) -> Result<Script> {
-        let mut scripts = self.scripts.lock().unwrap_or_else(PoisonError::into_inner);
-
-        let existing = scripts.get(&id).ok_or(ErrorKind::ScriptNotFound(id))?;
-
-        let updated = Script {
-            id,
-            name: name.to_string(),
-            description: description.to_string(),
-            short_description: short_description.to_string(),
-            is_public: false,
-            icon_id: None,
-            allowed_domains,
-            version: existing.version + 1,
-            script: script.to_string(),
-            last_updated: now(),
-            script_type,
-            parameters,
-        };
-
-        scripts.insert(id, updated.clone());
-
-        Ok(updated)
     }
 
     async fn enable_script(&self, script_id: Uuid) -> Result<()> {
@@ -140,16 +75,6 @@ impl Service for InMemoryScriptStorage {
             .iter()
             .filter_map(|id| scripts.get(id).cloned().map(ScriptMetadata::from))
             .collect())
-    }
-
-    async fn set_script_visibility(&self, script_id: Uuid, is_public: bool) -> Result<()> {
-        self.scripts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_mut(&script_id)
-            .ok_or(ErrorKind::ScriptNotFound(script_id))?
-            .is_public = is_public;
-        Ok(())
     }
 
     async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>> {
@@ -199,60 +124,38 @@ impl Service for InMemoryScriptStorage {
     }
 }
 
-fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::domains::scripts::FakeScript;
 
     #[tokio::test]
-    async fn creates_a_script_at_version_one() {
+    async fn fetches_an_inserted_script() {
         let storage = InMemoryScriptStorage::new();
+        let script = FakeScript::new().build();
+        storage.insert(script.clone());
 
-        let created = storage
-            .create_script(
-                "example",
-                vec![1, 2, 3],
-                "return 1 + 1",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
+        let fetched = storage.fetch_script(script.id).await.unwrap();
 
-        assert_eq!(created.name, "example");
-        assert_eq!(created.version, 1);
-        assert_eq!(created.script, "return 1 + 1");
+        assert_eq!(fetched, script);
     }
 
     #[tokio::test]
-    async fn fetches_a_previously_created_script() {
+    async fn inserting_a_script_again_replaces_it() {
         let storage = InMemoryScriptStorage::new();
-        let created = storage
-            .create_script(
-                "example",
-                Vec::new(),
-                "return 1",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
+        let script = FakeScript::new().build();
+        let id = script.id;
+        storage.insert(script);
+        let updated = FakeScript::new()
+            .with_id(id)
+            .with_version(2)
+            .with_script("return 2")
+            .build();
+        storage.insert(updated.clone());
 
-        let fetched = storage.fetch_script(created.id).await.unwrap();
-
-        assert_eq!(fetched, created);
+        assert_eq!(storage.fetch_script(id).await.unwrap(), updated);
     }
 
     #[tokio::test]
@@ -265,93 +168,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn updating_a_script_increments_its_version() {
-        let storage = InMemoryScriptStorage::new();
-        let created = storage
-            .create_script(
-                "example",
-                Vec::new(),
-                "return 1",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
-
-        let updated = storage
-            .update_script(
-                created.id,
-                "renamed",
-                vec![9],
-                "return 2",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(updated.version, 2);
-        assert_eq!(updated.name, "renamed");
-        assert_eq!(updated.script, "return 2");
-    }
-
-    #[tokio::test]
-    async fn updating_an_unknown_script_fails_with_not_found() {
-        let storage = InMemoryScriptStorage::new();
-
-        let err = storage
-            .update_script(
-                Uuid::now_v7(),
-                "renamed",
-                Vec::new(),
-                "return 2",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err.kind(), ErrorKind::ScriptNotFound(_)));
-    }
-
-    #[tokio::test]
     async fn lists_only_enabled_scripts() {
         let storage = InMemoryScriptStorage::new();
-        let enabled = storage
-            .create_script(
-                "enabled",
-                Vec::new(),
-                "return 1",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
-        let disabled = storage
-            .create_script(
-                "disabled",
-                Vec::new(),
-                "return 2",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
+        let enabled = FakeScript::new().build();
+        let disabled = FakeScript::new().build();
+        storage.insert(enabled.clone());
+        storage.insert(disabled.clone());
 
         storage.enable_script(enabled.id).await.unwrap();
 
@@ -364,102 +186,22 @@ mod tests {
     #[tokio::test]
     async fn lists_only_public_scripts() {
         let storage = InMemoryScriptStorage::new();
-        let public = storage
-            .create_script(
-                "public",
-                Vec::new(),
-                "return 1",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
-        let private = storage
-            .create_script(
-                "private",
-                Vec::new(),
-                "return 2",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
-        assert!(storage.list_public_scripts().await.unwrap().is_empty());
+        let public = FakeScript::new().with_public(true).build();
+        let private = FakeScript::new().with_public(false).build();
+        storage.insert(public.clone());
+        storage.insert(private.clone());
 
-        storage
-            .set_script_visibility(public.id, true)
-            .await
-            .unwrap();
         let listed = storage.list_public_scripts().await.unwrap();
 
-        let published = storage.fetch_script(public.id).await.unwrap();
-        assert!(published.is_public);
-        assert_eq!(listed, vec![ScriptMetadata::from(published)]);
+        assert_eq!(listed, vec![ScriptMetadata::from(public)]);
         assert!(!listed.contains(&ScriptMetadata::from(private)));
-    }
-
-    #[tokio::test]
-    async fn updating_a_published_script_makes_it_private_again() {
-        let storage = InMemoryScriptStorage::new();
-        let script = storage
-            .create_script(
-                "example",
-                Vec::new(),
-                "return 1",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
-        storage
-            .set_script_visibility(script.id, true)
-            .await
-            .unwrap();
-
-        let updated = storage
-            .update_script(
-                script.id,
-                "example",
-                Vec::new(),
-                "return 2",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(!updated.is_public);
-        assert!(storage.list_public_scripts().await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn installing_a_script_lists_it_immediately_replacing_a_previous_install() {
         let storage = InMemoryScriptStorage::new();
-        let script = storage
-            .create_script(
-                "example",
-                Vec::new(),
-                "return 1",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
+        let script = FakeScript::new().build();
+        storage.insert(script.clone());
 
         for username in ["alice", "bob"] {
             storage
@@ -487,19 +229,8 @@ mod tests {
     #[tokio::test]
     async fn disabling_a_script_removes_it_from_the_listing() {
         let storage = InMemoryScriptStorage::new();
-        let script = storage
-            .create_script(
-                "example",
-                Vec::new(),
-                "return 1",
-                "",
-                "",
-                Vec::new(),
-                ScriptType::Scraper,
-                HashMap::new(),
-            )
-            .await
-            .unwrap();
+        let script = FakeScript::new().build();
+        storage.insert(script.clone());
 
         storage.enable_script(script.id).await.unwrap();
         storage.disable_script(script.id).await.unwrap();

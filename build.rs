@@ -32,9 +32,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::compile_protos(proto_dir.join("usage/v1/usage.proto"))?;
     tonic_prost_build::compile_protos(proto_dir.join("attributes/v1/attributes.proto"))?;
     tonic_prost_build::compile_protos(proto_dir.join("icons/v1/icons.proto"))?;
-    // Only for `scripts::Service::set_script_visibility`, the one admin
-    // call: publishing a script is admin-only.
-    tonic_prost_build::compile_protos(proto_dir.join("admin/v1/admin.proto"))?;
 
     Ok(())
 }

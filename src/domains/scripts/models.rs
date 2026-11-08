@@ -80,7 +80,7 @@ pub struct ScriptParameter {
 }
 
 /// A user-authored script, as returned by [`super::Service::fetch_script`]/
-/// [`super::Service::list_user_scripts`]/[`super::Service::create_script`].
+/// [`super::Service::list_user_scripts`].
 /// Unlike [`crate::Document`], script content is not encrypted client-side —
 /// the server stores and can serve it in the clear, since scripts can be
 /// marked public and shared between users.
@@ -326,13 +326,13 @@ impl FakeScript {
         }
     }
 
-    pub fn with_icon_id(mut self, icon_id: Option<Uuid>) -> Self {
-        self.script.icon_id = icon_id;
+    pub fn with_id(mut self, id: Uuid) -> Self {
+        self.script.id = id;
         self
     }
 
-    pub fn with_id(mut self, id: Uuid) -> Self {
-        self.script.id = id;
+    pub fn with_public(mut self, is_public: bool) -> Self {
+        self.script.is_public = is_public;
         self
     }
 

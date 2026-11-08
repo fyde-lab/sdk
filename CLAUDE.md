@@ -182,13 +182,12 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   `initializeNdkContext(context)` before the first `Client::init`.
 - **sessions** (crate-private) — `authenticated_request`, `check_response` (see rules above;
   the `ExpiredSessionHandler` wipe runs on its own spawned task), `is_connected`.
-- **scripts** — server-side script CRUD and per-user enabling; a script is created private and
-  `update_script` makes it private again: only an admin publishes one, through
-  `set_script_visibility` (admin API's `SetScriptVisibility`, the one admin proto compiled here); `install_script` publishes an
-  encrypted `InstallScript` event, and installed scripts are read from the local
-  `installed_scripts` table. A script carries only its `icon_id`: `create_script`/
-  `update_script` still take the icon's bytes and save them through `icons` first.
-  `InMemoryScriptStorage` is a server-less `Service` for tooling (it drops icons).
+- **scripts** — fetching, listing (enabled/public) and per-user enabling of server-side scripts;
+  `install_script` publishes an encrypted `InstallScript` event, and installed scripts are read
+  from the local `installed_scripts` table. A script carries only its `icon_id`. No authoring:
+  creating, updating and publishing scripts is admin work, done by `../scripts`' `publish`
+  straight against the server's APIs (no admin proto is compiled here).
+  `InMemoryScriptStorage` is a server-less `Service` for tooling, filled with `insert`.
 - **icons** — read-through cache over the server's `icons.v1.IconsService`: `fetch_icon(id)`
   serves the local `icons` table, else fetches and caches (icons never change, so never
   revalidated); `create_icon` uploads then caches.

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -6,15 +5,11 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::domains::changelog::{EventType, Service as ChangelogService};
-use crate::domains::icons::Service as IconsService;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
-use super::grpc_client::{FydeClient, ScriptDraft, ScriptMetadataPage};
+use super::grpc_client::{FydeClient, ScriptMetadataPage};
 use super::storage::Storage;
-use super::{
-    InstallScriptRequest, InstalledScript, Script, ScriptMetadata, ScriptParameter, ScriptType,
-    Service,
-};
+use super::{InstallScriptRequest, InstalledScript, Script, ScriptMetadata, Service};
 
 /// Collects every page of one of the server's paginated listings, from the
 /// first one on: `list_page` lists the page a token points at (`None` for
@@ -37,14 +32,12 @@ where
 
 /// The default [`Service`] implementation. Composes the injected `grpc`
 /// client for talking to the server's scripts service, `changelog` to
-/// publish script installations, `storage` to read installed scripts back
-/// once the changelog has materialized them locally, and `icons` to save a
-/// script's icon, which the script then only refers to by id.
+/// publish script installations, and `storage` to read installed scripts
+/// back once the changelog has materialized them locally.
 pub(super) struct ScriptsClient<S: Storage> {
     grpc: Box<dyn FydeClient>,
     storage: S,
     changelog: Arc<dyn ChangelogService>,
-    icons: Arc<dyn IconsService>,
 }
 
 impl<S: Storage> ScriptsClient<S> {
@@ -52,90 +45,19 @@ impl<S: Storage> ScriptsClient<S> {
         grpc: impl FydeClient + 'static,
         storage: S,
         changelog: Arc<dyn ChangelogService>,
-        icons: Arc<dyn IconsService>,
     ) -> Self {
         Self {
             grpc: Box::new(grpc),
             storage,
             changelog,
-            icons,
         }
-    }
-
-    /// Saves `icon` (an encoded image, empty for none) through the icons
-    /// domain, returning the id the script is then saved with: `None` for
-    /// no icon.
-    async fn save_icon(&self, icon: Vec<u8>) -> Result<Option<Uuid>> {
-        if icon.is_empty() {
-            return Ok(None);
-        }
-
-        let icon = self
-            .icons
-            .create_icon(icon)
-            .await
-            .context("failed to save script icon")?;
-        Ok(Some(icon.id()))
     }
 }
 
 #[async_trait]
 impl<S: Storage> Service for ScriptsClient<S> {
-    async fn create_script(
-        &self,
-        name: &str,
-        icon: Vec<u8>,
-        script: &str,
-        description: &str,
-        short_description: &str,
-        allowed_domains: Vec<String>,
-        script_type: ScriptType,
-        parameters: HashMap<String, ScriptParameter>,
-    ) -> Result<Script> {
-        // The icon first: the script only carries its id.
-        let icon_id = self.save_icon(icon).await?;
-        let draft = ScriptDraft {
-            name: name.to_string(),
-            icon_id,
-            script: script.to_string(),
-            description: description.to_string(),
-            short_description: short_description.to_string(),
-            allowed_domains,
-            script_type,
-            parameters,
-        };
-        self.grpc.create_script(draft).await
-    }
-
     async fn fetch_script(&self, id: Uuid) -> Result<Script> {
         self.grpc.fetch_script(id).await
-    }
-
-    async fn update_script(
-        &self,
-        id: Uuid,
-        name: &str,
-        icon: Vec<u8>,
-        script: &str,
-        description: &str,
-        short_description: &str,
-        allowed_domains: Vec<String>,
-        script_type: ScriptType,
-        parameters: HashMap<String, ScriptParameter>,
-    ) -> Result<Script> {
-        // The icon first: the script only carries its id.
-        let icon_id = self.save_icon(icon).await?;
-        let draft = ScriptDraft {
-            name: name.to_string(),
-            icon_id,
-            script: script.to_string(),
-            description: description.to_string(),
-            short_description: short_description.to_string(),
-            allowed_domains,
-            script_type,
-            parameters,
-        };
-        self.grpc.update_script(id, draft).await
     }
 
     async fn enable_script(&self, script_id: Uuid) -> Result<()> {
@@ -152,10 +74,6 @@ impl<S: Storage> Service for ScriptsClient<S> {
 
     async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>> {
         all_pages(|page_token| self.grpc.list_public_scripts(page_token)).await
-    }
-
-    async fn set_script_visibility(&self, script_id: Uuid, is_public: bool) -> Result<()> {
-        self.grpc.set_script_visibility(script_id, is_public).await
     }
 
     async fn install_script(&self, request: InstallScriptRequest) -> Result<()> {
@@ -212,6 +130,7 @@ impl<S: Storage> Service for ScriptsClient<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use serde_json::json;
@@ -219,16 +138,11 @@ mod tests {
     use super::*;
     use crate::domains::changelog::ChangelogEvent;
     use crate::domains::documents::Metadata;
-    use crate::domains::icons::{FakeIcon, MockService as MockIconsService};
     use crate::domains::scripts::grpc_client::MockFydeClient;
     use crate::domains::scripts::storage::MockStorage;
     use crate::domains::scripts::{
-        FakeInstalledScript, FakeScript, FakeScriptMetadata, ScriptParameterType,
+        FakeInstalledScript, FakeScript, FakeScriptMetadata, ScriptParameter, ScriptParameterType,
     };
-
-    fn no_parameters() -> HashMap<String, ScriptParameter> {
-        HashMap::new()
-    }
 
     /// A single `send` call recorded by [`RecordingChangelog`].
     type SentEvent = (EventType, Uuid, Option<Vec<u8>>, Option<Metadata>);
@@ -276,25 +190,6 @@ mod tests {
         }
     }
 
-    /// An icons service for tests that never save an icon: any call panics.
-    fn unused_icons() -> Arc<dyn IconsService> {
-        Arc::new(MockIconsService::new())
-    }
-
-    /// An icons service saving exactly `content` once, as `icon`.
-    fn icons_saving(
-        content: &'static [u8],
-        icon: crate::domains::icons::Icon,
-    ) -> Arc<dyn IconsService> {
-        let mut icons = MockIconsService::new();
-        icons
-            .expect_create_icon()
-            .withf(move |saved| saved == content)
-            .times(1)
-            .return_once(move |_| Ok(icon));
-        Arc::new(icons)
-    }
-
     /// A changelog for tests that never publish anything: any recorded
     /// event is simply never looked at.
     fn unused_changelog() -> Arc<dyn ChangelogService> {
@@ -334,7 +229,6 @@ mod tests {
             grpc_fetching(script.clone()),
             MockStorage::new(),
             changelog.clone(),
-            unused_icons(),
         );
 
         client
@@ -367,7 +261,6 @@ mod tests {
             grpc_fetching(script.clone()),
             MockStorage::new(),
             changelog.clone(),
-            unused_icons(),
         );
 
         let err = client
@@ -401,7 +294,6 @@ mod tests {
             grpc_fetching(script.clone()),
             MockStorage::new(),
             changelog.clone(),
-            unused_icons(),
         );
 
         client
@@ -424,12 +316,7 @@ mod tests {
             .times(1)
             .returning(|id| Err(ErrorKind::ScriptNotFound(id).into()));
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = ScriptsClient::new(
-            mock_grpc,
-            MockStorage::new(),
-            changelog.clone(),
-            unused_icons(),
-        );
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), changelog.clone());
 
         let err = client
             .install_script(InstallScriptRequest {
@@ -459,12 +346,7 @@ mod tests {
             .times(1)
             .returning(move || Ok(returned.clone()));
 
-        let client = ScriptsClient::new(
-            MockFydeClient::new(),
-            storage,
-            unused_changelog(),
-            unused_icons(),
-        );
+        let client = ScriptsClient::new(MockFydeClient::new(), storage, unused_changelog());
 
         assert_eq!(client.list_installed_scripts().await.unwrap(), expected);
     }
@@ -480,12 +362,7 @@ mod tests {
             .times(1)
             .returning(move || Ok(installed.clone()));
 
-        let client = ScriptsClient::new(
-            MockFydeClient::new(),
-            storage,
-            unused_changelog(),
-            unused_icons(),
-        );
+        let client = ScriptsClient::new(MockFydeClient::new(), storage, unused_changelog());
 
         assert_eq!(client.fetch_installed_script(id).await.unwrap(), wanted);
     }
@@ -498,137 +375,13 @@ mod tests {
             .times(1)
             .returning(|| Ok(vec![FakeInstalledScript::new().build()]));
 
-        let client = ScriptsClient::new(
-            MockFydeClient::new(),
-            storage,
-            unused_changelog(),
-            unused_icons(),
-        );
+        let client = ScriptsClient::new(MockFydeClient::new(), storage, unused_changelog());
 
         let err = client
             .fetch_installed_script(Uuid::new_v4())
             .await
             .unwrap_err();
         assert_eq!(err.code(), crate::ErrorCode::ScriptNotInstalled);
-    }
-
-    /// The [`ScriptDraft`] the `create_script`/`update_script` delegation
-    /// tests below expect their arguments to be forwarded as.
-    fn expected_draft(icon_id: Option<Uuid>) -> ScriptDraft {
-        ScriptDraft {
-            name: "my-script".to_string(),
-            icon_id,
-            script: "return 1".to_string(),
-            description: "does something".to_string(),
-            short_description: "does a thing".to_string(),
-            allowed_domains: vec!["example.com".to_string()],
-            script_type: ScriptType::Scraper,
-            parameters: no_parameters(),
-        }
-    }
-
-    #[tokio::test]
-    async fn create_script_saves_the_icon_first_then_the_script_with_its_id() {
-        let icon = FakeIcon::new().build();
-        let icon_id = icon.id();
-        let expected = FakeScript::new().with_icon_id(Some(icon_id)).build();
-        let returned = expected.clone();
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc
-            .expect_create_script()
-            .withf(move |draft| *draft == expected_draft(Some(icon_id)))
-            .times(1)
-            .returning(move |_| Ok(returned.clone()));
-
-        let client = ScriptsClient::new(
-            mock_grpc,
-            MockStorage::new(),
-            unused_changelog(),
-            icons_saving(b"icon-bytes", icon),
-        );
-
-        let script = client
-            .create_script(
-                "my-script",
-                b"icon-bytes".to_vec(),
-                "return 1",
-                "does something",
-                "does a thing",
-                vec!["example.com".to_string()],
-                ScriptType::Scraper,
-                no_parameters(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(script, expected);
-    }
-
-    #[tokio::test]
-    async fn create_script_without_an_icon_saves_none() {
-        let expected = FakeScript::new().with_icon_id(None).build();
-        let returned = expected.clone();
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc
-            .expect_create_script()
-            .withf(|draft| *draft == expected_draft(None))
-            .times(1)
-            .returning(move |_| Ok(returned.clone()));
-
-        let client = ScriptsClient::new(
-            mock_grpc,
-            MockStorage::new(),
-            unused_changelog(),
-            unused_icons(),
-        );
-
-        let script = client
-            .create_script(
-                "my-script",
-                Vec::new(),
-                "return 1",
-                "does something",
-                "does a thing",
-                vec!["example.com".to_string()],
-                ScriptType::Scraper,
-                no_parameters(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(script, expected);
-    }
-
-    #[tokio::test]
-    async fn create_script_creates_no_script_when_its_icon_cant_be_saved() {
-        let mut icons = MockIconsService::new();
-        icons
-            .expect_create_icon()
-            .times(1)
-            .return_once(|_| Err(ErrorKind::InvalidResponse("boom".to_string()).into()));
-        // No expectation on the gRPC mock: creating the script panics.
-        let client = ScriptsClient::new(
-            MockFydeClient::new(),
-            MockStorage::new(),
-            unused_changelog(),
-            Arc::new(icons),
-        );
-
-        let err = client
-            .create_script(
-                "my-script",
-                b"icon-bytes".to_vec(),
-                "return 1",
-                "does something",
-                "does a thing",
-                vec!["example.com".to_string()],
-                ScriptType::Scraper,
-                no_parameters(),
-            )
-            .await
-            .unwrap_err();
-
-        assert!(err.has_context());
     }
 
     #[tokio::test]
@@ -643,55 +396,9 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(returned.clone()));
 
-        let client = ScriptsClient::new(
-            mock_grpc,
-            MockStorage::new(),
-            unused_changelog(),
-            unused_icons(),
-        );
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         assert_eq!(client.fetch_script(id).await.unwrap(), expected);
-    }
-
-    #[tokio::test]
-    async fn update_script_saves_the_icon_first_then_the_script_with_its_id() {
-        let icon = FakeIcon::new().build();
-        let icon_id = icon.id();
-        let expected = FakeScript::new().with_icon_id(Some(icon_id)).build();
-        let id = expected.id();
-        let returned = expected.clone();
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc
-            .expect_update_script()
-            .withf(move |requested_id, draft| {
-                *requested_id == id && *draft == expected_draft(Some(icon_id))
-            })
-            .times(1)
-            .returning(move |_, _| Ok(returned.clone()));
-
-        let client = ScriptsClient::new(
-            mock_grpc,
-            MockStorage::new(),
-            unused_changelog(),
-            icons_saving(b"icon-bytes", icon),
-        );
-
-        let script = client
-            .update_script(
-                id,
-                "my-script",
-                b"icon-bytes".to_vec(),
-                "return 1",
-                "does something",
-                "does a thing",
-                vec!["example.com".to_string()],
-                ScriptType::Scraper,
-                no_parameters(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(script, expected);
     }
 
     #[tokio::test]
@@ -704,12 +411,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ScriptsClient::new(
-            mock_grpc,
-            MockStorage::new(),
-            unused_changelog(),
-            unused_icons(),
-        );
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         client.enable_script(id).await.unwrap();
     }
@@ -724,12 +426,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        let client = ScriptsClient::new(
-            mock_grpc,
-            MockStorage::new(),
-            unused_changelog(),
-            unused_icons(),
-        );
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         client.disable_script(id).await.unwrap();
     }
@@ -758,12 +455,7 @@ mod tests {
             .times(1)
             .return_once(move |_| Ok(last_page));
 
-        let client = ScriptsClient::new(
-            mock_grpc,
-            MockStorage::new(),
-            unused_changelog(),
-            unused_icons(),
-        );
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         assert_eq!(
             client.list_user_scripts().await.unwrap(),
@@ -795,12 +487,7 @@ mod tests {
             .times(1)
             .return_once(move |_| Ok(last_page));
 
-        let client = ScriptsClient::new(
-            mock_grpc,
-            MockStorage::new(),
-            unused_changelog(),
-            unused_icons(),
-        );
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         assert_eq!(
             client.list_public_scripts().await.unwrap(),
@@ -826,33 +513,8 @@ mod tests {
             .times(1)
             .return_once(|_| Err(ErrorKind::InvalidResponse("boom".to_string()).into()));
 
-        let client = ScriptsClient::new(
-            mock_grpc,
-            MockStorage::new(),
-            unused_changelog(),
-            unused_icons(),
-        );
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
 
         client.list_public_scripts().await.unwrap_err();
-    }
-
-    #[tokio::test]
-    async fn set_script_visibility_goes_through_the_admin_api() {
-        let script_id = Uuid::now_v7();
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc
-            .expect_set_script_visibility()
-            .withf(move |id, is_public| *id == script_id && *is_public)
-            .times(1)
-            .returning(|_, _| Ok(()));
-
-        let client = ScriptsClient::new(
-            mock_grpc,
-            MockStorage::new(),
-            unused_changelog(),
-            unused_icons(),
-        );
-
-        client.set_script_visibility(script_id, true).await.unwrap();
     }
 }
