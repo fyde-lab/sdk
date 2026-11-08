@@ -2,16 +2,13 @@ mod grpc_client;
 mod models;
 mod service;
 mod storage;
-mod storage_in_memory;
 mod storage_sqlite;
 
 #[cfg(test)]
 pub(crate) use storage::MockStorage;
 pub(crate) use storage::Storage;
-pub use storage_in_memory::InMemoryScriptStorage;
 pub(crate) use storage_sqlite::SqliteStorage;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -32,13 +29,13 @@ pub use models::{
 
 use crate::Result;
 use crate::domains::changelog::Service as ChangelogService;
-use crate::domains::icons::Service as IconsService;
 use crate::domains::sessions::SessionsClient;
 
-/// Manages user-authored scripts against the fyde server's scripts service
-/// (see `grpc_client.rs`): creating, fetching and updating them,
-/// enabling/disabling them for the authenticated user, and listing the ones
-/// currently enabled or public. Running scripts against a document is done
+/// Reads scripts from the fyde server's scripts service (see
+/// `grpc_client.rs`): fetching them, enabling/disabling them for the
+/// authenticated user, listing the ones currently enabled or public, and
+/// installing them. Writing scripts is admin-only and out of this SDK: the
+/// server takes it through `admin.v1.AdminService`. Running scripts against a document is done
 /// by the `documents` domain's `parser` submodule, using
 /// [`Service::list_user_scripts`] and [`Service::fetch_script`] together
 /// with its own sandboxed Lua VM. Trait methods take `&self` (not `&mut self`) so
@@ -46,44 +43,8 @@ use crate::domains::sessions::SessionsClient;
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Service: Send + Sync {
-    /// Creates a new, private script owned by the authenticated user, at
-    /// version 1. Admin only: anyone else fails with
-    /// [`crate::ErrorCode::PermissionDenied`]. A non-empty `icon` (an encoded image) is first saved through
-    /// [`crate::IconsService::create_icon`], and the script created with
-    /// its id (see [`Script::icon_id`]); an empty one means no icon.
-    #[allow(clippy::too_many_arguments)]
-    async fn create_script(
-        &self,
-        name: &str,
-        icon: Vec<u8>,
-        script: &str,
-        description: &str,
-        short_description: &str,
-        allowed_domains: Vec<String>,
-        script_type: ScriptType,
-        parameters: HashMap<String, ScriptParameter>,
-    ) -> Result<Script>;
-
     /// Fetches the script matching `id`.
     async fn fetch_script(&self, id: Uuid) -> Result<Script>;
-
-    /// Replaces a script's content, whoever owns it, making it private
-    /// again and incrementing its version. Admin only, like
-    /// [`Self::create_script`]; fails if the script doesn't exist. `icon` is
-    /// saved like [`Self::create_script`] does.
-    #[allow(clippy::too_many_arguments)]
-    async fn update_script(
-        &self,
-        id: Uuid,
-        name: &str,
-        icon: Vec<u8>,
-        script: &str,
-        description: &str,
-        short_description: &str,
-        allowed_domains: Vec<String>,
-        script_type: ScriptType,
-        parameters: HashMap<String, ScriptParameter>,
-    ) -> Result<Script>;
 
     /// Enables `script_id` for the authenticated user. Enabling an
     /// already-enabled script is a no-op.
@@ -107,14 +68,6 @@ pub trait Service: Send + Sync {
     /// content, and its icon (by [`ScriptMetadata::icon_id`]) with
     /// [`crate::IconsService::fetch_icon`].
     async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>>;
-
-    /// Publishes (`is_public`) or unpublishes `script_id`, whoever owns it.
-    /// Admin only: anyone else fails with
-    /// [`crate::ErrorCode::PermissionDenied`]. A script is always created
-    /// private, and [`Self::update_script`] makes it private again, so a
-    /// published script's content only changes when an admin publishes it
-    /// again.
-    async fn set_script_visibility(&self, script_id: Uuid, is_public: bool) -> Result<()>;
 
     /// Installs the script `request.script_id` for the authenticated user,
     /// to be run with `request.parameters`: fetches the script (see
@@ -146,19 +99,16 @@ pub trait Service: Send + Sync {
 /// service over the shared `channel` connection, authenticating every call
 /// via `sessions`, publishes script installations through `changelog`, and
 /// reads installed scripts back from the local SQLite database (`pool`)
-/// the changelog materializes them into, and saves scripts' icons through
-/// `icons`.
+/// the changelog materializes them into.
 pub(crate) fn init(
     channel: Channel,
     sessions: Arc<SessionsClient>,
     pool: SqlitePool,
     changelog: Arc<dyn ChangelogService>,
-    icons: Arc<dyn IconsService>,
 ) -> Arc<dyn Service> {
     Arc::new(service::ScriptsClient::new(
         grpc_client::GrpcClient::new(channel, sessions),
         SqliteStorage::new(pool),
         changelog,
-        icons,
     ))
 }
