@@ -43,11 +43,6 @@ impl FakeIcon {
         self
     }
 
-    pub(crate) fn with_content(mut self, content: Vec<u8>) -> Self {
-        self.icon.content = content;
-        self
-    }
-
     pub(crate) fn build(self) -> Icon {
         self.icon
     }

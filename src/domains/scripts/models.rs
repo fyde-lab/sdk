@@ -361,11 +361,6 @@ impl FakeScript {
         }
     }
 
-    pub fn with_icon_id(mut self, icon_id: Option<Uuid>) -> Self {
-        self.script.icon_id = icon_id;
-        self
-    }
-
     pub fn with_id(mut self, id: Uuid) -> Self {
         self.script.id = id;
         self

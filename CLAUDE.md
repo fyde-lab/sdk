@@ -214,17 +214,14 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   `initializeNdkContext(context)` before the first `Client::init`.
 - **sessions** (crate-private) — `authenticated_request`, `check_response` (see rules above;
   the `ExpiredSessionHandler` wipe runs on its own spawned task), `is_connected`.
-- **scripts** — server-side script CRUD and per-user enabling. Writes are admin-only, through
-  the admin API (`admin.v1`): `create_script`/`update_script` (`CreateScript`/`UpdateScript`,
-  answered with a summary, so the service fetches the script back through `scripts.v1`) always
-  write it private, and `set_script_visibility` (`SetScriptVisibility`) publishes it; `install_script` publishes an
-  encrypted `InstallScript` event, and installed scripts are read from the local
-  `installed_scripts` table. A script carries only its `icon_id`: `create_script`/
-  `update_script` still take the icon's bytes and save them through `icons` first.
-  `InMemoryScriptStorage` is a server-less `Service` for tooling (it drops icons).
+- **scripts** — reads scripts from `scripts.v1` (`fetch_script`, `list_user_scripts`,
+  `list_public_scripts`) and enables/disables them for the user. Writing scripts and icons is
+  admin-only on the server (`admin.v1`) and not in this SDK: `../scripts`' `publish` calls the
+  admin API itself. `install_script` publishes an encrypted `InstallScript` event, and
+  installed scripts are read from the local `installed_scripts` table.
 - **icons** — read-through cache over the server's `icons.v1.IconsService`: `fetch_icon(id)`
   serves the local `icons` table, else fetches and caches (icons never change, so never
-  revalidated); `create_icon` uploads (admin API's `CreateIcon`, admin-only) then caches.
+  revalidated).
 - **settings** (key/value, non-secret; `Client::settings` hands callers `settings::public`,
   which stores their keys under `app.` so they never reach the SDK's own), **server_state**
   (gRPC health; never fails), **usage** (`get_usage`, plan limits + current usage; never cached).

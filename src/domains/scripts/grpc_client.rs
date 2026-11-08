@@ -14,7 +14,6 @@ use super::Script;
 use super::ScriptMetadata;
 use super::ScriptParameter;
 use super::ScriptParameterType;
-use super::ScriptType;
 
 /// Generated protobuf/gRPC bindings for the `scripts` service, compiled by
 /// `build.rs` from `scripts/v1/scripts.proto` in the `buf.build/fyde-lab/api`
@@ -23,16 +22,6 @@ mod proto {
     tonic::include_proto!("scripts.v1");
 }
 
-/// The admin API, for the admin-only writes: [`FydeClient::create_script`],
-/// [`FydeClient::update_script`] and [`FydeClient::set_script_visibility`].
-mod admin_proto {
-    tonic::include_proto!("admin.v1");
-}
-
-use admin_proto::{
-    CreateScriptRequest, ScriptContent, SetScriptVisibilityRequest, UpdateScriptRequest,
-    admin_service_client::AdminServiceClient as GeneratedAdminClient,
-};
 use proto::{
     DisableScriptRequest, EnableScriptRequest, FetchScriptRequest, ListPublicScriptsRequest,
     ListUserScriptsRequest, scripts_service_client::ScriptsServiceClient as GeneratedScriptsClient,
@@ -43,23 +32,6 @@ use proto::{
 /// maximum, so the whole catalog usually comes back in a single call
 /// instead of one round trip per page of the server's default 20.
 const LISTING_PAGE_SIZE: u32 = 200;
-
-/// Every field a script is created or updated with, by name rather than as
-/// a long run of positional arguments — several of them are `String`s, so
-/// swapping two (say `description` and `short_description`) at a call site
-/// would otherwise still compile.
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct ScriptDraft {
-    pub(super) name: String,
-    /// An icon created beforehand with [`crate::IconsService::create_icon`].
-    pub(super) icon_id: Option<Uuid>,
-    pub(super) script: String,
-    pub(super) description: String,
-    pub(super) short_description: String,
-    pub(super) allowed_domains: Vec<String>,
-    pub(super) script_type: ScriptType,
-    pub(super) parameters: HashMap<String, ScriptParameter>,
-}
 
 /// One page of one of the server's paginated script listings.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,20 +50,8 @@ pub(super) struct ScriptMetadataPage {
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(super) trait FydeClient: Send + Sync {
-    /// Creates a new, private script owned by the authenticated user, at
-    /// version 1, through the admin API's `CreateScript`, which only an
-    /// admin may call. Returns its id: the admin API answers with a summary
-    /// only, so fetch the script for the rest.
-    async fn create_script(&self, draft: ScriptDraft) -> Result<Uuid>;
-
     /// Fetches the script matching `id`.
     async fn fetch_script(&self, id: Uuid) -> Result<Script>;
-
-    /// Replaces a script's content, whoever owns it, making it private and
-    /// incrementing its version, through the admin API's `UpdateScript`,
-    /// which only an admin may call. Like [`Self::create_script`], fetch the
-    /// script for its new state.
-    async fn update_script(&self, id: Uuid, draft: ScriptDraft) -> Result<()>;
 
     /// Enables `script_id` for the authenticated user.
     async fn enable_script(&self, script_id: Uuid) -> Result<()>;
@@ -109,10 +69,6 @@ pub(super) trait FydeClient: Send + Sync {
     /// regardless of who owns it or whether the authenticated user has it
     /// enabled — see [`Self::list_user_scripts`] for `page_token`.
     async fn list_public_scripts(&self, page_token: Option<String>) -> Result<ScriptMetadataPage>;
-
-    /// Publishes or unpublishes `script_id` through the admin API's
-    /// `SetScriptVisibility`, which only an admin may call.
-    async fn set_script_visibility(&self, script_id: Uuid, is_public: bool) -> Result<()>;
 }
 
 /// The production [`FydeClient`] implementation, backed by a tonic
@@ -142,37 +98,10 @@ impl GrpcClient {
     fn client(&self) -> GeneratedScriptsClient<Channel> {
         GeneratedScriptsClient::new(self.channel.clone())
     }
-
-    /// Returns a generated admin API client wrapping the shared connection.
-    fn admin_client(&self) -> GeneratedAdminClient<Channel> {
-        GeneratedAdminClient::new(self.channel.clone())
-    }
 }
 
 #[async_trait]
 impl FydeClient for GrpcClient {
-    async fn create_script(&self, draft: ScriptDraft) -> Result<Uuid> {
-        let message = CreateScriptRequest {
-            content: Some(content_into_proto(draft)),
-        };
-        let request = self.sessions.authenticated_request(message).await?;
-
-        let response = self
-            .sessions
-            .check_response(self.admin_client().create_script(request).await)
-            .await
-            .context("failed to create script")?
-            .into_inner();
-
-        let script = response.script.ok_or_else(|| {
-            crate::ErrorKind::InvalidResponse("create script response had no script".to_string())
-        })?;
-        script
-            .id
-            .parse()
-            .context("failed to parse created script id returned by the server")
-    }
-
     async fn fetch_script(&self, id: Uuid) -> Result<Script> {
         let request = self
             .sessions
@@ -189,21 +118,6 @@ impl FydeClient for GrpcClient {
         into_domain(response.script.ok_or_else(|| {
             crate::ErrorKind::InvalidResponse("fetch script response had no script".to_string())
         })?)
-    }
-
-    async fn update_script(&self, id: Uuid, draft: ScriptDraft) -> Result<()> {
-        let message = UpdateScriptRequest {
-            script_id: id.to_string(),
-            content: Some(content_into_proto(draft)),
-        };
-        let request = self.sessions.authenticated_request(message).await?;
-
-        self.sessions
-            .check_response(self.admin_client().update_script(request).await)
-            .await
-            .with_context(|| format!("failed to update script {id}"))?;
-
-        Ok(())
     }
 
     async fn enable_script(&self, script_id: Uuid) -> Result<()> {
@@ -257,22 +171,6 @@ impl FydeClient for GrpcClient {
         page_into_domain(response.scripts, response.next_page_token)
     }
 
-    async fn set_script_visibility(&self, script_id: Uuid, is_public: bool) -> Result<()> {
-        let request = self
-            .sessions
-            .authenticated_request(SetScriptVisibilityRequest {
-                script_id: script_id.to_string(),
-                is_public,
-            })
-            .await?;
-
-        self.sessions
-            .check_response(self.admin_client().set_script_visibility(request).await)
-            .await
-            .with_context(|| format!("failed to set the visibility of script {script_id}"))?;
-        Ok(())
-    }
-
     async fn list_public_scripts(&self, page_token: Option<String>) -> Result<ScriptMetadataPage> {
         let request = self
             .sessions
@@ -305,15 +203,6 @@ fn parameter_type_into_domain(parameter_type: i32) -> ScriptParameterType {
     }
 }
 
-fn parameter_type_into_proto(parameter_type: ScriptParameterType) -> i32 {
-    use admin_proto::script_parameter::Type;
-    match parameter_type {
-        ScriptParameterType::String => Type::String as i32,
-        ScriptParameterType::Number => Type::Number as i32,
-        ScriptParameterType::Boolean => Type::Boolean as i32,
-    }
-}
-
 fn parameters_into_domain(
     parameters: HashMap<String, proto::ScriptParameter>,
 ) -> HashMap<String, ScriptParameter> {
@@ -332,47 +221,6 @@ fn parameters_into_domain(
             )
         })
         .collect()
-}
-
-fn parameters_into_proto(
-    parameters: HashMap<String, ScriptParameter>,
-) -> HashMap<String, admin_proto::ScriptParameter> {
-    parameters
-        .into_iter()
-        .map(|(key, parameter)| {
-            (
-                key,
-                admin_proto::ScriptParameter {
-                    label: parameter.label,
-                    placeholder: parameter.placeholder,
-                    r#type: parameter_type_into_proto(parameter.parameter_type),
-                    required: parameter.required,
-                    secret: parameter.secret,
-                },
-            )
-        })
-        .collect()
-}
-
-/// Converts a [`ScriptDraft`] into the admin API's `ScriptContent`, always
-/// private: only [`FydeClient::set_script_visibility`] publishes a script.
-fn content_into_proto(draft: ScriptDraft) -> ScriptContent {
-    ScriptContent {
-        name: draft.name,
-        is_public: false,
-        script: draft.script,
-        description: draft.description,
-        short_description: draft.short_description,
-        allowed_domains: draft.allowed_domains,
-        r#type: draft.script_type.to_string(),
-        parameters: parameters_into_proto(draft.parameters),
-        icon_id: icon_id_into_proto(draft.icon_id),
-    }
-}
-
-/// An optional icon id as a request carries it: empty for none.
-fn icon_id_into_proto(icon_id: Option<Uuid>) -> String {
-    icon_id.map(|id| id.to_string()).unwrap_or_default()
 }
 
 /// Parses an icon id as the server returns it: empty for none.
@@ -479,15 +327,11 @@ mod tests {
     }
 
     #[test]
-    fn icon_ids_round_trip_with_empty_meaning_none() {
+    fn icon_ids_parse_with_empty_meaning_none() {
         let id = Uuid::new_v4();
 
-        assert_eq!(icon_id_into_proto(None), "");
         assert_eq!(icon_id_into_domain("").unwrap(), None);
-        assert_eq!(
-            icon_id_into_domain(&icon_id_into_proto(Some(id))).unwrap(),
-            Some(id)
-        );
+        assert_eq!(icon_id_into_domain(&id.to_string()).unwrap(), Some(id));
         assert!(icon_id_into_domain("not-a-uuid").is_err());
     }
 }

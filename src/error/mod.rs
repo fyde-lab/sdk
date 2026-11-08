@@ -288,8 +288,6 @@ pub(crate) enum ErrorKind {
     UnsupportedDocumentExtension(String),
     #[error("a document with the same content is already saved locally as {0}")]
     DuplicateDocument(uuid::Uuid),
-    #[error("script {0} not found")]
-    ScriptNotFound(uuid::Uuid),
     #[error("script {0} is not installed on this device")]
     ScriptNotInstalled(uuid::Uuid),
     #[error("missing value for required parameter {parameter:?} of script {script_id}")]
@@ -398,7 +396,6 @@ impl ErrorKind {
             ErrorKind::Lua(err) => lua_code(err),
             ErrorKind::UnsupportedDocumentExtension(_) => ErrorCode::UnsupportedDocumentExtension,
             ErrorKind::DuplicateDocument(_) => ErrorCode::DuplicateDocument,
-            ErrorKind::ScriptNotFound(_) => ErrorCode::ScriptNotFound,
             ErrorKind::ScriptNotInstalled(_) => ErrorCode::ScriptNotInstalled,
             ErrorKind::MissingScriptParameter { .. } => ErrorCode::MissingScriptParameter,
             ErrorKind::InvalidChangelogEvent(_) => ErrorCode::InvalidChangelogEvent,

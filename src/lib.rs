@@ -20,8 +20,8 @@ pub use domains::scrapers::{
     ProgressStep, Service as ScrapersService,
 };
 pub use domains::scripts::{
-    InMemoryScriptStorage, InstallScriptRequest, InstalledScript, Script, ScriptMetadata,
-    ScriptParameter, ScriptParameterType, ScriptType, Service as ScriptsService,
+    InstallScriptRequest, InstalledScript, Script, ScriptMetadata, ScriptParameter,
+    ScriptParameterType, ScriptType, Service as ScriptsService,
 };
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
@@ -173,7 +173,6 @@ impl Client {
             sessions.clone(),
             sqlite.pool().clone(),
             changelog.clone(),
-            icons.clone(),
         );
         let usage = domains::usage::init(channel.clone(), sessions.clone());
         let attributes = domains::documents::attributes::init(channel.clone(), sessions.clone());
