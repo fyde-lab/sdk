@@ -18,6 +18,7 @@ use crate::{ErrorKind, Result};
 
 use super::super::cookies::Cookie;
 use super::super::host::{MAX_BODY_BYTES, is_host_allowed};
+use super::super::reports::redact_url;
 use super::Service;
 
 /// One pending `Eval` call's reply slot, keyed by the id embedded in the JS
@@ -51,7 +52,7 @@ fn deliver_download_url(pending_download: &PendingDownload, url: String) {
             let _ = sender.send(url);
         }
         None => tracing::warn!(
-            %url,
+            url = %redact_url(&url),
             "fyde.browser: cancelled a download no `download` call was waiting for"
         ),
     }
@@ -444,7 +445,8 @@ impl Service for BrowserDriver {
         };
         if !is_download_allowed(&url, &self.allowed_domains) {
             return Err(ErrorKind::Browser(format!(
-                "download url {url:?} is not in this scraper's allowed_domains list"
+                "download url {:?} is not in this scraper's allowed_domains list",
+                redact_url(&url)
             ))
             .into());
         }
@@ -614,7 +616,10 @@ fn build_webview(
         .with_navigation_handler(move |url| {
             let allowed = is_navigation_allowed(&url, &navigation_allowed_domains);
             if !allowed {
-                tracing::warn!(%url, "browser navigation blocked by allowed_domains");
+                tracing::warn!(
+                    url = %redact_url(&url),
+                    "browser navigation blocked by allowed_domains"
+                );
             }
             allowed
         })
@@ -632,7 +637,10 @@ fn build_webview(
             let pending_download = pending_download.clone();
             move |url, _features| {
                 if !is_navigation_allowed(&url, &new_window_allowed_domains) {
-                    tracing::warn!(%url, "browser popup blocked by allowed_domains");
+                    tracing::warn!(
+                        url = %redact_url(&url),
+                        "browser popup blocked by allowed_domains"
+                    );
                     return wry::NewWindowResponse::Deny;
                 }
                 let download_waiting = pending_download
@@ -696,7 +704,10 @@ fn handle_command(
                 return;
             };
             if let Err(err) = session.webview.load_url(&url) {
-                tracing::error!("fyde.browser: load_url({url:?}) failed: {err}");
+                tracing::error!(
+                    "fyde.browser: load_url({:?}) failed: {err}",
+                    redact_url(&url)
+                );
             }
         }
         Command::Eval { session, script } => {

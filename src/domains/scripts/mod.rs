@@ -36,13 +36,13 @@ use crate::domains::sessions::SessionsClient;
 /// Uses the scripts published on the fyde server's scripts service (see
 /// `grpc_client.rs`): fetching them, enabling/disabling them for the
 /// authenticated user, listing the ones currently enabled or public, and
-/// installing them. Authoring and publishing scripts is left to admin
-/// tooling talking to the server directly (e.g. `fyde-scripts publish`).
+/// installing them. Authoring and publishing scripts is admin work, done
+/// against the server's admin API directly (e.g. by `fyde-scripts publish`).
 /// Running scripts against a document is done by the `documents` domain's
 /// `parser` submodule, using [`Service::list_user_scripts`] and
 /// [`Service::fetch_script`] together with its own sandboxed Lua VM. Trait
-/// methods take `&self` (not `&mut self`) so
-/// implementations can be shared behind `Arc<dyn Service>`.
+/// methods take `&self` (not `&mut self`) so implementations can be shared
+/// behind `Arc<dyn Service>`.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Service: Send + Sync {

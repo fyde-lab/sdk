@@ -13,6 +13,8 @@ use opaque_ke::{
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use sha2_opaque::Digest as _;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{ErrorContext as _, ErrorKind, Result};
 
@@ -214,6 +216,21 @@ impl OpaqueClient for DefaultOpaqueClient {
     }
 }
 
+/// A well-formed OPAQUE `CredentialFinalization` (a random key-confirmation
+/// MAC of the key-exchange hash's length) that can never verify, for the
+/// SDK to close a login exchange it won't finish for real — because the
+/// password failed locally ([`OpaqueClient::finish_login`]), or because
+/// only the password check was wanted (`change_password`). `FinishLogin`
+/// consumes its `login_id` whatever the outcome, so sending this rejects it
+/// with UNAUTHENTICATED and frees the server's pending exchange instead of
+/// leaving it behind. Random rather than all zeros so it can't be told apart
+/// from a real wrong-password attempt on the wire.
+pub(super) fn abandoned_login_finalization() -> Vec<u8> {
+    let mut mac = vec![0u8; sha2_opaque::Sha512::output_size()];
+    rand::rng().fill_bytes(&mut mac);
+    mac
+}
+
 /// Produces a placeholder [`RegistrationState`]/[`LoginState`] for tests
 /// outside this module (`super::service`'s, mocking [`OpaqueClient`]) that
 /// need *a* value satisfying `finish_registration`/`finish_login`'s
@@ -251,9 +268,9 @@ struct WrappedMasterKey {
 
 /// Generates a fresh random 256-bit master key using the OS CSPRNG, as
 /// recommended by OWASP for symmetric key generation.
-fn generate_master_key() -> [u8; KEY_LEN] {
-    let mut key = [0u8; KEY_LEN];
-    rand::rng().fill_bytes(&mut key);
+fn generate_master_key() -> Zeroizing<[u8; KEY_LEN]> {
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    rand::rng().fill_bytes(key.as_mut_slice());
     key
 }
 
@@ -262,10 +279,10 @@ fn generate_master_key() -> [u8; KEY_LEN] {
 /// already the output of OPAQUE's own key-stretched, oblivious-PRF-hardened
 /// exchange (see [`high_effort_ksf`]) — running another slow hash over it
 /// would add cost without adding security.
-fn derive_wrapping_key(export_key: &[u8]) -> Result<[u8; KEY_LEN]> {
-    let mut key = [0u8; KEY_LEN];
+fn derive_wrapping_key(export_key: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>> {
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
     Hkdf::<sha2_opaque::Sha256>::new(None, export_key)
-        .expand(b"fyde/master-key-wrap-key-v1", &mut key)
+        .expand(b"fyde/master-key-wrap-key-v1", key.as_mut_slice())
         .map_err(|err| {
             ErrorKind::Encryption(format!("failed to derive key from export key: {err}"))
         })?;
@@ -318,10 +335,12 @@ fn encrypt_master_key(master_key: &[u8; KEY_LEN], wrapping_key: &[u8; KEY_LEN]) 
 /// — the only form the SDK persists locally, under
 /// [`crate::domains::secrets::MASTER_KEY_SECRET`] — and the wrapped form
 /// sent to the server, which is the only place it's ever stored.
-pub(super) fn generate_and_wrap_master_key(export_key: &[u8]) -> Result<(Vec<u8>, String)> {
+pub(super) fn generate_and_wrap_master_key(
+    export_key: &[u8],
+) -> Result<(Zeroizing<Vec<u8>>, String)> {
     let master_key = generate_master_key();
-    let wrapped = wrap_master_key(&master_key, export_key)?;
-    Ok((master_key.to_vec(), wrapped))
+    let wrapped = wrap_master_key(master_key.as_slice(), export_key)?;
+    Ok((Zeroizing::new(master_key.to_vec()), wrapped))
 }
 
 /// Decrypts a [`generate_and_wrap_master_key`]-produced wrapped master key
@@ -330,7 +349,10 @@ pub(super) fn generate_and_wrap_master_key(export_key: &[u8]) -> Result<(Vec<u8>
 /// Used by `login` to recover the account's master key from what
 /// `FinishLogin` returns, on a device that doesn't already have it cached
 /// locally.
-pub(super) fn unwrap_master_key(export_key: &[u8], wrapped_json: &str) -> Result<Vec<u8>> {
+pub(super) fn unwrap_master_key(
+    export_key: &[u8],
+    wrapped_json: &str,
+) -> Result<Zeroizing<Vec<u8>>> {
     let wrapping_key =
         derive_wrapping_key(export_key).context("failed to derive master key wrapping key")?;
 
@@ -338,7 +360,10 @@ pub(super) fn unwrap_master_key(export_key: &[u8], wrapped_json: &str) -> Result
 }
 
 /// Decrypts a JSON-serialized [`WrappedMasterKey`] under `wrapping_key`.
-fn decrypt_master_key(wrapped_json: &str, wrapping_key: &[u8; KEY_LEN]) -> Result<Vec<u8>> {
+fn decrypt_master_key(
+    wrapped_json: &str,
+    wrapping_key: &[u8; KEY_LEN],
+) -> Result<Zeroizing<Vec<u8>>> {
     let wrapped: WrappedMasterKey =
         serde_json::from_str(wrapped_json).context("failed to parse wrapped master key")?;
 
@@ -349,6 +374,7 @@ fn decrypt_master_key(wrapped_json: &str, wrapping_key: &[u8; KEY_LEN]) -> Resul
     let cipher = Aes256Gcm::new(&(*wrapping_key).into());
     cipher
         .decrypt(&Nonce::from(nonce_bytes), wrapped.ciphertext.as_slice())
+        .map(Zeroizing::new)
         .map_err(|_| ErrorKind::Encryption("failed to decrypt master key".into()).into())
 }
 
@@ -362,12 +388,19 @@ pub(super) struct RecoveryKeys {
     wrapping_key: [u8; KEY_LEN],
 }
 
+impl Drop for RecoveryKeys {
+    fn drop(&mut self) {
+        self.auth_key.zeroize();
+        self.wrapping_key.zeroize();
+    }
+}
+
 /// Generates a fresh recovery key: 256 bits from the OS CSPRNG, encoded as a
 /// 24-word English BIP39 mnemonic, words separated by single spaces.
 pub(super) fn generate_recovery_key() -> Result<String> {
-    let mut entropy = [0u8; RECOVERY_KEY_ENTROPY_LEN];
-    rand::rng().fill_bytes(&mut entropy);
-    let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)
+    let mut entropy = Zeroizing::new([0u8; RECOVERY_KEY_ENTROPY_LEN]);
+    rand::rng().fill_bytes(entropy.as_mut_slice());
+    let mnemonic = Mnemonic::from_entropy_in(Language::English, entropy.as_slice())
         .map_err(|err| ErrorKind::Encryption(format!("failed to encode recovery key: {err}")))?;
     Ok(mnemonic.to_string())
 }
@@ -390,7 +423,7 @@ pub(super) fn derive_recovery_keys(recovery_key: &str) -> Result<RecoveryKeys> {
         .into());
     }
 
-    let entropy = mnemonic.to_entropy();
+    let entropy = Zeroizing::new(mnemonic.to_entropy());
     let hkdf = Hkdf::<sha2_opaque::Sha256>::new(None, &entropy);
     let mut keys = RecoveryKeys {
         auth_key: [0u8; KEY_LEN],
@@ -420,13 +453,22 @@ pub(super) fn wrap_master_key_for_recovery(
 pub(super) fn unwrap_master_key_for_recovery(
     recovery_keys: &RecoveryKeys,
     wrapped_json: &str,
-) -> Result<Vec<u8>> {
+) -> Result<Zeroizing<Vec<u8>>> {
     decrypt_master_key(wrapped_json, &recovery_keys.wrapping_key)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abandoned_login_finalization_is_a_well_formed_fresh_finalization() {
+        let first = abandoned_login_finalization();
+        let second = abandoned_login_finalization();
+
+        opaque_ke::CredentialFinalization::<FydeCipherSuite>::deserialize(&first).unwrap();
+        assert_ne!(first, second);
+    }
 
     #[test]
     fn generate_recovery_key_produces_24_fresh_valid_words() {
@@ -480,11 +522,11 @@ mod tests {
         let keys = derive_recovery_keys(&generate_recovery_key().unwrap()).unwrap();
         let other_keys = derive_recovery_keys(&generate_recovery_key().unwrap()).unwrap();
 
-        let wrapped = wrap_master_key_for_recovery(&master_key, &keys).unwrap();
+        let wrapped = wrap_master_key_for_recovery(master_key.as_slice(), &keys).unwrap();
 
         assert_eq!(
-            unwrap_master_key_for_recovery(&keys, &wrapped).unwrap(),
-            master_key
+            *unwrap_master_key_for_recovery(&keys, &wrapped).unwrap(),
+            master_key.to_vec()
         );
         let err = unwrap_master_key_for_recovery(&other_keys, &wrapped).unwrap_err();
         assert!(matches!(err.kind(), ErrorKind::Encryption(_)));

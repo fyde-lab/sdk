@@ -27,19 +27,6 @@ impl<S: Storage> IconsClient<S> {
 
 #[async_trait]
 impl<S: Storage> Service for IconsClient<S> {
-    async fn create_icon(&self, content: Vec<u8>) -> Result<Icon> {
-        let icon = self.grpc.create_icon(content).await?;
-
-        // The creator is the first to show it: cache it right away rather
-        // than downloading back what was just uploaded.
-        self.storage
-            .save(&icon)
-            .await
-            .with_context(|| format!("failed to cache created icon {}", icon.id))?;
-
-        Ok(icon)
-    }
-
     async fn fetch_icon(&self, id: Uuid) -> Result<Icon> {
         if let Some(icon) = self
             .storage
@@ -68,31 +55,6 @@ mod tests {
     use crate::domains::icons::FakeIcon;
     use crate::domains::icons::grpc_client::MockFydeClient;
     use crate::domains::icons::storage::MockStorage;
-
-    #[tokio::test]
-    async fn create_icon_uploads_then_caches_the_icon() {
-        let icon = FakeIcon::new().with_content(vec![1, 2, 3]).build();
-        let mut grpc = MockFydeClient::new();
-        let returned = icon.clone();
-        grpc.expect_create_icon()
-            .with(eq(vec![1, 2, 3]))
-            .times(1)
-            .return_once(move |_| Ok(returned));
-        let mut storage = MockStorage::new();
-        let cached = icon.clone();
-        storage
-            .expect_save()
-            .withf(move |saved| *saved == cached)
-            .times(1)
-            .returning(|_| Ok(()));
-
-        let created = IconsClient::new(grpc, storage)
-            .create_icon(vec![1, 2, 3])
-            .await
-            .unwrap();
-
-        assert_eq!(created, icon);
-    }
 
     #[tokio::test]
     async fn fetch_icon_serves_a_cached_icon_without_asking_the_server() {

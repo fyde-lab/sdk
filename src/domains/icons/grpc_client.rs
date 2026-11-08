@@ -18,10 +18,7 @@ mod proto {
     tonic::include_proto!("icons.v1");
 }
 
-use proto::{
-    CreateIconRequest, FetchIconRequest,
-    icons_service_client::IconsServiceClient as GeneratedIconsClient,
-};
+use proto::{FetchIconRequest, icons_service_client::IconsServiceClient as GeneratedIconsClient};
 
 /// A gRPC transport for the fyde server's icons service. Knows nothing
 /// beyond translating between raw proto messages and the domain [`Icon`].
@@ -30,10 +27,6 @@ use proto::{
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(super) trait FydeClient: Send + Sync {
-    /// Stores `content` as an icon, or returns the existing icon with the
-    /// same content.
-    async fn create_icon(&self, content: Vec<u8>) -> Result<Icon>;
-
     /// Fetches the icon matching `id`.
     async fn fetch_icon(&self, id: Uuid) -> Result<Icon>;
 }
@@ -66,24 +59,6 @@ impl GrpcClient {
 
 #[async_trait]
 impl FydeClient for GrpcClient {
-    async fn create_icon(&self, content: Vec<u8>) -> Result<Icon> {
-        let request = self
-            .sessions
-            .authenticated_request(CreateIconRequest { content })
-            .await?;
-
-        let response = self
-            .sessions
-            .check_response(self.client().create_icon(request).await)
-            .await
-            .context("failed to create icon")?
-            .into_inner();
-
-        into_domain(response.icon.ok_or_else(|| {
-            ErrorKind::InvalidResponse("create icon response had no icon".to_string())
-        })?)
-    }
-
     async fn fetch_icon(&self, id: Uuid) -> Result<Icon> {
         let request = self
             .sessions

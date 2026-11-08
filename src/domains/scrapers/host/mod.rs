@@ -27,6 +27,7 @@ use super::browser::Service as BrowserService;
 use super::cookies::Cookie;
 use super::models::RunOptions;
 use super::reports::Recorder;
+use super::reports::redact_url;
 use super::stop::StopSignal;
 
 /// Handle returned by [`install`], letting `service.rs` read back
@@ -66,8 +67,10 @@ impl Installed {
 /// strings, outside the VM's memory limit, and `fyde.http` transparently
 /// decompresses gzip/brotli/zstd: without a cap, a small compressed
 /// response from a hostile or compromised allowed site could expand until
-/// the host process runs out of memory.
-pub(super) const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
+/// the host process runs out of memory. Kept below the Lua VM's own memory
+/// limit (`service::LUA_MEMORY_BYTES`), which a body must fit in once it
+/// becomes a Lua string.
+pub(super) const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Enforced by every `fyde.http.get/post_form/post_json/download` call and
 /// `fyde.browser:open` — the one network entry point each of those has —
@@ -91,14 +94,18 @@ fn ensure_domain_allowed(url: &str, allowed_domains: &[String]) -> std::result::
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_string));
     let Some(host) = host else {
-        return Err(format!("could not determine the host of url {url:?}"));
+        return Err(format!(
+            "could not determine the host of url {:?}",
+            redact_url(url)
+        ));
     };
 
     if is_host_allowed(&host, allowed_domains) {
         Ok(())
     } else {
         Err(format!(
-            "host {host:?} (from url {url:?}) is not in this scraper's allowed_domains list {allowed_domains:?}"
+            "host {host:?} (from url {:?}) is not in this scraper's allowed_domains list {allowed_domains:?}",
+            redact_url(url)
         ))
     }
 }

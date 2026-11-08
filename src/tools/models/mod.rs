@@ -281,7 +281,7 @@ impl ModelStore {
     }
 }
 
-fn file_name(model: &Model) -> String {
+pub(crate) fn file_name(model: &Model) -> String {
     format!("{}-{}", &model.sha256[..HASH_PREFIX_LEN], model.name)
 }
 

@@ -49,8 +49,9 @@ fn to_role(value: i32) -> Role {
 }
 
 /// What the server's `FinishLogin` answered, once the credentials checked
-/// out.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// out. Its `Debug` output never shows the session token or the wrapped
+/// master key.
+#[derive(Clone, PartialEq, Eq)]
 pub(super) enum FinishedLogin {
     /// A session was opened. `encrypted_master_key` is the account's master
     /// key, still encrypted client-side under a key derived from the OPAQUE
@@ -65,6 +66,27 @@ pub(super) enum FinishedLogin {
         max_sessions: u32,
         sessions: Vec<OpenSession>,
     },
+}
+
+impl std::fmt::Debug for FinishedLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FinishedLogin::Succeeded { role, .. } => f
+                .debug_struct("Succeeded")
+                .field("session_token", &"[redacted]")
+                .field("encrypted_master_key", &"[redacted]")
+                .field("role", role)
+                .finish(),
+            FinishedLogin::SessionLimitReached {
+                max_sessions,
+                sessions,
+            } => f
+                .debug_struct("SessionLimitReached")
+                .field("max_sessions", max_sessions)
+                .field("sessions", sessions)
+                .finish(),
+        }
+    }
 }
 
 /// A gRPC transport for talking to the fyde server's users service. Knows
@@ -317,6 +339,9 @@ impl FydeClient for GrpcClient {
                 opaque_upload: opaque_upload.to_vec(),
                 device_name: device_name.to_string(),
                 replace_session_id: replace_session_id.unwrap_or_default().to_string(),
+                // Always a regular session: an app device counts toward the
+                // plan's session limit.
+                admin_session: false,
             })
             .await?;
 
@@ -566,5 +591,27 @@ mod tests {
         let err = grpc.start_login("alice", b"the-request").await.unwrap_err();
 
         assert!(err.has_context());
+    }
+
+    #[test]
+    fn login_outcomes_never_show_the_session_token_or_master_key_in_debug_output() {
+        let finished = format!(
+            "{:?}",
+            FinishedLogin::Succeeded {
+                session_token: "secret-token".to_string(),
+                encrypted_master_key: b"secret-key".to_vec(),
+                role: Role::User,
+            }
+        );
+        let outcome = format!(
+            "{:?}",
+            crate::domains::users::LoginOutcome::LoggedIn {
+                session_token: "secret-token".to_string(),
+            }
+        );
+
+        for debug in [finished, outcome] {
+            assert!(!debug.contains("secret"), "{debug}");
+        }
     }
 }

@@ -1,8 +1,7 @@
 use uuid::Uuid;
 
 /// An image shown for another entity (e.g. a script's icon), as returned by
-/// [`super::Service::create_icon`]/[`super::Service::fetch_icon`]. Never
-/// changes once created.
+/// [`super::Service::fetch_icon`]. Never changes once created.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Icon {
     pub(super) id: Uuid,
@@ -40,11 +39,6 @@ impl FakeIcon {
 
     pub(crate) fn with_id(mut self, id: Uuid) -> Self {
         self.icon.id = id;
-        self
-    }
-
-    pub(crate) fn with_content(mut self, content: Vec<u8>) -> Self {
-        self.icon.content = content;
         self
     }
 

@@ -1,5 +1,6 @@
 mod models;
 mod recorder;
+mod redact;
 mod service;
 mod storage;
 mod storage_file;
@@ -7,6 +8,7 @@ mod storage_sqlite;
 
 pub(super) use models::Report;
 pub(super) use recorder::Recorder;
+pub(crate) use redact::redact_url;
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::Result;
 
-use super::{Document, FacetCount, Metadata, SearchFilters, SearchOrder};
+use super::{Document, DocumentEmbeddings, FacetCount, Metadata, SearchFilters, SearchOrder};
 
 /// A document field [`Storage::count_documents_by`] can count values of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,15 +16,21 @@ pub(crate) enum FacetField {
     ContentType,
 }
 
-/// Caches documents, unencrypted, locally. Implementations are injected
-/// into [`super::service::DocumentsClient`] (to cache what it uploads) and
-/// into `changelog::ChangelogClient` (to cache documents materialized from
-/// consumed events) at construction.
+/// Caches documents, unencrypted, locally, with their embeddings.
+/// Implementations are injected into [`super::service::DocumentsClient`]
+/// (to read cached documents back), [`super::service::DocumentIndexer`] (to
+/// cache documents materialized from consumed events) and
+/// `changelog::ChangelogClient` (to spot duplicates) at construction.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(crate) trait Storage: Send + Sync {
-    /// Persists a document as-is, unencrypted.
-    async fn save_document(&self, document: &Document) -> Result<()>;
+    /// Persists a document as-is, unencrypted, with `embeddings` as its
+    /// embeddings: both or neither.
+    async fn save_document(
+        &self,
+        document: &Document,
+        embeddings: &DocumentEmbeddings,
+    ) -> Result<()>;
 
     /// Fetches a document previously saved locally by [`Self::save_document`],
     /// or `None` if it doesn't exist.
@@ -75,8 +81,20 @@ pub(crate) trait Storage: Send + Sync {
         filters: &SearchFilters,
     ) -> Result<Option<(i64, i64)>>;
 
+    /// Fetches the metadata of a document previously saved locally by
+    /// [`Self::save_document`], or `None` if it doesn't exist. Never loads
+    /// its content.
+    async fn get_metadata(&self, id: Uuid) -> Result<Option<Metadata>>;
+
     /// Replaces the metadata of the document `id`, leaving its content
-    /// untouched. Does nothing if no document with `id` was previously
-    /// saved locally.
-    async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()>;
+    /// untouched, and its embeddings with `embeddings` when given: all or
+    /// nothing. Does nothing if no document with `id` was previously saved
+    /// locally and no `embeddings` are given (they'd have no document to
+    /// belong to, so fail).
+    async fn update_metadata(
+        &self,
+        id: Uuid,
+        metadata: &Metadata,
+        embeddings: Option<DocumentEmbeddings>,
+    ) -> Result<()>;
 }
