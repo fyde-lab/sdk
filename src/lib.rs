@@ -149,7 +149,14 @@ impl Client {
         let channel = lazy_channel(config.url)?;
         let models = Arc::new(tools::models::ModelStore::new(config.models_dir));
         let embedder = domains::documents::init_embedder(models);
-        let indexer = domains::documents::init_indexer(sqlite.pool().clone(), embedder.clone());
+        // Shared by uploads (which fill it), the sync job (which empties
+        // it) and logout (which clears it).
+        let embedding_cache = domains::documents::init_embedding_cache();
+        let indexer = domains::documents::init_indexer(
+            sqlite.pool().clone(),
+            embedder.clone(),
+            embedding_cache.clone(),
+        );
 
         let settings = domains::settings::init(sqlite.pool().clone());
         let sessions = domains::sessions::init(secrets.clone());
@@ -183,6 +190,7 @@ impl Client {
             attributes.clone(),
             indexer,
             embedder,
+            embedding_cache.clone(),
             config.on_document_change,
         );
         let users = domains::users::init(
@@ -193,6 +201,7 @@ impl Client {
             sqlite.clone(),
             Arc::new(client_directory(&location)),
             documents.clone(),
+            embedding_cache,
         )
         .await
         .context("failed to initialize users service")?;

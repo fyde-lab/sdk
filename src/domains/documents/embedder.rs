@@ -302,10 +302,14 @@ fn mean_pool(shape: &[i64], values: &[f32], mask: &[u32]) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::super::attributes::MockService as MockAttributesService;
+    use super::super::embedding_cache::MemoryEmbeddingCache;
     use super::super::service::{DocumentIndexer, DocumentsClient};
+    use super::super::storage_sqlite::tests::stored_embeddings;
+    use super::super::transcript::tests::build_pdf_pages;
     use super::super::{
-        ChangelogEvent, EventType, FakeDocument, FakeMetadata, Indexer as _, Metadata, MockIndexer,
-        SearchOrder, SearchQuery, Service as _, SqliteStorage,
+        ChangelogEvent, Document, EmbeddingCache as _, EventType, FakeDocument, FakeMetadata,
+        Indexer as _, Metadata, MockIndexer, SearchOrder, SearchQuery, Service as _, SqliteStorage,
+        UploadRequest,
     };
     use super::*;
     use crate::ErrorCode;
@@ -576,7 +580,11 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        let indexer = DocumentIndexer::new(SqliteStorage::new(pool.clone()), embedder.clone());
+        let indexer = DocumentIndexer::new(
+            SqliteStorage::new(pool.clone()),
+            embedder.clone(),
+            Arc::new(MemoryEmbeddingCache::new(0)),
+        );
         let documents = [
             (
                 "avis-impot-2024.pdf",
@@ -617,6 +625,7 @@ mod tests {
             Arc::new(MockAttributesService::new()),
             Arc::new(MockIndexer::new()),
             embedder,
+            Arc::new(MemoryEmbeddingCache::new(0)),
         );
         let text = "combien j'ai payé au fisc l'an dernier";
 
@@ -633,5 +642,161 @@ mod tests {
         eprintln!("found: {names:?}");
         assert!(by_terms.is_empty(), "{by_terms:?}");
         assert_eq!(found.first().map(|metadata| metadata.id), Some(ids[0]));
+    }
+
+    /// The real embedder, counting the passages calls it serves.
+    struct CountingEmbedder {
+        inner: OnnxEmbedder,
+        passages_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingEmbedder {
+        fn passages_calls(&self) -> usize {
+            self.passages_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for CountingEmbedder {
+        fn model(&self) -> String {
+            self.inner.model()
+        }
+
+        async fn load(&self) -> Result<()> {
+            self.inner.load().await
+        }
+
+        async fn embed_passages(&self, passages: Vec<String>) -> Result<Vec<Vec<f32>>> {
+            self.passages_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.embed_passages(passages).await
+        }
+
+        async fn embed_query(&self, text: String) -> Result<Vec<f32>> {
+            self.inner.embed_query(text).await
+        }
+    }
+
+    /// A changelog recording what an upload publishes, as a sync job would
+    /// receive it.
+    #[derive(Default)]
+    struct CapturingChangelog {
+        sent: std::sync::Mutex<Vec<(uuid::Uuid, Vec<u8>, Metadata)>>,
+    }
+
+    #[async_trait]
+    impl ChangelogService for CapturingChangelog {
+        async fn ensure_master_key(&self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send(
+            &self,
+            event_type: EventType,
+            subject_id: uuid::Uuid,
+            content: Option<&[u8]>,
+            metadata: Option<&Metadata>,
+        ) -> Result<()> {
+            assert_eq!(event_type, EventType::SaveDocument);
+            self.sent.lock().unwrap().push((
+                subject_id,
+                content.unwrap().to_vec(),
+                metadata.unwrap().clone(),
+            ));
+            Ok(())
+        }
+
+        async fn start_consume_job(
+            self: Arc<Self>,
+            _: Box<dyn FnMut(ChangelogEvent) + Send>,
+        ) -> Result<()> {
+            unreachable!("the test consumes the event itself")
+        }
+
+        fn stop_consume_job(&self) {}
+    }
+
+    async fn migrated_memory_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        pool
+    }
+
+    /// Uploads a synthetic PDF with the real model (see [`real_models`]),
+    /// then caches the document its event carries as the sync job would:
+    /// the text is embedded once, at upload, and the stored embeddings are
+    /// exactly those a sync with nothing cached computes.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "downloads a 135 MB model from Hugging Face"]
+    async fn multilingual_e5_upload_embeds_once_and_sync_stores_the_same_embeddings() {
+        let (_temp, models) = real_models();
+        let embedder = Arc::new(CountingEmbedder {
+            inner: OnnxEmbedder::new(models),
+            passages_calls: Default::default(),
+        });
+        let cache = Arc::new(MemoryEmbeddingCache::new(64 * 1024 * 1024));
+        let pool = migrated_memory_pool().await;
+        let indexer = DocumentIndexer::new(
+            SqliteStorage::new(pool.clone()),
+            embedder.clone(),
+            cache.clone(),
+        );
+        let changelog = Arc::new(CapturingChangelog::default());
+        let mut attributes = MockAttributesService::new();
+        attributes.expect_check().returning(|_| Ok(()));
+        let client = DocumentsClient::new(
+            SqliteStorage::new(pool.clone()),
+            changelog.clone(),
+            None,
+            Arc::new(attributes),
+            Arc::new(MockIndexer::new()),
+            embedder.clone(),
+            cache.clone(),
+        );
+        // Pages are never chunked together.
+        let pdf = build_pdf_pages(&[
+            "Facture d'electricite, periode : mars. Consommation : 320 kWh.",
+            "Montant TTC a payer : 84,20 EUR. Echeance : 15 avril.",
+        ]);
+
+        let id = client
+            .upload(UploadRequest::from_raw("facture-electricite-mars.pdf", pdf))
+            .await
+            .unwrap();
+        assert_eq!(embedder.passages_calls(), 1);
+        assert!(cache.get(id).is_some());
+
+        let (subject_id, content, metadata) = changelog.sent.lock().unwrap().pop().unwrap();
+        let document = Document::new(subject_id, content, metadata);
+        indexer.save_document(&document).await.unwrap();
+
+        assert_eq!(embedder.passages_calls(), 1, "embedded again at sync");
+        assert!(cache.get(id).is_none());
+        let stored = stored_embeddings(&SqliteStorage::new(pool), id).await;
+        assert_eq!(stored.len(), 2);
+        assert!(
+            stored.iter().all(
+                |(model, chunk)| *model == embedder.model() && chunk.vector.len() == DIMENSIONS
+            )
+        );
+
+        // The sync path with nothing cached, into a database of its own.
+        let reference_pool = migrated_memory_pool().await;
+        DocumentIndexer::new(
+            SqliteStorage::new(reference_pool.clone()),
+            embedder.clone(),
+            Arc::new(MemoryEmbeddingCache::new(64 * 1024 * 1024)),
+        )
+        .save_document(&document)
+        .await
+        .unwrap();
+        assert_eq!(embedder.passages_calls(), 2);
+        let reference = stored_embeddings(&SqliteStorage::new(reference_pool), id).await;
+        assert_eq!(stored, reference);
     }
 }

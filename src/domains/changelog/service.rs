@@ -595,7 +595,10 @@ mod tests {
     use super::super::grpc_client::MockFydeClient;
     use super::super::storage::MockCursorStorage;
     use super::*;
-    use crate::domains::documents::{FakeMetadata, MockIndexer, MockStorage};
+    use crate::domains::documents::{
+        DocumentIndexer, FakeCachedEmbeddings, FakeMetadata, MockEmbedder, MockEmbeddingCache,
+        MockIndexer, MockStorage,
+    };
     use crate::domains::scrapers::MockSessionStorage;
     use crate::domains::scripts::{
         FakeInstalledScript, FakeScript, MockStorage as MockScriptStorage,
@@ -772,6 +775,128 @@ mod tests {
             reachable_server_state(),
             fake_secrets(),
         );
+
+        client.consume_once(&mut |_| {}).await.unwrap();
+    }
+
+    /// The embeddings an upload left in the cache are stored with the
+    /// document its event carries, never embedded again, and survive a pass
+    /// that failed to save it, so the retried pass still reuses them. The
+    /// cursor only moves, and the entry is only dropped, once it's saved.
+    #[tokio::test]
+    async fn consume_reuses_an_uploads_cached_embeddings_even_after_a_failed_pass() {
+        let event_id = Uuid::now_v7();
+        let metadata = FakeMetadata::new()
+            .with_name("Facture mars.pdf")
+            .with_transcript("Montant : 42 €")
+            .build();
+        let document_id = metadata.id;
+        let encrypted_content = futures::executor::block_on(crypto::encrypt_event(
+            &*fake_secrets(),
+            EventType::SaveDocument,
+            document_id,
+            Some(b"content"),
+            Some(&metadata),
+        ))
+        .unwrap();
+        let proto = ProtoChangelogEvent {
+            id: event_id.to_string(),
+            encrypted_content,
+            previous_id: String::new(),
+        };
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_consume_since()
+            .times(2)
+            .returning(move |_| Ok(futures::stream::iter(vec![Ok(proto.clone())]).boxed()));
+        let mut document_storage = MockStorage::new();
+        document_storage
+            .expect_find_document_by_checksum()
+            .times(2)
+            .returning(|_| Ok(None));
+
+        // No `expect_embed_passages()`: embedding panics.
+        let mut embedder = MockEmbedder::new();
+        embedder.expect_load().times(2).returning(|| Ok(()));
+        embedder.expect_model().return_const("e5.onnx".to_string());
+
+        let cached = Arc::new(
+            FakeCachedEmbeddings::new()
+                .for_metadata(&metadata, "e5.onnx")
+                .build(),
+        );
+        let mut sequence = mockall::Sequence::new();
+        let mut cache = MockEmbeddingCache::new();
+        let entry = cached.clone();
+        cache
+            .expect_get()
+            .withf(move |id| *id == document_id)
+            .times(2)
+            .returning(move |_| Some(entry.clone()));
+        let mut indexer_storage = MockStorage::new();
+        let expected = cached.embeddings.clone();
+        indexer_storage
+            .expect_save_document()
+            .withf(move |document, embeddings| {
+                document.id() == document_id && *embeddings == expected
+            })
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(
+                |_, _| Err(ErrorKind::InvalidChangelogEvent("disk full".to_string()).into()),
+            );
+        let expected = cached.embeddings.clone();
+        indexer_storage
+            .expect_save_document()
+            .withf(move |_, embeddings| *embeddings == expected)
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_, _| Ok(()));
+        cache
+            .expect_remove()
+            .withf(move |id| *id == document_id)
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_const(());
+
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+        cursor_storage
+            .expect_is_applied()
+            .times(2)
+            .returning(|_| Ok(false));
+        cursor_storage
+            .expect_mark_applied()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(()));
+        cursor_storage
+            .expect_save_cursor()
+            .withf(move |id| *id == event_id)
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(()));
+
+        let client = ChangelogClient::new(
+            mock_grpc,
+            document_storage,
+            Arc::new(DocumentIndexer::new(
+                indexer_storage,
+                Arc::new(embedder),
+                Arc::new(cache),
+            )),
+            MockScriptStorage::new(),
+            MockSessionStorage::new(),
+            cursor_storage,
+            reachable_server_state(),
+            fake_secrets(),
+        );
+
+        let err = client.consume_once(&mut |_| {}).await.unwrap_err();
+        assert!(err.to_string().contains("disk full"), "{err}");
 
         client.consume_once(&mut |_| {}).await.unwrap();
     }

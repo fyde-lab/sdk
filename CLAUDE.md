@@ -64,7 +64,9 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
 - `logout` always clears secrets, wipes the database and deletes every other file in the
   client's directory (`tools::client_dir`; only the open database's files and the changelog
   lock stay), whether or not the server answers. Anything a domain writes to disk must live
-  in that directory, or logout leaves it behind.
+  in that directory, or logout leaves it behind. Plaintext-derived data held in memory (the
+  documents `EmbeddingCache`) is cleared by `users`' `clear_local_state` (logout and session
+  expiry). Never log embedding vectors or document text.
 - Every Lua VM is built with `tools::sandbox::new_vm` and scripts loaded with
   `sandbox::load_source` — never `Lua::new*` / `lua.load` (that would run precompiled bytecode).
 - Scraper debug reports never record request headers, request/download bodies, form values or
@@ -162,6 +164,18 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     document, cleared by `wipe`). `Indexer::prepare` fetches/loads the model; its last failure
     is `Service::indexing_model_error` (for the UI). One `OnnxEmbedder` (`init_embedder`) is
     shared by the indexer and searches.
+  - Upload-time embeddings: `upload` embeds the document (same `passages`, chunker and
+    embedder as the indexer, waiting for the model like it) before publishing, so the upload
+    flow has the vectors before emission. They never travel in the event, and `upload` writes
+    no table: it `put`s them in the in-memory `EmbeddingCache` (`init_embedding_cache`, one per
+    `Client`, shared by the documents service, the indexer and `users`; `embedding_cache.rs`
+    only stores: 64 MiB of entries, oldest put evicted first, never persisted) and removes
+    them if publishing fails. A blank transcript or a failed embed (logged, never fatal)
+    publishes without caching. Entries are keyed by `embedding_key`: document id + model +
+    `CHUNKER_VERSION` + SHA-256 of the length-prefixed passages (**bump `CHUNKER_VERSION`
+    whenever `chunk.rs` or the passage format changes**). The indexer's `save_document` stores a
+    matching entry's vectors as-is, else embeds inline, and removes the entry only once the
+    transaction committed (a failed pass retries with it).
   - Hybrid search: `search` with `Relevance` and non-blank text fuses (in `service.rs`) two
     storage rankings over the filtered documents, top `CANDIDATES` (200) each: `rank_by_terms`
     (bm25) and `rank_by_similarity` (cosine to the query, each document scored by its best

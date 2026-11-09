@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tonic::transport::Channel;
 use zeroize::Zeroizing;
 
-use crate::domains::documents::Service as DocumentsService;
+use crate::domains::documents::{EmbeddingCache, Service as DocumentsService};
 use crate::domains::secrets::{MASTER_KEY_SECRET, SecretLocation, Service as SecretsService};
 use crate::domains::sessions::{ExpiredSessionHandler, Service as SessionsService, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
@@ -114,6 +114,7 @@ pub struct UsersClient {
     local_db: Arc<dyn LocalDatabase>,
     local_files: Arc<dyn LocalFiles>,
     documents: Arc<dyn DocumentsService>,
+    embedding_cache: Arc<dyn EmbeddingCache>,
 }
 
 impl UsersClient {
@@ -121,10 +122,11 @@ impl UsersClient {
     /// connection to the fyde server. The account's master key is persisted
     /// in `secrets` and its role in `settings`; the session token is
     /// persisted, and outgoing calls authenticated, via `sessions`;
-    /// `secrets` is cleared, `local_db` wiped and `local_files` deleted on
-    /// `logout`; and changelog
+    /// `secrets` and `embedding_cache` are cleared, `local_db` wiped and
+    /// `local_files` deleted on `logout`; and changelog
     /// consumption on `documents` is started by `create`/`login` and stopped
     /// by `logout`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn new(
         channel: Channel,
         settings: Arc<dyn SettingsService>,
@@ -133,6 +135,7 @@ impl UsersClient {
         local_db: Arc<dyn LocalDatabase>,
         local_files: Arc<dyn LocalFiles>,
         documents: Arc<dyn DocumentsService>,
+        embedding_cache: Arc<dyn EmbeddingCache>,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(channel, sessions.clone())),
@@ -143,13 +146,15 @@ impl UsersClient {
             local_db,
             local_files,
             documents,
+            embedding_cache,
         })
     }
 
     /// Creates a client from already-constructed [`FydeClient`] and
     /// [`OpaqueClient`] implementations, for testing against
     /// [`super::grpc_client::MockFydeClient`]/[`super::crypto::MockOpaqueClient`]
-    /// instead of a live server and real cryptography.
+    /// instead of a live server and real cryptography. Its embedding cache
+    /// panics on any call (see [`Self::with_embedding_cache`]).
     #[cfg(test)]
     fn with_deps(
         grpc: impl FydeClient + 'static,
@@ -169,7 +174,14 @@ impl UsersClient {
             local_db,
             local_files,
             documents,
+            embedding_cache: Arc::new(crate::domains::documents::MockEmbeddingCache::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn with_embedding_cache(mut self, embedding_cache: impl EmbeddingCache + 'static) -> Self {
+        self.embedding_cache = Arc::new(embedding_cache);
+        self
     }
 
     /// Runs OPAQUE's `finish_registration` on the blocking pool: it runs the
@@ -204,13 +216,14 @@ impl UsersClient {
             .context("OPAQUE login task panicked")?
     }
 
-    /// Clears every trace of the account from this device: its secrets
-    /// from the credential store, every row of the local database and every
-    /// other file in the client's directory. All three always run, so a
-    /// failure in one never leaves the others' data behind. Changelog
-    /// consumption must already be stopped, so it can't write back what's
-    /// being wiped.
+    /// Clears every trace of the account from this device: the embeddings
+    /// uploads left in memory, its secrets from the credential store, every
+    /// row of the local database and every other file in the client's
+    /// directory. All always run, so a failure in one never leaves the
+    /// others' data behind. Changelog consumption must already be stopped,
+    /// so it can't write back what's being wiped.
     async fn clear_local_state(&self) -> Result<()> {
+        self.embedding_cache.clear();
         let cleared = self
             .secrets
             .clear()
@@ -727,6 +740,7 @@ mod tests {
     use super::super::crypto::{MockOpaqueClient, fake_login_state, fake_registration_state};
     use super::super::grpc_client::MockFydeClient;
     use super::*;
+    use crate::domains::documents::MockEmbeddingCache;
     use crate::domains::secrets::{MockService as MockSecretsService, SESSION_TOKEN_SECRET};
     use crate::domains::settings::MockService as MockSettingsService;
     use crate::tools::client_dir::MockLocalFiles;
@@ -747,6 +761,14 @@ mod tests {
             Arc::new(MockLocalFiles::new()),
             Arc::new(RecordingDocuments::default()),
         )
+    }
+
+    /// An embedding cache expecting to be cleared exactly once, and nothing
+    /// else.
+    fn cleared_cache() -> MockEmbeddingCache {
+        let mut cache = MockEmbeddingCache::new();
+        cache.expect_clear().times(1).return_const(());
+        cache
     }
 
     /// A [`DocumentsService`] fake recording whether
@@ -1945,7 +1967,8 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
-        );
+        )
+        .with_embedding_cache(cleared_cache());
 
         client.logout().await.unwrap();
     }
@@ -1973,7 +1996,8 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
-        );
+        )
+        .with_embedding_cache(cleared_cache());
 
         client.logout().await.unwrap();
     }
@@ -2001,7 +2025,8 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
-        );
+        )
+        .with_embedding_cache(cleared_cache());
 
         assert!(client.logout().await.is_err());
     }
@@ -2029,7 +2054,8 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
-        );
+        )
+        .with_embedding_cache(cleared_cache());
 
         assert!(client.logout().await.is_err());
     }
@@ -2086,7 +2112,8 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             documents.clone(),
-        );
+        )
+        .with_embedding_cache(cleared_cache());
 
         client.logout().await.unwrap();
 
@@ -2116,7 +2143,8 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             documents.clone(),
-        );
+        )
+        .with_embedding_cache(cleared_cache());
 
         client.end_expired_session().await.unwrap();
 
@@ -2147,7 +2175,8 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
-        );
+        )
+        .with_embedding_cache(cleared_cache());
 
         let err = client.end_expired_session().await.unwrap_err();
 

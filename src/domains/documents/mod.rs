@@ -2,6 +2,7 @@ pub(crate) mod attributes;
 mod chunk;
 mod dev;
 mod embedder;
+mod embedding_cache;
 mod models;
 mod service;
 mod storage;
@@ -16,14 +17,20 @@ pub use attributes::{
     SetAttributeRequest,
 };
 #[cfg(test)]
+pub(crate) use embedder::MockEmbedder;
+#[cfg(test)]
+pub(crate) use models::FakeCachedEmbeddings;
+#[cfg(test)]
 pub(crate) use models::FakeSearchFacets;
+pub(crate) use models::{CachedEmbeddings, ChunkEmbedding, DocumentEmbeddings, EmbeddingKey};
 pub use models::{
     Category, Document, DocumentType, FacetCount, Metadata, SearchFacets, SearchFilters,
     SearchOrder, SearchQuery, Subcategory, UploadRequest, UploadSource,
 };
-pub(crate) use models::{ChunkEmbedding, DocumentEmbeddings};
 #[cfg(any(test, feature = "testing"))]
 pub use models::{FakeDocument, FakeMetadata};
+#[cfg(test)]
+pub(crate) use service::DocumentIndexer;
 #[cfg(test)]
 pub(crate) use storage::MockStorage;
 pub(crate) use storage::Storage;
@@ -181,6 +188,34 @@ pub(crate) trait Indexer: Send + Sync {
     fn model_error(&self) -> Option<ErrorCode>;
 }
 
+/// Holds the embeddings [`Service::upload`] computes until the changelog
+/// consumer caches the document, so it reuses them instead of embedding the
+/// same text twice. Plaintext-derived, so in memory only, and cleared on
+/// logout.
+#[cfg_attr(test, automock)]
+pub(crate) trait EmbeddingCache: Send + Sync {
+    fn get(&self, document_id: Uuid) -> Option<Arc<CachedEmbeddings>>;
+
+    /// Stores `embeddings` under their `key.document_id`.
+    fn put(&self, embeddings: Arc<CachedEmbeddings>);
+
+    fn remove(&self, document_id: Uuid);
+
+    fn clear(&self);
+}
+
+/// How much memory the [`EmbeddingCache`] may hold: a scraper can upload
+/// hundreds of documents before sync consumes them.
+const EMBEDDING_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Initializes the [`EmbeddingCache`] shared by the documents [`Service`],
+/// its [`Indexer`] and logout.
+pub(crate) fn init_embedding_cache() -> Arc<dyn EmbeddingCache> {
+    Arc::new(embedding_cache::MemoryEmbeddingCache::new(
+        EMBEDDING_CACHE_BYTES,
+    ))
+}
+
 /// Initializes the on-device embedding model `models` holds, shared by the
 /// [`Indexer`] (which fetches it on the first [`Indexer::prepare`]) and the
 /// documents [`Service`]'s searches, so it's loaded once.
@@ -190,14 +225,17 @@ pub(crate) fn init_embedder(models: Arc<ModelStore>) -> Arc<dyn embedder::Embedd
 
 /// Initializes the [`Indexer`] the changelog consumer caches documents
 /// through, into the database behind `pool`, embedding them with
-/// `embedder` (see [`init_embedder`]).
+/// `embedder` (see [`init_embedder`]), unless `cache` holds the embeddings
+/// their upload computed.
 pub(crate) fn init_indexer(
     pool: SqlitePool,
     embedder: Arc<dyn embedder::Embedder>,
+    cache: Arc<dyn EmbeddingCache>,
 ) -> Arc<dyn Indexer> {
     Arc::new(service::DocumentIndexer::new(
         storage_sqlite::SqliteStorage::new(pool),
         embedder,
+        cache,
     ))
 }
 
@@ -207,14 +245,15 @@ pub(crate) fn init_indexer(
 /// `changelog::init`), wires up local SQLite-backed reads (via `pool`) of
 /// the documents it cached, and calls `on_document_change` (see
 /// [`crate::ClientConfig`]) for every event [`Service::start_sync`]
-/// consumes. Searches embed their text with `embedder` (see
-/// [`init_embedder`]).
+/// consumes. Uploads and searches embed their text with `embedder` (see
+/// [`init_embedder`]), uploads leaving theirs in `cache` for `indexer`.
 pub(crate) fn init(
     pool: SqlitePool,
     changelog: Arc<dyn changelog::Service>,
     attributes: Arc<dyn AttributesService>,
     indexer: Arc<dyn Indexer>,
     embedder: Arc<dyn embedder::Embedder>,
+    cache: Arc<dyn EmbeddingCache>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Arc<dyn Service> {
     let storage = storage_sqlite::SqliteStorage::new(pool);
@@ -226,6 +265,7 @@ pub(crate) fn init(
         attributes,
         indexer,
         embedder,
+        cache,
     ))
 }
 
