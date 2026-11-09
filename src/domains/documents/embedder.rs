@@ -302,6 +302,7 @@ fn mean_pool(shape: &[i64], values: &[f32], mask: &[u32]) -> Result<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::super::attributes::MockService as MockAttributesService;
+    use super::super::classification::{Classification, MockService as MockClassifier};
     use super::super::embedding_cache::MemoryEmbeddingCache;
     use super::super::service::{DocumentIndexer, DocumentsClient};
     use super::super::storage_sqlite::tests::stored_embeddings;
@@ -626,6 +627,7 @@ mod tests {
             Arc::new(MockIndexer::new()),
             embedder,
             Arc::new(MemoryEmbeddingCache::new(0)),
+            Arc::new(MockClassifier::new()),
         );
         let text = "combien j'ai payé au fisc l'an dernier";
 
@@ -749,6 +751,13 @@ mod tests {
         let changelog = Arc::new(CapturingChangelog::default());
         let mut attributes = MockAttributesService::new();
         attributes.expect_check().returning(|_| Ok(()));
+        // Mocked: the classifier embeds the document's text too, which
+        // `passages_calls` mustn't count.
+        let mut classifier = MockClassifier::new();
+        classifier
+            .expect_classify()
+            .times(1)
+            .returning(|_| Ok(Classification::default()));
         let client = DocumentsClient::new(
             SqliteStorage::new(pool.clone()),
             changelog.clone(),
@@ -757,6 +766,7 @@ mod tests {
             Arc::new(MockIndexer::new()),
             embedder.clone(),
             cache.clone(),
+            Arc::new(classifier),
         );
         // Pages are never chunked together.
         let pdf = build_pdf_pages(&[

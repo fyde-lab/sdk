@@ -191,6 +191,18 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     bm25 alone, never failing over the model. `search_facets` with non-blank text counts the
     same hybrid set (`count_documents_among`/`created_at_range_among`). `Newest`/`Oldest` and
     blank text stay bm25/filters only.
+  - `classification/` — zero-shot `Category`/`Subcategory`/`DocumentType` guess at upload
+    (ported from `doc-ai-poc`'s `classify.rs`): the whitespace-collapsed transcript (first 16 KiB)
+    embedded as one passage, against `query: `-embedded French descriptions per label
+    (`LABELS`, `TYPES`: business data, kept there; a label scores its best description).
+    Category = argmax over each category's best label, subcategory = argmax among that
+    category's labels (a `None`-subcategory label included: local taxes are `Taxes` alone, rent
+    `Housing` alone), type = flat argmax; each needs `*_MARGIN` over the runner-up, else `None`.
+    Descriptions are embedded lazily, once per process and model (`DESCRIPTIONS`). `upload`
+    classifies only after its embedding succeeded (model at hand) and only if the request set no
+    category/subcategory (a scraper's choice is never overridden; the type is then left to it
+    too); a request's type wins over the guessed one. A failure publishes unclassified. Never
+    run on consumption.
   - `dev.rs` — `DevDocumentsClient`, plain-file writes for `init_dev_scrapers`.
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
   (`SaveDocument`, `UpdateMetadata`, `InstallScript`). `crypto.rs`: AES-256-GCM, per-event DEK

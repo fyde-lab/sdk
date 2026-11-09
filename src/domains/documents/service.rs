@@ -17,6 +17,7 @@ use crate::domains::changelog::{
 
 use super::attributes::{self, Service as AttributesService};
 use super::chunk;
+use super::classification::Service as ClassificationService;
 use super::embedder::Embedder;
 use super::storage::{FacetField, Storage};
 use super::transcript;
@@ -72,6 +73,8 @@ pub(super) struct DocumentsClient<S: Storage> {
     /// Where uploads leave the embeddings they computed, for `indexer` to
     /// reuse.
     cache: Arc<dyn EmbeddingCache>,
+    /// What guesses uploads' category, subcategory and type.
+    classifier: Arc<dyn ClassificationService>,
     /// When embedding an upload last failed (see [`UPLOAD_EMBED_RETRY_AFTER`]).
     embed_failed_at: Mutex<Option<tokio::time::Instant>>,
 }
@@ -110,7 +113,9 @@ impl<S: Storage> DocumentsClient<S> {
     /// per consumed event, `attributes` to check the attributes of every
     /// document before it's published, `indexer` as what that job caches
     /// documents through, `embedder` to embed uploads' and searches' text,
-    /// and `cache` to hand uploads' embeddings over to `indexer`.
+    /// `cache` to hand uploads' embeddings over to `indexer`, and
+    /// `classifier` to classify uploads.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         storage: S,
         changelog: Arc<dyn ChangelogService>,
@@ -119,6 +124,7 @@ impl<S: Storage> DocumentsClient<S> {
         indexer: Arc<dyn Indexer>,
         embedder: Arc<dyn Embedder>,
         cache: Arc<dyn EmbeddingCache>,
+        classifier: Arc<dyn ClassificationService>,
     ) -> Self {
         Self {
             storage,
@@ -128,6 +134,7 @@ impl<S: Storage> DocumentsClient<S> {
             indexer,
             embedder,
             cache,
+            classifier,
             embed_failed_at: Mutex::new(None),
         }
     }
@@ -184,6 +191,25 @@ impl<S: Storage> DocumentsClient<S> {
                 );
                 None
             }
+        }
+    }
+
+    /// Sets `metadata`'s category, subcategory and, unless it has one, type
+    /// to what its text looks like (each left `None` where the classifier
+    /// can't tell), or leaves them as they are if that fails: the document
+    /// is then published unclassified rather than not at all.
+    async fn classify_upload(&self, metadata: &mut Metadata) {
+        match self.classifier.classify(&metadata.transcript).await {
+            Ok(classification) => {
+                metadata.category = classification.category;
+                metadata.subcategory = classification.subcategory;
+                metadata.r#type = metadata.r#type.or(classification.r#type);
+            }
+            Err(err) => tracing::warn!(
+                code = ?err.code(),
+                "failed to classify document {}, publishing it unclassified: {err}",
+                metadata.id
+            ),
         }
     }
 
@@ -405,6 +431,17 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .embed_upload(&metadata)
             .instrument(tracing::debug_span!("embed_document"))
             .await;
+
+        // Only with the model at hand (the document's just been embedded),
+        // so an upload never waits for its download twice, and never over a
+        // category the caller (a scraper, say) chose: the type is then
+        // theirs too, set or not.
+        if embeddings.is_some() && metadata.category.is_none() {
+            self.classify_upload(&mut metadata)
+                .instrument(tracing::debug_span!("classify_document"))
+                .await;
+        }
+
         let cached = embeddings.as_ref().map(|embeddings| {
             self.cache.put(embeddings.clone());
             CachedUntilPublished {
@@ -972,6 +1009,9 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::super::attributes::MockService as MockAttributesService;
+    use super::super::classification::{
+        Classification, FakeClassification, MockService as MockClassificationService,
+    };
     use super::super::embedder::MockEmbedder;
     use super::super::models::{FakeCachedEmbeddings, FakeChunkEmbedding, FakeDocumentEmbeddings};
     use super::super::storage::MockStorage;
@@ -1001,6 +1041,26 @@ mod tests {
             .expect_embed_passages()
             .returning(|_| Err(ErrorKind::ModelDownloadStatus(503).into()));
         Arc::new(embedder)
+    }
+
+    /// A classifier whose every call panics: for tests that never classify
+    /// an upload.
+    fn unused_classifier() -> Arc<dyn ClassificationService> {
+        Arc::new(MockClassificationService::new())
+    }
+
+    /// A classifier expected to classify exactly `times` uploads, each as
+    /// `classification`.
+    fn classifier_returning(
+        classification: Classification,
+        times: usize,
+    ) -> Arc<dyn ClassificationService> {
+        let mut classifier = MockClassificationService::new();
+        classifier
+            .expect_classify()
+            .times(times)
+            .returning(move |_| Ok(classification));
+        Arc::new(classifier)
     }
 
     /// An embedding cache whose every call panics: for tests that never
@@ -1043,6 +1103,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         let err = client
@@ -1171,6 +1232,7 @@ mod tests {
             unused_indexer(),
             embedder_without_model(),
             unused_cache(),
+            unused_classifier(),
         );
 
         let id = client
@@ -1227,6 +1289,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         let err = client
@@ -1253,6 +1316,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         let result = client.upload(UploadRequest::from_path(file.path())).await;
@@ -1273,6 +1337,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         let err = client
@@ -1306,6 +1371,7 @@ mod tests {
             unused_indexer(),
             embedder_without_model(),
             unused_cache(),
+            unused_classifier(),
         );
 
         let request = UploadRequest {
@@ -1349,6 +1415,7 @@ mod tests {
             unused_indexer(),
             embedder_without_model(),
             unused_cache(),
+            unused_classifier(),
         );
 
         request.source = super::super::UploadSource::Raw {
@@ -1384,6 +1451,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
         let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
         request.category = Some(Category::Money);
@@ -1409,6 +1477,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
         let mut request = UploadRequest::from_raw("raw.pdf", build_pdf("hello world"));
         request.attributes = BTreeMap::from([("price".to_string(), Attribute::Integer(1))]);
@@ -1445,6 +1514,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
         let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
         request.attributes = BTreeMap::from([("price".to_string(), Attribute::Float(f64::NAN))]);
@@ -1465,6 +1535,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
         let metadata = super::super::FakeMetadata::new()
             .with_attributes([("price".to_string(), Attribute::Integer(1))])
@@ -1487,6 +1558,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
         let attributes = BTreeMap::from([("price".to_string(), Attribute::Float(32.3))]);
         let metadata = super::super::FakeMetadata::new()
@@ -1510,6 +1582,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
         let metadata = super::super::FakeMetadata::new()
             .with_category(Category::Money)
@@ -1560,6 +1633,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         assert_eq!(client.get(id).await.unwrap(), Some(document));
@@ -1588,6 +1662,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         let page = client.list(1, 2).await.unwrap();
@@ -1633,6 +1708,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         let documents = client
@@ -1666,6 +1742,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         client.search(SearchQuery::new(" - ", 0, 10)).await.unwrap();
@@ -1691,6 +1768,7 @@ mod tests {
                 unused_indexer(),
                 unused_embedder(),
                 unused_cache(),
+                unused_classifier(),
             );
 
             let err = client.search(query.clone()).await.unwrap_err();
@@ -1808,6 +1886,7 @@ mod tests {
             unused_indexer(),
             unembeddable_queries(),
             unused_cache(),
+            unused_classifier(),
         );
 
         let facets = client.search_facets(" facture ", &filters).await.unwrap();
@@ -1840,6 +1919,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         let err = client
@@ -1860,6 +1940,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         let err = client
@@ -1970,6 +2051,7 @@ mod tests {
             unused_indexer(),
             embedder,
             unused_cache(),
+            unused_classifier(),
         )
     }
 
@@ -2293,6 +2375,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         client.update_metadata(metadata).await.unwrap();
@@ -2328,6 +2411,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         client.start_sync().await.unwrap();
@@ -2351,6 +2435,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         client.start_sync().await.unwrap();
@@ -2367,6 +2452,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         client.stop_sync();
@@ -2731,6 +2817,7 @@ mod tests {
             Arc::new(indexer),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         assert_eq!(
@@ -2944,6 +3031,7 @@ mod tests {
             unused_indexer(),
             Arc::new(embedder),
             Arc::new(cache),
+            classifier_returning(Classification::default(), 1),
         );
 
         let id = client
@@ -2988,6 +3076,7 @@ mod tests {
             unused_indexer(),
             embedder_without_model(),
             unused_cache(),
+            unused_classifier(),
         );
 
         let id = client
@@ -3015,6 +3104,7 @@ mod tests {
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
+            unused_classifier(),
         );
 
         client
@@ -3048,6 +3138,7 @@ mod tests {
             unused_indexer(),
             Arc::new(embedder),
             Arc::new(cache),
+            classifier_returning(Classification::default(), 1),
         );
 
         let err = client
@@ -3087,6 +3178,7 @@ mod tests {
             unused_indexer(),
             Arc::new(embedder),
             Arc::new(cache),
+            classifier_returning(Classification::default(), 1),
         );
 
         let upload = client.upload(UploadRequest::from_raw(
@@ -3138,6 +3230,7 @@ mod tests {
             unused_indexer(),
             Arc::new(embedder),
             Arc::new(cache),
+            classifier_returning(Classification::default(), 1),
         );
         let upload = |text| client.upload(UploadRequest::from_raw("a.pdf", build_pdf(text)));
 
@@ -3151,6 +3244,173 @@ mod tests {
 
         assert_eq!(changelog.sent.lock().unwrap().len(), 4);
         assert_eq!(put.lock().unwrap().as_ref().unwrap().key.document_id, id);
+    }
+
+    /// A client uploading through `changelog` with a model embedding
+    /// once, and classifying with `classifier`.
+    fn client_classifying_with(
+        changelog: Arc<RecordingChangelog>,
+        classifier: Arc<dyn ClassificationService>,
+    ) -> DocumentsClient<MockStorage> {
+        let (embedder, _) = embedder_embedding_once();
+        let mut cache = MockEmbeddingCache::new();
+        cache.expect_put().times(1).return_const(());
+        DocumentsClient::new(
+            storage_for_a_new_upload(),
+            changelog,
+            None,
+            accepting_attributes(),
+            unused_indexer(),
+            Arc::new(embedder),
+            Arc::new(cache),
+            classifier,
+        )
+    }
+
+    /// The metadata of the only document `changelog` published.
+    fn published_metadata(changelog: &RecordingChangelog) -> Metadata {
+        let sent = changelog.sent.lock().unwrap();
+        let [(EventType::SaveDocument, _, _, Some(metadata))] = &sent[..] else {
+            panic!("unexpected events: {sent:?}");
+        };
+        metadata.clone()
+    }
+
+    #[tokio::test]
+    async fn upload_publishes_the_document_classified_from_its_transcript() {
+        let classification = FakeClassification::new().build();
+        let mut classifier = MockClassificationService::new();
+        classifier
+            .expect_classify()
+            .withf(|text| text.contains("Montant : 42 €"))
+            .times(1)
+            .returning(move |_| Ok(classification));
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_classifying_with(changelog.clone(), Arc::new(classifier));
+
+        client
+            .upload(UploadRequest::from_raw(
+                "a.pdf",
+                build_pdf("Montant : 42 €"),
+            ))
+            .await
+            .unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(
+            (metadata.category, metadata.subcategory, metadata.r#type),
+            (
+                classification.category,
+                classification.subcategory,
+                classification.r#type
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_leaves_unclassified_what_the_classifier_can_t_tell() {
+        let classification = FakeClassification::new()
+            .with_subcategory(None)
+            .with_type(None)
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client =
+            client_classifying_with(changelog.clone(), classifier_returning(classification, 1));
+
+        client
+            .upload(UploadRequest::from_raw(
+                "a.pdf",
+                build_pdf("Montant : 42 €"),
+            ))
+            .await
+            .unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(metadata.category, classification.category);
+        assert_eq!((metadata.subcategory, metadata.r#type), (None, None));
+    }
+
+    #[tokio::test]
+    async fn upload_never_classifies_a_document_given_a_category() {
+        let changelog = Arc::new(RecordingChangelog::default());
+        // Strict: classifying panics.
+        let client = client_classifying_with(changelog.clone(), unused_classifier());
+        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
+        request.category = Some(Category::Housing);
+
+        client.upload(request).await.unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(metadata.category, Some(Category::Housing));
+        assert_eq!((metadata.subcategory, metadata.r#type), (None, None));
+    }
+
+    #[tokio::test]
+    async fn upload_never_classifies_a_document_given_a_subcategory_alone() {
+        let changelog = Arc::new(RecordingChangelog::default());
+        // Strict: classifying panics.
+        let client = client_classifying_with(changelog.clone(), unused_classifier());
+        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
+        request.subcategory = Some(Subcategory::Water);
+
+        client.upload(request).await.unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(
+            (metadata.category, metadata.subcategory),
+            (Some(Category::Housing), Some(Subcategory::Water))
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_classifies_a_document_given_a_type_alone_but_keeps_its_type() {
+        let classification = FakeClassification::new()
+            .with_category(Category::Work)
+            .with_subcategory(Subcategory::Payslips)
+            .with_type(DocumentType::Payslip)
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client =
+            client_classifying_with(changelog.clone(), classifier_returning(classification, 1));
+        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
+        request.r#type = Some(DocumentType::Contract);
+
+        client.upload(request).await.unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(
+            (metadata.category, metadata.subcategory, metadata.r#type),
+            (
+                Some(Category::Work),
+                Some(Subcategory::Payslips),
+                Some(DocumentType::Contract)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_publishes_the_document_unclassified_when_classifying_fails() {
+        let mut classifier = MockClassificationService::new();
+        classifier
+            .expect_classify()
+            .times(1)
+            .returning(|_| Err(ErrorKind::ModelNotDownloaded("e5".to_string()).into()));
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_classifying_with(changelog.clone(), Arc::new(classifier));
+
+        client
+            .upload(UploadRequest::from_raw(
+                "a.pdf",
+                build_pdf("Montant : 42 €"),
+            ))
+            .await
+            .unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(
+            (metadata.category, metadata.subcategory, metadata.r#type),
+            (None, None, None)
+        );
     }
 
     /// Uploads a document with a mocked model, then has an indexer over a
@@ -3170,6 +3430,7 @@ mod tests {
             unused_indexer(),
             Arc::new(embedder),
             Arc::new(cache),
+            classifier_returning(Classification::default(), 1),
         );
         let id = client
             .upload(UploadRequest::from_raw("Facture mars.pdf", pdf))
