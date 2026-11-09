@@ -3,9 +3,7 @@ use uuid::Uuid;
 
 use crate::domains::documents::Metadata;
 
-/// The kind of write recorded by a [`ChangelogEvent`]. Only [`Self::SaveDocument`]
-/// is producible today (there is no update/delete flow yet), but the shape
-/// is forward-compatible with the others.
+/// The kind of write recorded by a [`ChangelogEvent`].
 ///
 /// Variants are serialized by name inside each encrypted event, so the
 /// `alias`es keep events recorded under their former names decodable.
@@ -14,6 +12,8 @@ pub enum EventType {
     #[serde(alias = "Created")]
     SaveDocument,
     UpdateMetadata,
+    /// A document was deleted (see `documents::Service::delete`). Carries
+    /// only the document's id as `subject_id`.
     Deleted,
     /// A script was installed for the account (see
     /// `scripts::Service::install_script`). The event's `subject_id` is the

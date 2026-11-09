@@ -228,7 +228,8 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
     }
 
     /// Applies `event` to local storage: caches (and indexes) the document
-    /// it saves or updates, or saves the script it installs.
+    /// it saves or updates, removes the one it deletes, or saves the script
+    /// it installs.
     async fn apply(&self, event: &ChangelogEvent) -> Result<()> {
         match event.event_type {
             EventType::SaveDocument => {
@@ -292,7 +293,11 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
                     .await
                     .with_context(|| format!("failed to apply changelog event {}", event.id))
             }
-            EventType::Deleted => Ok(()),
+            EventType::Deleted => self
+                .indexer
+                .delete_document(event.subject_id)
+                .await
+                .with_context(|| format!("failed to apply changelog event {}", event.id)),
             EventType::InstallScript => {
                 let Some(content) = &event.content else {
                     return Err(ErrorKind::InvalidChangelogEvent(format!(
@@ -1316,7 +1321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_does_not_cache_the_document_for_a_deleted_event() {
+    async fn consume_deletes_the_cached_document_for_a_deleted_event() {
         let document_id = Uuid::now_v7();
         let event_id = Uuid::now_v7();
 
@@ -1330,9 +1335,16 @@ mod tests {
             .boxed())
         });
 
-        // No `expect_save_document()`/`expect_get_document()` set up: the
-        // mock panics if either is called, which is how this test proves
-        // neither is.
+        // No `expect_prepare()`: a deletion embeds nothing, so it doesn't
+        // wait for the indexing model.
+        let mut indexer = MockIndexer::new();
+        indexer
+            .expect_delete_document()
+            .withf(move |id| *id == document_id)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        // No expectations: the document is deleted through the indexer.
         let document_storage = MockStorage::new();
 
         let mut cursor_storage = MockCursorStorage::new();
@@ -1356,7 +1368,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
-            idle_indexer(),
+            Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1364,7 +1376,58 @@ mod tests {
             fake_secrets(),
         );
 
-        client.consume_once(&mut |_| {}).await.unwrap();
+        let mut received = Vec::new();
+        client
+            .consume_once(&mut |event| received.push(event))
+            .await
+            .unwrap();
+
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].event_type, EventType::Deleted);
+        assert_eq!(received[0].subject_id, document_id);
+    }
+
+    #[tokio::test]
+    async fn consume_does_not_advance_past_a_deletion_it_failed_to_apply() {
+        let event_id = Uuid::now_v7();
+
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            Ok(futures::stream::iter(vec![Ok(proto_event_with_type(
+                event_id,
+                Uuid::now_v7(),
+                EventType::Deleted,
+            ))])
+            .boxed())
+        });
+
+        let mut indexer = MockIndexer::new();
+        indexer
+            .expect_delete_document()
+            .returning(|_| Err(ErrorKind::InvalidChangelogEvent("disk full".into()).into()));
+
+        // No `expect_mark_applied()`/`expect_save_cursor()`: the cursor
+        // stays before the event, so the next pass retries it.
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage.expect_is_applied().returning(|_| Ok(false));
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+
+        let client = ChangelogClient::new(
+            mock_grpc,
+            MockStorage::new(),
+            Arc::new(indexer),
+            MockScriptStorage::new(),
+            MockSessionStorage::new(),
+            cursor_storage,
+            reachable_server_state(),
+            fake_secrets(),
+        );
+
+        let err = client.consume_once(&mut |_| {}).await.unwrap_err();
+
+        assert!(err.has_context(), "missing context: {err}");
     }
 
     #[tokio::test]

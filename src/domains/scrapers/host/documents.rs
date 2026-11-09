@@ -452,6 +452,10 @@ mod tests {
             unimplemented!()
         }
 
+        async fn delete(&self, _id: Uuid) -> crate::Result<()> {
+            unimplemented!()
+        }
+
         async fn start_sync(&self) -> crate::Result<()> {
             unimplemented!()
         }

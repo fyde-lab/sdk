@@ -415,6 +415,18 @@ impl Storage for SqliteStorage {
             .await
             .with_context(|| format!("failed to commit updating document {id} metadata"))
     }
+
+    async fn delete_document(&self, id: Uuid) -> Result<()> {
+        // Its embeddings cascade, and the `documents_fts` triggers drop it
+        // from the full-text index.
+        sqlx::query("DELETE FROM documents WHERE id = ?1")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("failed to delete document {id} from local database"))?;
+
+        Ok(())
+    }
 }
 
 /// Inserts `embeddings` as the embeddings of the document `id`, chunks
@@ -818,7 +830,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn embeddings_are_deleted_with_their_document() {
+    async fn delete_document_deletes_only_that_document_with_its_embeddings() {
         let storage = setup().await;
         let document = FakeDocument::new().build();
         let other = FakeDocument::new().build();
@@ -832,17 +844,47 @@ pub(super) mod tests {
             .await
             .unwrap();
 
-        sqlx::query("DELETE FROM documents WHERE id = ?1")
-            .bind(document.id.to_string())
-            .execute(&storage.pool)
-            .await
-            .unwrap();
+        storage.delete_document(document.id).await.unwrap();
 
+        assert_eq!(storage.get_document(document.id).await.unwrap(), None);
         assert!(stored_embeddings(&storage, document.id).await.is_empty());
+        assert!(storage.get_document(other.id).await.unwrap().is_some());
         assert_eq!(
             stored_embeddings(&storage, other.id).await,
             with_model(&other_embeddings)
         );
+    }
+
+    #[tokio::test]
+    async fn delete_document_drops_it_from_the_full_text_index() {
+        let storage = setup().await;
+        let deleted = Uuid::now_v7();
+        save(&storage, searchable("quittance kept", 1)).await;
+        save(
+            &storage,
+            searchable("quittance deleted", 2).with_id(deleted),
+        )
+        .await;
+
+        storage.delete_document(deleted).await.unwrap();
+
+        assert_eq!(
+            search_names(
+                &storage,
+                &["quittance"],
+                &SearchFilters::default(),
+                SearchOrder::Relevance
+            )
+            .await,
+            vec!["quittance kept"]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_document_does_nothing_for_a_missing_document() {
+        let storage = setup().await;
+
+        storage.delete_document(Uuid::now_v7()).await.unwrap();
     }
 
     #[tokio::test]

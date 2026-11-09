@@ -830,6 +830,10 @@ mod tests {
             unimplemented!()
         }
 
+        async fn delete(&self, _id: uuid::Uuid) -> Result<()> {
+            unimplemented!()
+        }
+
         async fn start_sync(&self) -> Result<()> {
             self.start_sync_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);

@@ -133,4 +133,9 @@ pub(crate) trait Storage: Send + Sync {
         metadata: &Metadata,
         embeddings: Option<DocumentEmbeddings>,
     ) -> Result<()>;
+
+    /// Deletes the document `id` previously saved locally by
+    /// [`Self::save_document`], with its embeddings. Does nothing if there's
+    /// none.
+    async fn delete_document(&self, id: Uuid) -> Result<()>;
 }
