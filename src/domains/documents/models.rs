@@ -995,6 +995,87 @@ impl FakeChunkEmbedding {
     }
 }
 
+/// Identifies what a document's embeddings were computed from: they can
+/// only stand in for the ones computed from the same key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EmbeddingKey {
+    pub(crate) document_id: Uuid,
+    /// See `Embedder::model`.
+    pub(crate) model: String,
+    pub(crate) chunker_version: u32,
+    /// The SHA-256 of the passages embedded, never the text itself.
+    pub(crate) text_sha256: [u8; 32],
+}
+
+/// A document's embeddings computed at upload, kept for the changelog
+/// consumer to reuse (see [`super::EmbeddingCache`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CachedEmbeddings {
+    pub(crate) key: EmbeddingKey,
+    pub(crate) embeddings: DocumentEmbeddings,
+}
+
+/// Builds a [`CachedEmbeddings`] filled with random-but-plausible data,
+/// overridable field by field, for use in tests.
+#[cfg(test)]
+pub(crate) struct FakeCachedEmbeddings {
+    cached: CachedEmbeddings,
+}
+
+#[cfg(test)]
+impl FakeCachedEmbeddings {
+    pub(crate) fn new() -> Self {
+        let embeddings = FakeDocumentEmbeddings::new().build();
+        Self {
+            cached: CachedEmbeddings {
+                key: EmbeddingKey {
+                    document_id: Uuid::now_v7(),
+                    model: embeddings.model.clone(),
+                    chunker_version: 1,
+                    text_sha256: std::array::from_fn(|_| {
+                        crate::tools::testing::random_u64(256) as u8
+                    }),
+                },
+                embeddings,
+            },
+        }
+    }
+
+    /// Keys the entry as the upload of `metadata` embedded with `model`
+    /// would.
+    pub(crate) fn for_metadata(mut self, metadata: &Metadata, model: &str) -> Self {
+        use super::service::{CHUNKER_VERSION, embedding_key, passages};
+
+        self.cached.key = embedding_key(
+            metadata.id,
+            model,
+            CHUNKER_VERSION,
+            &passages(metadata).texts,
+        );
+        self.cached.embeddings.model = model.to_string();
+        self
+    }
+
+    pub(crate) fn with_key(mut self, key: EmbeddingKey) -> Self {
+        self.cached.key = key;
+        self
+    }
+
+    pub(crate) fn with_document_id(mut self, id: Uuid) -> Self {
+        self.cached.key.document_id = id;
+        self
+    }
+
+    pub(crate) fn with_embeddings(mut self, embeddings: DocumentEmbeddings) -> Self {
+        self.cached.embeddings = embeddings;
+        self
+    }
+
+    pub(crate) fn build(self) -> CachedEmbeddings {
+        self.cached
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

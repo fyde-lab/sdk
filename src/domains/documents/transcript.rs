@@ -47,6 +47,12 @@ pub(crate) mod tests {
     /// fixture content in tests that need real (rather than hand-rolled)
     /// PDF bytes.
     pub(crate) fn build_pdf(text: &str) -> Vec<u8> {
+        build_pdf_pages(&[text])
+    }
+
+    /// Builds a minimal PDF with one page per element of `pages`, each
+    /// containing that text.
+    pub(crate) fn build_pdf_pages(pages: &[&str]) -> Vec<u8> {
         let mut doc = lopdf::Document::with_version("1.5");
 
         let pages_id = doc.new_object_id();
@@ -62,27 +68,30 @@ pub(crate) mod tests {
             },
         });
 
-        let content = Content {
-            operations: vec![
-                Operation::new("BT", vec![]),
-                Operation::new("Tf", vec!["F1".into(), 48.into()]),
-                Operation::new("Td", vec![100.into(), 600.into()]),
-                Operation::new("Tj", vec![Object::string_literal(text)]),
-                Operation::new("ET", vec![]),
-            ],
-        };
-        let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
-
-        let page_id = doc.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "Contents" => content_id,
-        });
+        let mut kids = Vec::new();
+        for text in pages {
+            let content = Content {
+                operations: vec![
+                    Operation::new("BT", vec![]),
+                    Operation::new("Tf", vec!["F1".into(), 48.into()]),
+                    Operation::new("Td", vec![100.into(), 600.into()]),
+                    Operation::new("Tj", vec![Object::string_literal(*text)]),
+                    Operation::new("ET", vec![]),
+                ],
+            };
+            let content_id = doc.add_object(Stream::new(dictionary! {}, content.encode().unwrap()));
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Contents" => content_id,
+            });
+            kids.push(page_id.into());
+        }
 
         let pages = dictionary! {
             "Type" => "Pages",
-            "Kids" => vec![page_id.into()],
-            "Count" => 1,
+            "Count" => kids.len() as i64,
+            "Kids" => kids,
             "Resources" => resources_id,
             "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
         };

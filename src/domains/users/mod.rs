@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tonic::transport::Channel;
 
-use crate::domains::documents::Service as DocumentsService;
+use crate::domains::documents::{EmbeddingCache, Service as DocumentsService};
 use crate::domains::secrets::Service as SecretsService;
 use crate::domains::sessions::{ExpiredSessionHandler, Service as _, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
@@ -493,13 +493,14 @@ pub trait Service: Send + Sync {
 /// persist the account's master key, and `sessions` the session token (read
 /// back by every other service's gRPC transport to authenticate their own
 /// calls); `settings` holds the cached role and language preference.
-/// `secrets` is cleared, `local_db` wiped and `local_files` deleted by
-/// `logout`. `documents`'
+/// `secrets` and `embedding_cache` are cleared, `local_db` wiped and
+/// `local_files` deleted by `logout`. `documents`'
 /// [`DocumentsService::start_sync`] is called by `create`/`login` once a
 /// session is open, and [`DocumentsService::stop_sync`] is called by
 /// `logout` to stop that consumption again. The returned service is also
 /// registered with `sessions` to log out locally once the server rejects
 /// the session (see [`crate::domains::sessions::Service::check_response`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn init(
     channel: Channel,
     settings: Arc<dyn SettingsService>,
@@ -508,6 +509,7 @@ pub(crate) async fn init(
     local_db: Arc<dyn LocalDatabase>,
     local_files: Arc<dyn LocalFiles>,
     documents: Arc<dyn DocumentsService>,
+    embedding_cache: Arc<dyn EmbeddingCache>,
 ) -> Result<Arc<dyn Service>> {
     let users = Arc::new(
         UsersClient::new(
@@ -518,6 +520,7 @@ pub(crate) async fn init(
             local_db,
             local_files,
             documents,
+            embedding_cache,
         )
         .await?,
     );

@@ -695,7 +695,7 @@ fn push_matching(query: &mut QueryBuilder<Sqlite>, terms: &[String], filters: &S
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::super::models::{FakeChunkEmbedding, FakeDocumentEmbeddings};
@@ -722,7 +722,10 @@ mod tests {
 
     /// The embeddings stored for the document `id`, in chunk order, each
     /// with the model stored beside it.
-    async fn stored_embeddings(storage: &SqliteStorage, id: Uuid) -> Vec<(String, ChunkEmbedding)> {
+    pub(in super::super) async fn stored_embeddings(
+        storage: &SqliteStorage,
+        id: Uuid,
+    ) -> Vec<(String, ChunkEmbedding)> {
         let rows: Vec<(i64, i64, i64, String, Vec<u8>)> = sqlx::query_as(
             "SELECT chunk, start, \"end\", model, vector FROM document_embeddings
              WHERE document_id = ?1 ORDER BY chunk",
