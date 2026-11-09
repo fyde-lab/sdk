@@ -4,6 +4,11 @@ mod classification;
 mod dev;
 mod embedder;
 mod embedding_cache;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "not wired into any document flow yet")
+)]
+mod gliner;
 mod models;
 mod service;
 mod storage;
