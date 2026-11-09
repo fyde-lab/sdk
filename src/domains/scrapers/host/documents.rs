@@ -54,13 +54,13 @@ pub(super) fn save_document_fn(
                 apply_upload_fields(&mut request, &fields)?;
             }
 
-            // An upload isn't cut short halfway (it publishes an event), but
-            // a stopped run doesn't start one.
-            stop.check()?;
-
+            // Stopping gives up on an upload under way: it may wait minutes
+            // for the embedding model's download. One given up on while
+            // publishing may still have been published.
+            //
             // A scraper re-run typically finds documents it already saved:
             // that's not a failure, just nothing to do.
-            let id = match runtime.block_on(documents.upload(request)) {
+            let id = match stop.block_on(&runtime, documents.upload(request))? {
                 Ok(id) => id,
                 Err(err) if err.code() == ErrorCode::DuplicateDocument => {
                     tracing::debug!(
@@ -347,5 +347,121 @@ mod tests {
         let result = lua.load(r#"save_document("a.pdf", {1, 2, 3})"#).exec();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn save_document_never_starts_an_upload_once_stopped() {
+        // Strict mock: an upload panics.
+        let documents = MockDocumentsService::new();
+        let stop = StopSignal::new();
+        stop.stop();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let lua = Lua::new();
+        let f = save_document_fn(
+            &lua,
+            Arc::new(documents),
+            "didaxis",
+            runtime.handle().clone(),
+            stop,
+        )
+        .unwrap();
+        lua.globals().set("save_document", f).unwrap();
+
+        let err = lua
+            .load(r#"save_document("a.pdf", "content")"#)
+            .exec()
+            .unwrap_err();
+
+        assert_eq!(crate::Error::from(err).code(), ErrorCode::ScraperRunStopped);
+    }
+
+    #[test]
+    fn save_document_gives_up_on_an_upload_under_way_when_stopped() {
+        let stop = StopSignal::new();
+        let documents = StoppingDocuments { stop: stop.clone() };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let lua = Lua::new();
+        let f = save_document_fn(
+            &lua,
+            Arc::new(documents),
+            "didaxis",
+            runtime.handle().clone(),
+            stop,
+        )
+        .unwrap();
+        lua.globals().set("save_document", f).unwrap();
+
+        let err = lua
+            .load(r#"save_document("a.pdf", "content")"#)
+            .exec()
+            .unwrap_err();
+
+        assert_eq!(crate::Error::from(err).code(), ErrorCode::ScraperRunStopped);
+    }
+
+    /// A [`DocumentsService`] whose upload stops `stop`, then never
+    /// finishes, as one waiting for the embedding model's download would.
+    /// Every other method is unused, so left unimplemented.
+    struct StoppingDocuments {
+        stop: StopSignal,
+    }
+
+    #[async_trait::async_trait]
+    impl DocumentsService for StoppingDocuments {
+        async fn upload(&self, _request: UploadRequest) -> crate::Result<Uuid> {
+            self.stop.stop();
+            std::future::pending().await
+        }
+
+        async fn get(
+            &self,
+            _id: Uuid,
+        ) -> crate::Result<Option<crate::domains::documents::Document>> {
+            unimplemented!()
+        }
+
+        async fn list(
+            &self,
+            _offset: i64,
+            _limit: i64,
+        ) -> crate::Result<Vec<crate::domains::documents::Metadata>> {
+            unimplemented!()
+        }
+
+        async fn search(
+            &self,
+            _query: crate::domains::documents::SearchQuery,
+        ) -> crate::Result<Vec<crate::domains::documents::Metadata>> {
+            unimplemented!()
+        }
+
+        async fn search_facets(
+            &self,
+            _text: &str,
+            _filters: &crate::domains::documents::SearchFilters,
+        ) -> crate::Result<crate::domains::documents::SearchFacets> {
+            unimplemented!()
+        }
+
+        async fn update_metadata(
+            &self,
+            _metadata: crate::domains::documents::Metadata,
+        ) -> crate::Result<()> {
+            unimplemented!()
+        }
+
+        async fn start_sync(&self) -> crate::Result<()> {
+            unimplemented!()
+        }
+
+        fn stop_sync(&self) {
+            unimplemented!()
+        }
+
+        fn indexing_model_error(&self) -> Option<ErrorCode> {
+            unimplemented!()
+        }
     }
 }

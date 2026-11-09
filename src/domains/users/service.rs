@@ -216,19 +216,22 @@ impl UsersClient {
             .context("OPAQUE login task panicked")?
     }
 
-    /// Clears every trace of the account from this device: the embeddings
-    /// uploads left in memory, its secrets from the credential store, every
+    /// Clears every trace of the account from this device: its secrets from
+    /// the credential store, the embeddings uploads left in memory, every
     /// row of the local database and every other file in the client's
     /// directory. All always run, so a failure in one never leaves the
     /// others' data behind. Changelog consumption must already be stopped,
     /// so it can't write back what's being wiped.
     async fn clear_local_state(&self) -> Result<()> {
-        self.embedding_cache.clear();
         let cleared = self
             .secrets
             .clear()
             .await
             .context("failed to clear secrets");
+        // Only once the master key is gone: an upload under way caches its
+        // embeddings before publishing them, so one that does so after this
+        // can't publish, and drops them.
+        self.embedding_cache.clear();
         let wiped = self
             .local_db
             .wipe()
@@ -1969,6 +1972,43 @@ mod tests {
             Arc::new(RecordingDocuments::default()),
         )
         .with_embedding_cache(cleared_cache());
+
+        client.logout().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn logout_clears_the_embedding_cache_only_once_the_secrets_are_cleared() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_logout().times(1).returning(|| Ok(()));
+
+        let mut order = mockall::Sequence::new();
+        let mut secrets = secrets_with_open_session();
+        secrets
+            .expect_clear()
+            .times(1)
+            .in_sequence(&mut order)
+            .returning(|| Ok(()));
+        let mut cache = MockEmbeddingCache::new();
+        cache
+            .expect_clear()
+            .times(1)
+            .in_sequence(&mut order)
+            .return_const(());
+        let mut local_db = MockLocalDatabase::new();
+        local_db.expect_wipe().times(1).returning(|| Ok(()));
+        let mut local_files = MockLocalFiles::new();
+        local_files.expect_clear().times(1).returning(|| Ok(()));
+
+        let client = UsersClient::with_deps(
+            mock_grpc,
+            MockOpaqueClient::new(),
+            Arc::new(MockSettingsService::new()),
+            Arc::new(secrets),
+            Arc::new(local_db),
+            Arc::new(local_files),
+            Arc::new(RecordingDocuments::default()),
+        )
+        .with_embedding_cache(cache);
 
         client.logout().await.unwrap();
     }

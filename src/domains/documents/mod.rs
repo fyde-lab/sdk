@@ -179,6 +179,10 @@ pub(crate) trait Indexer: Send + Sync {
     /// Caches `document`, unencrypted, with the embeddings of its text.
     async fn save_document(&self, document: &Document) -> Result<()>;
 
+    /// Called instead of [`Self::save_document`] for a document that won't
+    /// be cached (a duplicate): drops anything held for it.
+    fn skip_document(&self, id: Uuid);
+
     /// Replaces the metadata of the cached document `id`, and its
     /// embeddings too if that changes the text they embed. Does nothing if
     /// no document `id` is cached.

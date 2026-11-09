@@ -66,7 +66,8 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   lock stay), whether or not the server answers. Anything a domain writes to disk must live
   in that directory, or logout leaves it behind. Plaintext-derived data held in memory (the
   documents `EmbeddingCache`) is cleared by `users`' `clear_local_state` (logout and session
-  expiry). Never log embedding vectors or document text.
+  expiry), after the secrets: an upload caching its embeddings later can't publish, and
+  drops them. Never log embedding vectors or document text.
 - Every Lua VM is built with `tools::sandbox::new_vm` and scripts loaded with
   `sandbox::load_source` — never `Lua::new*` / `lua.load` (that would run precompiled bytecode).
 - Scraper debug reports never record request headers, request/download bodies, form values or
@@ -170,8 +171,12 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     no table: it `put`s them in the in-memory `EmbeddingCache` (`init_embedding_cache`, one per
     `Client`, shared by the documents service, the indexer and `users`; `embedding_cache.rs`
     only stores: 64 MiB of entries, oldest put evicted first, never persisted) and removes
-    them if publishing fails. A blank transcript or a failed embed (logged, never fatal)
-    publishes without caching. Entries are keyed by `embedding_key`: document id + model +
+    them unless it published (`CachedUntilPublished`: a failed publish, or an upload dropped
+    while publishing). A blank transcript or a failed embed (logged, never fatal)
+    publishes without caching; after a failed embed, uploads skip embedding for
+    `UPLOAD_EMBED_RETRY_AFTER` (5 min) rather than each wait for the model again. A
+    duplicate the consumer skips goes through `Indexer::skip_document`, which drops its
+    entry. Entries are keyed by `embedding_key`: document id + model +
     `CHUNKER_VERSION` + SHA-256 of the length-prefixed passages (**bump `CHUNKER_VERSION`
     whenever `chunk.rs` or the passage format changes**). The indexer's `save_document` stores a
     matching entry's vectors as-is, else embeds inline, and removes the entry only once the
@@ -283,8 +288,10 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     `StopSignal` (`stop.rs`): the sandbox's instruction hook (`new_vm`'s `interrupt`), every
     blocking host call (`StopSignal::block_on` instead of a bare `Handle::block_on` — keep it
     that way in new host functions), a pending `fyde.input.ask` (its handler runs on the
-    blocking pool and is abandoned) and before each upload (`check`; an upload under way
-    finishes). The run ends with `ScraperRunStopped` unless its script finished first.
+    blocking pool and is abandoned) and an upload (`save_document` is given up on, even
+    while it waits for the embedding model or publishes: one given up on while publishing
+    may still be published). The run ends with `ScraperRunStopped` unless its script
+    finished first.
   - `allowed_domains` fails closed: an empty list allows no host; an IP literal only matches
     exactly.
   - `browser/` — `wry`/`tao` webviews on one process-wide thread, started lazily (GTK panics if
