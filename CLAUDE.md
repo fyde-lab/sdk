@@ -160,8 +160,18 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     on ≤4 threads, loaded lazily once; a failed load is retried). Table `document_embeddings`
     (`(document_id, chunk)` key, `vector` = 384 little-endian `f32`, cascades with its
     document, cleared by `wipe`). `Indexer::prepare` fetches/loads the model; its last failure
-    is `Service::indexing_model_error` (for the UI). No semantic search yet (`embed_query` is
-    test-only).
+    is `Service::indexing_model_error` (for the UI). One `OnnxEmbedder` (`init_embedder`) is
+    shared by the indexer and searches.
+  - Hybrid search: `search` with `Relevance` and non-blank text fuses (in `service.rs`) two
+    storage rankings over the filtered documents, top `CANDIDATES` (200) each: `rank_by_terms`
+    (bm25) and `rank_by_similarity` (cosine to the query, each document scored by its best
+    chunk, kept only at or above `SIMILARITY_FLOOR`, 0.85, tuned on a real corpus: e5 puts
+    unrelated text around 0.8). Fusion is RRF (Σ 1/(60 + rank)), then the page is cut and only
+    its `Metadata` loaded (`get_metadatas`). `Embedder::embed_query` (`query: ` prefix) uses
+    `ModelStore::find`, which never downloads; if it fails the search logs and falls back to
+    bm25 alone, never failing over the model. `search_facets` with non-blank text counts the
+    same hybrid set (`count_documents_among`/`created_at_range_among`). `Newest`/`Oldest` and
+    blank text stay bm25/filters only.
   - `dev.rs` — `DevDocumentsClient`, plain-file writes for `init_dev_scrapers`.
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
   (`SaveDocument`, `UpdateMetadata`, `InstallScript`). `crypto.rs`: AES-256-GCM, per-event DEK
@@ -291,8 +301,10 @@ trusted by size. Otherwise it's downloaded over `wreq` (client built on the firs
 redirects followed) into a `.<file>.<uuid>.part` beside it, removed on any failure or
 cancellation, then renamed. A per-file lock makes concurrent `ensure`s download once. Before
 downloading, `ensure` removes the model's other revisions (`<other hash>-<name>`) and its stale
-partials of any revision (10 min untouched; vanished files are fine). Errors:
-`ModelDownloadFailed` (1201, transport, 408/429/5xx), `ModelUnavailable` (1204, any other HTTP
+partials of any revision (10 min untouched; vanished files are fine). `find` returns a model
+already fully there (same checks) or `None`, never downloading nor waiting on a download's lock.
+Errors: `ModelDownloadFailed` (1201, transport, 408/429/5xx, and `ModelNotDownloaded` for a
+model `find` lacks), `ModelUnavailable` (1204, any other HTTP
 status: only an update helps), `ModelCorrupted` (1202, wrong size/hash), `ModelLoadFailed`
 (1203, `tools::onnx`, and `ErrorKind::InvalidModel` for a model whose inputs/outputs don't match).
 `tools::onnx` is a thin port of `doc-ai-poc`'s loaders: `session(path, threads)` (Level3

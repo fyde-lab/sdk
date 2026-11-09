@@ -148,7 +148,8 @@ impl Client {
         let secrets = open_secrets(&location, &sqlite)?;
         let channel = lazy_channel(config.url)?;
         let models = Arc::new(tools::models::ModelStore::new(config.models_dir));
-        let indexer = domains::documents::init_indexer(sqlite.pool().clone(), models);
+        let embedder = domains::documents::init_embedder(models);
+        let indexer = domains::documents::init_indexer(sqlite.pool().clone(), embedder.clone());
 
         let settings = domains::settings::init(sqlite.pool().clone());
         let sessions = domains::sessions::init(secrets.clone());
@@ -181,6 +182,7 @@ impl Client {
             changelog,
             attributes.clone(),
             indexer,
+            embedder,
             config.on_document_change,
         );
         let users = domains::users::init(

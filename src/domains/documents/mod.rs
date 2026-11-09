@@ -84,7 +84,8 @@ pub trait Service: Send + Sync {
     /// matched against and how), keeping only those matching every one of
     /// `query.filters`, one page at a time in `query.order`, returning their
     /// metadata. Like [`Self::list`], never talks to the server nor loads
-    /// their content.
+    /// their content. [`SearchOrder::Relevance`] also matches by meaning,
+    /// but never downloads the model for it, nor fails without it.
     ///
     /// Fails with [`crate::ErrorCode::InvalidSearchQuery`] for a negative
     /// `offset`, a non-positive `limit`, or a `created_from` later than
@@ -96,7 +97,9 @@ pub trait Service: Send + Sync {
     /// (see [`SearchFacets`]): each field's values come from the documents
     /// [`Self::search`] would match with every filter *but that field's
     /// own*, so a UI can propose only the choices — and sub-choices, once a
-    /// parent filter is picked — that actually lead to documents.
+    /// parent filter is picked — that actually lead to documents. Counts
+    /// what a [`SearchOrder::Relevance`] search finds, documents close in
+    /// meaning included.
     ///
     /// Fails with [`crate::ErrorCode::InvalidSearchQuery`] for a
     /// `created_from` later than `created_until`.
@@ -178,13 +181,23 @@ pub(crate) trait Indexer: Send + Sync {
     fn model_error(&self) -> Option<ErrorCode>;
 }
 
+/// Initializes the on-device embedding model `models` holds, shared by the
+/// [`Indexer`] (which fetches it on the first [`Indexer::prepare`]) and the
+/// documents [`Service`]'s searches, so it's loaded once.
+pub(crate) fn init_embedder(models: Arc<ModelStore>) -> Arc<dyn embedder::Embedder> {
+    Arc::new(embedder::OnnxEmbedder::new(models))
+}
+
 /// Initializes the [`Indexer`] the changelog consumer caches documents
-/// through, into the database behind `pool`, embedding them with the
-/// on-device model `models` holds (fetched on the first [`Indexer::prepare`]).
-pub(crate) fn init_indexer(pool: SqlitePool, models: Arc<ModelStore>) -> Arc<dyn Indexer> {
+/// through, into the database behind `pool`, embedding them with
+/// `embedder` (see [`init_embedder`]).
+pub(crate) fn init_indexer(
+    pool: SqlitePool,
+    embedder: Arc<dyn embedder::Embedder>,
+) -> Arc<dyn Indexer> {
     Arc::new(service::DocumentIndexer::new(
         storage_sqlite::SqliteStorage::new(pool),
-        embedder::OnnxEmbedder::new(models),
+        embedder,
     ))
 }
 
@@ -194,12 +207,14 @@ pub(crate) fn init_indexer(pool: SqlitePool, models: Arc<ModelStore>) -> Arc<dyn
 /// `changelog::init`), wires up local SQLite-backed reads (via `pool`) of
 /// the documents it cached, and calls `on_document_change` (see
 /// [`crate::ClientConfig`]) for every event [`Service::start_sync`]
-/// consumes.
+/// consumes. Searches embed their text with `embedder` (see
+/// [`init_embedder`]).
 pub(crate) fn init(
     pool: SqlitePool,
     changelog: Arc<dyn changelog::Service>,
     attributes: Arc<dyn AttributesService>,
     indexer: Arc<dyn Indexer>,
+    embedder: Arc<dyn embedder::Embedder>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Arc<dyn Service> {
     let storage = storage_sqlite::SqliteStorage::new(pool);
@@ -210,6 +225,7 @@ pub(crate) fn init(
         on_document_change,
         attributes,
         indexer,
+        embedder,
     ))
 }
 
