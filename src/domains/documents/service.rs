@@ -72,6 +72,35 @@ pub(super) struct DocumentsClient<S: Storage> {
     /// Where uploads leave the embeddings they computed, for `indexer` to
     /// reuse.
     cache: Arc<dyn EmbeddingCache>,
+    /// When embedding an upload last failed (see [`UPLOAD_EMBED_RETRY_AFTER`]).
+    embed_failed_at: Mutex<Option<tokio::time::Instant>>,
+}
+
+/// How long uploads skip embedding after it failed: failing usually means
+/// waiting for the model's download (a timeout, say), which every upload
+/// would otherwise wait for again. The documents uploaded meanwhile are
+/// embedded once synced.
+const UPLOAD_EMBED_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// An upload's embeddings in the [`EmbeddingCache`], removed when dropped
+/// unless [`Self::keep`] is called once its event is published: when
+/// publishing fails, or the upload is given up on (a stopped scraper run)
+/// while publishing, and may never be published.
+struct CachedUntilPublished<'a> {
+    cache: &'a dyn EmbeddingCache,
+    document_id: Uuid,
+}
+
+impl CachedUntilPublished<'_> {
+    fn keep(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for CachedUntilPublished<'_> {
+    fn drop(&mut self) {
+        self.cache.remove(self.document_id);
+    }
 }
 
 impl<S: Storage> DocumentsClient<S> {
@@ -99,6 +128,7 @@ impl<S: Storage> DocumentsClient<S> {
             indexer,
             embedder,
             cache,
+            embed_failed_at: Mutex::new(None),
         }
     }
 }
@@ -117,11 +147,24 @@ impl<S: Storage> DocumentsClient<S> {
     /// Embeds an uploaded document's text exactly as [`DocumentIndexer`]
     /// would once the document syncs, under the key it looks them up by.
     /// `None` for a document with no text (indexed with no chunks, no model
-    /// needed), or if embedding fails (the model can't be fetched, say): the
-    /// document is then published anyway, and embedded when it syncs.
+    /// needed), or if embedding fails (the model can't be fetched, say) or
+    /// failed less than [`UPLOAD_EMBED_RETRY_AFTER`] ago: the document is
+    /// then published anyway, and embedded when it syncs.
     async fn embed_upload(&self, metadata: &Metadata) -> Option<Arc<CachedEmbeddings>> {
         let passages = passages(metadata);
         if passages.texts.is_empty() {
+            return None;
+        }
+
+        let failed_at = *self
+            .embed_failed_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if failed_at.is_some_and(|at| at.elapsed() < UPLOAD_EMBED_RETRY_AFTER) {
+            tracing::debug!(
+                "not embedding document {} at upload, embedding failed recently: it'll be embedded once synced",
+                metadata.id
+            );
             return None;
         }
 
@@ -130,6 +173,10 @@ impl<S: Storage> DocumentsClient<S> {
         match embed(&*self.embedder, model, passages).await {
             Ok(embeddings) => Some(Arc::new(CachedEmbeddings { key, embeddings })),
             Err(err) => {
+                *self
+                    .embed_failed_at
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(tokio::time::Instant::now());
                 tracing::warn!(
                     code = ?err.code(),
                     "failed to embed document {} at upload, it'll be embedded once synced: {err}",
@@ -358,23 +405,23 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .embed_upload(&metadata)
             .instrument(tracing::debug_span!("embed_document"))
             .await;
-        if let Some(embeddings) = &embeddings {
+        let cached = embeddings.as_ref().map(|embeddings| {
             self.cache.put(embeddings.clone());
-        }
+            CachedUntilPublished {
+                cache: &*self.cache,
+                document_id: id,
+            }
+        });
 
-        if let Err(err) = self
-            .changelog
+        self.changelog
             .send(EventType::SaveDocument, id, Some(&content), Some(&metadata))
             .instrument(tracing::debug_span!("publish_event"))
             .await
-        {
-            if embeddings.is_some() {
-                self.cache.remove(id);
-            }
-            return Err(err)
-                .with_context(|| format!("failed to publish changelog event for document {id}"));
-        }
+            .with_context(|| format!("failed to publish changelog event for document {id}"))?;
 
+        if let Some(cached) = cached {
+            cached.keep();
+        }
         Ok(id)
     }
 
@@ -595,6 +642,10 @@ impl<S: Storage> Indexer for DocumentIndexer<S> {
             self.cache.remove(id);
         }
         Ok(())
+    }
+
+    fn skip_document(&self, id: Uuid) {
+        self.cache.remove(id);
     }
 
     async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()> {
@@ -1023,6 +1074,9 @@ mod tests {
         no_master_key: bool,
         /// When set, `send` records the event, then fails.
         fail_send: bool,
+        /// When set, `send` records the event, notifies it, then never
+        /// returns.
+        hang_send: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[async_trait]
@@ -1053,6 +1107,10 @@ mod tests {
             ));
             if self.fail_send {
                 return Err(ErrorKind::InvalidChangelogEvent("refused".to_string()).into());
+            }
+            if let Some(reached) = &self.hang_send {
+                reached.notify_one();
+                std::future::pending::<()>().await;
             }
             Ok(())
         }
@@ -3006,6 +3064,95 @@ mod tests {
         assert_eq!(put.key.document_id, changelog.sent.lock().unwrap()[0].1);
     }
 
+    #[tokio::test]
+    async fn upload_drops_the_embeddings_it_cached_when_given_up_on_while_publishing() {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let changelog = Arc::new(RecordingChangelog {
+            hang_send: Some(reached.clone()),
+            ..Default::default()
+        });
+        let (embedder, _) = embedder_embedding_once();
+        let (mut cache, put) = cache_expecting_a_put_before_publishing(changelog.clone());
+        let removed = Arc::new(Mutex::new(None));
+        let captured = removed.clone();
+        cache
+            .expect_remove()
+            .times(1)
+            .returning(move |id| *captured.lock().unwrap() = Some(id));
+        let client = DocumentsClient::new(
+            storage_for_a_new_upload(),
+            changelog.clone(),
+            None,
+            accepting_attributes(),
+            unused_indexer(),
+            Arc::new(embedder),
+            Arc::new(cache),
+        );
+
+        let upload = client.upload(UploadRequest::from_raw(
+            "a.pdf",
+            build_pdf("Montant : 42 €"),
+        ));
+        // Dropping the upload once it's publishing, as a stopped run does.
+        tokio::select! {
+            () = reached.notified() => {}
+            result = upload => panic!("the upload finished: {result:?}"),
+        }
+
+        let put = put.lock().unwrap().clone().unwrap();
+        assert_eq!(*removed.lock().unwrap(), Some(put.key.document_id));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_skips_embedding_for_a_while_after_embedding_failed() {
+        let mut storage = MockStorage::new();
+        storage
+            .expect_find_document_by_checksum()
+            .times(4)
+            .returning(|_| Ok(None));
+        let mut order = mockall::Sequence::new();
+        let mut embedder = idle_embedder("e5.onnx");
+        embedder
+            .expect_embed_passages()
+            .times(1)
+            .in_sequence(&mut order)
+            .returning(|_| Err(ErrorKind::ModelDownloadStatus(503).into()));
+        embedder
+            .expect_embed_passages()
+            .times(1)
+            .in_sequence(&mut order)
+            .returning(|passages| Ok(passages.iter().map(|_| vector(0.5)).collect()));
+        let put = Arc::new(Mutex::new(None));
+        let captured = put.clone();
+        let mut cache = MockEmbeddingCache::new();
+        cache
+            .expect_put()
+            .times(1)
+            .returning(move |cached| *captured.lock().unwrap() = Some(cached));
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = DocumentsClient::new(
+            storage,
+            changelog.clone(),
+            None,
+            accepting_attributes(),
+            unused_indexer(),
+            Arc::new(embedder),
+            Arc::new(cache),
+        );
+        let upload = |text| client.upload(UploadRequest::from_raw("a.pdf", build_pdf(text)));
+
+        // Fails to embed, then skips embedding until the pause is over.
+        upload("first").await.unwrap();
+        upload("second").await.unwrap();
+        tokio::time::advance(UPLOAD_EMBED_RETRY_AFTER - std::time::Duration::from_secs(1)).await;
+        upload("third").await.unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let id = upload("fourth").await.unwrap();
+
+        assert_eq!(changelog.sent.lock().unwrap().len(), 4);
+        assert_eq!(put.lock().unwrap().as_ref().unwrap().key.document_id, id);
+    }
+
     /// Uploads a document with a mocked model, then has an indexer over a
     /// cache holding what the upload put there consume the event the upload
     /// published, as the changelog consumer would.
@@ -3258,6 +3405,20 @@ mod tests {
         );
 
         indexer.save_document(&document).await.unwrap();
+    }
+
+    #[test]
+    fn indexer_skip_document_drops_the_documents_cached_embeddings_and_stores_nothing() {
+        let id = Uuid::now_v7();
+        let mut cache = MockEmbeddingCache::new();
+        cache
+            .expect_remove()
+            .withf(move |removed| *removed == id)
+            .times(1)
+            .return_const(());
+
+        // Strict storage and embedder: any call panics.
+        indexer_with(MockStorage::new(), MockEmbedder::new(), cache).skip_document(id);
     }
 
     #[tokio::test]

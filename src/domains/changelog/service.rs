@@ -268,6 +268,7 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
                         "skipping caching document {}: a document with the same content is already cached locally as {existing}",
                         event.subject_id
                     );
+                    self.indexer.skip_document(event.subject_id);
                     return Ok(());
                 }
 
@@ -988,10 +989,18 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
+        // Still told, so it drops the embeddings this upload cached.
+        let mut indexer = ready_indexer();
+        indexer
+            .expect_skip_document()
+            .withf(move |id| *id == document_id)
+            .times(1)
+            .return_const(());
+
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
-            Arc::new(ready_indexer()),
+            Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
