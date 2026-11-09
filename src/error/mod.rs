@@ -362,6 +362,10 @@ pub(crate) enum ErrorKind {
     ModelDownloadStatus(u16),
     #[error("corrupted model file: {0}")]
     ModelCorrupted(String),
+    /// A model needed without waiting for its download: it isn't in the
+    /// models directory yet, or is being downloaded right now.
+    #[error("model not downloaded yet: {0}")]
+    ModelNotDownloaded(String),
     /// A model whose inputs or outputs aren't the ones its caller expects.
     #[error("unexpected model behaviour: {0}")]
     InvalidModel(String),
@@ -431,6 +435,7 @@ impl ErrorKind {
             ErrorKind::ModelDownloadStatus(408 | 429 | 500..=599) => ErrorCode::ModelDownloadFailed,
             ErrorKind::ModelDownloadStatus(_) => ErrorCode::ModelUnavailable,
             ErrorKind::ModelCorrupted(_) => ErrorCode::ModelCorrupted,
+            ErrorKind::ModelNotDownloaded(_) => ErrorCode::ModelDownloadFailed,
             ErrorKind::Onnx(_) | ErrorKind::Tokenizer(_) | ErrorKind::InvalidModel(_) => {
                 ErrorCode::ModelLoadFailed
             }
@@ -739,6 +744,13 @@ mod tests {
         for permanent in [400, 401, 403, 404, 410, 451, 499, 600] {
             assert_eq!(code(permanent), ErrorCode::ModelUnavailable, "{permanent}");
         }
+    }
+
+    #[test]
+    fn a_model_not_downloaded_yet_is_worth_retrying() {
+        let err: Error = ErrorKind::ModelNotDownloaded("e5".to_string()).into();
+
+        assert_eq!(err.code(), ErrorCode::ModelDownloadFailed);
     }
 
     #[test]

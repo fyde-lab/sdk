@@ -3,7 +3,7 @@
 //! turns text into vectors: what to embed is up to
 //! [`super::service::DocumentIndexer`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
@@ -42,6 +42,12 @@ pub(crate) trait Embedder: Send + Sync {
     /// Embeds each of `passages` as a passage to retrieve, in order,
     /// [`Self::load`]ing the model first if needed.
     async fn embed_passages(&self, passages: Vec<String>) -> Result<Vec<Vec<f32>>>;
+
+    /// Embeds `query` as a search query, to compare against passages. Uses
+    /// the model if it's loaded or already downloaded, but never downloads
+    /// it nor waits for its download (failing with
+    /// [`ErrorKind::ModelNotDownloaded`]): a search mustn't take minutes.
+    async fn embed_query(&self, query: String) -> Result<Vec<f32>>;
 }
 
 /// The [`Embedder`] running multilingual-e5-small. Its session is loaded on
@@ -63,20 +69,6 @@ impl OnnxEmbedder {
         }
     }
 
-    /// Embeds `query` as a search query, to compare against passages.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "semantic search over the embeddings is to come")
-    )]
-    pub(crate) async fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
-        let loaded = self.loaded().await?;
-        let input = query_input(query);
-
-        tokio::task::spawn_blocking(move || loaded.embed(&input))
-            .await
-            .context("the query embedding task failed")?
-    }
-
     async fn loaded(&self) -> Result<Arc<Loaded>> {
         self.loaded
             .get_or_try_init(|| async {
@@ -90,15 +82,49 @@ impl OnnxEmbedder {
                     .ensure(&MULTILINGUAL_E5_SMALL_TOKENIZER)
                     .await
                     .context("failed to fetch the embedding model's tokenizer")?;
-                let threads = self.threads;
 
-                tokio::task::spawn_blocking(move || Loaded::open(&model, &tokenizer, threads))
-                    .await
-                    .context("the embedding model loading task failed")?
-                    .map(Arc::new)
+                self.open(model, tokenizer).await
             })
             .await
             .cloned()
+    }
+
+    /// Like [`Self::loaded`], but never downloads the model, nor waits for
+    /// its download.
+    async fn loaded_if_downloaded(&self) -> Result<Arc<Loaded>> {
+        if let Some(loaded) = self.loaded.get() {
+            return Ok(loaded.clone());
+        }
+
+        let model = self
+            .models
+            .find(&MULTILINGUAL_E5_SMALL)
+            .await
+            .context("failed to look for the embedding model")?;
+        let tokenizer = self
+            .models
+            .find(&MULTILINGUAL_E5_SMALL_TOKENIZER)
+            .await
+            .context("failed to look for the embedding model's tokenizer")?;
+        let (Some(model), Some(tokenizer)) = (model, tokenizer) else {
+            return Err(
+                ErrorKind::ModelNotDownloaded(MULTILINGUAL_E5_SMALL.name.to_string()).into(),
+            );
+        };
+
+        self.loaded
+            .get_or_try_init(|| self.open(model, tokenizer))
+            .await
+            .cloned()
+    }
+
+    async fn open(&self, model: PathBuf, tokenizer: PathBuf) -> Result<Arc<Loaded>> {
+        let threads = self.threads;
+
+        tokio::task::spawn_blocking(move || Loaded::open(&model, &tokenizer, threads))
+            .await
+            .context("the embedding model loading task failed")?
+            .map(Arc::new)
     }
 }
 
@@ -128,6 +154,16 @@ impl Embedder for OnnxEmbedder {
         })
         .await
         .context("the passage embedding task failed")?
+    }
+
+    async fn embed_query(&self, query: String) -> Result<Vec<f32>> {
+        let loaded = self.loaded_if_downloaded().await?;
+        let input = query_input(&query);
+
+        tokio::task::spawn_blocking(move || loaded.embed(&input))
+            .await
+            .context("the query embedding task failed")?
+            .context("failed to embed the query")
     }
 }
 
@@ -265,8 +301,15 @@ fn mean_pool(shape: &[i64], values: &[f32], mask: &[u32]) -> Result<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::attributes::MockService as MockAttributesService;
+    use super::super::service::{DocumentIndexer, DocumentsClient};
+    use super::super::{
+        ChangelogEvent, EventType, FakeDocument, FakeMetadata, Indexer as _, Metadata, MockIndexer,
+        SearchOrder, SearchQuery, Service as _, SqliteStorage,
+    };
     use super::*;
     use crate::ErrorCode;
+    use crate::domains::changelog::Service as ChangelogService;
 
     /// A `[1, tokens.len(), DIMENSIONS]` output whose token `i` is
     /// `tokens[i]` followed by zeros.
@@ -408,17 +451,62 @@ mod tests {
         assert!(err.has_context());
     }
 
-    /// Downloads multilingual-e5-small (into `FYDE_TEST_MODELS_DIR` when set,
-    /// to reuse it across runs) and checks it ranks an invoice above a
-    /// payslip for a question about an invoice.
+    #[tokio::test]
+    async fn embed_query_never_downloads_a_missing_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let embedder = OnnxEmbedder::new(Arc::new(ModelStore::new(dir.path().to_path_buf())));
+
+        let err = embedder
+            .embed_query("impôts".to_string())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err.kind(), ErrorKind::ModelNotDownloaded(_)),
+            "{err:?}"
+        );
+        assert!(embedder.loaded.get().is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn embed_query_treats_a_corrupted_model_as_not_downloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = ModelStore::new(dir.path().to_path_buf());
+        for model in [&MULTILINGUAL_E5_SMALL, &MULTILINGUAL_E5_SMALL_TOKENIZER] {
+            let file = std::fs::File::create(dir.path().join(models::file_name(model))).unwrap();
+            file.set_len(model.size).unwrap();
+        }
+        let embedder = OnnxEmbedder::new(Arc::new(models));
+
+        let err = embedder
+            .embed_query("impôts".to_string())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err.kind(), ErrorKind::ModelNotDownloaded(_)),
+            "{err:?}"
+        );
+    }
+
+    /// The real model's store: `FYDE_TEST_MODELS_DIR` when set, to reuse a
+    /// download across runs, else the returned temporary directory.
+    fn real_models() -> (tempfile::TempDir, Arc<ModelStore>) {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = std::env::var_os("FYDE_TEST_MODELS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| temp.path().to_path_buf());
+        (temp, Arc::new(ModelStore::new(dir)))
+    }
+
+    /// Downloads multilingual-e5-small (see [`real_models`]) and checks it
+    /// ranks an invoice above a payslip for a question about an invoice.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "downloads a 135 MB model from Hugging Face"]
     async fn multilingual_e5_ranks_an_invoice_above_a_payslip_for_an_invoice_query() {
-        let temp = tempfile::tempdir().unwrap();
-        let dir = std::env::var_os("FYDE_TEST_MODELS_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| temp.path().to_path_buf());
-        let embedder = OnnxEmbedder::new(Arc::new(ModelStore::new(dir)));
+        let (_temp, models) = real_models();
+        let embedder = OnnxEmbedder::new(models);
 
         let passages = embedder
             .embed_passages(vec![
@@ -433,7 +521,7 @@ mod tests {
             .await
             .unwrap();
         let query = embedder
-            .embed_query("combien dois-je payer pour ma facture d'électricité ?")
+            .embed_query("combien dois-je payer pour ma facture d'électricité ?".to_string())
             .await
             .unwrap();
 
@@ -442,5 +530,108 @@ mod tests {
         eprintln!("invoice: {invoice:.4}, payslip: {payslip:.4}");
         assert!(passages.iter().all(|passage| passage.len() == DIMENSIONS));
         assert!(invoice > payslip, "invoice {invoice} <= payslip {payslip}");
+    }
+
+    /// A changelog for searches, which never touch it.
+    struct UnusedChangelog;
+
+    #[async_trait]
+    impl ChangelogService for UnusedChangelog {
+        async fn ensure_master_key(&self) -> Result<()> {
+            unreachable!("searches never publish")
+        }
+
+        async fn send(
+            &self,
+            _: EventType,
+            _: uuid::Uuid,
+            _: Option<&[u8]>,
+            _: Option<&Metadata>,
+        ) -> Result<()> {
+            unreachable!("searches never publish")
+        }
+
+        async fn start_consume_job(
+            self: Arc<Self>,
+            _: Box<dyn FnMut(ChangelogEvent) + Send>,
+        ) -> Result<()> {
+            unreachable!("searches never consume")
+        }
+
+        fn stop_consume_job(&self) {}
+    }
+
+    /// Indexes a synthetic tax notice and two distractors with the real
+    /// model (see [`real_models`]) into a real database, then searches with
+    /// a question sharing no word with the notice: terms alone find nothing,
+    /// so the notice can only come from its embeddings clearing the floor.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "downloads a 135 MB model from Hugging Face"]
+    async fn multilingual_e5_search_finds_a_tax_notice_sharing_no_word_with_the_query() {
+        let (_temp, models) = real_models();
+        let embedder: Arc<dyn Embedder> = Arc::new(OnnxEmbedder::new(models));
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let indexer = DocumentIndexer::new(SqliteStorage::new(pool.clone()), embedder.clone());
+        let documents = [
+            (
+                "avis-impot-2024.pdf",
+                "Direction générale des Finances publiques\n\
+                 Avis d'impôt 2024 sur les revenus de 2023\n\
+                 Impôt sur le revenu net : 2 315 €\n\
+                 Prélèvement à la source déjà acquitté : 1 900 €\n\
+                 Reste dû : 415 €, prélevé le 25 septembre 2024",
+            ),
+            (
+                "facture-electricite-mars.pdf",
+                "Facture d'électricité\nPériode : mars\nConsommation : 320 kWh\n\
+                 Montant TTC à payer : 84,20 €\nÉchéance : 15 avril",
+            ),
+            (
+                "recette-tarte-pommes.pdf",
+                "Tarte aux pommes\nIngrédients : 4 pommes, 200 g de farine, 100 g de beurre\n\
+                 Cuisson : 35 minutes à 180 °C",
+            ),
+        ];
+        let mut ids = Vec::new();
+        for (name, transcript) in documents {
+            let document = FakeDocument::new()
+                .with_metadata(
+                    FakeMetadata::new()
+                        .with_name(name)
+                        .with_transcript(transcript)
+                        .build(),
+                )
+                .build();
+            ids.push(document.id);
+            indexer.save_document(&document).await.unwrap();
+        }
+        let client = DocumentsClient::new(
+            SqliteStorage::new(pool),
+            Arc::new(UnusedChangelog),
+            None,
+            Arc::new(MockAttributesService::new()),
+            Arc::new(MockIndexer::new()),
+            embedder,
+        );
+        let text = "combien j'ai payé au fisc l'an dernier";
+
+        let by_terms = client
+            .search(SearchQuery {
+                order: SearchOrder::Newest,
+                ..SearchQuery::new(text, 0, 10)
+            })
+            .await
+            .unwrap();
+        let found = client.search(SearchQuery::new(text, 0, 10)).await.unwrap();
+
+        let names: Vec<_> = found.iter().map(|metadata| &metadata.name).collect();
+        eprintln!("found: {names:?}");
+        assert!(by_terms.is_empty(), "{by_terms:?}");
+        assert_eq!(found.first().map(|metadata| metadata.id), Some(ids[0]));
     }
 }

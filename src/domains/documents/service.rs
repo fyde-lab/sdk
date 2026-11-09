@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,7 +21,8 @@ use super::storage::{FacetField, Storage};
 use super::transcript;
 use super::{
     Category, ChunkEmbedding, Document, DocumentEmbeddings, FacetCount, Indexer, Metadata,
-    SearchFacets, SearchFilters, SearchQuery, Service, Subcategory, UploadRequest, UploadSource,
+    SearchFacets, SearchFilters, SearchOrder, SearchQuery, Service, Subcategory, UploadRequest,
+    UploadSource,
 };
 
 /// The only content type [`Service::upload`] currently accepts.
@@ -30,6 +31,22 @@ pub(super) const PDF_CONTENT_TYPE: &str = "application/pdf";
 /// The size of the chunks a document's text is embedded in, in characters
 /// of whitespace-collapsed text (see [`chunk::chunk`]).
 const CHUNK_CHARS: usize = 1000;
+
+/// How many of its best matches each ranking contributes to a hybrid
+/// search (see [`DocumentsClient::rank`]): no page is found past their
+/// fusion.
+const CANDIDATES: usize = 200;
+
+/// Reciprocal Rank Fusion's `k` (see [`fuse`]): the usual 60 keeps the very
+/// first ranks from drowning out a document found by both rankings.
+const RRF_K: f64 = 60.0;
+
+/// The cosine similarity to a query below which a document's best chunk
+/// doesn't count as a match. multilingual-e5-small squeezes every cosine
+/// into roughly 0.7–0.9, so even unrelated text scores high. Tuned on a real
+/// French corpus: documents answering a query scored 0.85–0.91, while most
+/// off-topic queries' best matches stayed below 0.85.
+const SIMILARITY_FLOOR: f32 = 0.85;
 
 /// The default [`Service`] implementation: publishes new documents as
 /// encrypted changelog events via an injected [`ChangelogService`], and
@@ -43,6 +60,8 @@ pub(super) struct DocumentsClient<S: Storage> {
     attributes: Arc<dyn AttributesService>,
     /// What [`Service::start_sync`]'s consume job caches documents through.
     indexer: Arc<dyn Indexer>,
+    /// What searches embed their text with.
+    embedder: Arc<dyn Embedder>,
 }
 
 impl<S: Storage> DocumentsClient<S> {
@@ -50,14 +69,15 @@ impl<S: Storage> DocumentsClient<S> {
     /// `changelog` to publish new ones and drive [`Service::start_sync`],
     /// `on_document_change` as the callback [`Service::start_sync`] invokes
     /// per consumed event, `attributes` to check the attributes of every
-    /// document before it's published, and `indexer` as what that job
-    /// caches documents through.
+    /// document before it's published, `indexer` as what that job caches
+    /// documents through, and `embedder` to embed searches' text.
     pub(super) fn new(
         storage: S,
         changelog: Arc<dyn ChangelogService>,
         on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
         attributes: Arc<dyn AttributesService>,
         indexer: Arc<dyn Indexer>,
+        embedder: Arc<dyn Embedder>,
     ) -> Self {
         Self {
             storage,
@@ -65,6 +85,7 @@ impl<S: Storage> DocumentsClient<S> {
             on_document_change,
             attributes,
             indexer,
+            embedder,
         }
     }
 }
@@ -80,11 +101,71 @@ impl<S: Storage> DocumentsClient<S> {
             .context("invalid document attributes")
     }
 
+    /// Embeds a search's `text`, or `None` if that fails (the model isn't
+    /// downloaded yet, say): searching then falls back to its terms alone,
+    /// rather than fail because of the model.
+    async fn embed_query(&self, text: &str) -> Option<Vec<f32>> {
+        match self.embedder.embed_query(text.trim().to_string()).await {
+            Ok(vector) => Some(vector),
+            Err(err) => {
+                tracing::warn!(
+                    code = ?err.code(),
+                    "searching by terms only, the search text couldn't be embedded: {err}"
+                );
+                None
+            }
+        }
+    }
+
+    /// The two rankings a hybrid search fuses, each best first and at most
+    /// [`CANDIDATES`] long, among documents matching `filters`: by `terms`
+    /// (`bm25`), then by the similarity of their best chunk to `vector`,
+    /// only those at or above [`SIMILARITY_FLOOR`].
+    async fn rank(
+        &self,
+        terms: &[String],
+        vector: &[f32],
+        filters: &SearchFilters,
+    ) -> Result<[Vec<Uuid>; 2]> {
+        let by_terms = self
+            .storage
+            .rank_by_terms(terms, filters, CANDIDATES)
+            .await
+            .context("failed to rank local documents by their terms")?;
+        let by_similarity = self
+            .storage
+            .rank_by_similarity(vector, &self.embedder.model(), filters, CANDIDATES)
+            .await
+            .context("failed to rank local documents by their similarity")?
+            .into_iter()
+            .filter(|(_, similarity)| *similarity >= SIMILARITY_FLOOR)
+            .map(|(id, _)| id)
+            .collect();
+
+        Ok([by_terms, by_similarity])
+    }
+
+    /// Every document a hybrid search (see [`Self::rank`]) could return,
+    /// in no particular order.
+    async fn hybrid_matches(
+        &self,
+        terms: &[String],
+        vector: &[f32],
+        filters: &SearchFilters,
+    ) -> Result<Vec<Uuid>> {
+        let mut ids = self.rank(terms, vector, filters).await?.concat();
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
     /// Counts the documents matching `terms` and `filters` — minus
-    /// `field`'s own filter — per value of `field`.
+    /// `field`'s own filter — per value of `field`: those a hybrid search
+    /// could return when given the search text's `vector`.
     async fn count_documents_by(
         &self,
         terms: &[String],
+        vector: Option<&[f32]>,
         filters: &SearchFilters,
         field: FacetField,
     ) -> Result<Vec<FacetCount<String>>> {
@@ -96,10 +177,43 @@ impl<S: Storage> DocumentsClient<S> {
             FacetField::ContentType => filters.content_types.clear(),
         }
 
-        self.storage
-            .count_documents_by(terms, &filters, field)
-            .await
-            .with_context(|| format!("failed to count matching documents by {field:?}"))
+        match vector {
+            Some(vector) => {
+                let ids = self.hybrid_matches(terms, vector, &filters).await?;
+                self.storage.count_documents_among(&ids, field).await
+            }
+            None => {
+                self.storage
+                    .count_documents_by(terms, &filters, field)
+                    .await
+            }
+        }
+        .with_context(|| format!("failed to count matching documents by {field:?}"))
+    }
+
+    /// The creation date range of the documents matching `terms` and
+    /// `filters` — minus the date filters themselves: those a hybrid search
+    /// could return when given the search text's `vector`.
+    async fn created_at_range(
+        &self,
+        terms: &[String],
+        vector: Option<&[f32]>,
+        filters: &SearchFilters,
+    ) -> Result<Option<(i64, i64)>> {
+        let filters = SearchFilters {
+            created_from: None,
+            created_until: None,
+            ..filters.clone()
+        };
+
+        match vector {
+            Some(vector) => {
+                let ids = self.hybrid_matches(terms, vector, &filters).await?;
+                self.storage.created_at_range_among(&ids).await
+            }
+            None => self.storage.created_at_range(terms, &filters).await,
+        }
+        .context("failed to find the creation date range of matching documents")
     }
 }
 
@@ -235,6 +349,25 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
         let terms = search_terms(&query.text);
 
+        if query.order == SearchOrder::Relevance
+            && !terms.is_empty()
+            && let Some(vector) = self.embed_query(&query.text).await
+        {
+            let rankings = self.rank(&terms, &vector, &query.filters).await?;
+            let fused = fuse(&rankings);
+            let page = page(&fused, query.offset, query.limit);
+
+            let mut found: HashMap<Uuid, Metadata> = self
+                .storage
+                .get_metadatas(page)
+                .await
+                .context("failed to load the metadata of the documents found")?
+                .into_iter()
+                .map(|metadata| (metadata.id, metadata))
+                .collect();
+            return Ok(page.iter().filter_map(|id| found.remove(id)).collect());
+        }
+
         self.storage
             .search_documents(
                 &terms,
@@ -251,41 +384,40 @@ impl<S: Storage> Service for DocumentsClient<S> {
         check_created_range(filters)?;
 
         let terms = search_terms(text);
+        // Counting what a hybrid search finds whenever there's text, as
+        // `search` does with `SearchOrder::Relevance`: what callers pick when
+        // searching text, and the one order that ever finds documents
+        // sharing no term with it.
+        let vector = if terms.is_empty() {
+            None
+        } else {
+            self.embed_query(text).await
+        };
+        let vector = vector.as_deref();
 
         // Each field is counted with its own filter lifted, so the values on
         // offer for it are every alternative compatible with the *rest* of
         // the search, not only the one(s) already picked — while every other
         // field narrows to what's left under the picked ones.
         let categories = self
-            .count_documents_by(&terms, filters, FacetField::Category)
+            .count_documents_by(&terms, vector, filters, FacetField::Category)
             .await?;
         let subcategories = self
-            .count_documents_by(&terms, filters, FacetField::Subcategory)
+            .count_documents_by(&terms, vector, filters, FacetField::Subcategory)
             .await?;
-        let created_at_range = self
-            .storage
-            .created_at_range(
-                &terms,
-                &SearchFilters {
-                    created_from: None,
-                    created_until: None,
-                    ..filters.clone()
-                },
-            )
-            .await
-            .context("failed to find the creation date range of matching documents")?;
+        let types = self
+            .count_documents_by(&terms, vector, filters, FacetField::Type)
+            .await?;
+        let content_types = self
+            .count_documents_by(&terms, vector, filters, FacetField::ContentType)
+            .await?;
+        let created_at_range = self.created_at_range(&terms, vector, filters).await?;
 
         Ok(SearchFacets {
             categories: parse_facet(categories, "category")?,
             subcategories: parse_facet(subcategories, "subcategory")?,
-            types: parse_facet(
-                self.count_documents_by(&terms, filters, FacetField::Type)
-                    .await?,
-                "document type",
-            )?,
-            content_types: self
-                .count_documents_by(&terms, filters, FacetField::ContentType)
-                .await?,
+            types: parse_facet(types, "document type")?,
+            content_types,
             earliest_created_at: created_at_range.map(|(earliest, _)| earliest),
             latest_created_at: created_at_range.map(|(_, latest)| latest),
         })
@@ -328,15 +460,15 @@ impl<S: Storage> Service for DocumentsClient<S> {
 /// The default [`Indexer`]: embeds a document's text in chunks with an
 /// injected [`Embedder`], then caches it with its embeddings through an
 /// injected [`Storage`], in one call.
-pub(super) struct DocumentIndexer<S: Storage, E: Embedder> {
+pub(super) struct DocumentIndexer<S: Storage> {
     storage: S,
-    embedder: E,
+    embedder: Arc<dyn Embedder>,
     /// Why the last [`Indexer::prepare`] failed, if it did.
     model_error: Mutex<Option<ErrorCode>>,
 }
 
-impl<S: Storage, E: Embedder> DocumentIndexer<S, E> {
-    pub(super) fn new(storage: S, embedder: E) -> Self {
+impl<S: Storage> DocumentIndexer<S> {
+    pub(super) fn new(storage: S, embedder: Arc<dyn Embedder>) -> Self {
         Self {
             storage,
             embedder,
@@ -395,7 +527,7 @@ impl<S: Storage, E: Embedder> DocumentIndexer<S, E> {
 }
 
 #[async_trait]
-impl<S: Storage, E: Embedder> Indexer for DocumentIndexer<S, E> {
+impl<S: Storage> Indexer for DocumentIndexer<S> {
     async fn prepare(&self) -> Result<()> {
         match self.embedder.load().await {
             Ok(()) => {
@@ -460,6 +592,54 @@ impl<S: Storage, E: Embedder> Indexer for DocumentIndexer<S, E> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// Fuses `rankings` (ids, best first) with Reciprocal Rank Fusion: each
+/// document scores `1 / (RRF_K + rank)` (from rank 1) in every ranking it's
+/// in, summed, best first. Ties go to the best single rank, then to the
+/// earliest ranking it's in.
+fn fuse(rankings: &[Vec<Uuid>]) -> Vec<Uuid> {
+    struct Fused {
+        score: f64,
+        best_rank: usize,
+        best_ranking: usize,
+    }
+
+    let mut fused = HashMap::<Uuid, Fused>::new();
+    for (ranking, ids) in rankings.iter().enumerate() {
+        for (i, id) in ids.iter().enumerate() {
+            let rank = i + 1;
+            let entry = fused.entry(*id).or_insert(Fused {
+                score: 0.0,
+                best_rank: rank,
+                best_ranking: ranking,
+            });
+            entry.score += 1.0 / (RRF_K + rank as f64);
+            if rank < entry.best_rank {
+                entry.best_rank = rank;
+                entry.best_ranking = ranking;
+            }
+        }
+    }
+
+    let mut fused = fused.into_iter().collect::<Vec<_>>();
+    fused.sort_by(|(_, a), (_, b)| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.best_rank.cmp(&b.best_rank))
+            .then(a.best_ranking.cmp(&b.best_ranking))
+    });
+    fused.into_iter().map(|(id, _)| id).collect()
+}
+
+/// The page of `ids` skipping `offset` then at most `limit` long (both
+/// already checked not negative), empty past the end.
+fn page(ids: &[Uuid], offset: i64, limit: i64) -> &[Uuid] {
+    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(ids.len());
+    let end = start
+        .saturating_add(usize::try_from(limit).unwrap_or(usize::MAX))
+        .min(ids.len());
+    &ids[start..end]
 }
 
 /// The title a document's text is embedded under: its name without its
@@ -633,6 +813,11 @@ mod tests {
 
     /// An [`AttributesService`] fake accepting any attributes, for tests
     /// that don't exercise attribute checks.
+    /// An embedder whose every call panics: for tests that never search.
+    fn unused_embedder() -> Arc<dyn Embedder> {
+        Arc::new(MockEmbedder::new())
+    }
+
     fn accepting_attributes() -> Arc<dyn AttributesService> {
         let mut attributes = MockAttributesService::new();
         attributes.expect_check().returning(|_| Ok(()));
@@ -665,6 +850,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         let err = client
@@ -779,6 +965,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         let id = client
@@ -833,6 +1020,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         let err = client
@@ -857,6 +1045,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         let result = client.upload(UploadRequest::from_path(file.path())).await;
@@ -875,6 +1064,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         let err = client
@@ -906,6 +1096,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         let request = UploadRequest {
@@ -947,6 +1138,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         request.source = super::super::UploadSource::Raw {
@@ -980,6 +1172,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
         let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
         request.category = Some(Category::Money);
@@ -1003,6 +1196,7 @@ mod tests {
             None,
             rejecting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
         let mut request = UploadRequest::from_raw("raw.pdf", build_pdf("hello world"));
         request.attributes = BTreeMap::from([("price".to_string(), Attribute::Integer(1))]);
@@ -1037,6 +1231,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
         let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
         request.attributes = BTreeMap::from([("price".to_string(), Attribute::Float(f64::NAN))]);
@@ -1055,6 +1250,7 @@ mod tests {
             None,
             rejecting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
         let metadata = super::super::FakeMetadata::new()
             .with_attributes([("price".to_string(), Attribute::Integer(1))])
@@ -1075,6 +1271,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
         let attributes = BTreeMap::from([("price".to_string(), Attribute::Float(32.3))]);
         let metadata = super::super::FakeMetadata::new()
@@ -1096,6 +1293,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
         let metadata = super::super::FakeMetadata::new()
             .with_category(Category::Money)
@@ -1144,6 +1342,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         assert_eq!(client.get(id).await.unwrap(), Some(document));
@@ -1170,6 +1369,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         let page = client.list(1, 2).await.unwrap();
@@ -1213,6 +1413,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         let documents = client
@@ -1244,6 +1445,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         client.search(SearchQuery::new(" - ", 0, 10)).await.unwrap();
@@ -1267,6 +1469,7 @@ mod tests {
                 None,
                 accepting_attributes(),
                 unused_indexer(),
+                unused_embedder(),
             );
 
             let err = client.search(query.clone()).await.unwrap_err();
@@ -1296,7 +1499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_facets_counts_each_field_without_its_own_filter_but_with_every_other() {
+    async fn search_facets_counts_term_matches_when_the_text_cant_be_embedded() {
         use super::super::{Category, SearchFilters, Subcategory};
 
         let filters = SearchFilters {
@@ -1382,6 +1585,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unembeddable_queries(),
         );
 
         let facets = client.search_facets(" facture ", &filters).await.unwrap();
@@ -1412,6 +1616,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         let err = client
@@ -1430,6 +1635,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         let err = client
@@ -1447,6 +1653,405 @@ mod tests {
         assert_eq!(err.code(), crate::ErrorCode::InvalidSearchQuery);
     }
 
+    /// An embedder that can't embed queries: its model isn't downloaded.
+    fn unembeddable_queries() -> Arc<dyn Embedder> {
+        let mut embedder = MockEmbedder::new();
+        embedder.expect_embed_query().returning(|_| {
+            Err(ErrorKind::ModelNotDownloaded("multilingual-e5-small.onnx".to_string()).into())
+        });
+        Arc::new(embedder)
+    }
+
+    const QUERY_MODEL: &str = "e5";
+
+    /// An embedder embedding exactly `text` once as `vector`, under
+    /// [`QUERY_MODEL`].
+    fn query_embedder(text: &'static str, vector: Vec<f32>) -> Arc<dyn Embedder> {
+        let mut embedder = MockEmbedder::new();
+        embedder
+            .expect_embed_query()
+            .withf(move |query| query == text)
+            .times(1)
+            .returning(move |_| Ok(vector.clone()));
+        embedder
+            .expect_model()
+            .return_const(QUERY_MODEL.to_string());
+        Arc::new(embedder)
+    }
+
+    fn ids(count: usize) -> Vec<Uuid> {
+        (0..count).map(|_| Uuid::new_v4()).collect()
+    }
+
+    #[test]
+    fn fuse_ranks_a_document_in_both_rankings_above_ones_in_a_single_ranking() {
+        let [both, by_terms, by_similarity] = ids(3).try_into().unwrap();
+
+        let fused = fuse(&[vec![by_terms, both], vec![by_similarity, both]]);
+
+        // 2 / 62 for `both`, against 1 / 61 for the others.
+        assert_eq!(fused, [both, by_terms, by_similarity]);
+    }
+
+    #[test]
+    fn fuse_breaks_ties_by_best_rank_then_by_earliest_ranking() {
+        // At rank 62 in both rankings, `both` scores 2 / 122: exactly as much
+        // as the first of either ranking, 1 / 61.
+        let [both, first_by_terms, first_by_similarity] = ids(3).try_into().unwrap();
+        let mut by_terms = vec![first_by_terms];
+        by_terms.extend(ids(60));
+        by_terms.push(both);
+        let mut by_similarity = vec![first_by_similarity];
+        by_similarity.extend(ids(60));
+        by_similarity.push(both);
+
+        let fused = fuse(&[by_terms, by_similarity]);
+
+        assert_eq!(fused[..3], [first_by_terms, first_by_similarity, both]);
+        assert_eq!(fused.len(), 123);
+    }
+
+    #[test]
+    fn fuse_keeps_a_lone_ranking_in_its_order() {
+        let ranking = ids(3);
+
+        assert_eq!(fuse(&[ranking.clone(), Vec::new()]), ranking);
+        assert_eq!(fuse(&[Vec::new(), ranking.clone()]), ranking);
+        assert!(fuse(&[Vec::new(), Vec::new()]).is_empty());
+    }
+
+    #[test]
+    fn page_skips_offset_then_keeps_at_most_limit() {
+        let all = ids(5);
+
+        assert_eq!(page(&all, 0, 2), &all[..2]);
+        assert_eq!(page(&all, 2, 2), &all[2..4]);
+        assert_eq!(page(&all, 4, 2), &all[4..], "the last page is partial");
+        assert_eq!(page(&all, 0, i64::MAX), &all[..]);
+        assert!(page(&all, 5, 2).is_empty());
+        assert!(page(&all, 6, 2).is_empty(), "offset past the end");
+        assert!(page(&all, i64::MAX, i64::MAX).is_empty());
+    }
+
+    /// A client over `storage`, embedding queries with `embedder`.
+    fn searching(
+        storage: MockStorage,
+        embedder: Arc<dyn Embedder>,
+    ) -> DocumentsClient<MockStorage> {
+        DocumentsClient::new(
+            storage,
+            Arc::new(RecordingChangelog::default()),
+            None,
+            accepting_attributes(),
+            unused_indexer(),
+            embedder,
+        )
+    }
+
+    /// Expects one ranking of each kind, returning `by_terms` and
+    /// `by_similarity`.
+    fn expect_rankings(
+        storage: &mut MockStorage,
+        by_terms: Vec<Uuid>,
+        by_similarity: Vec<(Uuid, f32)>,
+    ) {
+        storage
+            .expect_rank_by_terms()
+            .times(1)
+            .returning(move |_, _, _| Ok(by_terms.clone()));
+        storage
+            .expect_rank_by_similarity()
+            .times(1)
+            .returning(move |_, _, _, _| Ok(by_similarity.clone()));
+    }
+
+    /// Expects the metadata of exactly `ids` to be loaded once, returning it
+    /// in reverse order.
+    fn expect_page(storage: &mut MockStorage, ids: Vec<Uuid>) {
+        storage
+            .expect_get_metadatas()
+            .withf({
+                let ids = ids.clone();
+                move |requested| requested == ids
+            })
+            .times(1)
+            .returning(move |_| {
+                Ok(ids
+                    .iter()
+                    .rev()
+                    .map(|id| super::super::FakeMetadata::new().with_id(*id).build())
+                    .collect())
+            });
+    }
+
+    fn found_ids(found: Vec<Metadata>) -> Vec<Uuid> {
+        found.into_iter().map(|metadata| metadata.id).collect()
+    }
+
+    #[tokio::test]
+    async fn search_by_relevance_fuses_both_rankings_and_loads_only_the_requested_page() {
+        let [both, by_terms, by_similarity] = ids(3).try_into().unwrap();
+        let filters = super::super::SearchFilters {
+            categories: vec![super::super::Category::Money],
+            ..Default::default()
+        };
+        let mut storage = MockStorage::new();
+        let expected_filters = filters.clone();
+        storage
+            .expect_rank_by_terms()
+            .withf(move |terms, filters, limit| {
+                terms == ["impôts", "2016"] && *filters == expected_filters && *limit == CANDIDATES
+            })
+            .times(1)
+            .returning(move |_, _, _| Ok(vec![both, by_terms]));
+        let expected_filters = filters.clone();
+        storage
+            .expect_rank_by_similarity()
+            .withf(move |query, model, filters, limit| {
+                query == [0.6, 0.8]
+                    && model == QUERY_MODEL
+                    && *filters == expected_filters
+                    && *limit == CANDIDATES
+            })
+            .times(1)
+            .returning(move |_, _, _, _| Ok(vec![(by_similarity, 0.9), (both, 0.85)]));
+        // Fused: `both`, `by_similarity` (1 / 61), `by_terms` (1 / 62).
+        expect_page(&mut storage, vec![by_similarity, by_terms]);
+
+        let found = searching(storage, query_embedder("impôts 2016 ?", vec![0.6, 0.8]))
+            .search(SearchQuery {
+                text: " impôts 2016 ? ".to_string(),
+                filters,
+                order: super::super::SearchOrder::Relevance,
+                offset: 1,
+                limit: 5,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(found_ids(found), [by_similarity, by_terms]);
+    }
+
+    #[tokio::test]
+    async fn search_by_relevance_loads_nothing_past_the_last_match() {
+        let mut storage = MockStorage::new();
+        expect_rankings(&mut storage, ids(2), Vec::new());
+        expect_page(&mut storage, Vec::new());
+
+        let found = searching(storage, query_embedder("impôts", vec![1.0]))
+            .search(SearchQuery::new("impôts", 2, 10))
+            .await
+            .unwrap();
+
+        assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_by_relevance_finds_a_document_without_vectors_by_its_terms() {
+        let id = Uuid::new_v4();
+        let mut storage = MockStorage::new();
+        expect_rankings(&mut storage, vec![id], Vec::new());
+        expect_page(&mut storage, vec![id]);
+
+        let found = searching(storage, query_embedder("impôts", vec![1.0]))
+            .search(SearchQuery::new("impôts", 0, 10))
+            .await
+            .unwrap();
+
+        assert_eq!(found_ids(found), [id]);
+    }
+
+    #[tokio::test]
+    async fn search_by_relevance_drops_similarities_below_the_floor() {
+        let [at_floor, below_floor] = ids(2).try_into().unwrap();
+        let mut storage = MockStorage::new();
+        expect_rankings(
+            &mut storage,
+            Vec::new(),
+            vec![
+                (at_floor, SIMILARITY_FLOOR),
+                (below_floor, SIMILARITY_FLOOR - 0.001),
+            ],
+        );
+        expect_page(&mut storage, vec![at_floor]);
+
+        let found = searching(storage, query_embedder("impôts", vec![1.0]))
+            .search(SearchQuery::new("impôts", 0, 10))
+            .await
+            .unwrap();
+
+        assert_eq!(found_ids(found), [at_floor]);
+    }
+
+    #[tokio::test]
+    async fn search_by_relevance_ranks_by_terms_alone_when_the_text_cant_be_embedded() {
+        for err in [
+            ErrorKind::ModelNotDownloaded("multilingual-e5-small.onnx".to_string()),
+            ErrorKind::InvalidModel("broken".to_string()),
+        ] {
+            let mut embedder = MockEmbedder::new();
+            let case = format!("{err:?}");
+            let mut err = Some(err);
+            embedder
+                .expect_embed_query()
+                .times(1)
+                .returning(move |_| Err(err.take().unwrap().into()));
+            let found = vec![super::super::FakeMetadata::new().build()];
+            let mut storage = MockStorage::new();
+            let returned = found.clone();
+            storage
+                .expect_search_documents()
+                .withf(|terms, _, order, offset, limit| {
+                    terms == ["impôts"]
+                        && *order == super::super::SearchOrder::Relevance
+                        && *offset == 0
+                        && *limit == 10
+                })
+                .times(1)
+                .returning(move |_, _, _, _, _| Ok(returned.clone()));
+
+            let documents = searching(storage, Arc::new(embedder))
+                .search(SearchQuery::new("impôts", 0, 10))
+                .await
+                .unwrap();
+
+            assert_eq!(documents, found, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_by_relevance_fails_with_context_when_a_ranking_fails() {
+        let mut storage = MockStorage::new();
+        storage
+            .expect_rank_by_terms()
+            .returning(|_, _, _| Err(ErrorKind::InvalidSearchQuery("boom".to_string()).into()));
+
+        let err = searching(storage, query_embedder("impôts", vec![1.0]))
+            .search(SearchQuery::new("impôts", 0, 10))
+            .await
+            .unwrap_err();
+
+        assert!(err.has_context());
+    }
+
+    #[tokio::test]
+    async fn search_never_embeds_by_date_or_without_terms() {
+        use super::super::SearchOrder;
+
+        for (text, order) in [
+            ("impôts", SearchOrder::Newest),
+            ("impôts", SearchOrder::Oldest),
+            (" - ", SearchOrder::Relevance),
+            ("", SearchOrder::Relevance),
+        ] {
+            let mut storage = MockStorage::new();
+            storage
+                .expect_search_documents()
+                .withf(move |_, _, queried, _, _| *queried == order)
+                .times(1)
+                .returning(|_, _, _, _, _| Ok(Vec::new()));
+
+            // `unused_embedder` panics if a query is embedded.
+            searching(storage, unused_embedder())
+                .search(SearchQuery {
+                    order,
+                    ..SearchQuery::new(text, 0, 10)
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn search_facets_counts_what_a_hybrid_search_finds_when_the_text_embeds() {
+        use super::super::{Category, SearchFilters};
+
+        let filters = SearchFilters {
+            categories: vec![Category::Money],
+            types: vec![DocumentType::Statement],
+            created_from: Some(1),
+            created_until: Some(2),
+            ..Default::default()
+        };
+        let [by_terms, both, by_similarity, weak] = ids(4).try_into().unwrap();
+        let mut found = vec![by_terms, both, by_similarity];
+        found.sort_unstable();
+        let lifted = [
+            without_own_filter(&filters, FacetField::Category),
+            without_own_filter(&filters, FacetField::Subcategory),
+            without_own_filter(&filters, FacetField::Type),
+            without_own_filter(&filters, FacetField::ContentType),
+            SearchFilters {
+                created_from: None,
+                created_until: None,
+                ..filters.clone()
+            },
+        ];
+
+        let mut storage = MockStorage::new();
+        for expected in lifted {
+            let expected_filters = expected.clone();
+            storage
+                .expect_rank_by_terms()
+                .withf(move |terms, filters, _| terms == ["impôts"] && *filters == expected_filters)
+                .times(1)
+                .returning(move |_, _, _| Ok(vec![by_terms, both]));
+            storage
+                .expect_rank_by_similarity()
+                .withf(move |_, _, filters, _| *filters == expected)
+                .times(1)
+                .returning(move |_, _, _, _| {
+                    Ok(vec![(both, 0.9), (by_similarity, 0.9), (weak, 0.1)])
+                });
+        }
+        for field in [
+            FacetField::Category,
+            FacetField::Subcategory,
+            FacetField::Type,
+            FacetField::ContentType,
+        ] {
+            let found = found.clone();
+            storage
+                .expect_count_documents_among()
+                .withf(move |ids, queried| ids == found && *queried == field)
+                .times(1)
+                .returning(move |_, field| {
+                    Ok(if field == FacetField::Category {
+                        vec![FacetCount {
+                            value: Category::Money.as_str().to_string(),
+                            count: 3,
+                        }]
+                    } else {
+                        Vec::new()
+                    })
+                });
+        }
+        storage
+            .expect_created_at_range_among()
+            .withf(move |ids| ids == found)
+            .times(1)
+            .returning(|_| Ok(Some((10, 20))));
+
+        let facets = searching(storage, query_embedder("impôts", vec![1.0]))
+            .search_facets(" impôts ", &filters)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            facets,
+            super::super::FakeSearchFacets::new()
+                .with_categories(vec![FacetCount {
+                    value: Category::Money,
+                    count: 3
+                }])
+                .with_subcategories(Vec::new())
+                .with_types(Vec::new())
+                .with_content_types(Vec::new())
+                .with_created_at_range(Some((10, 20)))
+                .build()
+        );
+    }
+
     #[tokio::test]
     async fn update_metadata_publishes_an_update_metadata_event_with_the_given_metadata() {
         let metadata = super::super::FakeMetadata::new()
@@ -1461,6 +2066,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         client.update_metadata(metadata).await.unwrap();
@@ -1494,6 +2100,7 @@ mod tests {
             Some(on_document_change),
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         client.start_sync().await.unwrap();
@@ -1515,6 +2122,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         client.start_sync().await.unwrap();
@@ -1529,6 +2137,7 @@ mod tests {
             None,
             accepting_attributes(),
             unused_indexer(),
+            unused_embedder(),
         );
 
         client.stop_sync();
@@ -1536,11 +2145,8 @@ mod tests {
         assert!(changelog.stopped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    fn indexer(
-        storage: MockStorage,
-        embedder: MockEmbedder,
-    ) -> DocumentIndexer<MockStorage, MockEmbedder> {
-        DocumentIndexer::new(storage, embedder)
+    fn indexer(storage: MockStorage, embedder: MockEmbedder) -> DocumentIndexer<MockStorage> {
+        DocumentIndexer::new(storage, Arc::new(embedder))
     }
 
     /// An embedder for `model`, expected to never embed anything.
@@ -1878,6 +2484,7 @@ mod tests {
             None,
             accepting_attributes(),
             Arc::new(indexer),
+            unused_embedder(),
         );
 
         assert_eq!(

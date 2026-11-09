@@ -621,7 +621,10 @@ pub struct SearchFacets {
 /// The order [`super::Service::search`] returns its matches in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SearchOrder {
-    /// Best text match first, newest first among equally good matches.
+    /// Best match first. Besides the documents matching every word (see
+    /// [`SearchQuery::text`]), finds those whose text is close in meaning
+    /// to the search text, even sharing no word with it, and ranks both
+    /// together; with no indexing model on the device yet, only the former.
     /// With no search text there's nothing to rank by, so this is the same
     /// as [`Self::Newest`].
     #[default]

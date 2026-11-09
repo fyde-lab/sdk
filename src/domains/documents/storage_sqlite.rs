@@ -1,12 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use async_trait::async_trait;
+use futures::TryStreamExt as _;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tracing::Instrument as _;
 use uuid::Uuid;
 
-use crate::{ErrorContext as _, Result};
+use crate::{ErrorContext as _, ErrorKind, Result};
 
 use super::storage::{FacetField, Storage};
 use super::{
@@ -193,17 +194,11 @@ impl Storage for SqliteStorage {
         filters: &SearchFilters,
         field: FacetField,
     ) -> Result<Vec<FacetCount<String>>> {
-        let column = match field {
-            FacetField::Category => "d.category",
-            FacetField::Subcategory => "d.subcategory",
-            FacetField::Type => "d.type",
-            FacetField::ContentType => "d.content_type",
-        };
-
         // `''` and `NULL` both mean "unset" here: see the `*_to_column`
-        // helpers above.
+        // helpers below.
         let mut query = QueryBuilder::<Sqlite>::new(format!(
-            "SELECT value, COUNT(*) AS count FROM (SELECT {column} AS value"
+            "SELECT value, COUNT(*) AS count FROM (SELECT {} AS value",
+            facet_column(field, "d.")
         ));
         push_matching(&mut query, terms, filters);
         query.push(") WHERE value IS NOT NULL AND value != '' GROUP BY value");
@@ -215,13 +210,7 @@ impl Storage for SqliteStorage {
             .await
             .with_context(|| format!("failed to count documents by {field:?}"))?;
 
-        Ok(rows
-            .iter()
-            .map(|row| FacetCount {
-                value: row.get("value"),
-                count: row.get::<i64, _>("count") as u64,
-            })
-            .collect())
+        Ok(rows.iter().map(facet_count_from_row).collect())
     }
 
     async fn created_at_range(
@@ -239,6 +228,128 @@ impl Storage for SqliteStorage {
             .fetch_one(&self.pool)
             .await
             .context("failed to find the creation date range of matching documents")?;
+
+        let earliest: Option<i64> = row.get("earliest");
+        let latest: Option<i64> = row.get("latest");
+        Ok(earliest.zip(latest))
+    }
+
+    async fn rank_by_terms(
+        &self,
+        terms: &[String],
+        filters: &SearchFilters,
+        limit: usize,
+    ) -> Result<Vec<Uuid>> {
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT d.id");
+        push_matching(&mut query, terms, filters);
+        query
+            .push(" ORDER BY ")
+            .push(FTS_RANK)
+            .push(", d.created_at DESC, d.id DESC LIMIT ")
+            .push_bind(limit as i64);
+
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to rank documents by their terms")?;
+
+        rows.iter()
+            .map(|row| id_from_column(row.get("id")))
+            .collect()
+    }
+
+    async fn rank_by_similarity(
+        &self,
+        query: &[f32],
+        model: &str,
+        filters: &SearchFilters,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, f32)>> {
+        let query_norm = norm(query);
+        let mut sql = QueryBuilder::<Sqlite>::new(
+            "SELECT e.document_id AS id, e.vector FROM document_embeddings e WHERE e.model = ",
+        );
+        sql.push_bind(model)
+            .push(" AND e.document_id IN (SELECT d.id");
+        push_matching(&mut sql, &[], filters);
+        sql.push(")");
+
+        // Streamed: every chunk vector of every document is read, so they're
+        // never all held in memory at once.
+        let mut best = HashMap::<String, f32>::new();
+        let mut rows = sql.build().fetch(&self.pool);
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .context("failed to read document embeddings")?
+        {
+            let id: String = row.get("id");
+            let vector: &[u8] = row.get("vector");
+            let Some(similarity) = cosine(query, query_norm, vector)
+                .with_context(|| format!("invalid embedding of document {id}"))?
+            else {
+                continue;
+            };
+            best.entry(id)
+                .and_modify(|best| *best = best.max(similarity))
+                .or_insert(similarity);
+        }
+
+        let mut ranked = best
+            .into_iter()
+            .map(|(id, similarity)| Ok((id_from_column(id)?, similarity)))
+            .collect::<Result<Vec<_>>>()?;
+        ranked.sort_by(|(a_id, a), (b_id, b)| b.total_cmp(a).then(a_id.cmp(b_id)));
+        ranked.truncate(limit);
+        Ok(ranked)
+    }
+
+    async fn get_metadatas(&self, ids: &[Uuid]) -> Result<Vec<Metadata>> {
+        let rows = sqlx::query(
+            "SELECT id, name, original_name, content_type, length(content) AS size, checksum, created_at, transcript, type, category, subcategory, attributes FROM documents
+             WHERE id IN (SELECT value FROM json_each(?1))",
+        )
+        .bind(ids_to_json(ids)?)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("failed to fetch the metadata of {} documents", ids.len()))?;
+
+        rows.iter().map(metadata_from_row).collect()
+    }
+
+    async fn count_documents_among(
+        &self,
+        ids: &[Uuid],
+        field: FacetField,
+    ) -> Result<Vec<FacetCount<String>>> {
+        let column = facet_column(field, "");
+        let mut query = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT {column} AS value, COUNT(*) AS count FROM documents
+             WHERE id IN (SELECT value FROM json_each("
+        ));
+        query.push_bind(ids_to_json(ids)?).push(format!(
+            ")) AND {column} IS NOT NULL AND {column} != ''
+             GROUP BY {column} ORDER BY count DESC, value ASC"
+        ));
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| format!("failed to count listed documents by {field:?}"))?;
+
+        Ok(rows.iter().map(facet_count_from_row).collect())
+    }
+
+    async fn created_at_range_among(&self, ids: &[Uuid]) -> Result<Option<(i64, i64)>> {
+        let row = sqlx::query(
+            "SELECT MIN(created_at) AS earliest, MAX(created_at) AS latest FROM documents
+             WHERE id IN (SELECT value FROM json_each(?1))",
+        )
+        .bind(ids_to_json(ids)?)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to find the creation date range of listed documents")?;
 
         let earliest: Option<i64> = row.get("earliest");
         let latest: Option<i64> = row.get("latest");
@@ -330,6 +441,64 @@ async fn insert_embeddings(
     }
 
     Ok(())
+}
+
+/// The column holding `field`, its table aliased as `alias` (`"d."`, or
+/// `""` for none).
+fn facet_column(field: FacetField, alias: &str) -> String {
+    let column = match field {
+        FacetField::Category => "category",
+        FacetField::Subcategory => "subcategory",
+        FacetField::Type => "type",
+        FacetField::ContentType => "content_type",
+    };
+    format!("{alias}{column}")
+}
+
+fn facet_count_from_row(row: &SqliteRow) -> FacetCount<String> {
+    FacetCount {
+        value: row.get("value"),
+        count: row.get::<i64, _>("count") as u64,
+    }
+}
+
+fn id_from_column(id: String) -> Result<Uuid> {
+    Uuid::parse_str(&id).with_context(|| format!("invalid document id in local database: {id}"))
+}
+
+/// `ids` as a JSON array of their `id` columns, for `json_each`: binding one
+/// array rather than one parameter per id keeps under SQLite's limit.
+fn ids_to_json(ids: &[Uuid]) -> Result<String> {
+    serde_json::to_string(&ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
+        .context("failed to encode document ids as json")
+}
+
+fn norm(vector: &[f32]) -> f32 {
+    vector.iter().map(|value| value * value).sum::<f32>().sqrt()
+}
+
+/// The cosine similarity of `query` (whose length is `query_norm`) and the
+/// vector stored as `column` (see [`vector_to_column`]), or `None` when
+/// either is zero, pointing nowhere.
+fn cosine(query: &[f32], query_norm: f32, column: &[u8]) -> Result<Option<f32>> {
+    let (values, rest) = column.as_chunks::<4>();
+    if values.len() != query.len() || !rest.is_empty() {
+        return Err(ErrorKind::InvalidModel(format!(
+            "a {}-byte embedding can't be compared to a {}-dimension query",
+            column.len(),
+            query.len()
+        ))
+        .into());
+    }
+
+    let (mut dot, mut squares) = (0.0_f32, 0.0_f32);
+    for (bytes, q) in values.iter().zip(query) {
+        let value = f32::from_le_bytes(*bytes);
+        dot += value * q;
+        squares += value * value;
+    }
+    let norms = squares.sqrt() * query_norm;
+    Ok((norms > 0.0).then(|| dot / norms))
 }
 
 /// A vector as its `vector` column: each value as a little-endian f32.
@@ -1714,5 +1883,380 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    const MODEL: &str = "e5.onnx";
+
+    /// Saves `metadata` with one chunk per vector of `vectors`, embedded by
+    /// `model`, returning its id.
+    async fn save_embedded(
+        storage: &SqliteStorage,
+        metadata: FakeMetadata,
+        model: &str,
+        vectors: &[&[f32]],
+    ) -> Uuid {
+        let metadata = metadata.build();
+        let id = metadata.id;
+        let embeddings = FakeDocumentEmbeddings::new()
+            .with_model(model)
+            .with_chunks(
+                vectors
+                    .iter()
+                    .map(|vector| {
+                        FakeChunkEmbedding::new()
+                            .with_vector(vector.to_vec())
+                            .build()
+                    })
+                    .collect(),
+            )
+            .build();
+        storage
+            .save_document(
+                &FakeDocument::new()
+                    .with_id(id)
+                    .with_metadata(metadata)
+                    .build(),
+                &embeddings,
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn similar(
+        storage: &SqliteStorage,
+        query: &[f32],
+        filters: &SearchFilters,
+        limit: usize,
+    ) -> Vec<(Uuid, f32)> {
+        storage
+            .rank_by_similarity(query, MODEL, filters, limit)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn rank_by_similarity_scores_a_document_by_its_best_chunk() {
+        let storage = setup().await;
+        let one_good_chunk = save_embedded(
+            &storage,
+            searchable("one-good-chunk", 1),
+            MODEL,
+            &[&[0.0, 1.0], &[1.0, 0.0], &[-1.0, 0.0]],
+        )
+        .await;
+        // Unnormalized: its cosine is 0.6 whatever its length.
+        let fair = save_embedded(&storage, searchable("fair", 2), MODEL, &[&[6.0, 8.0]]).await;
+
+        let ranked = similar(&storage, &[2.0, 0.0], &SearchFilters::default(), 10).await;
+
+        assert_eq!(
+            ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [one_good_chunk, fair]
+        );
+        assert!((ranked[0].1 - 1.0).abs() < 1e-6, "{ranked:?}");
+        assert!((ranked[1].1 - 0.6).abs() < 1e-6, "{ranked:?}");
+    }
+
+    #[tokio::test]
+    async fn rank_by_similarity_keeps_only_documents_matching_every_filter() {
+        let storage = setup().await;
+        let embedded = |metadata| save_embedded(&storage, metadata, MODEL, &[&[1.0, 0.0]]);
+        let matching = embedded(
+            searchable("match", 10)
+                .with_category(Category::Health)
+                .with_subcategory(Subcategory::Banking)
+                .with_type(DocumentType::Receipt),
+        )
+        .await;
+        // Each differs from "match" in exactly one filtered field.
+        embedded(
+            searchable("wrong-category", 10)
+                .with_category(Category::Money)
+                .with_subcategory(Subcategory::Banking)
+                .with_type(DocumentType::Receipt),
+        )
+        .await;
+        embedded(
+            searchable("wrong-subcategory", 10)
+                .with_category(Category::Health)
+                .with_type(DocumentType::Receipt),
+        )
+        .await;
+        embedded(
+            searchable("wrong-type", 10)
+                .with_category(Category::Health)
+                .with_subcategory(Subcategory::Banking)
+                .with_type(DocumentType::Statement),
+        )
+        .await;
+        embedded(
+            searchable("wrong-content-type", 10)
+                .with_content_type("text/plain")
+                .with_category(Category::Health)
+                .with_subcategory(Subcategory::Banking)
+                .with_type(DocumentType::Receipt),
+        )
+        .await;
+        embedded(
+            searchable("too-old", 1)
+                .with_category(Category::Health)
+                .with_subcategory(Subcategory::Banking)
+                .with_type(DocumentType::Receipt),
+        )
+        .await;
+        embedded(
+            searchable("too-new", 100)
+                .with_category(Category::Health)
+                .with_subcategory(Subcategory::Banking)
+                .with_type(DocumentType::Receipt),
+        )
+        .await;
+        let filters = SearchFilters {
+            categories: vec![Category::Health],
+            subcategories: vec![Subcategory::Banking],
+            types: vec![DocumentType::Receipt],
+            content_types: vec!["application/pdf".to_string()],
+            created_from: Some(10),
+            created_until: Some(10),
+        };
+
+        let ranked = similar(&storage, &[1.0, 0.0], &filters, 10).await;
+
+        assert_eq!(
+            ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [matching]
+        );
+        assert_eq!(
+            similar(&storage, &[1.0, 0.0], &SearchFilters::default(), 10)
+                .await
+                .len(),
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn rank_by_similarity_skips_documents_without_embeddings_from_the_model() {
+        let storage = setup().await;
+        let embedded = save_embedded(&storage, searchable("e5", 1), MODEL, &[&[1.0, 0.0]]).await;
+        save_embedded(
+            &storage,
+            searchable("other-model", 2),
+            "other.onnx",
+            &[&[1.0, 0.0]],
+        )
+        .await;
+        save_embedded(&storage, searchable("no-chunks", 3), MODEL, &[]).await;
+        save_embedded(
+            &storage,
+            searchable("zero-vector", 4),
+            MODEL,
+            &[&[0.0, 0.0]],
+        )
+        .await;
+
+        let ranked = similar(&storage, &[1.0, 0.0], &SearchFilters::default(), 10).await;
+
+        assert_eq!(
+            ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [embedded]
+        );
+        assert!(
+            similar(&storage, &[0.0, 0.0], &SearchFilters::default(), 10)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn rank_by_similarity_returns_at_most_limit_most_similar_first_ties_by_id() {
+        let storage = setup().await;
+        let mut tied = Vec::new();
+        for name in ["a", "b", "c"] {
+            tied.push(save_embedded(&storage, searchable(name, 1), MODEL, &[&[1.0, 0.0]]).await);
+        }
+        tied.sort_unstable();
+        save_embedded(&storage, searchable("worse", 1), MODEL, &[&[0.0, 1.0]]).await;
+
+        let ranked = similar(&storage, &[1.0, 0.0], &SearchFilters::default(), 2).await;
+
+        assert_eq!(
+            ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            tied[..2]
+        );
+    }
+
+    #[tokio::test]
+    async fn rank_by_similarity_fails_on_an_embedding_of_another_length() {
+        let storage = setup().await;
+        save_embedded(
+            &storage,
+            searchable("longer", 1),
+            MODEL,
+            &[&[1.0, 0.0, 0.0]],
+        )
+        .await;
+
+        let err = storage
+            .rank_by_similarity(&[1.0, 0.0], MODEL, &SearchFilters::default(), 10)
+            .await
+            .unwrap_err();
+
+        assert!(err.has_context());
+    }
+
+    #[tokio::test]
+    async fn rank_by_terms_ranks_ids_as_search_documents_does_by_relevance() {
+        let storage = setup().await;
+        // Newer, so it would come first if relevance weren't ranked.
+        save(
+            &storage,
+            searchable("in-transcript", 2).with_transcript("contains the word quittance"),
+        )
+        .await;
+        save(&storage, searchable("quittance", 1)).await;
+        save(
+            &storage,
+            searchable("quittance-health", 1).with_category(Category::Health),
+        )
+        .await;
+        save(&storage, searchable("unrelated", 3)).await;
+        let terms = ["quittance".to_string()];
+        let filters = SearchFilters::default();
+        let expected = storage
+            .search_documents(&terms, &filters, SearchOrder::Relevance, 0, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|metadata| metadata.id)
+            .collect::<Vec<_>>();
+
+        let ranked = storage.rank_by_terms(&terms, &filters, 10).await.unwrap();
+        let first = storage.rank_by_terms(&terms, &filters, 1).await.unwrap();
+        let health = storage
+            .rank_by_terms(
+                &terms,
+                &SearchFilters {
+                    categories: vec![Category::Health],
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(expected.len(), 3);
+        assert_eq!(ranked, expected);
+        assert_eq!(first, expected[..1]);
+        assert_eq!(health.len(), 1);
+        assert_eq!(
+            storage.get_metadata(health[0]).await.unwrap().unwrap().name,
+            "quittance-health"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_metadatas_returns_the_listed_documents_skipping_unknown_ids() {
+        let storage = setup().await;
+        let listed = FakeMetadata::new().build();
+        let id = listed.id;
+        storage
+            .save_document(
+                &FakeDocument::new()
+                    .with_id(id)
+                    .with_content(vec![1, 2, 3])
+                    .with_metadata(listed.clone())
+                    .build(),
+                &embeddings(),
+            )
+            .await
+            .unwrap();
+        save(&storage, searchable("not-listed", 1)).await;
+
+        let found = storage.get_metadatas(&[Uuid::new_v4(), id]).await.unwrap();
+
+        assert_eq!(found, [Metadata { size: 3, ..listed }]);
+        assert!(storage.get_metadatas(&[]).await.unwrap().is_empty());
+    }
+
+    async fn save_ids(storage: &SqliteStorage, metadata: Vec<FakeMetadata>) -> Vec<Uuid> {
+        let mut ids = Vec::new();
+        for metadata in metadata {
+            ids.push(save_embedded(storage, metadata, MODEL, &[]).await);
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn count_documents_among_counts_only_the_listed_documents() {
+        let storage = setup().await;
+        let ids = save_ids(
+            &storage,
+            vec![
+                searchable("a", 1)
+                    .with_category(Category::Housing)
+                    .with_subcategory(Subcategory::Banking)
+                    .with_type(DocumentType::Invoice),
+                searchable("b", 2)
+                    .with_category(Category::Money)
+                    .with_content_type("image/png"),
+                searchable("c", 3).with_category(Category::Money),
+                searchable("unclassified", 4),
+                searchable("not-listed", 5).with_category(Category::Health),
+            ],
+        )
+        .await;
+        let listed = &ids[..4];
+        let among = async |field| {
+            storage
+                .count_documents_among(listed, field)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|facet| (facet.value, facet.count))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            among(FacetField::Category).await,
+            counts(&[("money", 2), ("housing", 1)])
+        );
+        assert_eq!(
+            among(FacetField::Subcategory).await,
+            counts(&[("banking", 1)])
+        );
+        assert_eq!(among(FacetField::Type).await, counts(&[("invoice", 1)]));
+        assert_eq!(
+            among(FacetField::ContentType).await,
+            counts(&[("application/pdf", 3), ("image/png", 1)])
+        );
+        assert!(
+            storage
+                .count_documents_among(&[], FacetField::Category)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn created_at_range_among_spans_the_listed_documents_only() {
+        let storage = setup().await;
+        let ids = save_ids(
+            &storage,
+            vec![
+                searchable("oldest", 1),
+                searchable("a", 5),
+                searchable("b", 7),
+                searchable("newest", 9),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            storage.created_at_range_among(&ids[1..3]).await.unwrap(),
+            Some((5, 7))
+        );
+        assert_eq!(storage.created_at_range_among(&[]).await.unwrap(), None);
     }
 }

@@ -163,6 +163,35 @@ impl ModelStore {
         Ok(path)
     }
 
+    /// Returns `model`'s local path if it's already there and matches its
+    /// pinned size and SHA-256 (checked like [`Self::ensure`] does), never
+    /// downloading it nor waiting for a download: `None` if it's missing,
+    /// doesn't match (left for `ensure` to replace), or another call is
+    /// checking or downloading it right now.
+    pub(crate) async fn find(&self, model: &Model) -> Result<Option<PathBuf>> {
+        let path = self.path(model);
+        let lock = self.file_lock(model);
+        let Ok(mut verified) = lock.try_lock() else {
+            return Ok(None);
+        };
+
+        match tokio::fs::metadata(&path).await {
+            Ok(metadata) if metadata.len() == model.size => {}
+            _ => return Ok(None),
+        }
+        if !*verified {
+            let sha256 = sha256_of(&path)
+                .await
+                .with_context(|| format!("failed to check the model {}", model.name))?;
+            if sha256 != model.sha256 {
+                return Ok(None);
+            }
+            *verified = true;
+        }
+
+        Ok(Some(path))
+    }
+
     fn file_lock(&self, model: &Model) -> Arc<tokio::sync::Mutex<bool>> {
         self.files
             .lock()
@@ -924,6 +953,72 @@ mod tests {
         assert_eq!(first.unwrap(), second.unwrap());
         assert_eq!(server.requests.load(Ordering::SeqCst), 1);
         assert_eq!(files_in(dir.path()), vec![file_name(&model)]);
+    }
+
+    #[tokio::test]
+    async fn find_returns_a_model_already_present_without_downloading() {
+        let content = content();
+        let server = serve(|_| Reply::status("500 Internal Server Error")).await;
+        let model = model(&server, "/model.onnx", &content);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
+        std::fs::write(store.path(&model), &content).unwrap();
+
+        assert_eq!(store.find(&model).await.unwrap(), Some(store.path(&model)));
+        // Checked once, then trusted by size like `ensure` does.
+        assert!(*store.file_lock(&model).lock().await);
+        assert_eq!(store.find(&model).await.unwrap(), Some(store.path(&model)));
+        assert_eq!(server.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn find_never_downloads_a_missing_model() {
+        let content = content();
+        let served = content.clone();
+        let server = serve(move |_| Reply::ok(&served)).await;
+        let model = model(&server, "/model.onnx", &content);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(dir.path().join("not-created"));
+
+        assert_eq!(store.find(&model).await.unwrap(), None);
+        assert_eq!(server.requests.load(Ordering::SeqCst), 0);
+        assert!(!dir.path().join("not-created").exists());
+    }
+
+    #[tokio::test]
+    async fn find_leaves_a_mismatched_file_for_ensure_to_replace() {
+        let content = content();
+        let server = serve(|_| Reply::status("500 Internal Server Error")).await;
+        let model = model(&server, "/model.onnx", &content);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
+        let mut same_size = content.clone();
+        same_size[0] ^= 0xff;
+
+        for present in [b"truncated".to_vec(), same_size] {
+            std::fs::write(store.path(&model), &present).unwrap();
+
+            assert_eq!(store.find(&model).await.unwrap(), None);
+            assert_eq!(std::fs::read(store.path(&model)).unwrap(), present);
+        }
+        assert!(!*store.file_lock(&model).lock().await);
+    }
+
+    #[tokio::test]
+    async fn find_does_not_wait_for_a_model_being_checked_or_downloaded() {
+        let content = content();
+        let server = serve(|_| Reply::status("500 Internal Server Error")).await;
+        let model = model(&server, "/model.onnx", &content);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(dir.path().to_path_buf());
+        std::fs::write(store.path(&model), &content).unwrap();
+        let lock = store.file_lock(&model);
+        let held = lock.lock().await;
+
+        assert_eq!(store.find(&model).await.unwrap(), None);
+
+        drop(held);
+        assert_eq!(store.find(&model).await.unwrap(), Some(store.path(&model)));
     }
 
     #[tokio::test]

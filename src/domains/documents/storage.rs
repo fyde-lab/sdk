@@ -81,6 +81,42 @@ pub(crate) trait Storage: Send + Sync {
         filters: &SearchFilters,
     ) -> Result<Option<(i64, i64)>>;
 
+    /// The ids of the documents [`Self::search_documents`] would match for
+    /// `terms` (at least one) and `filters`, best `bm25` match first (the
+    /// order [`SearchOrder::Relevance`] lists them in), at most `limit`.
+    async fn rank_by_terms(
+        &self,
+        terms: &[String],
+        filters: &SearchFilters,
+        limit: usize,
+    ) -> Result<Vec<Uuid>>;
+
+    /// The ids of the documents matching every one of `filters` that have
+    /// embeddings from `model`, each with its best chunk's cosine similarity
+    /// to `query`, most similar first (ties by id), at most `limit`.
+    async fn rank_by_similarity(
+        &self,
+        query: &[f32],
+        model: &str,
+        filters: &SearchFilters,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, f32)>>;
+
+    /// The metadata of every document among `ids` previously saved locally
+    /// by [`Self::save_document`], in no particular order, skipping ids with
+    /// no document. Never loads their content.
+    async fn get_metadatas(&self, ids: &[Uuid]) -> Result<Vec<Metadata>>;
+
+    /// Like [`Self::count_documents_by`], over the documents among `ids`.
+    async fn count_documents_among(
+        &self,
+        ids: &[Uuid],
+        field: FacetField,
+    ) -> Result<Vec<FacetCount<String>>>;
+
+    /// Like [`Self::created_at_range`], over the documents among `ids`.
+    async fn created_at_range_among(&self, ids: &[Uuid]) -> Result<Option<(i64, i64)>>;
+
     /// Fetches the metadata of a document previously saved locally by
     /// [`Self::save_document`], or `None` if it doesn't exist. Never loads
     /// its content.
