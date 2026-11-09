@@ -25,6 +25,7 @@ RUSTFLAGS="--cfg tokio_unstable" cargo build --features tokio-console  # serve t
   library on the first build (network, then cached); `ORT_LIB_PATH` points it at a local build.
 - `FYDE_TEST_MODELS_DIR=/some/dir cargo test -- --ignored multilingual_e5` runs the real-model
   tests (`tools::onnx` and `documents::embedder`; downloads ~135 MB from Hugging Face; the directory keeps them for the next run).
+  `-- --ignored gliner_x_small` runs `documents::gliner`'s (~190 MB).
 
 ## Non-negotiable rules
 
@@ -92,7 +93,8 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
 - Exceptions, which test real adapters: `grpc_client.rs`, `crypto.rs`, `tools/sql/sqlite.rs`, `tools/client_dir.rs`,
   `tools/models` (a local `TcpListener` HTTP server), `tools/onnx` (a hand-encoded ONNX model; the
   real-model test is `#[ignore]`), `documents/embedder.rs` (pooling on hand-built outputs; the
-  real-model ranking test is `#[ignore]`),
+  real-model ranking test is `#[ignore]`), `documents/gliner.rs` (splitting, windows, inputs and
+  logit decoding are pure functions tested directly; the real-model test is `#[ignore]`),
   `storage_sqlite.rs` files, `secrets/storage_keystore.rs` (keyring's in-memory mock),
   `changelog/storage_settings.rs`. `changelog::Service` can't be automocked (its
   `start_consume_job` takes a boxed `FnMut`), so use the hand-written `RecordingChangelog`-style
@@ -206,6 +208,15 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     category/subcategory (a scraper's choice is never overridden; the type is then left to it
     too); a request's type wins over the guessed one. A failure publishes unclassified. Never
     run on consumption.
+  - `gliner.rs` — `SpanFinder` (`OnnxGliner`, GLiNER-X small; ported from `doc-ai-poc`'s
+    `gliner.rs`), a pure adapter not wired into any flow yet: `spans(text, labels, threshold,
+    max_words)` returns every span (byte range, label index, sigmoid score) scoring at least
+    `threshold`, best first, overlaps and window-boundary duplicates included. Keep the model's
+    details as they are: `<<ENT>>` = 250100 / `<<SEP>>` = 250101 (not in `tokenizer.json`),
+    `MAX_WIDTH` 12, 320-word windows overlapping by 12, `split_words` mimicking GLiNER's
+    `\w+(?:[-_]\w+)*|\S`, only the inputs the model declares passed (an unknown one fails), logits
+    checked to be `[1, words, 12, labels]`. Loaded lazily on the first call with something to
+    look for (a failure is retried), run on the blocking pool.
   - `dev.rs` — `DevDocumentsClient`, plain-file writes for `init_dev_scrapers`.
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
   (`SaveDocument`, `UpdateMetadata`, `Deleted`, `InstallScript`). `crypto.rs`: AES-256-GCM, per-event DEK
@@ -329,9 +340,10 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
 
 ### On-device models (`src/tools/models/`, `src/tools/onnx/`)
 
-Used by `documents::embedder`. `tools::models` is the registry: each `Model` is one file (name, URL
-at a fixed Hugging Face revision, size, SHA-256); today `MULTILINGUAL_E5_SMALL` (int8 ONNX) and
-its `_TOKENIZER`. `ModelStore::ensure` returns `<models_dir>/<sha256[..16]>-<name>`. A file
+Used by `documents::embedder` and `documents::gliner`. `tools::models` is the registry: each `Model`
+is one file (name, URL at a fixed Hugging Face revision, size, SHA-256); today
+`MULTILINGUAL_E5_SMALL` (MIT) and `GLINER_X_SMALL` (Apache-2.0, `knowledgator/gliner-x-small`),
+both int8 ONNX, each with its `_TOKENIZER`. `ModelStore::ensure` returns `<models_dir>/<sha256[..16]>-<name>`. A file
 already there is SHA-256-checked the first time the store sees it (replaced on mismatch), then
 trusted by size. Otherwise it's downloaded over `wreq` (client built on the first download;
 redirects followed) into a `.<file>.<uuid>.part` beside it, removed on any failure or

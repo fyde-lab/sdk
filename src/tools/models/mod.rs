@@ -60,6 +60,33 @@ pub(crate) const MULTILINGUAL_E5_SMALL_TOKENIZER: Model = Model {
     sha256: "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
 };
 
+macro_rules! gliner_x_small_url {
+    ($file:literal) => {
+        concat!(
+            "https://huggingface.co/knowledgator/gliner-x-small/resolve/",
+            "d51a0984d11084a55f9df3899d9dbf7704f580f5/",
+            $file
+        )
+    };
+}
+
+/// GLiNER-X small (Apache-2.0, mT5-small encoder), int8-quantized:
+/// multilingual zero-shot entity spans (see `documents::gliner`).
+pub(crate) const GLINER_X_SMALL: Model = Model {
+    name: "gliner-x-small.onnx",
+    url: gliner_x_small_url!("onnx/model_quantized.onnx"),
+    size: 172_716_978,
+    sha256: "d76b3349fd4bfe44573221c0912ed459f432d14317552fdc65935dabcb833c4a",
+};
+
+/// [`GLINER_X_SMALL`]'s tokenizer.
+pub(crate) const GLINER_X_SMALL_TOKENIZER: Model = Model {
+    name: "gliner-x-small.tokenizer.json",
+    url: gliner_x_small_url!("tokenizer.json"),
+    size: 16_335_050,
+    sha256: "619d3790cf59a0e50afdf04239db19093568fbd8d806963e35d54a8fb71d099c",
+};
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a download may go without receiving a byte before it fails.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1099,7 +1126,12 @@ mod tests {
 
     #[test]
     fn registry_entries_are_pinned() {
-        let registry = [MULTILINGUAL_E5_SMALL, MULTILINGUAL_E5_SMALL_TOKENIZER];
+        let registry = [
+            MULTILINGUAL_E5_SMALL,
+            MULTILINGUAL_E5_SMALL_TOKENIZER,
+            GLINER_X_SMALL,
+            GLINER_X_SMALL_TOKENIZER,
+        ];
 
         for model in registry {
             let revision = model
