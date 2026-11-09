@@ -1,5 +1,6 @@
 pub(crate) mod attributes;
 mod chunk;
+mod classification;
 mod dev;
 mod embedder;
 mod embedding_cache;
@@ -61,8 +62,12 @@ pub trait Service: Send + Sync {
     /// generated id. Metadata fields set on `request` (`name`, `type`,
     /// `category`, `subcategory`, `attributes`) override whatever would
     /// otherwise be derived from the document itself: its name comes from
-    /// the source's file name, its type, classification and attributes are
-    /// left empty. Attributes that aren't valid — see
+    /// the source's file name, its attributes are left empty, and its
+    /// category, subcategory and type are guessed from its text, on device,
+    /// unless `request` sets a category (or a subcategory): those are then
+    /// the caller's, and so is the type, set or not. A guess the classifier
+    /// isn't sure of is left `None`, and so is everything if the embedding
+    /// model isn't available. Attributes that aren't valid — see
     /// [`AttributesService::check`] — are rejected with
     /// [`crate::ErrorCode::InvalidAttribute`].
     ///
@@ -250,7 +255,8 @@ pub(crate) fn init_indexer(
 /// the documents it cached, and calls `on_document_change` (see
 /// [`crate::ClientConfig`]) for every event [`Service::start_sync`]
 /// consumes. Uploads and searches embed their text with `embedder` (see
-/// [`init_embedder`]), uploads leaving theirs in `cache` for `indexer`.
+/// [`init_embedder`]), uploads leaving theirs in `cache` for `indexer`, and
+/// are classified with it.
 pub(crate) fn init(
     pool: SqlitePool,
     changelog: Arc<dyn changelog::Service>,
@@ -268,8 +274,9 @@ pub(crate) fn init(
         on_document_change,
         attributes,
         indexer,
-        embedder,
+        embedder.clone(),
         cache,
+        classification::init(embedder),
     ))
 }
 
