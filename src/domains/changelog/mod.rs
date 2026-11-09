@@ -54,7 +54,7 @@ pub(crate) trait Service: Send + Sync {
     /// Encrypts and publishes a new event about `subject_id` — a document
     /// or script id depending on `event_type` (see [`ChangelogEvent`]).
     /// `content`/`metadata` are `None` for event types that don't carry
-    /// them (e.g. a future `Deleted` event only carries `subject_id`).
+    /// them (e.g. a `Deleted` event only carries `subject_id`).
     async fn send(
         &self,
         event_type: EventType,
@@ -69,7 +69,8 @@ pub(crate) trait Service: Send + Sync {
     /// `changelog.proto`), resuming from the cursor persisted locally in
     /// the settings store (from the very beginning of the changelog if it's
     /// never been consumed before). For each `SaveDocument` event, caches the
-    /// resulting document in local storage before invoking `callback` (and
+    /// resulting document in local storage before invoking `callback`
+    /// (removes it for a `Deleted` event, and
     /// likewise saves the installed script for a `InstallScript` event,
     /// via the `scripts` domain's local storage, first clearing that
     /// scraper's saved session if the event installs another version of the

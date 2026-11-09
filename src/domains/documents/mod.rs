@@ -125,12 +125,23 @@ pub trait Service: Send + Sync {
     /// it is removed. Rejects invalid attributes like [`Self::upload`].
     async fn update_metadata(&self, metadata: Metadata) -> Result<()>;
 
+    /// Publishes a "deleted" changelog event for the document `id`. Like
+    /// [`Self::upload`]'s, its effect is local only once the sync job
+    /// consumes it back (on this device as on every other): the document
+    /// then disappears from local storage, embeddings and search index
+    /// included, and `on_document_change` gets the event. Doesn't check that
+    /// `id` is cached, so a document uploaded but not synced yet can be
+    /// deleted too; deleting an unknown or already deleted document is a
+    /// no-op once consumed. A deleted document's content can be uploaded
+    /// again afterwards.
+    async fn delete(&self, id: Uuid) -> Result<()>;
+
     /// Starts a background job that streams and decrypts every changelog
     /// event since the last consumed id, oldest first (replaying persisted
     /// history, then continuing with the live tail). Resumes from the
     /// cursor persisted locally by a previous call, or from the beginning
     /// of the changelog if it's never been consumed before. For each
-    /// "created"/"update metadata" event, updates local storage, indexing
+    /// "created"/"update metadata"/"deleted" event, updates local storage, indexing
     /// the document's text along the way (about a second per document on a
     /// desktop CPU), before invoking the `on_document_change` callback
     /// configured on the client (see [`crate::ClientConfig`]), so it's
@@ -192,6 +203,10 @@ pub(crate) trait Indexer: Send + Sync {
     /// embeddings too if that changes the text they embed. Does nothing if
     /// no document `id` is cached.
     async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()>;
+
+    /// Removes the cached document `id` with its embeddings. Does nothing if
+    /// no document `id` is cached.
+    async fn delete_document(&self, id: Uuid) -> Result<()>;
 
     /// Why the last [`Self::prepare`] failed, if it did.
     fn model_error(&self) -> Option<ErrorCode>;

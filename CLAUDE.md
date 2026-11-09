@@ -139,7 +139,10 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   server decodes with tonic's 4 MiB default) and a known checksum (`DuplicateDocument`), both
   before parsing; `changelog::Service::send` re-checks the encrypted event's size, parses, then
   publishes an encrypted `SaveDocument` event; the document reaches the local cache only when
-  the sync job consumes it back. `get`/`list`/`search`/`search_facets` are local-only
+  the sync job consumes it back. `delete` likewise only publishes a `Deleted` event (id only,
+  no local check, so an unsynced upload can be deleted); consuming it removes the cached
+  document through `Indexer::delete_document` (embeddings cascade, FTS triggers follow), a
+  no-op if it isn't cached. `get`/`list`/`search`/`search_facets` are local-only
   (`storage_sqlite.rs`, FTS5 `bm25` ranking over contentless `documents_fts`). `list`/`search`
   return `Metadata` only (their query never selects `content`; `size` is `length(content)`):
   `get` is the only call that loads a document's content, for when it's actually shown.
@@ -205,7 +208,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     run on consumption.
   - `dev.rs` — `DevDocumentsClient`, plain-file writes for `init_dev_scrapers`.
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
-  (`SaveDocument`, `UpdateMetadata`, `InstallScript`). `crypto.rs`: AES-256-GCM, per-event DEK
+  (`SaveDocument`, `UpdateMetadata`, `Deleted`, `InstallScript`). `crypto.rs`: AES-256-GCM, per-event DEK
   wrapped by a KEK derived from the master key. The consume job replays from the persisted
   cursor then tails live, materializing documents and installed scripts (an `InstallScript`
   whose script version differs from the installed one first deletes that scraper's saved

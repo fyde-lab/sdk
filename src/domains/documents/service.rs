@@ -578,6 +578,13 @@ impl<S: Storage> Service for DocumentsClient<S> {
         Ok(())
     }
 
+    async fn delete(&self, id: Uuid) -> Result<()> {
+        self.changelog
+            .send(EventType::Deleted, id, None, None)
+            .await
+            .with_context(|| format!("failed to publish the deletion of document {id}"))
+    }
+
     async fn start_sync(&self) -> Result<()> {
         let on_document_change = self.on_document_change.clone();
         let callback: Box<dyn FnMut(ChangelogEvent) + Send> = Box::new(move |event| {
@@ -712,6 +719,13 @@ impl<S: Storage> Indexer for DocumentIndexer<S> {
             .update_metadata(id, metadata, embeddings)
             .await
             .with_context(|| format!("failed to update cached document {id} locally"))
+    }
+
+    async fn delete_document(&self, id: Uuid) -> Result<()> {
+        self.storage
+            .delete_document(id)
+            .await
+            .with_context(|| format!("failed to delete cached document {id} locally"))
     }
 
     fn model_error(&self) -> Option<ErrorCode> {
@@ -2458,6 +2472,64 @@ mod tests {
         client.stop_sync();
 
         assert!(changelog.stopped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A documents client over `changelog` alone, for tests of calls that
+    /// only publish an event.
+    fn publishing_client(changelog: Arc<RecordingChangelog>) -> DocumentsClient<MockStorage> {
+        DocumentsClient::new(
+            MockStorage::new(),
+            changelog,
+            None,
+            Arc::new(MockAttributesService::new()),
+            unused_indexer(),
+            unused_embedder(),
+            unused_cache(),
+            unused_classifier(),
+        )
+    }
+
+    #[tokio::test]
+    async fn delete_publishes_a_deleted_event_for_the_document_alone() {
+        let id = Uuid::now_v7();
+        let changelog = Arc::new(RecordingChangelog::default());
+        // `MockStorage` without expectations: deleting never touches the
+        // local cache itself, nor checks the document is in it.
+        let client = publishing_client(changelog.clone());
+
+        client.delete(id).await.unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(*sent, vec![(EventType::Deleted, id, None, None)]);
+    }
+
+    #[tokio::test]
+    async fn delete_fails_with_context_when_publishing_fails() {
+        let changelog = Arc::new(RecordingChangelog {
+            fail_send: true,
+            ..Default::default()
+        });
+        let client = publishing_client(changelog);
+
+        let err = client.delete(Uuid::now_v7()).await.unwrap_err();
+
+        assert!(err.has_context(), "missing context: {err}");
+    }
+
+    #[tokio::test]
+    async fn indexer_delete_document_deletes_the_cached_document() {
+        let id = Uuid::now_v7();
+        let mut storage = MockStorage::new();
+        storage
+            .expect_delete_document()
+            .withf(move |deleted| *deleted == id)
+            .times(1)
+            .returning(|_| Ok(()));
+        // No expectations on the embedder or the cache: deleting embeds
+        // nothing and holds nothing.
+        let indexer = indexer_with(storage, MockEmbedder::new(), MockEmbeddingCache::new());
+
+        indexer.delete_document(id).await.unwrap();
     }
 
     fn indexer(storage: MockStorage, embedder: MockEmbedder) -> DocumentIndexer<MockStorage> {

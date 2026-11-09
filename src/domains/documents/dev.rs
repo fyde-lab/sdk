@@ -118,6 +118,10 @@ impl Service for DevDocumentsClient {
         Ok(())
     }
 
+    async fn delete(&self, _id: Uuid) -> Result<()> {
+        Ok(())
+    }
+
     async fn start_sync(&self) -> Result<()> {
         Ok(())
     }
