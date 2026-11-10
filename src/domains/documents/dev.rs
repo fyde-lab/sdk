@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::{ErrorCode, ErrorContext as _, Result};
+use crate::{ErrorContext as _, Result};
 
 use super::{
     Attribute, Category, Document, DocumentType, Metadata, SearchFacets, SearchFilters,
@@ -127,10 +127,6 @@ impl Service for DevDocumentsClient {
     }
 
     fn stop_sync(&self) {}
-
-    fn indexing_model_error(&self) -> Option<ErrorCode> {
-        None
-    }
 }
 
 /// The metadata [`DevDocumentsClient::upload`] writes as JSON next to each

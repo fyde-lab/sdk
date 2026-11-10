@@ -33,33 +33,6 @@ pub(crate) struct Model {
     pub(crate) sha256: &'static str,
 }
 
-macro_rules! multilingual_e5_small_url {
-    ($file:literal) => {
-        concat!(
-            "https://huggingface.co/Xenova/multilingual-e5-small/resolve/",
-            "761b726dd34fb83930e26aab4e9ac3899aa1fa78/",
-            $file
-        )
-    };
-}
-
-/// multilingual-e5-small (MIT), int8-quantized: 384-dimension text
-/// embeddings, inputs up to 512 tokens, prefixed `query: ` or `passage: `.
-pub(crate) const MULTILINGUAL_E5_SMALL: Model = Model {
-    name: "multilingual-e5-small.onnx",
-    url: multilingual_e5_small_url!("onnx/model_quantized.onnx"),
-    size: 118_308_185,
-    sha256: "f80102d3f2a1229f387d3c81909990d8945513e347b0eab049f7de3c6f98c193",
-};
-
-/// [`MULTILINGUAL_E5_SMALL`]'s tokenizer.
-pub(crate) const MULTILINGUAL_E5_SMALL_TOKENIZER: Model = Model {
-    name: "multilingual-e5-small.tokenizer.json",
-    url: multilingual_e5_small_url!("tokenizer.json"),
-    size: 17_082_730,
-    sha256: "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
-};
-
 macro_rules! gliner_x_small_url {
     ($file:literal) => {
         concat!(
@@ -188,35 +161,6 @@ impl ModelStore {
         *verified = true;
 
         Ok(path)
-    }
-
-    /// Returns `model`'s local path if it's already there and matches its
-    /// pinned size and SHA-256 (checked like [`Self::ensure`] does), never
-    /// downloading it nor waiting for a download: `None` if it's missing,
-    /// doesn't match (left for `ensure` to replace), or another call is
-    /// checking or downloading it right now.
-    pub(crate) async fn find(&self, model: &Model) -> Result<Option<PathBuf>> {
-        let path = self.path(model);
-        let lock = self.file_lock(model);
-        let Ok(mut verified) = lock.try_lock() else {
-            return Ok(None);
-        };
-
-        match tokio::fs::metadata(&path).await {
-            Ok(metadata) if metadata.len() == model.size => {}
-            _ => return Ok(None),
-        }
-        if !*verified {
-            let sha256 = sha256_of(&path)
-                .await
-                .with_context(|| format!("failed to check the model {}", model.name))?;
-            if sha256 != model.sha256 {
-                return Ok(None);
-            }
-            *verified = true;
-        }
-
-        Ok(Some(path))
     }
 
     fn file_lock(&self, model: &Model) -> Arc<tokio::sync::Mutex<bool>> {
@@ -983,72 +927,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_returns_a_model_already_present_without_downloading() {
-        let content = content();
-        let server = serve(|_| Reply::status("500 Internal Server Error")).await;
-        let model = model(&server, "/model.onnx", &content);
-        let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf());
-        std::fs::write(store.path(&model), &content).unwrap();
-
-        assert_eq!(store.find(&model).await.unwrap(), Some(store.path(&model)));
-        // Checked once, then trusted by size like `ensure` does.
-        assert!(*store.file_lock(&model).lock().await);
-        assert_eq!(store.find(&model).await.unwrap(), Some(store.path(&model)));
-        assert_eq!(server.requests.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn find_never_downloads_a_missing_model() {
-        let content = content();
-        let served = content.clone();
-        let server = serve(move |_| Reply::ok(&served)).await;
-        let model = model(&server, "/model.onnx", &content);
-        let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().join("not-created"));
-
-        assert_eq!(store.find(&model).await.unwrap(), None);
-        assert_eq!(server.requests.load(Ordering::SeqCst), 0);
-        assert!(!dir.path().join("not-created").exists());
-    }
-
-    #[tokio::test]
-    async fn find_leaves_a_mismatched_file_for_ensure_to_replace() {
-        let content = content();
-        let server = serve(|_| Reply::status("500 Internal Server Error")).await;
-        let model = model(&server, "/model.onnx", &content);
-        let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf());
-        let mut same_size = content.clone();
-        same_size[0] ^= 0xff;
-
-        for present in [b"truncated".to_vec(), same_size] {
-            std::fs::write(store.path(&model), &present).unwrap();
-
-            assert_eq!(store.find(&model).await.unwrap(), None);
-            assert_eq!(std::fs::read(store.path(&model)).unwrap(), present);
-        }
-        assert!(!*store.file_lock(&model).lock().await);
-    }
-
-    #[tokio::test]
-    async fn find_does_not_wait_for_a_model_being_checked_or_downloaded() {
-        let content = content();
-        let server = serve(|_| Reply::status("500 Internal Server Error")).await;
-        let model = model(&server, "/model.onnx", &content);
-        let dir = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(dir.path().to_path_buf());
-        std::fs::write(store.path(&model), &content).unwrap();
-        let lock = store.file_lock(&model);
-        let held = lock.lock().await;
-
-        assert_eq!(store.find(&model).await.unwrap(), None);
-
-        drop(held);
-        assert_eq!(store.find(&model).await.unwrap(), Some(store.path(&model)));
-    }
-
-    #[tokio::test]
     async fn new_builds_no_http_client_until_a_download() {
         let content = content();
         let served = content.clone();
@@ -1095,20 +973,20 @@ mod tests {
 
     #[test]
     fn is_revision_of_matches_the_name_after_any_hash_prefix() {
-        let model = MULTILINGUAL_E5_SMALL;
+        let model = GLINER_X_SMALL;
 
         assert!(is_revision_of(&file_name(&model), &model));
         assert!(is_revision_of(
-            "0123456789abcdef-multilingual-e5-small.onnx",
+            "0123456789abcdef-gliner-x-small.onnx",
             &model
         ));
         for name in [
-            "multilingual-e5-small.onnx",
-            "0123456789ABCDEF-multilingual-e5-small.onnx",
-            "0123456789abcde-multilingual-e5-small.onnx",
-            "0123456789abcdef0-multilingual-e5-small.onnx",
-            "0123456789abcdef-multilingual-e5-small.tokenizer.json",
-            "0123456789abcdef-multilingual-e5-small.onnx.old",
+            "gliner-x-small.onnx",
+            "0123456789ABCDEF-gliner-x-small.onnx",
+            "0123456789abcde-gliner-x-small.onnx",
+            "0123456789abcdef0-gliner-x-small.onnx",
+            "0123456789abcdef-gliner-x-small.tokenizer.json",
+            "0123456789abcdef-gliner-x-small.onnx.old",
         ] {
             assert!(!is_revision_of(name, &model), "{name:?}");
         }
@@ -1119,19 +997,14 @@ mod tests {
         let store = ModelStore::new(PathBuf::from("/models"));
 
         assert_eq!(
-            store.path(&MULTILINGUAL_E5_SMALL),
-            Path::new("/models/f80102d3f2a1229f-multilingual-e5-small.onnx")
+            store.path(&GLINER_X_SMALL),
+            Path::new("/models/d76b3349fd4bfe44-gliner-x-small.onnx")
         );
     }
 
     #[test]
     fn registry_entries_are_pinned() {
-        let registry = [
-            MULTILINGUAL_E5_SMALL,
-            MULTILINGUAL_E5_SMALL_TOKENIZER,
-            GLINER_X_SMALL,
-            GLINER_X_SMALL_TOKENIZER,
-        ];
+        let registry = [GLINER_X_SMALL, GLINER_X_SMALL_TOKENIZER];
 
         for model in registry {
             let revision = model

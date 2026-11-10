@@ -1,7 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
-use std::ops::Range;
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -9,52 +8,22 @@ use sha2::{Digest, Sha256};
 use tracing::Instrument as _;
 use uuid::Uuid;
 
-use crate::{ErrorCode, ErrorContext as _, ErrorKind, Result};
+use crate::{ErrorContext as _, ErrorKind, Result};
 
 use crate::domains::changelog::{
     ChangelogEvent, EventType, MAX_EVENT_BYTES, Service as ChangelogService,
 };
 
 use super::attributes::{self, Service as AttributesService};
-use super::chunk;
-use super::classification::Service as ClassificationService;
-use super::embedder::Embedder;
 use super::storage::{FacetField, Storage};
 use super::transcript;
 use super::{
-    CachedEmbeddings, Category, ChunkEmbedding, Document, DocumentEmbeddings, EmbeddingCache,
-    EmbeddingKey, FacetCount, Indexer, Metadata, SearchFacets, SearchFilters, SearchOrder,
-    SearchQuery, Service, Subcategory, UploadRequest, UploadSource,
+    Category, Document, FacetCount, Indexer, Metadata, SearchFacets, SearchFilters, SearchQuery,
+    Service, Subcategory, UploadRequest, UploadSource,
 };
 
 /// The only content type [`Service::upload`] currently accepts.
 pub(super) const PDF_CONTENT_TYPE: &str = "application/pdf";
-
-/// The size of the chunks a document's text is embedded in, in characters
-/// of whitespace-collapsed text (see [`chunk::chunk`]).
-const CHUNK_CHARS: usize = 1000;
-
-/// The version of how a document's text becomes the passages it's embedded
-/// as (see [`passages`]), part of every [`EmbeddingKey`]: bump it whenever
-/// [`chunk::chunk`], [`CHUNK_CHARS`] or the passages' format changes, so
-/// embeddings computed the old way are never reused.
-pub(super) const CHUNKER_VERSION: u32 = 1;
-
-/// How many of its best matches each ranking contributes to a hybrid
-/// search (see [`DocumentsClient::rank`]): no page is found past their
-/// fusion.
-const CANDIDATES: usize = 200;
-
-/// Reciprocal Rank Fusion's `k` (see [`fuse`]): the usual 60 keeps the very
-/// first ranks from drowning out a document found by both rankings.
-const RRF_K: f64 = 60.0;
-
-/// The cosine similarity to a query below which a document's best chunk
-/// doesn't count as a match. multilingual-e5-small squeezes every cosine
-/// into roughly 0.7–0.9, so even unrelated text scores high. Tuned on a real
-/// French corpus: documents answering a query scored 0.85–0.91, while most
-/// off-topic queries' best matches stayed below 0.85.
-const SIMILARITY_FLOOR: f32 = 0.85;
 
 /// The default [`Service`] implementation: publishes new documents as
 /// encrypted changelog events via an injected [`ChangelogService`], and
@@ -66,76 +35,25 @@ pub(super) struct DocumentsClient<S: Storage> {
     /// set — see [`crate::ClientConfig::on_document_change`].
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
     attributes: Arc<dyn AttributesService>,
-    /// What [`Service::start_sync`]'s consume job caches documents through.
-    indexer: Arc<dyn Indexer>,
-    /// What uploads and searches embed their text with.
-    embedder: Arc<dyn Embedder>,
-    /// Where uploads leave the embeddings they computed, for `indexer` to
-    /// reuse.
-    cache: Arc<dyn EmbeddingCache>,
-    /// What guesses uploads' category, subcategory and type.
-    classifier: Arc<dyn ClassificationService>,
-    /// When embedding an upload last failed (see [`UPLOAD_EMBED_RETRY_AFTER`]).
-    embed_failed_at: Mutex<Option<tokio::time::Instant>>,
-}
-
-/// How long uploads skip embedding after it failed: failing usually means
-/// waiting for the model's download (a timeout, say), which every upload
-/// would otherwise wait for again. The documents uploaded meanwhile are
-/// embedded once synced.
-const UPLOAD_EMBED_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-
-/// An upload's embeddings in the [`EmbeddingCache`], removed when dropped
-/// unless [`Self::keep`] is called once its event is published: when
-/// publishing fails, or the upload is given up on (a stopped scraper run)
-/// while publishing, and may never be published.
-struct CachedUntilPublished<'a> {
-    cache: &'a dyn EmbeddingCache,
-    document_id: Uuid,
-}
-
-impl CachedUntilPublished<'_> {
-    fn keep(self) {
-        std::mem::forget(self);
-    }
-}
-
-impl Drop for CachedUntilPublished<'_> {
-    fn drop(&mut self) {
-        self.cache.remove(self.document_id);
-    }
 }
 
 impl<S: Storage> DocumentsClient<S> {
     /// Creates a documents client using `storage` to read cached documents,
     /// `changelog` to publish new ones and drive [`Service::start_sync`],
     /// `on_document_change` as the callback [`Service::start_sync`] invokes
-    /// per consumed event, `attributes` to check the attributes of every
-    /// document before it's published, `indexer` as what that job caches
-    /// documents through, `embedder` to embed uploads' and searches' text,
-    /// `cache` to hand uploads' embeddings over to `indexer`, and
-    /// `classifier` to classify uploads.
-    #[allow(clippy::too_many_arguments)]
+    /// per consumed event, and `attributes` to check the attributes of every
+    /// document before it's published.
     pub(super) fn new(
         storage: S,
         changelog: Arc<dyn ChangelogService>,
         on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
         attributes: Arc<dyn AttributesService>,
-        indexer: Arc<dyn Indexer>,
-        embedder: Arc<dyn Embedder>,
-        cache: Arc<dyn EmbeddingCache>,
-        classifier: Arc<dyn ClassificationService>,
     ) -> Self {
         Self {
             storage,
             changelog,
             on_document_change,
             attributes,
-            indexer,
-            embedder,
-            cache,
-            classifier,
-            embed_failed_at: Mutex::new(None),
         }
     }
 }
@@ -151,133 +69,11 @@ impl<S: Storage> DocumentsClient<S> {
             .context("invalid document attributes")
     }
 
-    /// Embeds an uploaded document's text exactly as [`DocumentIndexer`]
-    /// would once the document syncs, under the key it looks them up by.
-    /// `None` for a document with no text (indexed with no chunks, no model
-    /// needed), or if embedding fails (the model can't be fetched, say) or
-    /// failed less than [`UPLOAD_EMBED_RETRY_AFTER`] ago: the document is
-    /// then published anyway, and embedded when it syncs.
-    async fn embed_upload(&self, metadata: &Metadata) -> Option<Arc<CachedEmbeddings>> {
-        let passages = passages(metadata);
-        if passages.texts.is_empty() {
-            return None;
-        }
-
-        let failed_at = *self
-            .embed_failed_at
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if failed_at.is_some_and(|at| at.elapsed() < UPLOAD_EMBED_RETRY_AFTER) {
-            tracing::debug!(
-                "not embedding document {} at upload, embedding failed recently: it'll be embedded once synced",
-                metadata.id
-            );
-            return None;
-        }
-
-        let model = self.embedder.model();
-        let key = embedding_key(metadata.id, &model, CHUNKER_VERSION, &passages.texts);
-        match embed(&*self.embedder, model, passages).await {
-            Ok(embeddings) => Some(Arc::new(CachedEmbeddings { key, embeddings })),
-            Err(err) => {
-                *self
-                    .embed_failed_at
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(tokio::time::Instant::now());
-                tracing::warn!(
-                    code = ?err.code(),
-                    "failed to embed document {} at upload, it'll be embedded once synced: {err}",
-                    metadata.id
-                );
-                None
-            }
-        }
-    }
-
-    /// Sets `metadata`'s category, subcategory and, unless it has one, type
-    /// to what its text looks like (each left `None` where the classifier
-    /// can't tell), or leaves them as they are if that fails: the document
-    /// is then published unclassified rather than not at all.
-    async fn classify_upload(&self, metadata: &mut Metadata) {
-        match self.classifier.classify(&metadata.transcript).await {
-            Ok(classification) => {
-                metadata.category = classification.category;
-                metadata.subcategory = classification.subcategory;
-                metadata.r#type = metadata.r#type.or(classification.r#type);
-            }
-            Err(err) => tracing::warn!(
-                code = ?err.code(),
-                "failed to classify document {}, publishing it unclassified: {err}",
-                metadata.id
-            ),
-        }
-    }
-
-    /// Embeds a search's `text`, or `None` if that fails (the model isn't
-    /// downloaded yet, say): searching then falls back to its terms alone,
-    /// rather than fail because of the model.
-    async fn embed_query(&self, text: &str) -> Option<Vec<f32>> {
-        match self.embedder.embed_query(text.trim().to_string()).await {
-            Ok(vector) => Some(vector),
-            Err(err) => {
-                tracing::warn!(
-                    code = ?err.code(),
-                    "searching by terms only, the search text couldn't be embedded: {err}"
-                );
-                None
-            }
-        }
-    }
-
-    /// The two rankings a hybrid search fuses, each best first and at most
-    /// [`CANDIDATES`] long, among documents matching `filters`: by `terms`
-    /// (`bm25`), then by the similarity of their best chunk to `vector`,
-    /// only those at or above [`SIMILARITY_FLOOR`].
-    async fn rank(
-        &self,
-        terms: &[String],
-        vector: &[f32],
-        filters: &SearchFilters,
-    ) -> Result<[Vec<Uuid>; 2]> {
-        let by_terms = self
-            .storage
-            .rank_by_terms(terms, filters, CANDIDATES)
-            .await
-            .context("failed to rank local documents by their terms")?;
-        let by_similarity = self
-            .storage
-            .rank_by_similarity(vector, &self.embedder.model(), filters, CANDIDATES)
-            .await
-            .context("failed to rank local documents by their similarity")?
-            .into_iter()
-            .filter(|(_, similarity)| *similarity >= SIMILARITY_FLOOR)
-            .map(|(id, _)| id)
-            .collect();
-
-        Ok([by_terms, by_similarity])
-    }
-
-    /// Every document a hybrid search (see [`Self::rank`]) could return,
-    /// in no particular order.
-    async fn hybrid_matches(
-        &self,
-        terms: &[String],
-        vector: &[f32],
-        filters: &SearchFilters,
-    ) -> Result<Vec<Uuid>> {
-        let mut ids = self.rank(terms, vector, filters).await?.concat();
-        ids.sort_unstable();
-        ids.dedup();
-        Ok(ids)
-    }
-
     /// Counts the documents matching `terms` and `filters` — minus
-    /// `field`'s own filter — per value of `field`: those a hybrid search
-    /// could return when given the search text's `vector`.
+    /// `field`'s own filter — per value of `field`.
     async fn count_documents_by(
         &self,
         terms: &[String],
-        vector: Option<&[f32]>,
         filters: &SearchFilters,
         field: FacetField,
     ) -> Result<Vec<FacetCount<String>>> {
@@ -289,27 +85,17 @@ impl<S: Storage> DocumentsClient<S> {
             FacetField::ContentType => filters.content_types.clear(),
         }
 
-        match vector {
-            Some(vector) => {
-                let ids = self.hybrid_matches(terms, vector, &filters).await?;
-                self.storage.count_documents_among(&ids, field).await
-            }
-            None => {
-                self.storage
-                    .count_documents_by(terms, &filters, field)
-                    .await
-            }
-        }
-        .with_context(|| format!("failed to count matching documents by {field:?}"))
+        self.storage
+            .count_documents_by(terms, &filters, field)
+            .await
+            .with_context(|| format!("failed to count matching documents by {field:?}"))
     }
 
     /// The creation date range of the documents matching `terms` and
-    /// `filters` — minus the date filters themselves: those a hybrid search
-    /// could return when given the search text's `vector`.
+    /// `filters` — minus the date filters themselves.
     async fn created_at_range(
         &self,
         terms: &[String],
-        vector: Option<&[f32]>,
         filters: &SearchFilters,
     ) -> Result<Option<(i64, i64)>> {
         let filters = SearchFilters {
@@ -318,14 +104,10 @@ impl<S: Storage> DocumentsClient<S> {
             ..filters.clone()
         };
 
-        match vector {
-            Some(vector) => {
-                let ids = self.hybrid_matches(terms, vector, &filters).await?;
-                self.storage.created_at_range_among(&ids).await
-            }
-            None => self.storage.created_at_range(terms, &filters).await,
-        }
-        .context("failed to find the creation date range of matching documents")
+        self.storage
+            .created_at_range(terms, &filters)
+            .await
+            .context("failed to find the creation date range of matching documents")
     }
 }
 
@@ -423,42 +205,12 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .with_context(|| format!("invalid metadata for document {original_name:?}"))?;
 
         let id = metadata.id;
-
-        // Never part of the event: only handed over to this client's own
-        // consumer, which may receive the event before `send` even returns,
-        // hence cached first.
-        let embeddings = self
-            .embed_upload(&metadata)
-            .instrument(tracing::debug_span!("embed_document"))
-            .await;
-
-        // Only with the model at hand (the document's just been embedded),
-        // so an upload never waits for its download twice, and never over a
-        // category the caller (a scraper, say) chose: the type is then
-        // theirs too, set or not.
-        if embeddings.is_some() && metadata.category.is_none() {
-            self.classify_upload(&mut metadata)
-                .instrument(tracing::debug_span!("classify_document"))
-                .await;
-        }
-
-        let cached = embeddings.as_ref().map(|embeddings| {
-            self.cache.put(embeddings.clone());
-            CachedUntilPublished {
-                cache: &*self.cache,
-                document_id: id,
-            }
-        });
-
         self.changelog
             .send(EventType::SaveDocument, id, Some(&content), Some(&metadata))
             .instrument(tracing::debug_span!("publish_event"))
             .await
             .with_context(|| format!("failed to publish changelog event for document {id}"))?;
 
-        if let Some(cached) = cached {
-            cached.keep();
-        }
         Ok(id)
     }
 
@@ -489,26 +241,6 @@ impl<S: Storage> Service for DocumentsClient<S> {
         check_created_range(&query.filters)?;
 
         let terms = search_terms(&query.text);
-
-        if query.order == SearchOrder::Relevance
-            && !terms.is_empty()
-            && let Some(vector) = self.embed_query(&query.text).await
-        {
-            let rankings = self.rank(&terms, &vector, &query.filters).await?;
-            let fused = fuse(&rankings);
-            let page = page(&fused, query.offset, query.limit);
-
-            let mut found: HashMap<Uuid, Metadata> = self
-                .storage
-                .get_metadatas(page)
-                .await
-                .context("failed to load the metadata of the documents found")?
-                .into_iter()
-                .map(|metadata| (metadata.id, metadata))
-                .collect();
-            return Ok(page.iter().filter_map(|id| found.remove(id)).collect());
-        }
-
         self.storage
             .search_documents(
                 &terms,
@@ -525,34 +257,24 @@ impl<S: Storage> Service for DocumentsClient<S> {
         check_created_range(filters)?;
 
         let terms = search_terms(text);
-        // Counting what a hybrid search finds whenever there's text, as
-        // `search` does with `SearchOrder::Relevance`: what callers pick when
-        // searching text, and the one order that ever finds documents
-        // sharing no term with it.
-        let vector = if terms.is_empty() {
-            None
-        } else {
-            self.embed_query(text).await
-        };
-        let vector = vector.as_deref();
 
         // Each field is counted with its own filter lifted, so the values on
         // offer for it are every alternative compatible with the *rest* of
         // the search, not only the one(s) already picked — while every other
         // field narrows to what's left under the picked ones.
         let categories = self
-            .count_documents_by(&terms, vector, filters, FacetField::Category)
+            .count_documents_by(&terms, filters, FacetField::Category)
             .await?;
         let subcategories = self
-            .count_documents_by(&terms, vector, filters, FacetField::Subcategory)
+            .count_documents_by(&terms, filters, FacetField::Subcategory)
             .await?;
         let types = self
-            .count_documents_by(&terms, vector, filters, FacetField::Type)
+            .count_documents_by(&terms, filters, FacetField::Type)
             .await?;
         let content_types = self
-            .count_documents_by(&terms, vector, filters, FacetField::ContentType)
+            .count_documents_by(&terms, filters, FacetField::ContentType)
             .await?;
-        let created_at_range = self.created_at_range(&terms, vector, filters).await?;
+        let created_at_range = self.created_at_range(&terms, filters).await?;
 
         Ok(SearchFacets {
             categories: parse_facet(categories, "category")?,
@@ -599,124 +321,32 @@ impl<S: Storage> Service for DocumentsClient<S> {
     fn stop_sync(&self) {
         self.changelog.stop_consume_job();
     }
-
-    fn indexing_model_error(&self) -> Option<ErrorCode> {
-        self.indexer.model_error()
-    }
 }
 
-/// The default [`Indexer`]: embeds a document's text in chunks with an
-/// injected [`Embedder`], unless an injected [`EmbeddingCache`] holds the
-/// embeddings its upload computed, then caches it with its embeddings
-/// through an injected [`Storage`], in one call.
+/// The default [`Indexer`]: caches documents through an injected
+/// [`Storage`] (whose triggers keep the full-text search index in step).
 pub(crate) struct DocumentIndexer<S: Storage> {
     storage: S,
-    embedder: Arc<dyn Embedder>,
-    cache: Arc<dyn EmbeddingCache>,
-    /// Why the last [`Indexer::prepare`] failed, if it did.
-    model_error: Mutex<Option<ErrorCode>>,
 }
 
 impl<S: Storage> DocumentIndexer<S> {
-    pub(crate) fn new(
-        storage: S,
-        embedder: Arc<dyn Embedder>,
-        cache: Arc<dyn EmbeddingCache>,
-    ) -> Self {
-        Self {
-            storage,
-            embedder,
-            cache,
-            model_error: Mutex::new(None),
-        }
-    }
-
-    fn set_model_error(&self, error: Option<ErrorCode>) {
-        *self
-            .model_error
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = error;
+    pub(crate) fn new(storage: S) -> Self {
+        Self { storage }
     }
 }
 
 #[async_trait]
 impl<S: Storage> Indexer for DocumentIndexer<S> {
-    async fn prepare(&self) -> Result<()> {
-        match self.embedder.load().await {
-            Ok(()) => {
-                self.set_model_error(None);
-                Ok(())
-            }
-            Err(err) => {
-                tracing::error!(
-                    code = ?err.code(),
-                    "the indexing model is unavailable: documents won't sync until it can be fetched: {err}"
-                );
-                self.set_model_error(Some(err.code()));
-                Err(err).context("the indexing model is unavailable")
-            }
-        }
-    }
-
     async fn save_document(&self, document: &Document) -> Result<()> {
-        let id = document.id;
-        let model = self.embedder.model();
-        let passages = passages(&document.metadata);
-        let key = embedding_key(id, &model, CHUNKER_VERSION, &passages.texts);
-
-        // Reused only if computed for this very text, model and chunking:
-        // anything else (an older SDK's chunking, a renamed document...)
-        // is embedded again, as with no entry at all.
-        let cached = self.cache.get(id);
-        let embeddings = match &cached {
-            Some(cached) if cached.key == key => cached.embeddings.clone(),
-            _ => embed(&*self.embedder, model, passages)
-                .await
-                .with_context(|| format!("failed to index document {id}"))?,
-        };
-
         self.storage
-            .save_document(document, &embeddings)
+            .save_document(document)
             .await
-            .with_context(|| format!("failed to cache document {id} locally"))?;
-
-        // Only once saved: an event that failed is retried, and should
-        // still find its entry then.
-        if cached.is_some() {
-            self.cache.remove(id);
-        }
-        Ok(())
-    }
-
-    fn skip_document(&self, id: Uuid) {
-        self.cache.remove(id);
+            .with_context(|| format!("failed to cache document {} locally", document.id))
     }
 
     async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()> {
-        let previous = self
-            .storage
-            .get_metadata(id)
-            .await
-            .with_context(|| format!("failed to read cached document {id}"))?;
-
-        // Re-embedding takes about a second per document: only when the
-        // text it embeds changes, not for a new category or attribute.
-        let embeddings = match previous {
-            Some(previous)
-                if title(&previous.name) != title(&metadata.name)
-                    || previous.transcript != metadata.transcript =>
-            {
-                Some(
-                    embed(&*self.embedder, self.embedder.model(), passages(metadata))
-                        .await
-                        .with_context(|| format!("failed to re-index document {id}"))?,
-                )
-            }
-            _ => None,
-        };
-
         self.storage
-            .update_metadata(id, metadata, embeddings)
+            .update_metadata(id, metadata)
             .await
             .with_context(|| format!("failed to update cached document {id} locally"))
     }
@@ -726,153 +356,6 @@ impl<S: Storage> Indexer for DocumentIndexer<S> {
             .delete_document(id)
             .await
             .with_context(|| format!("failed to delete cached document {id} locally"))
-    }
-
-    fn model_error(&self) -> Option<ErrorCode> {
-        *self
-            .model_error
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// A document's text as it's embedded: each chunk of its transcript (see
-/// [`chunk::chunk`]), after its title (see [`title`]).
-pub(super) struct Passages {
-    /// Where each chunk is in the transcript.
-    pub(super) ranges: Vec<Range<usize>>,
-    /// The text embedded for each chunk.
-    pub(super) texts: Vec<String>,
-}
-
-/// The passages `metadata`'s text is embedded as. A blank transcript has no
-/// chunks, so none. The one function both uploads and [`DocumentIndexer`]
-/// build them with, so their [`embedding_key`]s match.
-pub(super) fn passages(metadata: &Metadata) -> Passages {
-    let ranges = chunk::chunk(&metadata.transcript, CHUNK_CHARS);
-    let title = title(&metadata.name);
-    let texts = ranges
-        .iter()
-        .map(|range| format!("{title}\n{}", &metadata.transcript[range.clone()]))
-        .collect();
-    Passages { ranges, texts }
-}
-
-/// The key embeddings of `document_id`'s `passages` (see [`passages`]) are
-/// cached under: what they were computed from, the text only by its
-/// SHA-256. Each passage is hashed after its length, so splitting the same
-/// text differently changes it.
-pub(super) fn embedding_key(
-    document_id: Uuid,
-    model: &str,
-    chunker_version: u32,
-    passages: &[String],
-) -> EmbeddingKey {
-    let mut hasher = Sha256::new();
-    for passage in passages {
-        hasher.update((passage.len() as u64).to_le_bytes());
-        hasher.update(passage.as_bytes());
-    }
-    EmbeddingKey {
-        document_id,
-        model: model.to_string(),
-        chunker_version,
-        text_sha256: hasher.finalize().into(),
-    }
-}
-
-/// Embeds `passages` with `embedder`, as `model`'s embeddings. None for no
-/// passages at all, without calling `embedder`.
-async fn embed(
-    embedder: &dyn Embedder,
-    model: String,
-    passages: Passages,
-) -> Result<DocumentEmbeddings> {
-    let Passages { ranges, texts } = passages;
-    if ranges.is_empty() {
-        return Ok(DocumentEmbeddings {
-            model,
-            chunks: Vec::new(),
-        });
-    }
-
-    let vectors = embedder
-        .embed_passages(texts)
-        .await
-        .context("failed to embed the document's text")?;
-    if vectors.len() != ranges.len() {
-        return Err(ErrorKind::InvalidModel(format!(
-            "the embedding model returned {} vectors for {} chunks",
-            vectors.len(),
-            ranges.len()
-        ))
-        .into());
-    }
-
-    Ok(DocumentEmbeddings {
-        model,
-        chunks: ranges
-            .into_iter()
-            .zip(vectors)
-            .map(|(range, vector)| ChunkEmbedding { range, vector })
-            .collect(),
-    })
-}
-
-/// Fuses `rankings` (ids, best first) with Reciprocal Rank Fusion: each
-/// document scores `1 / (RRF_K + rank)` (from rank 1) in every ranking it's
-/// in, summed, best first. Ties go to the best single rank, then to the
-/// earliest ranking it's in.
-fn fuse(rankings: &[Vec<Uuid>]) -> Vec<Uuid> {
-    struct Fused {
-        score: f64,
-        best_rank: usize,
-        best_ranking: usize,
-    }
-
-    let mut fused = HashMap::<Uuid, Fused>::new();
-    for (ranking, ids) in rankings.iter().enumerate() {
-        for (i, id) in ids.iter().enumerate() {
-            let rank = i + 1;
-            let entry = fused.entry(*id).or_insert(Fused {
-                score: 0.0,
-                best_rank: rank,
-                best_ranking: ranking,
-            });
-            entry.score += 1.0 / (RRF_K + rank as f64);
-            if rank < entry.best_rank {
-                entry.best_rank = rank;
-                entry.best_ranking = ranking;
-            }
-        }
-    }
-
-    let mut fused = fused.into_iter().collect::<Vec<_>>();
-    fused.sort_by(|(_, a), (_, b)| {
-        b.score
-            .total_cmp(&a.score)
-            .then(a.best_rank.cmp(&b.best_rank))
-            .then(a.best_ranking.cmp(&b.best_ranking))
-    });
-    fused.into_iter().map(|(id, _)| id).collect()
-}
-
-/// The page of `ids` skipping `offset` then at most `limit` long (both
-/// already checked not negative), empty past the end.
-fn page(ids: &[Uuid], offset: i64, limit: i64) -> &[Uuid] {
-    let start = usize::try_from(offset).unwrap_or(usize::MAX).min(ids.len());
-    let end = start
-        .saturating_add(usize::try_from(limit).unwrap_or(usize::MAX))
-        .min(ids.len());
-    &ids[start..end]
-}
-
-/// The title a document's text is embedded under: its name without its
-/// extension, like a file stem (`"Facture mars.pdf"` is `"Facture mars"`).
-fn title(name: &str) -> &str {
-    match name.rsplit_once('.') {
-        Some((stem, _)) if !stem.is_empty() => stem,
-        _ => name,
     }
 }
 
@@ -1023,65 +506,11 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::super::attributes::MockService as MockAttributesService;
-    use super::super::classification::{
-        Classification, FakeClassification, MockService as MockClassificationService,
-    };
-    use super::super::embedder::MockEmbedder;
-    use super::super::models::{FakeCachedEmbeddings, FakeChunkEmbedding, FakeDocumentEmbeddings};
     use super::super::storage::MockStorage;
     use super::super::transcript::tests::build_pdf;
     use super::super::{Attribute, DocumentType};
-    use super::super::{FakeDocument, FakeMetadata, MockEmbeddingCache, MockIndexer};
+    use super::super::{FakeDocument, FakeMetadata};
     use super::*;
-
-    /// An [`Indexer`] fake for tests that never sync.
-    fn unused_indexer() -> Arc<dyn Indexer> {
-        Arc::new(MockIndexer::new())
-    }
-
-    /// An [`AttributesService`] fake accepting any attributes, for tests
-    /// that don't exercise attribute checks.
-    /// An embedder whose every call panics: for tests that never search.
-    fn unused_embedder() -> Arc<dyn Embedder> {
-        Arc::new(MockEmbedder::new())
-    }
-
-    /// An embedder whose model can't be fetched: for tests whose uploads
-    /// are then published without embeddings.
-    fn embedder_without_model() -> Arc<dyn Embedder> {
-        let mut embedder = MockEmbedder::new();
-        embedder.expect_model().return_const("e5.onnx".to_string());
-        embedder
-            .expect_embed_passages()
-            .returning(|_| Err(ErrorKind::ModelDownloadStatus(503).into()));
-        Arc::new(embedder)
-    }
-
-    /// A classifier whose every call panics: for tests that never classify
-    /// an upload.
-    fn unused_classifier() -> Arc<dyn ClassificationService> {
-        Arc::new(MockClassificationService::new())
-    }
-
-    /// A classifier expected to classify exactly `times` uploads, each as
-    /// `classification`.
-    fn classifier_returning(
-        classification: Classification,
-        times: usize,
-    ) -> Arc<dyn ClassificationService> {
-        let mut classifier = MockClassificationService::new();
-        classifier
-            .expect_classify()
-            .times(times)
-            .returning(move |_| Ok(classification));
-        Arc::new(classifier)
-    }
-
-    /// An embedding cache whose every call panics: for tests that never
-    /// embed an upload.
-    fn unused_cache() -> Arc<dyn EmbeddingCache> {
-        Arc::new(MockEmbeddingCache::new())
-    }
 
     fn accepting_attributes() -> Arc<dyn AttributesService> {
         let mut attributes = MockAttributesService::new();
@@ -1109,16 +538,8 @@ mod tests {
         });
         // `MockStorage` panics on any call, proving `upload` never reaches
         // the duplicate check (or anything after it) once this check fails.
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            changelog,
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
-        );
+        let client =
+            DocumentsClient::new(MockStorage::new(), changelog, None, accepting_attributes());
 
         let err = client
             .upload(UploadRequest::from_path(file.path()))
@@ -1238,16 +659,7 @@ mod tests {
             .returning(|_| Ok(None));
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            storage,
-            changelog.clone(),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            embedder_without_model(),
-            unused_cache(),
-            unused_classifier(),
-        );
+        let client = DocumentsClient::new(storage, changelog.clone(), None, accepting_attributes());
 
         let id = client
             .upload(UploadRequest::from_path(file.path()))
@@ -1295,16 +707,7 @@ mod tests {
             .returning(move |_| Ok(Some(existing)));
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            storage,
-            changelog.clone(),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
-        );
+        let client = DocumentsClient::new(storage, changelog.clone(), None, accepting_attributes());
 
         let err = client
             .upload(UploadRequest::from_path(file.path()))
@@ -1327,10 +730,6 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
 
         let result = client.upload(UploadRequest::from_path(file.path())).await;
@@ -1348,10 +747,6 @@ mod tests {
             changelog.clone(),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
 
         let err = client
@@ -1377,16 +772,7 @@ mod tests {
             .returning(|_| Ok(None));
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            storage,
-            changelog.clone(),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            embedder_without_model(),
-            unused_cache(),
-            unused_classifier(),
-        );
+        let client = DocumentsClient::new(storage, changelog.clone(), None, accepting_attributes());
 
         let request = UploadRequest {
             source: super::super::UploadSource::Raw {
@@ -1421,16 +807,7 @@ mod tests {
             .times(1)
             .returning(|_| Ok(None));
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            storage,
-            changelog.clone(),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            embedder_without_model(),
-            unused_cache(),
-            unused_classifier(),
-        );
+        let client = DocumentsClient::new(storage, changelog.clone(), None, accepting_attributes());
 
         request.source = super::super::UploadSource::Raw {
             name: "raw.pdf".to_string(),
@@ -1462,10 +839,6 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
         let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
         request.category = Some(Category::Money);
@@ -1483,16 +856,7 @@ mod tests {
             .expect_find_document_by_checksum()
             .returning(|_| Ok(None));
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            storage,
-            changelog.clone(),
-            None,
-            rejecting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
-        );
+        let client = DocumentsClient::new(storage, changelog.clone(), None, rejecting_attributes());
         let mut request = UploadRequest::from_raw("raw.pdf", build_pdf("hello world"));
         request.attributes = BTreeMap::from([("price".to_string(), Attribute::Integer(1))]);
 
@@ -1525,10 +889,6 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
         let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
         request.attributes = BTreeMap::from([("price".to_string(), Attribute::Float(f64::NAN))]);
@@ -1546,10 +906,6 @@ mod tests {
             changelog.clone(),
             None,
             rejecting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
         let metadata = super::super::FakeMetadata::new()
             .with_attributes([("price".to_string(), Attribute::Integer(1))])
@@ -1569,10 +925,6 @@ mod tests {
             changelog.clone(),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
         let attributes = BTreeMap::from([("price".to_string(), Attribute::Float(32.3))]);
         let metadata = super::super::FakeMetadata::new()
@@ -1593,10 +945,6 @@ mod tests {
             changelog.clone(),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
         let metadata = super::super::FakeMetadata::new()
             .with_category(Category::Money)
@@ -1644,10 +992,6 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
 
         assert_eq!(client.get(id).await.unwrap(), Some(document));
@@ -1673,10 +1017,6 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
 
         let page = client.list(1, 2).await.unwrap();
@@ -1719,10 +1059,6 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
 
         let documents = client
@@ -1753,10 +1089,6 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
 
         client.search(SearchQuery::new(" - ", 0, 10)).await.unwrap();
@@ -1779,10 +1111,6 @@ mod tests {
                 Arc::new(RecordingChangelog::default()),
                 None,
                 accepting_attributes(),
-                unused_indexer(),
-                unused_embedder(),
-                unused_cache(),
-                unused_classifier(),
             );
 
             let err = client.search(query.clone()).await.unwrap_err();
@@ -1812,7 +1140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_facets_counts_term_matches_when_the_text_cant_be_embedded() {
+    async fn search_facets_counts_each_field_with_its_own_filter_lifted() {
         use super::super::{Category, SearchFilters, Subcategory};
 
         let filters = SearchFilters {
@@ -1897,10 +1225,6 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unembeddable_queries(),
-            unused_cache(),
-            unused_classifier(),
         );
 
         let facets = client.search_facets(" facture ", &filters).await.unwrap();
@@ -1930,10 +1254,6 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
 
         let err = client
@@ -1951,10 +1271,6 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
 
         let err = client
@@ -1972,407 +1288,6 @@ mod tests {
         assert_eq!(err.code(), crate::ErrorCode::InvalidSearchQuery);
     }
 
-    /// An embedder that can't embed queries: its model isn't downloaded.
-    fn unembeddable_queries() -> Arc<dyn Embedder> {
-        let mut embedder = MockEmbedder::new();
-        embedder.expect_embed_query().returning(|_| {
-            Err(ErrorKind::ModelNotDownloaded("multilingual-e5-small.onnx".to_string()).into())
-        });
-        Arc::new(embedder)
-    }
-
-    const QUERY_MODEL: &str = "e5";
-
-    /// An embedder embedding exactly `text` once as `vector`, under
-    /// [`QUERY_MODEL`].
-    fn query_embedder(text: &'static str, vector: Vec<f32>) -> Arc<dyn Embedder> {
-        let mut embedder = MockEmbedder::new();
-        embedder
-            .expect_embed_query()
-            .withf(move |query| query == text)
-            .times(1)
-            .returning(move |_| Ok(vector.clone()));
-        embedder
-            .expect_model()
-            .return_const(QUERY_MODEL.to_string());
-        Arc::new(embedder)
-    }
-
-    fn ids(count: usize) -> Vec<Uuid> {
-        (0..count).map(|_| Uuid::new_v4()).collect()
-    }
-
-    #[test]
-    fn fuse_ranks_a_document_in_both_rankings_above_ones_in_a_single_ranking() {
-        let [both, by_terms, by_similarity] = ids(3).try_into().unwrap();
-
-        let fused = fuse(&[vec![by_terms, both], vec![by_similarity, both]]);
-
-        // 2 / 62 for `both`, against 1 / 61 for the others.
-        assert_eq!(fused, [both, by_terms, by_similarity]);
-    }
-
-    #[test]
-    fn fuse_breaks_ties_by_best_rank_then_by_earliest_ranking() {
-        // At rank 62 in both rankings, `both` scores 2 / 122: exactly as much
-        // as the first of either ranking, 1 / 61.
-        let [both, first_by_terms, first_by_similarity] = ids(3).try_into().unwrap();
-        let mut by_terms = vec![first_by_terms];
-        by_terms.extend(ids(60));
-        by_terms.push(both);
-        let mut by_similarity = vec![first_by_similarity];
-        by_similarity.extend(ids(60));
-        by_similarity.push(both);
-
-        let fused = fuse(&[by_terms, by_similarity]);
-
-        assert_eq!(fused[..3], [first_by_terms, first_by_similarity, both]);
-        assert_eq!(fused.len(), 123);
-    }
-
-    #[test]
-    fn fuse_keeps_a_lone_ranking_in_its_order() {
-        let ranking = ids(3);
-
-        assert_eq!(fuse(&[ranking.clone(), Vec::new()]), ranking);
-        assert_eq!(fuse(&[Vec::new(), ranking.clone()]), ranking);
-        assert!(fuse(&[Vec::new(), Vec::new()]).is_empty());
-    }
-
-    #[test]
-    fn page_skips_offset_then_keeps_at_most_limit() {
-        let all = ids(5);
-
-        assert_eq!(page(&all, 0, 2), &all[..2]);
-        assert_eq!(page(&all, 2, 2), &all[2..4]);
-        assert_eq!(page(&all, 4, 2), &all[4..], "the last page is partial");
-        assert_eq!(page(&all, 0, i64::MAX), &all[..]);
-        assert!(page(&all, 5, 2).is_empty());
-        assert!(page(&all, 6, 2).is_empty(), "offset past the end");
-        assert!(page(&all, i64::MAX, i64::MAX).is_empty());
-    }
-
-    /// A client over `storage`, embedding queries with `embedder`.
-    fn searching(
-        storage: MockStorage,
-        embedder: Arc<dyn Embedder>,
-    ) -> DocumentsClient<MockStorage> {
-        DocumentsClient::new(
-            storage,
-            Arc::new(RecordingChangelog::default()),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            embedder,
-            unused_cache(),
-            unused_classifier(),
-        )
-    }
-
-    /// Expects one ranking of each kind, returning `by_terms` and
-    /// `by_similarity`.
-    fn expect_rankings(
-        storage: &mut MockStorage,
-        by_terms: Vec<Uuid>,
-        by_similarity: Vec<(Uuid, f32)>,
-    ) {
-        storage
-            .expect_rank_by_terms()
-            .times(1)
-            .returning(move |_, _, _| Ok(by_terms.clone()));
-        storage
-            .expect_rank_by_similarity()
-            .times(1)
-            .returning(move |_, _, _, _| Ok(by_similarity.clone()));
-    }
-
-    /// Expects the metadata of exactly `ids` to be loaded once, returning it
-    /// in reverse order.
-    fn expect_page(storage: &mut MockStorage, ids: Vec<Uuid>) {
-        storage
-            .expect_get_metadatas()
-            .withf({
-                let ids = ids.clone();
-                move |requested| requested == ids
-            })
-            .times(1)
-            .returning(move |_| {
-                Ok(ids
-                    .iter()
-                    .rev()
-                    .map(|id| super::super::FakeMetadata::new().with_id(*id).build())
-                    .collect())
-            });
-    }
-
-    fn found_ids(found: Vec<Metadata>) -> Vec<Uuid> {
-        found.into_iter().map(|metadata| metadata.id).collect()
-    }
-
-    #[tokio::test]
-    async fn search_by_relevance_fuses_both_rankings_and_loads_only_the_requested_page() {
-        let [both, by_terms, by_similarity] = ids(3).try_into().unwrap();
-        let filters = super::super::SearchFilters {
-            categories: vec![super::super::Category::Money],
-            ..Default::default()
-        };
-        let mut storage = MockStorage::new();
-        let expected_filters = filters.clone();
-        storage
-            .expect_rank_by_terms()
-            .withf(move |terms, filters, limit| {
-                terms == ["impôts", "2016"] && *filters == expected_filters && *limit == CANDIDATES
-            })
-            .times(1)
-            .returning(move |_, _, _| Ok(vec![both, by_terms]));
-        let expected_filters = filters.clone();
-        storage
-            .expect_rank_by_similarity()
-            .withf(move |query, model, filters, limit| {
-                query == [0.6, 0.8]
-                    && model == QUERY_MODEL
-                    && *filters == expected_filters
-                    && *limit == CANDIDATES
-            })
-            .times(1)
-            .returning(move |_, _, _, _| Ok(vec![(by_similarity, 0.9), (both, 0.85)]));
-        // Fused: `both`, `by_similarity` (1 / 61), `by_terms` (1 / 62).
-        expect_page(&mut storage, vec![by_similarity, by_terms]);
-
-        let found = searching(storage, query_embedder("impôts 2016 ?", vec![0.6, 0.8]))
-            .search(SearchQuery {
-                text: " impôts 2016 ? ".to_string(),
-                filters,
-                order: super::super::SearchOrder::Relevance,
-                offset: 1,
-                limit: 5,
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(found_ids(found), [by_similarity, by_terms]);
-    }
-
-    #[tokio::test]
-    async fn search_by_relevance_loads_nothing_past_the_last_match() {
-        let mut storage = MockStorage::new();
-        expect_rankings(&mut storage, ids(2), Vec::new());
-        expect_page(&mut storage, Vec::new());
-
-        let found = searching(storage, query_embedder("impôts", vec![1.0]))
-            .search(SearchQuery::new("impôts", 2, 10))
-            .await
-            .unwrap();
-
-        assert!(found.is_empty());
-    }
-
-    #[tokio::test]
-    async fn search_by_relevance_finds_a_document_without_vectors_by_its_terms() {
-        let id = Uuid::new_v4();
-        let mut storage = MockStorage::new();
-        expect_rankings(&mut storage, vec![id], Vec::new());
-        expect_page(&mut storage, vec![id]);
-
-        let found = searching(storage, query_embedder("impôts", vec![1.0]))
-            .search(SearchQuery::new("impôts", 0, 10))
-            .await
-            .unwrap();
-
-        assert_eq!(found_ids(found), [id]);
-    }
-
-    #[tokio::test]
-    async fn search_by_relevance_drops_similarities_below_the_floor() {
-        let [at_floor, below_floor] = ids(2).try_into().unwrap();
-        let mut storage = MockStorage::new();
-        expect_rankings(
-            &mut storage,
-            Vec::new(),
-            vec![
-                (at_floor, SIMILARITY_FLOOR),
-                (below_floor, SIMILARITY_FLOOR - 0.001),
-            ],
-        );
-        expect_page(&mut storage, vec![at_floor]);
-
-        let found = searching(storage, query_embedder("impôts", vec![1.0]))
-            .search(SearchQuery::new("impôts", 0, 10))
-            .await
-            .unwrap();
-
-        assert_eq!(found_ids(found), [at_floor]);
-    }
-
-    #[tokio::test]
-    async fn search_by_relevance_ranks_by_terms_alone_when_the_text_cant_be_embedded() {
-        for err in [
-            ErrorKind::ModelNotDownloaded("multilingual-e5-small.onnx".to_string()),
-            ErrorKind::InvalidModel("broken".to_string()),
-        ] {
-            let mut embedder = MockEmbedder::new();
-            let case = format!("{err:?}");
-            let mut err = Some(err);
-            embedder
-                .expect_embed_query()
-                .times(1)
-                .returning(move |_| Err(err.take().unwrap().into()));
-            let found = vec![super::super::FakeMetadata::new().build()];
-            let mut storage = MockStorage::new();
-            let returned = found.clone();
-            storage
-                .expect_search_documents()
-                .withf(|terms, _, order, offset, limit| {
-                    terms == ["impôts"]
-                        && *order == super::super::SearchOrder::Relevance
-                        && *offset == 0
-                        && *limit == 10
-                })
-                .times(1)
-                .returning(move |_, _, _, _, _| Ok(returned.clone()));
-
-            let documents = searching(storage, Arc::new(embedder))
-                .search(SearchQuery::new("impôts", 0, 10))
-                .await
-                .unwrap();
-
-            assert_eq!(documents, found, "{case}");
-        }
-    }
-
-    #[tokio::test]
-    async fn search_by_relevance_fails_with_context_when_a_ranking_fails() {
-        let mut storage = MockStorage::new();
-        storage
-            .expect_rank_by_terms()
-            .returning(|_, _, _| Err(ErrorKind::InvalidSearchQuery("boom".to_string()).into()));
-
-        let err = searching(storage, query_embedder("impôts", vec![1.0]))
-            .search(SearchQuery::new("impôts", 0, 10))
-            .await
-            .unwrap_err();
-
-        assert!(err.has_context());
-    }
-
-    #[tokio::test]
-    async fn search_never_embeds_by_date_or_without_terms() {
-        use super::super::SearchOrder;
-
-        for (text, order) in [
-            ("impôts", SearchOrder::Newest),
-            ("impôts", SearchOrder::Oldest),
-            (" - ", SearchOrder::Relevance),
-            ("", SearchOrder::Relevance),
-        ] {
-            let mut storage = MockStorage::new();
-            storage
-                .expect_search_documents()
-                .withf(move |_, _, queried, _, _| *queried == order)
-                .times(1)
-                .returning(|_, _, _, _, _| Ok(Vec::new()));
-
-            // `unused_embedder` panics if a query is embedded.
-            searching(storage, unused_embedder())
-                .search(SearchQuery {
-                    order,
-                    ..SearchQuery::new(text, 0, 10)
-                })
-                .await
-                .unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn search_facets_counts_what_a_hybrid_search_finds_when_the_text_embeds() {
-        use super::super::{Category, SearchFilters};
-
-        let filters = SearchFilters {
-            categories: vec![Category::Money],
-            types: vec![DocumentType::Statement],
-            created_from: Some(1),
-            created_until: Some(2),
-            ..Default::default()
-        };
-        let [by_terms, both, by_similarity, weak] = ids(4).try_into().unwrap();
-        let mut found = vec![by_terms, both, by_similarity];
-        found.sort_unstable();
-        let lifted = [
-            without_own_filter(&filters, FacetField::Category),
-            without_own_filter(&filters, FacetField::Subcategory),
-            without_own_filter(&filters, FacetField::Type),
-            without_own_filter(&filters, FacetField::ContentType),
-            SearchFilters {
-                created_from: None,
-                created_until: None,
-                ..filters.clone()
-            },
-        ];
-
-        let mut storage = MockStorage::new();
-        for expected in lifted {
-            let expected_filters = expected.clone();
-            storage
-                .expect_rank_by_terms()
-                .withf(move |terms, filters, _| terms == ["impôts"] && *filters == expected_filters)
-                .times(1)
-                .returning(move |_, _, _| Ok(vec![by_terms, both]));
-            storage
-                .expect_rank_by_similarity()
-                .withf(move |_, _, filters, _| *filters == expected)
-                .times(1)
-                .returning(move |_, _, _, _| {
-                    Ok(vec![(both, 0.9), (by_similarity, 0.9), (weak, 0.1)])
-                });
-        }
-        for field in [
-            FacetField::Category,
-            FacetField::Subcategory,
-            FacetField::Type,
-            FacetField::ContentType,
-        ] {
-            let found = found.clone();
-            storage
-                .expect_count_documents_among()
-                .withf(move |ids, queried| ids == found && *queried == field)
-                .times(1)
-                .returning(move |_, field| {
-                    Ok(if field == FacetField::Category {
-                        vec![FacetCount {
-                            value: Category::Money.as_str().to_string(),
-                            count: 3,
-                        }]
-                    } else {
-                        Vec::new()
-                    })
-                });
-        }
-        storage
-            .expect_created_at_range_among()
-            .withf(move |ids| ids == found)
-            .times(1)
-            .returning(|_| Ok(Some((10, 20))));
-
-        let facets = searching(storage, query_embedder("impôts", vec![1.0]))
-            .search_facets(" impôts ", &filters)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            facets,
-            super::super::FakeSearchFacets::new()
-                .with_categories(vec![FacetCount {
-                    value: Category::Money,
-                    count: 3
-                }])
-                .with_subcategories(Vec::new())
-                .with_types(Vec::new())
-                .with_content_types(Vec::new())
-                .with_created_at_range(Some((10, 20)))
-                .build()
-        );
-    }
-
     #[tokio::test]
     async fn update_metadata_publishes_an_update_metadata_event_with_the_given_metadata() {
         let metadata = super::super::FakeMetadata::new()
@@ -2386,10 +1301,6 @@ mod tests {
             changelog.clone(),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
 
         client.update_metadata(metadata).await.unwrap();
@@ -2422,10 +1333,6 @@ mod tests {
             changelog,
             Some(on_document_change),
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
 
         client.start_sync().await.unwrap();
@@ -2441,16 +1348,8 @@ mod tests {
             to_consume: Mutex::new(vec![event]),
             ..Default::default()
         });
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            changelog,
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
-        );
+        let client =
+            DocumentsClient::new(MockStorage::new(), changelog, None, accepting_attributes());
 
         client.start_sync().await.unwrap();
     }
@@ -2463,10 +1362,6 @@ mod tests {
             changelog.clone(),
             None,
             accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         );
 
         client.stop_sync();
@@ -2482,10 +1377,6 @@ mod tests {
             changelog,
             None,
             Arc::new(MockAttributesService::new()),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
         )
     }
 
@@ -2517,6 +1408,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn indexer_save_document_caches_the_document() {
+        let document = FakeDocument::new().build();
+        let id = document.id;
+        let mut storage = MockStorage::new();
+        storage
+            .expect_save_document()
+            .withf(move |saved| saved.id == id)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        DocumentIndexer::new(storage)
+            .save_document(&document)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn indexer_save_document_fails_with_context_when_storage_fails() {
+        let document = FakeDocument::new().build();
+        let mut storage = MockStorage::new();
+        storage
+            .expect_save_document()
+            .returning(|_| Err(ErrorKind::InvalidChangelogEvent("refused".to_string()).into()));
+
+        let err = DocumentIndexer::new(storage)
+            .save_document(&document)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("failed to cache document"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn indexer_update_metadata_replaces_the_cached_metadata() {
+        let metadata = FakeMetadata::new().build();
+        let id = metadata.id;
+        let expected = metadata.clone();
+        let mut storage = MockStorage::new();
+        storage
+            .expect_update_metadata()
+            .withf(move |updated, metadata| *updated == id && *metadata == expected)
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        DocumentIndexer::new(storage)
+            .update_metadata(id, &metadata)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn indexer_delete_document_deletes_the_cached_document() {
         let id = Uuid::now_v7();
         let mut storage = MockStorage::new();
@@ -2525,1269 +1470,10 @@ mod tests {
             .withf(move |deleted| *deleted == id)
             .times(1)
             .returning(|_| Ok(()));
-        // No expectations on the embedder or the cache: deleting embeds
-        // nothing and holds nothing.
-        let indexer = indexer_with(storage, MockEmbedder::new(), MockEmbeddingCache::new());
 
-        indexer.delete_document(id).await.unwrap();
-    }
-
-    fn indexer(storage: MockStorage, embedder: MockEmbedder) -> DocumentIndexer<MockStorage> {
-        indexer_with(storage, embedder, empty_cache())
-    }
-
-    fn indexer_with(
-        storage: MockStorage,
-        embedder: MockEmbedder,
-        cache: MockEmbeddingCache,
-    ) -> DocumentIndexer<MockStorage> {
-        DocumentIndexer::new(storage, Arc::new(embedder), Arc::new(cache))
-    }
-
-    /// A cache holding nothing, expected to never be written to.
-    fn empty_cache() -> MockEmbeddingCache {
-        let mut cache = MockEmbeddingCache::new();
-        cache.expect_get().returning(|_| None);
-        cache
-    }
-
-    /// An embedder for `model`, expected to never embed anything.
-    fn idle_embedder(model: &'static str) -> MockEmbedder {
-        let mut embedder = MockEmbedder::new();
-        embedder.expect_model().return_const(model.to_string());
-        embedder
-    }
-
-    /// An embedder for `model` expecting exactly `passages` once, and
-    /// returning `vectors` for them.
-    fn embedder_expecting(
-        model: &'static str,
-        passages: &[&str],
-        vectors: Vec<Vec<f32>>,
-    ) -> MockEmbedder {
-        let passages: Vec<String> = passages.iter().map(|p| p.to_string()).collect();
-        let mut embedder = idle_embedder(model);
-        embedder
-            .expect_embed_passages()
-            .withf(move |given| *given == passages)
-            .times(1)
-            .return_once(move |_| Ok(vectors));
-        embedder
-    }
-
-    fn vector(seed: f32) -> Vec<f32> {
-        vec![seed; 4]
-    }
-
-    fn embeddings(
-        model: &str,
-        chunks: Vec<(std::ops::Range<usize>, Vec<f32>)>,
-    ) -> DocumentEmbeddings {
-        FakeDocumentEmbeddings::new()
-            .with_model(model)
-            .with_chunks(
-                chunks
-                    .into_iter()
-                    .map(|(range, vector)| {
-                        FakeChunkEmbedding::new()
-                            .with_range(range)
-                            .with_vector(vector)
-                            .build()
-                    })
-                    .collect(),
-            )
-            .build()
-    }
-
-    fn document_with(name: &str, transcript: &str) -> Document {
-        FakeDocument::new()
-            .with_metadata(
-                FakeMetadata::new()
-                    .with_name(name)
-                    .with_transcript(transcript)
-                    .build(),
-            )
-            .with_id(Uuid::now_v7())
-            .build()
-    }
-
-    #[tokio::test]
-    async fn indexer_save_document_embeds_each_chunk_after_the_title_and_saves_them_with_it() {
-        let document = document_with(
-            "Facture mars.pdf",
-            "Montant : 42 €\n\n---\n\nÉchéance : avril",
-        );
-        let embedder = embedder_expecting(
-            "e5.onnx",
-            &[
-                "Facture mars\nMontant : 42 €",
-                "Facture mars\nÉchéance : avril",
-            ],
-            vec![vector(0.1), vector(0.2)],
-        );
-        let expected = embeddings(
-            "e5.onnx",
-            vec![
-                (0.."Montant : 42 €".len(), vector(0.1)),
-                (
-                    "Montant : 42 €\n\n---\n\n".len()..document.metadata.transcript.len(),
-                    vector(0.2),
-                ),
-            ],
-        );
-        let mut storage = MockStorage::new();
-        let saved = document.clone();
-        storage
-            .expect_save_document()
-            .withf(move |document, embeddings| *document == saved && *embeddings == expected)
-            .times(1)
-            .returning(|_, _| Ok(()));
-
-        indexer(storage, embedder)
-            .save_document(&document)
+        DocumentIndexer::new(storage)
+            .delete_document(id)
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn indexer_save_document_saves_a_document_with_no_text_as_indexed_without_embedding() {
-        let document = document_with("scan.pdf", " \n\n ");
-        let mut storage = MockStorage::new();
-        storage
-            .expect_save_document()
-            .withf(|_, embeddings| embeddings.model == "e5.onnx" && embeddings.chunks.is_empty())
-            .times(1)
-            .returning(|_, _| Ok(()));
-
-        indexer(storage, idle_embedder("e5.onnx"))
-            .save_document(&document)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn indexer_save_document_saves_nothing_when_embedding_fails() {
-        let document = document_with("a.pdf", "some text");
-        let mut embedder = idle_embedder("e5.onnx");
-        embedder
-            .expect_embed_passages()
-            .returning(|_| Err(ErrorKind::InvalidModel("boom".to_string()).into()));
-
-        let err = indexer(MockStorage::new(), embedder)
-            .save_document(&document)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.code(), ErrorCode::ModelLoadFailed);
-        assert!(err.to_string().contains(&document.id.to_string()), "{err}");
-    }
-
-    #[tokio::test]
-    async fn indexer_save_document_rejects_a_vector_per_chunk_missing() {
-        let document = document_with("a.pdf", "one\n\n---\n\ntwo");
-        let mut embedder = idle_embedder("e5.onnx");
-        embedder
-            .expect_embed_passages()
-            .returning(|_| Ok(vec![vector(0.1)]));
-
-        let err = indexer(MockStorage::new(), embedder)
-            .save_document(&document)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.code(), ErrorCode::ModelLoadFailed);
-        assert!(err.has_context());
-    }
-
-    #[tokio::test]
-    async fn indexer_save_document_fails_with_context_when_storage_fails() {
-        let document = document_with("a.pdf", "");
-        let mut storage = MockStorage::new();
-        storage
-            .expect_save_document()
-            .returning(|_, _| Err(ErrorKind::InvalidChangelogEvent("refused".to_string()).into()));
-
-        let err = indexer(storage, idle_embedder("e5.onnx"))
-            .save_document(&document)
-            .await
-            .unwrap_err();
-
-        assert!(
-            err.to_string().contains("failed to cache document"),
-            "{err}"
-        );
-    }
-
-    /// Updates a cached document from `previous` to `updated` metadata,
-    /// expecting the storage update to carry `expected` embeddings.
-    async fn update_cached(
-        previous: Option<Metadata>,
-        updated: &Metadata,
-        embedder: MockEmbedder,
-        expected: Option<DocumentEmbeddings>,
-    ) {
-        let id = updated.id;
-        let mut storage = MockStorage::new();
-        storage
-            .expect_get_metadata()
-            .withf(move |given| *given == id)
-            .times(1)
-            .return_once(move |_| Ok(previous));
-        let saved = updated.clone();
-        storage
-            .expect_update_metadata()
-            .withf(move |given, metadata, embeddings| {
-                *given == id && *metadata == saved && *embeddings == expected
-            })
-            .times(1)
-            .returning(|_, _, _| Ok(()));
-
-        indexer(storage, embedder)
-            .update_metadata(id, updated)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn indexer_update_metadata_re_embeds_a_changed_transcript() {
-        let previous = FakeMetadata::new()
-            .with_name("a.pdf")
-            .with_transcript("old")
-            .build();
-        let updated = Metadata {
-            transcript: "new".to_string(),
-            ..previous.clone()
-        };
-        let embedder = embedder_expecting("e5.onnx", &["a\nnew"], vec![vector(0.3)]);
-        let expected = embeddings("e5.onnx", vec![(0..3, vector(0.3))]);
-
-        update_cached(Some(previous), &updated, embedder, Some(expected)).await;
-    }
-
-    #[tokio::test]
-    async fn indexer_update_metadata_re_embeds_a_changed_title() {
-        let previous = FakeMetadata::new()
-            .with_name("a.pdf")
-            .with_transcript("text")
-            .build();
-        let updated = Metadata {
-            name: "Facture.pdf".to_string(),
-            ..previous.clone()
-        };
-        let embedder = embedder_expecting("e5.onnx", &["Facture\ntext"], vec![vector(0.3)]);
-        let expected = embeddings("e5.onnx", vec![(0..4, vector(0.3))]);
-
-        update_cached(Some(previous), &updated, embedder, Some(expected)).await;
-    }
-
-    #[tokio::test]
-    async fn indexer_update_metadata_can_re_embed_to_no_chunks_at_all() {
-        let previous = FakeMetadata::new()
-            .with_name("a.pdf")
-            .with_transcript("text")
-            .build();
-        let updated = Metadata {
-            transcript: String::new(),
-            ..previous.clone()
-        };
-        let expected = embeddings("e5.onnx", Vec::new());
-
-        update_cached(
-            Some(previous),
-            &updated,
-            idle_embedder("e5.onnx"),
-            Some(expected),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn indexer_update_metadata_keeps_the_embeddings_when_their_text_is_unchanged() {
-        let previous = FakeMetadata::new()
-            .with_name("a.pdf")
-            .with_transcript("text")
-            .build();
-        let updated = Metadata {
-            name: "a.PDF".to_string(),
-            category: Some(Category::Housing),
-            attributes: BTreeMap::from([("paid".to_string(), Attribute::Boolean(true))]),
-            ..previous.clone()
-        };
-
-        update_cached(Some(previous), &updated, MockEmbedder::new(), None).await;
-    }
-
-    #[tokio::test]
-    async fn indexer_update_metadata_embeds_nothing_for_a_document_not_cached() {
-        let updated = FakeMetadata::new().build();
-
-        update_cached(None, &updated, MockEmbedder::new(), None).await;
-    }
-
-    #[tokio::test]
-    async fn indexer_update_metadata_updates_nothing_when_re_embedding_fails() {
-        let previous = FakeMetadata::new().with_transcript("old").build();
-        let updated = Metadata {
-            transcript: "new".to_string(),
-            ..previous.clone()
-        };
-        let mut storage = MockStorage::new();
-        storage
-            .expect_get_metadata()
-            .return_once(move |_| Ok(Some(previous)));
-        let mut embedder = idle_embedder("e5.onnx");
-        embedder
-            .expect_embed_passages()
-            .returning(|_| Err(ErrorKind::InvalidModel("boom".to_string()).into()));
-
-        let err = indexer(storage, embedder)
-            .update_metadata(updated.id, &updated)
-            .await
-            .unwrap_err();
-
-        assert!(
-            err.to_string().contains("failed to re-index document"),
-            "{err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn indexer_prepare_records_why_the_model_is_unavailable_until_it_loads() {
-        let mut embedder = MockEmbedder::new();
-        let mut attempts = 0;
-        embedder.expect_load().times(2).returning(move || {
-            attempts += 1;
-            if attempts == 1 {
-                Err(ErrorKind::ModelDownloadStatus(503).into())
-            } else {
-                Ok(())
-            }
-        });
-        let indexer = indexer(MockStorage::new(), embedder);
-        assert_eq!(indexer.model_error(), None);
-
-        let err = indexer.prepare().await.unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ModelDownloadFailed);
-        assert!(err.has_context());
-        assert_eq!(indexer.model_error(), Some(ErrorCode::ModelDownloadFailed));
-
-        indexer.prepare().await.unwrap();
-        assert_eq!(indexer.model_error(), None);
-    }
-
-    #[tokio::test]
-    async fn indexing_model_error_is_the_indexers() {
-        let mut indexer = MockIndexer::new();
-        indexer
-            .expect_model_error()
-            .return_const(Some(ErrorCode::ModelUnavailable));
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            Arc::new(RecordingChangelog::default()),
-            None,
-            accepting_attributes(),
-            Arc::new(indexer),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
-        );
-
-        assert_eq!(
-            client.indexing_model_error(),
-            Some(ErrorCode::ModelUnavailable)
-        );
-    }
-
-    #[test]
-    fn passages_are_each_chunk_of_the_transcript_after_the_title() {
-        let metadata = FakeMetadata::new()
-            .with_name("Facture mars.pdf")
-            .with_transcript("Montant : 42 €\n\n---\n\nÉchéance : avril")
-            .build();
-
-        let passages = passages(&metadata);
-
-        assert_eq!(
-            passages.texts,
-            [
-                "Facture mars\nMontant : 42 €",
-                "Facture mars\nÉchéance : avril"
-            ]
-        );
-        assert_eq!(
-            passages.ranges,
-            [
-                0.."Montant : 42 €".len(),
-                "Montant : 42 €\n\n---\n\n".len()..metadata.transcript.len()
-            ]
-        );
-    }
-
-    #[test]
-    fn passages_of_a_blank_transcript_are_none() {
-        let metadata = FakeMetadata::new().with_transcript(" \n\n ").build();
-
-        let passages = passages(&metadata);
-
-        assert!(passages.texts.is_empty() && passages.ranges.is_empty());
-    }
-
-    fn key_for(metadata: &Metadata, model: &str, chunker_version: u32) -> EmbeddingKey {
-        embedding_key(
-            metadata.id,
-            model,
-            chunker_version,
-            &passages(metadata).texts,
-        )
-    }
-
-    #[test]
-    fn embedding_key_is_the_same_for_an_upload_and_the_document_its_event_carries() {
-        let metadata = FakeMetadata::new()
-            .with_name("Facture mars.pdf")
-            .with_transcript("Montant : 42 €")
-            .build();
-        let uploaded = FakeCachedEmbeddings::new()
-            .for_metadata(&metadata, "e5.onnx")
-            .build();
-        let consumed = Document::new(metadata.id, b"content".to_vec(), metadata.clone());
-
-        assert_eq!(
-            uploaded.key,
-            embedding_key(
-                consumed.id,
-                "e5.onnx",
-                CHUNKER_VERSION,
-                &passages(&consumed.metadata).texts
-            )
-        );
-        assert_eq!(uploaded.key, key_for(&metadata, "e5.onnx", CHUNKER_VERSION));
-    }
-
-    #[test]
-    fn embedding_key_changes_with_anything_the_embeddings_depend_on() {
-        let metadata = FakeMetadata::new()
-            .with_name("Facture mars.pdf")
-            .with_transcript("Montant : 42 €")
-            .build();
-        let key = key_for(&metadata, "e5.onnx", CHUNKER_VERSION);
-        let renamed = Metadata {
-            name: "Facture avril.pdf".to_string(),
-            ..metadata.clone()
-        };
-        let retranscribed = Metadata {
-            transcript: "Montant : 43 €".to_string(),
-            ..metadata.clone()
-        };
-        let another_document = Metadata {
-            id: Uuid::now_v7(),
-            ..metadata.clone()
-        };
-
-        for (what, other) in [
-            ("name", key_for(&renamed, "e5.onnx", CHUNKER_VERSION)),
-            (
-                "transcript",
-                key_for(&retranscribed, "e5.onnx", CHUNKER_VERSION),
-            ),
-            ("model", key_for(&metadata, "e5-v2.onnx", CHUNKER_VERSION)),
-            (
-                "chunker version",
-                key_for(&metadata, "e5.onnx", CHUNKER_VERSION + 1),
-            ),
-            (
-                "document",
-                key_for(&another_document, "e5.onnx", CHUNKER_VERSION),
-            ),
-        ] {
-            assert_ne!(other, key, "a new {what} kept the key");
-        }
-        assert_eq!(key_for(&metadata, "e5.onnx", CHUNKER_VERSION), key);
-    }
-
-    #[test]
-    fn embedding_key_tells_the_same_text_split_differently_apart() {
-        let id = Uuid::now_v7();
-        let split = |passages: &[&str]| {
-            let passages: Vec<String> = passages.iter().map(|p| p.to_string()).collect();
-            embedding_key(id, "e5.onnx", CHUNKER_VERSION, &passages)
-        };
-
-        assert_ne!(split(&["ab", "c"]), split(&["a", "bc"]));
-        assert_ne!(split(&["abc"]), split(&["abc", ""]));
-    }
-
-    #[test]
-    fn embedding_key_holds_a_digest_of_the_text_never_the_text() {
-        let metadata = FakeMetadata::new()
-            .with_name("secret.pdf")
-            .with_transcript("Numéro fiscal 1234567890123")
-            .build();
-
-        let key = key_for(&metadata, "e5.onnx", CHUNKER_VERSION);
-
-        assert!(!format!("{key:?}").contains("1234567890123"));
-        assert_eq!(
-            key.text_sha256,
-            <[u8; 32]>::from(Sha256::digest(
-                [
-                    &("secret\nNuméro fiscal 1234567890123".len() as u64).to_le_bytes()[..],
-                    "secret\nNuméro fiscal 1234567890123".as_bytes(),
-                ]
-                .concat()
-            ))
-        );
-    }
-
-    /// A storage only ever asked whether a new upload is a duplicate: any
-    /// write panics.
-    fn storage_for_a_new_upload() -> MockStorage {
-        let mut storage = MockStorage::new();
-        storage
-            .expect_find_document_by_checksum()
-            .times(1)
-            .returning(|_| Ok(None));
-        storage
-    }
-
-    /// An embedder for `"e5.onnx"` expected to embed exactly once, returning
-    /// `vector(i)` for passage `i`, and the passages it was given.
-    fn embedder_embedding_once() -> (MockEmbedder, Arc<Mutex<Vec<String>>>) {
-        let given = Arc::new(Mutex::new(Vec::new()));
-        let recorded = given.clone();
-        let mut embedder = idle_embedder("e5.onnx");
-        embedder
-            .expect_embed_passages()
-            .times(1)
-            .returning(move |passages| {
-                let vectors = (0..passages.len()).map(|i| vector(i as f32)).collect();
-                *recorded.lock().unwrap() = passages;
-                Ok(vectors)
-            });
-        (embedder, given)
-    }
-
-    /// A cache expecting exactly one `put`, before anything was published
-    /// to `changelog`, and what was put.
-    #[allow(clippy::type_complexity)]
-    fn cache_expecting_a_put_before_publishing(
-        changelog: Arc<RecordingChangelog>,
-    ) -> (
-        MockEmbeddingCache,
-        Arc<Mutex<Option<Arc<CachedEmbeddings>>>>,
-    ) {
-        let put = Arc::new(Mutex::new(None));
-        let captured = put.clone();
-        let mut cache = MockEmbeddingCache::new();
-        cache.expect_put().times(1).returning(move |cached| {
-            assert!(
-                changelog.sent.lock().unwrap().is_empty(),
-                "the embeddings were cached after the event was published"
-            );
-            *captured.lock().unwrap() = Some(cached);
-        });
-        (cache, put)
-    }
-
-    #[tokio::test]
-    async fn upload_embeds_the_document_once_and_caches_its_embeddings_before_publishing_it() {
-        let pdf = build_pdf("Montant : 42 €");
-        let changelog = Arc::new(RecordingChangelog::default());
-        let (embedder, given) = embedder_embedding_once();
-        let (cache, put) = cache_expecting_a_put_before_publishing(changelog.clone());
-        let client = DocumentsClient::new(
-            storage_for_a_new_upload(),
-            changelog.clone(),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            Arc::new(embedder),
-            Arc::new(cache),
-            classifier_returning(Classification::default(), 1),
-        );
-
-        let id = client
-            .upload(UploadRequest::from_raw("Facture mars.pdf", pdf.clone()))
-            .await
-            .unwrap();
-
-        let sent = changelog.sent.lock().unwrap();
-        let [(EventType::SaveDocument, sent_id, Some(content), Some(metadata))] = &sent[..] else {
-            panic!("unexpected events: {sent:?}");
-        };
-        assert_eq!((*sent_id, metadata.id), (id, id));
-        assert_eq!(*content, pdf);
-        let expected = passages(metadata);
-        assert!(!expected.texts.is_empty());
-        assert_eq!(*given.lock().unwrap(), expected.texts);
-        let put = put.lock().unwrap().clone().unwrap();
-        assert_eq!(put.key, key_for(metadata, "e5.onnx", CHUNKER_VERSION));
-        assert_eq!(
-            put.embeddings,
-            embeddings(
-                "e5.onnx",
-                expected
-                    .ranges
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, range)| (range, vector(i as f32)))
-                    .collect()
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn upload_without_the_model_publishes_the_document_and_caches_nothing() {
-        let changelog = Arc::new(RecordingChangelog::default());
-        // Strict: any `put` panics.
-        let client = DocumentsClient::new(
-            storage_for_a_new_upload(),
-            changelog.clone(),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            embedder_without_model(),
-            unused_cache(),
-            unused_classifier(),
-        );
-
-        let id = client
-            .upload(UploadRequest::from_raw(
-                "a.pdf",
-                build_pdf("Montant : 42 €"),
-            ))
-            .await
-            .unwrap();
-
-        let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].1, id);
-    }
-
-    #[tokio::test]
-    async fn upload_of_a_document_with_no_text_neither_embeds_nor_caches_anything() {
-        let changelog = Arc::new(RecordingChangelog::default());
-        // Both strict: embedding or caching panics.
-        let client = DocumentsClient::new(
-            storage_for_a_new_upload(),
-            changelog.clone(),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
-        );
-
-        client
-            .upload(UploadRequest::from_raw("scan.pdf", build_pdf(" ")))
-            .await
-            .unwrap();
-
-        let sent = changelog.sent.lock().unwrap();
-        assert!(sent[0].3.as_ref().unwrap().transcript.trim().is_empty());
-    }
-
-    #[tokio::test]
-    async fn upload_drops_the_embeddings_it_cached_when_publishing_fails() {
-        let changelog = Arc::new(RecordingChangelog {
-            fail_send: true,
-            ..Default::default()
-        });
-        let (embedder, _) = embedder_embedding_once();
-        let (mut cache, put) = cache_expecting_a_put_before_publishing(changelog.clone());
-        let removed = Arc::new(Mutex::new(None));
-        let captured = removed.clone();
-        cache
-            .expect_remove()
-            .times(1)
-            .returning(move |id| *captured.lock().unwrap() = Some(id));
-        let client = DocumentsClient::new(
-            storage_for_a_new_upload(),
-            changelog.clone(),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            Arc::new(embedder),
-            Arc::new(cache),
-            classifier_returning(Classification::default(), 1),
-        );
-
-        let err = client
-            .upload(UploadRequest::from_raw(
-                "a.pdf",
-                build_pdf("Montant : 42 €"),
-            ))
-            .await
-            .unwrap_err();
-
-        assert!(err.to_string().contains("failed to publish"), "{err}");
-        let put = put.lock().unwrap().clone().unwrap();
-        assert_eq!(*removed.lock().unwrap(), Some(put.key.document_id));
-        assert_eq!(put.key.document_id, changelog.sent.lock().unwrap()[0].1);
-    }
-
-    #[tokio::test]
-    async fn upload_drops_the_embeddings_it_cached_when_given_up_on_while_publishing() {
-        let reached = Arc::new(tokio::sync::Notify::new());
-        let changelog = Arc::new(RecordingChangelog {
-            hang_send: Some(reached.clone()),
-            ..Default::default()
-        });
-        let (embedder, _) = embedder_embedding_once();
-        let (mut cache, put) = cache_expecting_a_put_before_publishing(changelog.clone());
-        let removed = Arc::new(Mutex::new(None));
-        let captured = removed.clone();
-        cache
-            .expect_remove()
-            .times(1)
-            .returning(move |id| *captured.lock().unwrap() = Some(id));
-        let client = DocumentsClient::new(
-            storage_for_a_new_upload(),
-            changelog.clone(),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            Arc::new(embedder),
-            Arc::new(cache),
-            classifier_returning(Classification::default(), 1),
-        );
-
-        let upload = client.upload(UploadRequest::from_raw(
-            "a.pdf",
-            build_pdf("Montant : 42 €"),
-        ));
-        // Dropping the upload once it's publishing, as a stopped run does.
-        tokio::select! {
-            () = reached.notified() => {}
-            result = upload => panic!("the upload finished: {result:?}"),
-        }
-
-        let put = put.lock().unwrap().clone().unwrap();
-        assert_eq!(*removed.lock().unwrap(), Some(put.key.document_id));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn upload_skips_embedding_for_a_while_after_embedding_failed() {
-        let mut storage = MockStorage::new();
-        storage
-            .expect_find_document_by_checksum()
-            .times(4)
-            .returning(|_| Ok(None));
-        let mut order = mockall::Sequence::new();
-        let mut embedder = idle_embedder("e5.onnx");
-        embedder
-            .expect_embed_passages()
-            .times(1)
-            .in_sequence(&mut order)
-            .returning(|_| Err(ErrorKind::ModelDownloadStatus(503).into()));
-        embedder
-            .expect_embed_passages()
-            .times(1)
-            .in_sequence(&mut order)
-            .returning(|passages| Ok(passages.iter().map(|_| vector(0.5)).collect()));
-        let put = Arc::new(Mutex::new(None));
-        let captured = put.clone();
-        let mut cache = MockEmbeddingCache::new();
-        cache
-            .expect_put()
-            .times(1)
-            .returning(move |cached| *captured.lock().unwrap() = Some(cached));
-        let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            storage,
-            changelog.clone(),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            Arc::new(embedder),
-            Arc::new(cache),
-            classifier_returning(Classification::default(), 1),
-        );
-        let upload = |text| client.upload(UploadRequest::from_raw("a.pdf", build_pdf(text)));
-
-        // Fails to embed, then skips embedding until the pause is over.
-        upload("first").await.unwrap();
-        upload("second").await.unwrap();
-        tokio::time::advance(UPLOAD_EMBED_RETRY_AFTER - std::time::Duration::from_secs(1)).await;
-        upload("third").await.unwrap();
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        let id = upload("fourth").await.unwrap();
-
-        assert_eq!(changelog.sent.lock().unwrap().len(), 4);
-        assert_eq!(put.lock().unwrap().as_ref().unwrap().key.document_id, id);
-    }
-
-    /// A client uploading through `changelog` with a model embedding
-    /// once, and classifying with `classifier`.
-    fn client_classifying_with(
-        changelog: Arc<RecordingChangelog>,
-        classifier: Arc<dyn ClassificationService>,
-    ) -> DocumentsClient<MockStorage> {
-        let (embedder, _) = embedder_embedding_once();
-        let mut cache = MockEmbeddingCache::new();
-        cache.expect_put().times(1).return_const(());
-        DocumentsClient::new(
-            storage_for_a_new_upload(),
-            changelog,
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            Arc::new(embedder),
-            Arc::new(cache),
-            classifier,
-        )
-    }
-
-    /// The metadata of the only document `changelog` published.
-    fn published_metadata(changelog: &RecordingChangelog) -> Metadata {
-        let sent = changelog.sent.lock().unwrap();
-        let [(EventType::SaveDocument, _, _, Some(metadata))] = &sent[..] else {
-            panic!("unexpected events: {sent:?}");
-        };
-        metadata.clone()
-    }
-
-    #[tokio::test]
-    async fn upload_publishes_the_document_classified_from_its_transcript() {
-        let classification = FakeClassification::new().build();
-        let mut classifier = MockClassificationService::new();
-        classifier
-            .expect_classify()
-            .withf(|text| text.contains("Montant : 42 €"))
-            .times(1)
-            .returning(move |_| Ok(classification));
-        let changelog = Arc::new(RecordingChangelog::default());
-        let client = client_classifying_with(changelog.clone(), Arc::new(classifier));
-
-        client
-            .upload(UploadRequest::from_raw(
-                "a.pdf",
-                build_pdf("Montant : 42 €"),
-            ))
-            .await
-            .unwrap();
-
-        let metadata = published_metadata(&changelog);
-        assert_eq!(
-            (metadata.category, metadata.subcategory, metadata.r#type),
-            (
-                classification.category,
-                classification.subcategory,
-                classification.r#type
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn upload_leaves_unclassified_what_the_classifier_can_t_tell() {
-        let classification = FakeClassification::new()
-            .with_subcategory(None)
-            .with_type(None)
-            .build();
-        let changelog = Arc::new(RecordingChangelog::default());
-        let client =
-            client_classifying_with(changelog.clone(), classifier_returning(classification, 1));
-
-        client
-            .upload(UploadRequest::from_raw(
-                "a.pdf",
-                build_pdf("Montant : 42 €"),
-            ))
-            .await
-            .unwrap();
-
-        let metadata = published_metadata(&changelog);
-        assert_eq!(metadata.category, classification.category);
-        assert_eq!((metadata.subcategory, metadata.r#type), (None, None));
-    }
-
-    #[tokio::test]
-    async fn upload_never_classifies_a_document_given_a_category() {
-        let changelog = Arc::new(RecordingChangelog::default());
-        // Strict: classifying panics.
-        let client = client_classifying_with(changelog.clone(), unused_classifier());
-        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
-        request.category = Some(Category::Housing);
-
-        client.upload(request).await.unwrap();
-
-        let metadata = published_metadata(&changelog);
-        assert_eq!(metadata.category, Some(Category::Housing));
-        assert_eq!((metadata.subcategory, metadata.r#type), (None, None));
-    }
-
-    #[tokio::test]
-    async fn upload_never_classifies_a_document_given_a_subcategory_alone() {
-        let changelog = Arc::new(RecordingChangelog::default());
-        // Strict: classifying panics.
-        let client = client_classifying_with(changelog.clone(), unused_classifier());
-        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
-        request.subcategory = Some(Subcategory::Water);
-
-        client.upload(request).await.unwrap();
-
-        let metadata = published_metadata(&changelog);
-        assert_eq!(
-            (metadata.category, metadata.subcategory),
-            (Some(Category::Housing), Some(Subcategory::Water))
-        );
-    }
-
-    #[tokio::test]
-    async fn upload_classifies_a_document_given_a_type_alone_but_keeps_its_type() {
-        let classification = FakeClassification::new()
-            .with_category(Category::Work)
-            .with_subcategory(Subcategory::Payslips)
-            .with_type(DocumentType::Payslip)
-            .build();
-        let changelog = Arc::new(RecordingChangelog::default());
-        let client =
-            client_classifying_with(changelog.clone(), classifier_returning(classification, 1));
-        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
-        request.r#type = Some(DocumentType::Contract);
-
-        client.upload(request).await.unwrap();
-
-        let metadata = published_metadata(&changelog);
-        assert_eq!(
-            (metadata.category, metadata.subcategory, metadata.r#type),
-            (
-                Some(Category::Work),
-                Some(Subcategory::Payslips),
-                Some(DocumentType::Contract)
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn upload_publishes_the_document_unclassified_when_classifying_fails() {
-        let mut classifier = MockClassificationService::new();
-        classifier
-            .expect_classify()
-            .times(1)
-            .returning(|_| Err(ErrorKind::ModelNotDownloaded("e5".to_string()).into()));
-        let changelog = Arc::new(RecordingChangelog::default());
-        let client = client_classifying_with(changelog.clone(), Arc::new(classifier));
-
-        client
-            .upload(UploadRequest::from_raw(
-                "a.pdf",
-                build_pdf("Montant : 42 €"),
-            ))
-            .await
-            .unwrap();
-
-        let metadata = published_metadata(&changelog);
-        assert_eq!(
-            (metadata.category, metadata.subcategory, metadata.r#type),
-            (None, None, None)
-        );
-    }
-
-    /// Uploads a document with a mocked model, then has an indexer over a
-    /// cache holding what the upload put there consume the event the upload
-    /// published, as the changelog consumer would.
-    #[tokio::test]
-    async fn an_uploads_embeddings_are_stored_as_is_when_its_event_is_consumed() {
-        let pdf = build_pdf("Montant : 42 €\n\n---\n\nÉchéance : avril");
-        let changelog = Arc::new(RecordingChangelog::default());
-        let (embedder, _) = embedder_embedding_once();
-        let (cache, put) = cache_expecting_a_put_before_publishing(changelog.clone());
-        let client = DocumentsClient::new(
-            storage_for_a_new_upload(),
-            changelog.clone(),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            Arc::new(embedder),
-            Arc::new(cache),
-            classifier_returning(Classification::default(), 1),
-        );
-        let id = client
-            .upload(UploadRequest::from_raw("Facture mars.pdf", pdf))
-            .await
-            .unwrap();
-        let put = put.lock().unwrap().clone().unwrap();
-        let (_, subject_id, content, metadata) = changelog.sent.lock().unwrap()[0].clone();
-        let document = Document::new(subject_id, content.unwrap(), metadata.unwrap());
-
-        let mut cache = MockEmbeddingCache::new();
-        let cached = put.clone();
-        cache
-            .expect_get()
-            .withf(move |given| *given == id)
-            .return_once(move |_| Some(cached));
-        cache
-            .expect_remove()
-            .withf(move |given| *given == id)
-            .times(1)
-            .return_const(());
-        let mut storage = MockStorage::new();
-        let expected = put.embeddings.clone();
-        storage
-            .expect_save_document()
-            .withf(move |_, embeddings| *embeddings == expected)
-            .times(1)
-            .returning(|_, _| Ok(()));
-
-        // `idle_embedder`: embedding again panics.
-        indexer_with(storage, idle_embedder("e5.onnx"), cache)
-            .save_document(&document)
-            .await
-            .unwrap();
-    }
-
-    /// A cache holding `cached` for `id`, expecting it to be removed only
-    /// after `storage` saved the document (see `in_sequence`).
-    fn cache_holding(
-        id: Uuid,
-        cached: CachedEmbeddings,
-        sequence: &mut mockall::Sequence,
-    ) -> MockEmbeddingCache {
-        let mut cache = MockEmbeddingCache::new();
-        let cached = Arc::new(cached);
-        cache
-            .expect_get()
-            .withf(move |given| *given == id)
-            .times(1)
-            .in_sequence(sequence)
-            .return_once(move |_| Some(cached));
-        cache
-    }
-
-    #[tokio::test]
-    async fn indexer_save_document_stores_the_cached_embeddings_without_embedding_then_drops_them()
-    {
-        let document = document_with("Facture mars.pdf", "Montant : 42 €");
-        let cached = FakeCachedEmbeddings::new()
-            .for_metadata(&document.metadata, "e5.onnx")
-            .build();
-        let expected = cached.embeddings.clone();
-        let mut sequence = mockall::Sequence::new();
-        let mut cache = cache_holding(document.id, cached, &mut sequence);
-        let mut storage = MockStorage::new();
-        let saved = document.clone();
-        storage
-            .expect_save_document()
-            .withf(move |document, embeddings| *document == saved && *embeddings == expected)
-            .times(1)
-            .in_sequence(&mut sequence)
-            .returning(|_, _| Ok(()));
-        let id = document.id;
-        cache
-            .expect_remove()
-            .withf(move |given| *given == id)
-            .times(1)
-            .in_sequence(&mut sequence)
-            .return_const(());
-
-        indexer_with(storage, idle_embedder("e5.onnx"), cache)
-            .save_document(&document)
-            .await
-            .unwrap();
-    }
-
-    /// Saves `document` with `cached` in the cache, which must not match:
-    /// the document is embedded inline as if nothing were cached, then the
-    /// stale entry dropped.
-    async fn save_with_stale_entry(document: Document, cached: CachedEmbeddings) {
-        let embedder = embedder_expecting(
-            "e5.onnx",
-            &["Facture mars\nMontant : 42 €"],
-            vec![vector(0.7)],
-        );
-        let expected = embeddings(
-            "e5.onnx",
-            vec![(0..document.metadata.transcript.len(), vector(0.7))],
-        );
-        let mut sequence = mockall::Sequence::new();
-        let mut cache = cache_holding(document.id, cached, &mut sequence);
-        let mut storage = MockStorage::new();
-        storage
-            .expect_save_document()
-            .withf(move |_, embeddings| *embeddings == expected)
-            .times(1)
-            .in_sequence(&mut sequence)
-            .returning(|_, _| Ok(()));
-        let id = document.id;
-        cache
-            .expect_remove()
-            .withf(move |given| *given == id)
-            .times(1)
-            .in_sequence(&mut sequence)
-            .return_const(());
-
-        indexer_with(storage, embedder, cache)
-            .save_document(&document)
-            .await
-            .unwrap();
-    }
-
-    fn facture() -> Document {
-        document_with("Facture mars.pdf", "Montant : 42 €")
-    }
-
-    #[tokio::test]
-    async fn indexer_save_document_embeds_again_for_another_model() {
-        let document = facture();
-        let cached = FakeCachedEmbeddings::new()
-            .for_metadata(&document.metadata, "e5-old.onnx")
-            .build();
-
-        save_with_stale_entry(document, cached).await;
-    }
-
-    #[tokio::test]
-    async fn indexer_save_document_embeds_again_for_another_chunker_version() {
-        let document = facture();
-        let key = embedding_key(
-            document.id,
-            "e5.onnx",
-            CHUNKER_VERSION + 1,
-            &passages(&document.metadata).texts,
-        );
-        let cached = FakeCachedEmbeddings::new().with_key(key).build();
-
-        save_with_stale_entry(document, cached).await;
-    }
-
-    #[tokio::test]
-    async fn indexer_save_document_embeds_again_for_another_transcript() {
-        let document = facture();
-        let uploaded = Metadata {
-            transcript: "Montant : 41 €".to_string(),
-            ..document.metadata.clone()
-        };
-        let cached = FakeCachedEmbeddings::new()
-            .for_metadata(&uploaded, "e5.onnx")
-            .build();
-
-        save_with_stale_entry(document, cached).await;
-    }
-
-    #[tokio::test]
-    async fn indexer_save_document_embeds_again_for_another_name() {
-        let document = facture();
-        let uploaded = Metadata {
-            name: "Facture avril.pdf".to_string(),
-            ..document.metadata.clone()
-        };
-        let cached = FakeCachedEmbeddings::new()
-            .for_metadata(&uploaded, "e5.onnx")
-            .build();
-
-        save_with_stale_entry(document, cached).await;
-    }
-
-    #[tokio::test]
-    async fn indexer_save_document_embeds_again_for_another_documents_entry() {
-        let document = facture();
-        let cached = FakeCachedEmbeddings::new()
-            .for_metadata(&document.metadata, "e5.onnx")
-            .with_document_id(Uuid::now_v7())
-            .build();
-
-        save_with_stale_entry(document, cached).await;
-    }
-
-    #[tokio::test]
-    async fn indexer_save_document_keeps_the_cached_embeddings_until_a_retry_saves_them() {
-        let document = facture();
-        let cached = Arc::new(
-            FakeCachedEmbeddings::new()
-                .for_metadata(&document.metadata, "e5.onnx")
-                .build(),
-        );
-        let expected = cached.embeddings.clone();
-        let id = document.id;
-        let mut sequence = mockall::Sequence::new();
-        let mut cache = MockEmbeddingCache::new();
-        cache
-            .expect_get()
-            .withf(move |given| *given == id)
-            .times(2)
-            .returning(move |_| Some(cached.clone()));
-        let mut storage = MockStorage::new();
-        storage
-            .expect_save_document()
-            .withf(move |_, embeddings| *embeddings == expected)
-            .times(1)
-            .in_sequence(&mut sequence)
-            .returning(
-                |_, _| Err(ErrorKind::InvalidChangelogEvent("disk full".to_string()).into()),
-            );
-        storage
-            .expect_save_document()
-            .times(1)
-            .in_sequence(&mut sequence)
-            .returning(|_, _| Ok(()));
-        // Only once the retry saved it.
-        cache
-            .expect_remove()
-            .withf(move |given| *given == id)
-            .times(1)
-            .in_sequence(&mut sequence)
-            .return_const(());
-        let indexer = indexer_with(storage, idle_embedder("e5.onnx"), cache);
-
-        let err = indexer.save_document(&document).await.unwrap_err();
-        assert!(
-            err.to_string().contains("failed to cache document"),
-            "{err}"
-        );
-
-        indexer.save_document(&document).await.unwrap();
-    }
-
-    #[test]
-    fn indexer_skip_document_drops_the_documents_cached_embeddings_and_stores_nothing() {
-        let id = Uuid::now_v7();
-        let mut cache = MockEmbeddingCache::new();
-        cache
-            .expect_remove()
-            .withf(move |removed| *removed == id)
-            .times(1)
-            .return_const(());
-
-        // Strict storage and embedder: any call panics.
-        indexer_with(MockStorage::new(), MockEmbedder::new(), cache).skip_document(id);
-    }
-
-    #[tokio::test]
-    async fn indexer_update_metadata_never_reads_the_cache() {
-        let previous = FakeMetadata::new()
-            .with_name("a.pdf")
-            .with_transcript("old")
-            .build();
-        let updated = Metadata {
-            transcript: "new".to_string(),
-            ..previous.clone()
-        };
-        let id = updated.id;
-        let mut storage = MockStorage::new();
-        storage
-            .expect_get_metadata()
-            .return_once(move |_| Ok(Some(previous)));
-        storage.expect_update_metadata().returning(|_, _, _| Ok(()));
-
-        // Strict cache: any call panics.
-        indexer_with(
-            storage,
-            embedder_expecting("e5.onnx", &["a\nnew"], vec![vector(0.3)]),
-            MockEmbeddingCache::new(),
-        )
-        .update_metadata(id, &updated)
-        .await
-        .unwrap();
-    }
-
-    #[test]
-    fn title_is_the_name_without_its_extension() {
-        assert_eq!(title("Facture mars.pdf"), "Facture mars");
-        assert_eq!(title("relevé.2024.PDF"), "relevé.2024");
-        assert_eq!(title("no extension"), "no extension");
-        assert_eq!(title(".pdf"), ".pdf");
-        assert_eq!(title(""), "");
     }
 }

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tonic::transport::Channel;
 use zeroize::Zeroizing;
 
-use crate::domains::documents::{EmbeddingCache, Service as DocumentsService};
+use crate::domains::documents::Service as DocumentsService;
 use crate::domains::secrets::{MASTER_KEY_SECRET, SecretLocation, Service as SecretsService};
 use crate::domains::sessions::{ExpiredSessionHandler, Service as SessionsService, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
@@ -114,7 +114,6 @@ pub struct UsersClient {
     local_db: Arc<dyn LocalDatabase>,
     local_files: Arc<dyn LocalFiles>,
     documents: Arc<dyn DocumentsService>,
-    embedding_cache: Arc<dyn EmbeddingCache>,
 }
 
 impl UsersClient {
@@ -122,7 +121,7 @@ impl UsersClient {
     /// connection to the fyde server. The account's master key is persisted
     /// in `secrets` and its role in `settings`; the session token is
     /// persisted, and outgoing calls authenticated, via `sessions`;
-    /// `secrets` and `embedding_cache` are cleared, `local_db` wiped and
+    /// `secrets` are cleared, `local_db` wiped and
     /// `local_files` deleted on `logout`; and changelog
     /// consumption on `documents` is started by `create`/`login` and stopped
     /// by `logout`.
@@ -135,7 +134,6 @@ impl UsersClient {
         local_db: Arc<dyn LocalDatabase>,
         local_files: Arc<dyn LocalFiles>,
         documents: Arc<dyn DocumentsService>,
-        embedding_cache: Arc<dyn EmbeddingCache>,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(channel, sessions.clone())),
@@ -146,15 +144,13 @@ impl UsersClient {
             local_db,
             local_files,
             documents,
-            embedding_cache,
         })
     }
 
     /// Creates a client from already-constructed [`FydeClient`] and
     /// [`OpaqueClient`] implementations, for testing against
     /// [`super::grpc_client::MockFydeClient`]/[`super::crypto::MockOpaqueClient`]
-    /// instead of a live server and real cryptography. Its embedding cache
-    /// panics on any call (see [`Self::with_embedding_cache`]).
+    /// instead of a live server and real cryptography.
     #[cfg(test)]
     fn with_deps(
         grpc: impl FydeClient + 'static,
@@ -174,14 +170,7 @@ impl UsersClient {
             local_db,
             local_files,
             documents,
-            embedding_cache: Arc::new(crate::domains::documents::MockEmbeddingCache::new()),
         }
-    }
-
-    #[cfg(test)]
-    fn with_embedding_cache(mut self, embedding_cache: impl EmbeddingCache + 'static) -> Self {
-        self.embedding_cache = Arc::new(embedding_cache);
-        self
     }
 
     /// Runs OPAQUE's `finish_registration` on the blocking pool: it runs the
@@ -217,7 +206,7 @@ impl UsersClient {
     }
 
     /// Clears every trace of the account from this device: its secrets from
-    /// the credential store, the embeddings uploads left in memory, every
+    /// the credential store, every
     /// row of the local database and every other file in the client's
     /// directory. All always run, so a failure in one never leaves the
     /// others' data behind. Changelog consumption must already be stopped,
@@ -228,10 +217,6 @@ impl UsersClient {
             .clear()
             .await
             .context("failed to clear secrets");
-        // Only once the master key is gone: an upload under way caches its
-        // embeddings before publishing them, so one that does so after this
-        // can't publish, and drops them.
-        self.embedding_cache.clear();
         let wiped = self
             .local_db
             .wipe()
@@ -743,7 +728,6 @@ mod tests {
     use super::super::crypto::{MockOpaqueClient, fake_login_state, fake_registration_state};
     use super::super::grpc_client::MockFydeClient;
     use super::*;
-    use crate::domains::documents::MockEmbeddingCache;
     use crate::domains::secrets::{MockService as MockSecretsService, SESSION_TOKEN_SECRET};
     use crate::domains::settings::MockService as MockSettingsService;
     use crate::tools::client_dir::MockLocalFiles;
@@ -764,14 +748,6 @@ mod tests {
             Arc::new(MockLocalFiles::new()),
             Arc::new(RecordingDocuments::default()),
         )
-    }
-
-    /// An embedding cache expecting to be cleared exactly once, and nothing
-    /// else.
-    fn cleared_cache() -> MockEmbeddingCache {
-        let mut cache = MockEmbeddingCache::new();
-        cache.expect_clear().times(1).return_const(());
-        cache
     }
 
     /// A [`DocumentsService`] fake recording whether
@@ -843,10 +819,6 @@ mod tests {
         fn stop_sync(&self) {
             self.stop_sync_called
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        fn indexing_model_error(&self) -> Option<crate::ErrorCode> {
-            unimplemented!()
         }
     }
 
@@ -1974,45 +1946,7 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
-        )
-        .with_embedding_cache(cleared_cache());
-
-        client.logout().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn logout_clears_the_embedding_cache_only_once_the_secrets_are_cleared() {
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc.expect_logout().times(1).returning(|| Ok(()));
-
-        let mut order = mockall::Sequence::new();
-        let mut secrets = secrets_with_open_session();
-        secrets
-            .expect_clear()
-            .times(1)
-            .in_sequence(&mut order)
-            .returning(|| Ok(()));
-        let mut cache = MockEmbeddingCache::new();
-        cache
-            .expect_clear()
-            .times(1)
-            .in_sequence(&mut order)
-            .return_const(());
-        let mut local_db = MockLocalDatabase::new();
-        local_db.expect_wipe().times(1).returning(|| Ok(()));
-        let mut local_files = MockLocalFiles::new();
-        local_files.expect_clear().times(1).returning(|| Ok(()));
-
-        let client = UsersClient::with_deps(
-            mock_grpc,
-            MockOpaqueClient::new(),
-            Arc::new(MockSettingsService::new()),
-            Arc::new(secrets),
-            Arc::new(local_db),
-            Arc::new(local_files),
-            Arc::new(RecordingDocuments::default()),
-        )
-        .with_embedding_cache(cache);
+        );
 
         client.logout().await.unwrap();
     }
@@ -2040,8 +1974,7 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
-        )
-        .with_embedding_cache(cleared_cache());
+        );
 
         client.logout().await.unwrap();
     }
@@ -2069,8 +2002,7 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
-        )
-        .with_embedding_cache(cleared_cache());
+        );
 
         assert!(client.logout().await.is_err());
     }
@@ -2098,8 +2030,7 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
-        )
-        .with_embedding_cache(cleared_cache());
+        );
 
         assert!(client.logout().await.is_err());
     }
@@ -2156,8 +2087,7 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             documents.clone(),
-        )
-        .with_embedding_cache(cleared_cache());
+        );
 
         client.logout().await.unwrap();
 
@@ -2187,8 +2117,7 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             documents.clone(),
-        )
-        .with_embedding_cache(cleared_cache());
+        );
 
         client.end_expired_session().await.unwrap();
 
@@ -2219,8 +2148,7 @@ mod tests {
             Arc::new(local_db),
             Arc::new(local_files),
             Arc::new(RecordingDocuments::default()),
-        )
-        .with_embedding_cache(cleared_cache());
+        );
 
         let err = client.end_expired_session().await.unwrap_err();
 

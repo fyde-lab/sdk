@@ -142,7 +142,7 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
 {
     /// Creates a client for the changelog service over `grpc`, using
     /// `document_storage` to spot documents [`Service::consume`] already
-    /// cached, `indexer` to cache (and index) the ones it materializes,
+    /// cached, `indexer` to cache the ones it materializes,
     /// `script_storage` to save the scripts it
     /// materializes, `scraper_session_storage` to clear the saved session
     /// of a scraper whose script changes version, `cursor_storage` to track its progress through the
@@ -269,7 +269,6 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
                         "skipping caching document {}: a document with the same content is already cached locally as {existing}",
                         event.subject_id
                     );
-                    self.indexer.skip_document(event.subject_id);
                     return Ok(());
                 }
 
@@ -402,10 +401,6 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
         // cursor.
         let mut offset = since;
 
-        // Whether the indexing model is loaded: documents are indexed as
-        // they're cached, so none is applied until it is.
-        let mut indexing_ready = false;
-
         while let Some(proto_event) = stream.next().await {
             let proto_event = proto_event.context("failed to read next changelog event")?;
             let proto_id = proto_event.id.clone();
@@ -443,23 +438,6 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
                 self.event_applied();
                 offset = Some(event.id);
                 continue;
-            }
-
-            // A model that can't be fetched isn't the event's fault, so isn't
-            // counted against it.
-            if !indexing_ready
-                && matches!(
-                    event.event_type,
-                    EventType::SaveDocument | EventType::UpdateMetadata
-                )
-            {
-                self.indexer.prepare().await.with_context(|| {
-                    format!(
-                        "cannot apply changelog event {} before the indexing model is available",
-                        event.id
-                    )
-                })?;
-                indexing_ready = true;
             }
 
             self.apply(&event)
@@ -601,10 +579,7 @@ mod tests {
     use super::super::grpc_client::MockFydeClient;
     use super::super::storage::MockCursorStorage;
     use super::*;
-    use crate::domains::documents::{
-        DocumentIndexer, FakeCachedEmbeddings, FakeMetadata, MockEmbedder, MockEmbeddingCache,
-        MockIndexer, MockStorage,
-    };
+    use crate::domains::documents::{FakeMetadata, MockIndexer, MockStorage};
     use crate::domains::scrapers::MockSessionStorage;
     use crate::domains::scripts::{
         FakeInstalledScript, FakeScript, MockStorage as MockScriptStorage,
@@ -632,13 +607,6 @@ mod tests {
             .withf(|key| key == crate::domains::secrets::MASTER_KEY_SECRET)
             .returning(move |_| Ok(Some(encoded.clone())));
         Arc::new(mock)
-    }
-
-    /// An indexer with the model loaded, expected to cache nothing.
-    fn ready_indexer() -> MockIndexer {
-        let mut indexer = MockIndexer::new();
-        indexer.expect_prepare().returning(|| Ok(()));
-        indexer
     }
 
     /// An indexer expected to never be called.
@@ -688,7 +656,7 @@ mod tests {
             .expect_find_document_by_checksum()
             .times(1)
             .returning(|_| Ok(None));
-        let mut indexer = ready_indexer();
+        let mut indexer = MockIndexer::new();
         indexer
             .expect_save_document()
             .withf(move |document| document.id() == document_id && document.content() == b"content")
@@ -752,7 +720,7 @@ mod tests {
         document_storage
             .expect_find_document_by_checksum()
             .returning(|_| Ok(None));
-        let mut indexer = ready_indexer();
+        let mut indexer = MockIndexer::new();
         indexer.expect_save_document().returning(|_| Ok(()));
 
         let mut cursor_storage = MockCursorStorage::new();
@@ -781,128 +749,6 @@ mod tests {
             reachable_server_state(),
             fake_secrets(),
         );
-
-        client.consume_once(&mut |_| {}).await.unwrap();
-    }
-
-    /// The embeddings an upload left in the cache are stored with the
-    /// document its event carries, never embedded again, and survive a pass
-    /// that failed to save it, so the retried pass still reuses them. The
-    /// cursor only moves, and the entry is only dropped, once it's saved.
-    #[tokio::test]
-    async fn consume_reuses_an_uploads_cached_embeddings_even_after_a_failed_pass() {
-        let event_id = Uuid::now_v7();
-        let metadata = FakeMetadata::new()
-            .with_name("Facture mars.pdf")
-            .with_transcript("Montant : 42 €")
-            .build();
-        let document_id = metadata.id;
-        let encrypted_content = futures::executor::block_on(crypto::encrypt_event(
-            &*fake_secrets(),
-            EventType::SaveDocument,
-            document_id,
-            Some(b"content"),
-            Some(&metadata),
-        ))
-        .unwrap();
-        let proto = ProtoChangelogEvent {
-            id: event_id.to_string(),
-            encrypted_content,
-            previous_id: String::new(),
-        };
-
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc
-            .expect_consume_since()
-            .times(2)
-            .returning(move |_| Ok(futures::stream::iter(vec![Ok(proto.clone())]).boxed()));
-        let mut document_storage = MockStorage::new();
-        document_storage
-            .expect_find_document_by_checksum()
-            .times(2)
-            .returning(|_| Ok(None));
-
-        // No `expect_embed_passages()`: embedding panics.
-        let mut embedder = MockEmbedder::new();
-        embedder.expect_load().times(2).returning(|| Ok(()));
-        embedder.expect_model().return_const("e5.onnx".to_string());
-
-        let cached = Arc::new(
-            FakeCachedEmbeddings::new()
-                .for_metadata(&metadata, "e5.onnx")
-                .build(),
-        );
-        let mut sequence = mockall::Sequence::new();
-        let mut cache = MockEmbeddingCache::new();
-        let entry = cached.clone();
-        cache
-            .expect_get()
-            .withf(move |id| *id == document_id)
-            .times(2)
-            .returning(move |_| Some(entry.clone()));
-        let mut indexer_storage = MockStorage::new();
-        let expected = cached.embeddings.clone();
-        indexer_storage
-            .expect_save_document()
-            .withf(move |document, embeddings| {
-                document.id() == document_id && *embeddings == expected
-            })
-            .times(1)
-            .in_sequence(&mut sequence)
-            .returning(
-                |_, _| Err(ErrorKind::InvalidChangelogEvent("disk full".to_string()).into()),
-            );
-        let expected = cached.embeddings.clone();
-        indexer_storage
-            .expect_save_document()
-            .withf(move |_, embeddings| *embeddings == expected)
-            .times(1)
-            .in_sequence(&mut sequence)
-            .returning(|_, _| Ok(()));
-        cache
-            .expect_remove()
-            .withf(move |id| *id == document_id)
-            .times(1)
-            .in_sequence(&mut sequence)
-            .return_const(());
-
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
-        cursor_storage
-            .expect_is_applied()
-            .times(2)
-            .returning(|_| Ok(false));
-        cursor_storage
-            .expect_mark_applied()
-            .times(1)
-            .in_sequence(&mut sequence)
-            .returning(|_| Ok(()));
-        cursor_storage
-            .expect_save_cursor()
-            .withf(move |id| *id == event_id)
-            .times(1)
-            .in_sequence(&mut sequence)
-            .returning(|_| Ok(()));
-
-        let client = ChangelogClient::new(
-            mock_grpc,
-            document_storage,
-            Arc::new(DocumentIndexer::new(
-                indexer_storage,
-                Arc::new(embedder),
-                Arc::new(cache),
-            )),
-            MockScriptStorage::new(),
-            MockSessionStorage::new(),
-            cursor_storage,
-            reachable_server_state(),
-            fake_secrets(),
-        );
-
-        let err = client.consume_once(&mut |_| {}).await.unwrap_err();
-        assert!(err.to_string().contains("disk full"), "{err}");
 
         client.consume_once(&mut |_| {}).await.unwrap();
     }
@@ -994,18 +840,10 @@ mod tests {
             .times(1)
             .returning(|_| Ok(()));
 
-        // Still told, so it drops the embeddings this upload cached.
-        let mut indexer = ready_indexer();
-        indexer
-            .expect_skip_document()
-            .withf(move |id| *id == document_id)
-            .times(1)
-            .return_const(());
-
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
-            Arc::new(indexer),
+            idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1039,7 +877,7 @@ mod tests {
         document_storage
             .expect_find_document_by_checksum()
             .returning(|_| Ok(None));
-        let mut indexer = ready_indexer();
+        let mut indexer = MockIndexer::new();
         indexer.expect_save_document().returning(|_| Ok(()));
 
         let mut cursor_storage = MockCursorStorage::new();
@@ -1335,8 +1173,6 @@ mod tests {
             .boxed())
         });
 
-        // No `expect_prepare()`: a deletion embeds nothing, so it doesn't
-        // wait for the indexing model.
         let mut indexer = MockIndexer::new();
         indexer
             .expect_delete_document()
@@ -1446,7 +1282,7 @@ mod tests {
         });
 
         let document_storage = MockStorage::new();
-        let mut indexer = ready_indexer();
+        let mut indexer = MockIndexer::new();
         indexer
             .expect_update_metadata()
             .withf(move |id, _metadata| *id == document_id)
@@ -1525,7 +1361,7 @@ mod tests {
         let client = ChangelogClient::new(
             mock_grpc,
             document_storage,
-            Arc::new(ready_indexer()),
+            idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
             cursor_storage,
@@ -1563,7 +1399,7 @@ mod tests {
         document_storage
             .expect_find_document_by_checksum()
             .returning(|_| Ok(None));
-        let mut indexer = ready_indexer();
+        let mut indexer = MockIndexer::new();
         indexer.expect_save_document().returning(|_| Ok(()));
 
         let mut cursor_storage = MockCursorStorage::new();
@@ -1613,7 +1449,7 @@ mod tests {
         document_storage
             .expect_find_document_by_checksum()
             .returning(|_| Ok(None));
-        let mut indexer = ready_indexer();
+        let mut indexer = MockIndexer::new();
         indexer.expect_save_document().returning(|_| Ok(()));
 
         let mut cursor_storage = MockCursorStorage::new();
@@ -2113,77 +1949,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_prepares_the_indexing_model_once_per_pass_before_the_first_document() {
-        let (first_id, second_id) = (Uuid::now_v7(), Uuid::now_v7());
-        let first = proto_event_with_type(first_id, Uuid::now_v7(), EventType::UpdateMetadata);
-        let second = ProtoChangelogEvent {
-            previous_id: first_id.to_string(),
-            ..proto_event(second_id, Uuid::now_v7())
-        };
-
-        let mut sequence = mockall::Sequence::new();
+    async fn consume_leaves_the_cursor_before_a_document_that_fails_to_cache() {
+        let event_id = Uuid::now_v7();
         let mut indexer = MockIndexer::new();
-        indexer
-            .expect_prepare()
-            .times(1)
-            .in_sequence(&mut sequence)
-            .returning(|| Ok(()));
-        indexer
-            .expect_update_metadata()
-            .times(1)
-            .in_sequence(&mut sequence)
-            .returning(|_, _| Ok(()));
         indexer
             .expect_save_document()
             .times(1)
-            .in_sequence(&mut sequence)
-            .returning(|_| Ok(()));
-
-        let mut mock_grpc = MockFydeClient::new();
-        mock_grpc.expect_consume_since().returning(move |_| {
-            Ok(futures::stream::iter(vec![Ok(first.clone()), Ok(second.clone())]).boxed())
-        });
-        let mut document_storage = MockStorage::new();
-        document_storage
-            .expect_find_document_by_checksum()
-            .returning(|_| Ok(None));
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
-        cursor_storage.expect_is_applied().returning(|_| Ok(false));
-        cursor_storage
-            .expect_mark_applied()
-            .times(2)
-            .returning(|_| Ok(()));
-        cursor_storage
-            .expect_save_cursor()
-            .times(2)
-            .returning(|_| Ok(()));
-        let client = ChangelogClient::new(
-            mock_grpc,
-            document_storage,
-            Arc::new(indexer),
-            MockScriptStorage::new(),
-            MockSessionStorage::new(),
-            cursor_storage,
-            reachable_server_state(),
-            fake_secrets(),
-        );
-
-        client.consume_once(&mut |_| {}).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn consume_applies_no_document_until_the_indexing_model_is_available() {
-        let event_id = Uuid::now_v7();
-        // No `save_document`: the mock panics if the document is cached
-        // without its embeddings.
-        let mut indexer = MockIndexer::new();
-        indexer
-            .expect_prepare()
-            .times(1)
-            .returning(|| Err(ErrorKind::ModelDownloadStatus(503).into()));
+            .returning(|_| Err(ErrorKind::InvalidChangelogEvent("disk full".to_string()).into()));
         let client = client_applying_nothing(vec![proto_event(event_id, Uuid::now_v7())], indexer);
 
         let mut called_back = false;
@@ -2192,28 +1964,6 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(err.code(), crate::ErrorCode::ModelDownloadFailed);
-        assert!(err.to_string().contains(&event_id.to_string()), "{err}");
-        assert!(!called_back);
-    }
-
-    #[tokio::test]
-    async fn consume_leaves_the_cursor_before_a_document_that_fails_to_index() {
-        let event_id = Uuid::now_v7();
-        let mut indexer = ready_indexer();
-        indexer
-            .expect_save_document()
-            .times(1)
-            .returning(|_| Err(ErrorKind::InvalidModel("boom".to_string()).into()));
-        let client = client_applying_nothing(vec![proto_event(event_id, Uuid::now_v7())], indexer);
-
-        let mut called_back = false;
-        let err = client
-            .consume_once(&mut |_| called_back = true)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.code(), crate::ErrorCode::ModelLoadFailed);
         assert!(
             err.to_string()
                 .contains(&format!("failed to apply changelog event {event_id}")),
@@ -2223,12 +1973,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_leaves_the_cursor_before_a_metadata_update_that_fails_to_index() {
-        let mut indexer = ready_indexer();
-        indexer
-            .expect_update_metadata()
-            .times(1)
-            .returning(|_, _| Err(ErrorKind::InvalidModel("boom".to_string()).into()));
+    async fn consume_leaves_the_cursor_before_a_metadata_update_that_fails_to_cache() {
+        let mut indexer = MockIndexer::new();
+        indexer.expect_update_metadata().times(1).returning(|_, _| {
+            Err(ErrorKind::InvalidChangelogEvent("disk full".to_string()).into())
+        });
         let client = client_applying_nothing(
             vec![proto_event_with_type(
                 Uuid::now_v7(),
@@ -2240,7 +1989,7 @@ mod tests {
 
         let err = client.consume_once(&mut |_| {}).await.unwrap_err();
 
-        assert_eq!(err.code(), crate::ErrorCode::ModelLoadFailed);
+        assert!(err.to_string().contains("disk full"), "{err}");
     }
 
     /// Runs `consume_once` on `client` `passes` times, each expected to
@@ -2276,10 +2025,10 @@ mod tests {
     #[tokio::test]
     async fn consume_reports_an_event_failing_pass_after_pass_as_blocking_sync() {
         let event_id = Uuid::now_v7();
-        let mut indexer = ready_indexer();
+        let mut indexer = MockIndexer::new();
         indexer
             .expect_save_document()
-            .returning(|_| Err(ErrorKind::InvalidModel("boom".to_string()).into()));
+            .returning(|_| Err(ErrorKind::InvalidChangelogEvent("disk full".to_string()).into()));
         let client = client_applying_nothing(vec![proto_event(event_id, Uuid::now_v7())], indexer);
 
         let logs = failing_passes_logs(&client, POISON_PILL_PASSES - 1).await;
@@ -2297,19 +2046,19 @@ mod tests {
     #[tokio::test]
     async fn consume_counts_failing_passes_afresh_for_another_event() {
         let (first_id, second_id) = (Uuid::now_v7(), Uuid::now_v7());
-        let mut indexer = ready_indexer();
+        let mut indexer = MockIndexer::new();
         indexer
             .expect_save_document()
-            .returning(|_| Err(ErrorKind::InvalidModel("boom".to_string()).into()));
+            .returning(|_| Err(ErrorKind::InvalidChangelogEvent("disk full".to_string()).into()));
         let first = client_applying_nothing(vec![proto_event(first_id, Uuid::now_v7())], indexer);
         let logs = failing_passes_logs(&first, POISON_PILL_PASSES - 1).await;
         assert_eq!(logs, Vec::<String>::new());
 
         // The same client state, now failing on another event.
-        let mut indexer = ready_indexer();
+        let mut indexer = MockIndexer::new();
         indexer
             .expect_save_document()
-            .returning(|_| Err(ErrorKind::InvalidModel("boom".to_string()).into()));
+            .returning(|_| Err(ErrorKind::InvalidChangelogEvent("disk full".to_string()).into()));
         let second = client_applying_nothing(vec![proto_event(second_id, Uuid::now_v7())], indexer);
         *second.failure_streak.lock().unwrap() = first.failure_streak.lock().unwrap().clone();
         let logs = failing_passes_logs(&second, 1).await;
@@ -2330,21 +2079,6 @@ mod tests {
 
         client.consume_once(&mut |_| {}).await.unwrap();
 
-        assert_eq!(*client.failure_streak.lock().unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn consume_does_not_count_an_unavailable_model_against_the_event() {
-        let mut indexer = MockIndexer::new();
-        indexer
-            .expect_prepare()
-            .returning(|| Err(ErrorKind::ModelDownloadStatus(503).into()));
-        let client =
-            client_applying_nothing(vec![proto_event(Uuid::now_v7(), Uuid::now_v7())], indexer);
-
-        let logs = failing_passes_logs(&client, POISON_PILL_PASSES + 1).await;
-
-        assert_eq!(logs, Vec::<String>::new());
         assert_eq!(*client.failure_streak.lock().unwrap(), None);
     }
 }

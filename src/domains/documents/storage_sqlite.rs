@@ -1,18 +1,17 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use futures::TryStreamExt as _;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tracing::Instrument as _;
 use uuid::Uuid;
 
-use crate::{ErrorContext as _, ErrorKind, Result};
+use crate::{ErrorContext as _, Result};
 
 use super::storage::{FacetField, Storage};
 use super::{
-    Attribute, Category, Document, DocumentEmbeddings, DocumentType, FacetCount, Metadata,
-    SearchFilters, SearchOrder, Subcategory,
+    Attribute, Category, Document, DocumentType, FacetCount, Metadata, SearchFilters, SearchOrder,
+    Subcategory,
 };
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
@@ -29,17 +28,7 @@ impl SqliteStorage {
 
 #[async_trait]
 impl Storage for SqliteStorage {
-    async fn save_document(
-        &self,
-        document: &Document,
-        embeddings: &DocumentEmbeddings,
-    ) -> Result<()> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .with_context(|| format!("failed to start saving document {}", document.id))?;
-
+    async fn save_document(&self, document: &Document) -> Result<()> {
         sqlx::query(
             "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, attributes)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -58,15 +47,11 @@ impl Storage for SqliteStorage {
             document.metadata.subcategory,
         ))
         .bind(attributes_to_column(&document.metadata.attributes)?)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await
         .with_context(|| format!("failed to save document {} to local database", document.id))?;
 
-        insert_embeddings(&mut tx, document.id, embeddings).await?;
-
-        tx.commit()
-            .await
-            .with_context(|| format!("failed to commit saving document {}", document.id))
+        Ok(())
     }
 
     async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
@@ -234,152 +219,7 @@ impl Storage for SqliteStorage {
         Ok(earliest.zip(latest))
     }
 
-    async fn rank_by_terms(
-        &self,
-        terms: &[String],
-        filters: &SearchFilters,
-        limit: usize,
-    ) -> Result<Vec<Uuid>> {
-        let mut query = QueryBuilder::<Sqlite>::new("SELECT d.id");
-        push_matching(&mut query, terms, filters);
-        query
-            .push(" ORDER BY ")
-            .push(FTS_RANK)
-            .push(", d.created_at DESC, d.id DESC LIMIT ")
-            .push_bind(limit as i64);
-
-        let rows = query
-            .build()
-            .fetch_all(&self.pool)
-            .await
-            .context("failed to rank documents by their terms")?;
-
-        rows.iter()
-            .map(|row| id_from_column(row.get("id")))
-            .collect()
-    }
-
-    async fn rank_by_similarity(
-        &self,
-        query: &[f32],
-        model: &str,
-        filters: &SearchFilters,
-        limit: usize,
-    ) -> Result<Vec<(Uuid, f32)>> {
-        let query_norm = norm(query);
-        let mut sql = QueryBuilder::<Sqlite>::new(
-            "SELECT e.document_id AS id, e.vector FROM document_embeddings e WHERE e.model = ",
-        );
-        sql.push_bind(model)
-            .push(" AND e.document_id IN (SELECT d.id");
-        push_matching(&mut sql, &[], filters);
-        sql.push(")");
-
-        // Streamed: every chunk vector of every document is read, so they're
-        // never all held in memory at once.
-        let mut best = HashMap::<String, f32>::new();
-        let mut rows = sql.build().fetch(&self.pool);
-        while let Some(row) = rows
-            .try_next()
-            .await
-            .context("failed to read document embeddings")?
-        {
-            let id: String = row.get("id");
-            let vector: &[u8] = row.get("vector");
-            let Some(similarity) = cosine(query, query_norm, vector)
-                .with_context(|| format!("invalid embedding of document {id}"))?
-            else {
-                continue;
-            };
-            best.entry(id)
-                .and_modify(|best| *best = best.max(similarity))
-                .or_insert(similarity);
-        }
-
-        let mut ranked = best
-            .into_iter()
-            .map(|(id, similarity)| Ok((id_from_column(id)?, similarity)))
-            .collect::<Result<Vec<_>>>()?;
-        ranked.sort_by(|(a_id, a), (b_id, b)| b.total_cmp(a).then(a_id.cmp(b_id)));
-        ranked.truncate(limit);
-        Ok(ranked)
-    }
-
-    async fn get_metadatas(&self, ids: &[Uuid]) -> Result<Vec<Metadata>> {
-        let rows = sqlx::query(
-            "SELECT id, name, original_name, content_type, length(content) AS size, checksum, created_at, transcript, type, category, subcategory, attributes FROM documents
-             WHERE id IN (SELECT value FROM json_each(?1))",
-        )
-        .bind(ids_to_json(ids)?)
-        .fetch_all(&self.pool)
-        .await
-        .with_context(|| format!("failed to fetch the metadata of {} documents", ids.len()))?;
-
-        rows.iter().map(metadata_from_row).collect()
-    }
-
-    async fn count_documents_among(
-        &self,
-        ids: &[Uuid],
-        field: FacetField,
-    ) -> Result<Vec<FacetCount<String>>> {
-        let column = facet_column(field, "");
-        let mut query = QueryBuilder::<Sqlite>::new(format!(
-            "SELECT {column} AS value, COUNT(*) AS count FROM documents
-             WHERE id IN (SELECT value FROM json_each("
-        ));
-        query.push_bind(ids_to_json(ids)?).push(format!(
-            ")) AND {column} IS NOT NULL AND {column} != ''
-             GROUP BY {column} ORDER BY count DESC, value ASC"
-        ));
-        let rows = query
-            .build()
-            .fetch_all(&self.pool)
-            .await
-            .with_context(|| format!("failed to count listed documents by {field:?}"))?;
-
-        Ok(rows.iter().map(facet_count_from_row).collect())
-    }
-
-    async fn created_at_range_among(&self, ids: &[Uuid]) -> Result<Option<(i64, i64)>> {
-        let row = sqlx::query(
-            "SELECT MIN(created_at) AS earliest, MAX(created_at) AS latest FROM documents
-             WHERE id IN (SELECT value FROM json_each(?1))",
-        )
-        .bind(ids_to_json(ids)?)
-        .fetch_one(&self.pool)
-        .await
-        .context("failed to find the creation date range of listed documents")?;
-
-        let earliest: Option<i64> = row.get("earliest");
-        let latest: Option<i64> = row.get("latest");
-        Ok(earliest.zip(latest))
-    }
-
-    async fn get_metadata(&self, id: Uuid) -> Result<Option<Metadata>> {
-        let row = sqlx::query(
-            "SELECT id, name, original_name, content_type, length(content) AS size, checksum, created_at, transcript, type, category, subcategory, attributes FROM documents WHERE id = ?1",
-        )
-        .bind(id.to_string())
-        .fetch_optional(&self.pool)
-        .await
-        .with_context(|| format!("failed to fetch document {id} metadata from local database"))?;
-
-        row.as_ref().map(metadata_from_row).transpose()
-    }
-
-    async fn update_metadata(
-        &self,
-        id: Uuid,
-        metadata: &Metadata,
-        embeddings: Option<DocumentEmbeddings>,
-    ) -> Result<()> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .with_context(|| format!("failed to start updating document {id} metadata"))?;
-
+    async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()> {
         sqlx::query(
             "UPDATE documents
              SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6, type = ?7, category = ?8, subcategory = ?9, attributes = ?10
@@ -398,27 +238,15 @@ impl Storage for SqliteStorage {
         ))
         .bind(attributes_to_column(&metadata.attributes)?)
         .bind(id.to_string())
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await
         .with_context(|| format!("failed to update document {id} metadata in local database"))?;
 
-        if let Some(embeddings) = embeddings {
-            sqlx::query("DELETE FROM document_embeddings WHERE document_id = ?1")
-                .bind(id.to_string())
-                .execute(&mut *tx)
-                .await
-                .with_context(|| format!("failed to delete document {id}'s previous embeddings"))?;
-            insert_embeddings(&mut tx, id, &embeddings).await?;
-        }
-
-        tx.commit()
-            .await
-            .with_context(|| format!("failed to commit updating document {id} metadata"))
+        Ok(())
     }
 
     async fn delete_document(&self, id: Uuid) -> Result<()> {
-        // Its embeddings cascade, and the `documents_fts` triggers drop it
-        // from the full-text index.
+        // The `documents_fts` triggers drop it from the full-text index.
         sqlx::query("DELETE FROM documents WHERE id = ?1")
             .bind(id.to_string())
             .execute(&self.pool)
@@ -427,32 +255,6 @@ impl Storage for SqliteStorage {
 
         Ok(())
     }
-}
-
-/// Inserts `embeddings` as the embeddings of the document `id`, chunks
-/// numbered in order.
-async fn insert_embeddings(
-    tx: &mut sqlx::Transaction<'_, Sqlite>,
-    id: Uuid,
-    embeddings: &DocumentEmbeddings,
-) -> Result<()> {
-    for (chunk, embedding) in embeddings.chunks.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO document_embeddings (document_id, chunk, start, \"end\", model, vector)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )
-        .bind(id.to_string())
-        .bind(chunk as i64)
-        .bind(embedding.range.start as i64)
-        .bind(embedding.range.end as i64)
-        .bind(&embeddings.model)
-        .bind(vector_to_column(&embedding.vector))
-        .execute(&mut **tx)
-        .await
-        .with_context(|| format!("failed to save embedding {chunk} of document {id}"))?;
-    }
-
-    Ok(())
 }
 
 /// The column holding `field`, its table aliased as `alias` (`"d."`, or
@@ -472,63 +274,6 @@ fn facet_count_from_row(row: &SqliteRow) -> FacetCount<String> {
         value: row.get("value"),
         count: row.get::<i64, _>("count") as u64,
     }
-}
-
-fn id_from_column(id: String) -> Result<Uuid> {
-    Uuid::parse_str(&id).with_context(|| format!("invalid document id in local database: {id}"))
-}
-
-/// `ids` as a JSON array of their `id` columns, for `json_each`: binding one
-/// array rather than one parameter per id keeps under SQLite's limit.
-fn ids_to_json(ids: &[Uuid]) -> Result<String> {
-    serde_json::to_string(&ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
-        .context("failed to encode document ids as json")
-}
-
-fn norm(vector: &[f32]) -> f32 {
-    vector.iter().map(|value| value * value).sum::<f32>().sqrt()
-}
-
-/// The cosine similarity of `query` (whose length is `query_norm`) and the
-/// vector stored as `column` (see [`vector_to_column`]), or `None` when
-/// either is zero, pointing nowhere.
-fn cosine(query: &[f32], query_norm: f32, column: &[u8]) -> Result<Option<f32>> {
-    let (values, rest) = column.as_chunks::<4>();
-    if values.len() != query.len() || !rest.is_empty() {
-        return Err(ErrorKind::InvalidModel(format!(
-            "a {}-byte embedding can't be compared to a {}-dimension query",
-            column.len(),
-            query.len()
-        ))
-        .into());
-    }
-
-    let (mut dot, mut squares) = (0.0_f32, 0.0_f32);
-    for (bytes, q) in values.iter().zip(query) {
-        let value = f32::from_le_bytes(*bytes);
-        dot += value * q;
-        squares += value * value;
-    }
-    let norms = squares.sqrt() * query_norm;
-    Ok((norms > 0.0).then(|| dot / norms))
-}
-
-/// A vector as its `vector` column: each value as a little-endian f32.
-fn vector_to_column(vector: &[f32]) -> Vec<u8> {
-    vector
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect()
-}
-
-#[cfg(test)]
-fn vector_from_column(column: &[u8]) -> Vec<f32> {
-    column
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|bytes| f32::from_le_bytes(*bytes))
-        .collect()
 }
 
 /// The `category` column has no NULL state (`NOT NULL DEFAULT ''`),
@@ -707,11 +452,10 @@ fn push_matching(query: &mut QueryBuilder<Sqlite>, terms: &[String], filters: &S
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use super::super::models::{FakeChunkEmbedding, FakeDocumentEmbeddings};
-    use super::super::{ChunkEmbedding, FakeDocument, FakeMetadata};
+    use super::super::{FakeDocument, FakeMetadata};
     use super::*;
 
     async fn setup() -> SqliteStorage {
@@ -728,131 +472,18 @@ pub(super) mod tests {
         SqliteStorage::new(pool)
     }
 
-    fn embeddings() -> DocumentEmbeddings {
-        FakeDocumentEmbeddings::new().build()
-    }
-
-    /// The embeddings stored for the document `id`, in chunk order, each
-    /// with the model stored beside it.
-    pub(in super::super) async fn stored_embeddings(
-        storage: &SqliteStorage,
-        id: Uuid,
-    ) -> Vec<(String, ChunkEmbedding)> {
-        let rows: Vec<(i64, i64, i64, String, Vec<u8>)> = sqlx::query_as(
-            "SELECT chunk, start, \"end\", model, vector FROM document_embeddings
-             WHERE document_id = ?1 ORDER BY chunk",
-        )
-        .bind(id.to_string())
-        .fetch_all(&storage.pool)
-        .await
-        .unwrap();
-
-        rows.into_iter()
-            .enumerate()
-            .map(|(i, (chunk, start, end, model, vector))| {
-                assert_eq!(chunk, i as i64, "chunks are numbered in order from 0");
-                let chunk = FakeChunkEmbedding::new()
-                    .with_range(start as usize..end as usize)
-                    .with_vector(vector_from_column(&vector))
-                    .build();
-                (model, chunk)
-            })
-            .collect()
-    }
-
-    fn with_model(embeddings: &DocumentEmbeddings) -> Vec<(String, ChunkEmbedding)> {
-        embeddings
-            .chunks
-            .iter()
-            .map(|chunk| (embeddings.model.clone(), chunk.clone()))
-            .collect()
-    }
-
-    /// Makes every insert into `document_embeddings` fail.
-    async fn fail_embedding_inserts(storage: &SqliteStorage) {
-        sqlx::query(
-            "CREATE TRIGGER fail_embedding_inserts BEFORE INSERT ON document_embeddings
-             BEGIN SELECT RAISE(ABORT, 'embedding insert refused'); END",
-        )
-        .execute(&storage.pool)
-        .await
-        .unwrap();
-    }
-
     #[tokio::test]
-    async fn save_document_saves_its_embeddings_with_it() {
-        let storage = setup().await;
-        let document = FakeDocument::new().build();
-        let embeddings = FakeDocumentEmbeddings::new()
-            .with_chunks(vec![
-                FakeChunkEmbedding::new().with_range(0..120).build(),
-                FakeChunkEmbedding::new().with_range(122..980).build(),
-            ])
-            .build();
-
-        storage.save_document(&document, &embeddings).await.unwrap();
-
-        assert!(storage.get_document(document.id).await.unwrap().is_some());
-        assert_eq!(
-            stored_embeddings(&storage, document.id).await,
-            with_model(&embeddings)
-        );
-    }
-
-    #[tokio::test]
-    async fn save_document_with_no_chunks_saves_the_document_alone() {
-        let storage = setup().await;
-        let document = FakeDocument::new().build();
-        let embeddings = FakeDocumentEmbeddings::new()
-            .with_chunks(Vec::new())
-            .build();
-
-        storage.save_document(&document, &embeddings).await.unwrap();
-
-        assert!(storage.get_document(document.id).await.unwrap().is_some());
-        assert!(stored_embeddings(&storage, document.id).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn save_document_saves_nothing_when_an_embedding_cant_be_saved() {
-        let storage = setup().await;
-        fail_embedding_inserts(&storage).await;
-        let document = FakeDocument::new().build();
-
-        let err = storage
-            .save_document(&document, &embeddings())
-            .await
-            .unwrap_err();
-
-        assert!(err.has_context());
-        assert_eq!(storage.get_document(document.id).await.unwrap(), None);
-        assert!(stored_embeddings(&storage, document.id).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn delete_document_deletes_only_that_document_with_its_embeddings() {
+    async fn delete_document_deletes_only_that_document() {
         let storage = setup().await;
         let document = FakeDocument::new().build();
         let other = FakeDocument::new().build();
-        let other_embeddings = embeddings();
-        storage
-            .save_document(&document, &embeddings())
-            .await
-            .unwrap();
-        storage
-            .save_document(&other, &other_embeddings)
-            .await
-            .unwrap();
+        storage.save_document(&document).await.unwrap();
+        storage.save_document(&other).await.unwrap();
 
         storage.delete_document(document.id).await.unwrap();
 
         assert_eq!(storage.get_document(document.id).await.unwrap(), None);
-        assert!(stored_embeddings(&storage, document.id).await.is_empty());
         assert!(storage.get_document(other.id).await.unwrap().is_some());
-        assert_eq!(
-            stored_embeddings(&storage, other.id).await,
-            with_model(&other_embeddings)
-        );
     }
 
     #[tokio::test]
@@ -888,140 +519,12 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn get_metadata_returns_a_saved_documents_metadata_without_its_content() {
-        let storage = setup().await;
-        let document = FakeDocument::new().with_content(b"12345".to_vec()).build();
-        storage
-            .save_document(&document, &embeddings())
-            .await
-            .unwrap();
-
-        let metadata = storage.get_metadata(document.id).await.unwrap();
-
-        let expected = Metadata {
-            size: 5,
-            ..document.metadata
-        };
-        assert_eq!(metadata, Some(expected));
-    }
-
-    #[tokio::test]
-    async fn get_metadata_returns_none_when_missing() {
-        let storage = setup().await;
-
-        assert_eq!(storage.get_metadata(Uuid::now_v7()).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn update_metadata_replaces_the_embeddings_when_given_some() {
-        let storage = setup().await;
-        let document = FakeDocument::new().build();
-        storage
-            .save_document(&document, &embeddings())
-            .await
-            .unwrap();
-        let metadata = FakeMetadata::new().with_id(document.id).build();
-        let replacement = FakeDocumentEmbeddings::new()
-            .with_chunks(vec![FakeChunkEmbedding::new().build()])
-            .build();
-
-        storage
-            .update_metadata(document.id, &metadata, Some(replacement.clone()))
-            .await
-            .unwrap();
-
-        let saved = storage.get_metadata(document.id).await.unwrap().unwrap();
-        assert_eq!(saved.name, metadata.name);
-        assert_eq!(
-            stored_embeddings(&storage, document.id).await,
-            with_model(&replacement)
-        );
-    }
-
-    #[tokio::test]
-    async fn update_metadata_can_replace_the_embeddings_with_none_at_all() {
-        let storage = setup().await;
-        let document = FakeDocument::new().build();
-        storage
-            .save_document(&document, &embeddings())
-            .await
-            .unwrap();
-        let empty = FakeDocumentEmbeddings::new()
-            .with_chunks(Vec::new())
-            .build();
-
-        storage
-            .update_metadata(document.id, &document.metadata, Some(empty))
-            .await
-            .unwrap();
-
-        assert!(stored_embeddings(&storage, document.id).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn update_metadata_keeps_the_embeddings_when_given_none() {
-        let storage = setup().await;
-        let document = FakeDocument::new().build();
-        let embeddings = embeddings();
-        storage.save_document(&document, &embeddings).await.unwrap();
-        let metadata = FakeMetadata::new().with_id(document.id).build();
-
-        storage
-            .update_metadata(document.id, &metadata, None)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            stored_embeddings(&storage, document.id).await,
-            with_model(&embeddings)
-        );
-    }
-
-    #[tokio::test]
-    async fn update_metadata_changes_nothing_when_the_new_embeddings_cant_be_saved() {
-        let storage = setup().await;
-        let document = FakeDocument::new().build();
-        let embeddings = embeddings();
-        storage.save_document(&document, &embeddings).await.unwrap();
-        fail_embedding_inserts(&storage).await;
-        let metadata = FakeMetadata::new().with_id(document.id).build();
-
-        let err = storage
-            .update_metadata(document.id, &metadata, Some(self::embeddings()))
-            .await
-            .unwrap_err();
-
-        assert!(err.has_context());
-        let saved = storage.get_metadata(document.id).await.unwrap().unwrap();
-        assert_eq!(saved.name, document.metadata.name);
-        assert_eq!(
-            stored_embeddings(&storage, document.id).await,
-            with_model(&embeddings)
-        );
-    }
-
-    #[test]
-    fn vectors_are_stored_as_little_endian_f32() {
-        assert_eq!(
-            vector_to_column(&[1.0, -2.5]),
-            [0, 0, 0x80, 0x3f, 0, 0, 0x20, 0xc0]
-        );
-
-        let vector = FakeChunkEmbedding::new().build().vector;
-        assert_eq!(vector_to_column(&vector).len(), 4 * vector.len());
-        assert_eq!(vector_from_column(&vector_to_column(&vector)), vector);
-    }
-
-    #[tokio::test]
     async fn find_document_by_checksum_returns_the_id_of_a_document_with_that_checksum() {
         let storage = setup().await;
         let document = FakeDocument::new()
             .with_metadata(FakeMetadata::new().with_checksum("cafebabe").build())
             .build();
-        storage
-            .save_document(&document, &embeddings())
-            .await
-            .unwrap();
+        storage.save_document(&document).await.unwrap();
 
         let found = storage.find_document_by_checksum("cafebabe").await.unwrap();
 
@@ -1034,10 +537,7 @@ pub(super) mod tests {
         let document = FakeDocument::new()
             .with_metadata(FakeMetadata::new().with_checksum("cafebabe").build())
             .build();
-        storage
-            .save_document(&document, &embeddings())
-            .await
-            .unwrap();
+        storage.save_document(&document).await.unwrap();
 
         let found = storage.find_document_by_checksum("deadbeef").await.unwrap();
 
@@ -1059,27 +559,24 @@ pub(super) mod tests {
         let id = Uuid::now_v7();
 
         storage
-            .save_document(
-                &Document {
+            .save_document(&Document {
+                id,
+                content: b"hello".to_vec(),
+                metadata: Metadata {
                     id,
-                    content: b"hello".to_vec(),
-                    metadata: Metadata {
-                        id,
-                        name: "report.pdf".to_string(),
-                        original_name: "report.pdf".to_string(),
-                        content_type: "application/pdf".to_string(),
-                        created_at: 1_700_000_000,
-                        size: 5,
-                        checksum: "deadbeef".to_string(),
-                        transcript: "hello".to_string(),
-                        r#type: None,
-                        category: None,
-                        subcategory: None,
-                        attributes: BTreeMap::new(),
-                    },
+                    name: "report.pdf".to_string(),
+                    original_name: "report.pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    created_at: 1_700_000_000,
+                    size: 5,
+                    checksum: "deadbeef".to_string(),
+                    transcript: "hello".to_string(),
+                    r#type: None,
+                    category: None,
+                    subcategory: None,
+                    attributes: BTreeMap::new(),
                 },
-                &embeddings(),
-            )
+            })
             .await
             .unwrap();
 
@@ -1117,10 +614,7 @@ pub(super) mod tests {
         let document = FakeDocument::new().with_metadata(metadata).build();
         let id = document.id;
 
-        storage
-            .save_document(&document, &embeddings())
-            .await
-            .unwrap();
+        storage.save_document(&document).await.unwrap();
         let saved = storage.get_document(id).await.unwrap().unwrap();
         assert_eq!(saved.metadata.attributes, document.metadata.attributes);
 
@@ -1128,7 +622,7 @@ pub(super) mod tests {
         updated
             .attributes
             .insert("paid".to_string(), Attribute::Boolean(true));
-        storage.update_metadata(id, &updated, None).await.unwrap();
+        storage.update_metadata(id, &updated).await.unwrap();
 
         let reloaded = storage.get_document(id).await.unwrap().unwrap();
         assert_eq!(reloaded.metadata.attributes, updated.attributes);
@@ -1140,51 +634,45 @@ pub(super) mod tests {
         let (id1, id2) = (Uuid::now_v7(), Uuid::now_v7());
 
         storage
-            .save_document(
-                &Document {
+            .save_document(&Document {
+                id: id1,
+                content: b"one".to_vec(),
+                metadata: Metadata {
                     id: id1,
-                    content: b"one".to_vec(),
-                    metadata: Metadata {
-                        id: id1,
-                        name: "one.txt".to_string(),
-                        original_name: "one.txt".to_string(),
-                        content_type: "text/plain".to_string(),
-                        created_at: 1_700_000_000,
-                        size: 3,
-                        checksum: "checksum-one".to_string(),
-                        transcript: String::new(),
-                        r#type: None,
-                        category: None,
-                        subcategory: None,
-                        attributes: BTreeMap::new(),
-                    },
+                    name: "one.txt".to_string(),
+                    original_name: "one.txt".to_string(),
+                    content_type: "text/plain".to_string(),
+                    created_at: 1_700_000_000,
+                    size: 3,
+                    checksum: "checksum-one".to_string(),
+                    transcript: String::new(),
+                    r#type: None,
+                    category: None,
+                    subcategory: None,
+                    attributes: BTreeMap::new(),
                 },
-                &embeddings(),
-            )
+            })
             .await
             .unwrap();
         storage
-            .save_document(
-                &Document {
+            .save_document(&Document {
+                id: id2,
+                content: b"two".to_vec(),
+                metadata: Metadata {
                     id: id2,
-                    content: b"two".to_vec(),
-                    metadata: Metadata {
-                        id: id2,
-                        name: "two.txt".to_string(),
-                        original_name: "two.txt".to_string(),
-                        content_type: "text/plain".to_string(),
-                        created_at: 1_700_000_001,
-                        size: 3,
-                        checksum: "checksum-two".to_string(),
-                        transcript: String::new(),
-                        r#type: None,
-                        category: None,
-                        subcategory: None,
-                        attributes: BTreeMap::new(),
-                    },
+                    name: "two.txt".to_string(),
+                    original_name: "two.txt".to_string(),
+                    content_type: "text/plain".to_string(),
+                    created_at: 1_700_000_001,
+                    size: 3,
+                    checksum: "checksum-two".to_string(),
+                    transcript: String::new(),
+                    r#type: None,
+                    category: None,
+                    subcategory: None,
+                    attributes: BTreeMap::new(),
                 },
-                &embeddings(),
-            )
+            })
             .await
             .unwrap();
 
@@ -1198,27 +686,24 @@ pub(super) mod tests {
         for (i, name) in names.iter().enumerate() {
             let id = Uuid::now_v7();
             storage
-                .save_document(
-                    &Document {
+                .save_document(&Document {
+                    id,
+                    content: Vec::new(),
+                    metadata: Metadata {
                         id,
-                        content: Vec::new(),
-                        metadata: Metadata {
-                            id,
-                            name: name.to_string(),
-                            original_name: name.to_string(),
-                            content_type: "text/plain".to_string(),
-                            created_at: 1_700_000_000 + i as i64,
-                            size: 0,
-                            checksum: String::new(),
-                            transcript: String::new(),
-                            r#type: None,
-                            category: None,
-                            subcategory: None,
-                            attributes: BTreeMap::new(),
-                        },
+                        name: name.to_string(),
+                        original_name: name.to_string(),
+                        content_type: "text/plain".to_string(),
+                        created_at: 1_700_000_000 + i as i64,
+                        size: 0,
+                        checksum: String::new(),
+                        transcript: String::new(),
+                        r#type: None,
+                        category: None,
+                        subcategory: None,
+                        attributes: BTreeMap::new(),
                     },
-                    &embeddings(),
-                )
+                })
                 .await
                 .unwrap();
         }
@@ -1271,7 +756,6 @@ pub(super) mod tests {
                     .with_content(b"hello".to_vec())
                     .with_metadata(metadata)
                     .build(),
-                &embeddings(),
             )
             .await
             .unwrap();
@@ -1291,27 +775,24 @@ pub(super) mod tests {
         let storage = setup().await;
         let id = Uuid::now_v7();
         storage
-            .save_document(
-                &Document {
+            .save_document(&Document {
+                id,
+                content: b"hello".to_vec(),
+                metadata: Metadata {
                     id,
-                    content: b"hello".to_vec(),
-                    metadata: Metadata {
-                        id,
-                        name: "old.pdf".to_string(),
-                        original_name: "old.pdf".to_string(),
-                        content_type: "application/pdf".to_string(),
-                        created_at: 1_700_000_000,
-                        size: 5,
-                        checksum: "deadbeef".to_string(),
-                        transcript: "hello".to_string(),
-                        r#type: None,
-                        category: None,
-                        subcategory: None,
-                        attributes: BTreeMap::new(),
-                    },
+                    name: "old.pdf".to_string(),
+                    original_name: "old.pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    created_at: 1_700_000_000,
+                    size: 5,
+                    checksum: "deadbeef".to_string(),
+                    transcript: "hello".to_string(),
+                    r#type: None,
+                    category: None,
+                    subcategory: None,
+                    attributes: BTreeMap::new(),
                 },
-                &embeddings(),
-            )
+            })
             .await
             .unwrap();
 
@@ -1332,7 +813,6 @@ pub(super) mod tests {
                     subcategory: None,
                     attributes: BTreeMap::new(),
                 },
-                None,
             )
             .await
             .unwrap();
@@ -1363,7 +843,6 @@ pub(super) mod tests {
                     subcategory: None,
                     attributes: BTreeMap::new(),
                 },
-                None,
             )
             .await;
 
@@ -1394,7 +873,6 @@ pub(super) mod tests {
                     .with_id(metadata.id)
                     .with_metadata(metadata)
                     .build(),
-                &embeddings(),
             )
             .await
             .unwrap();
@@ -1733,7 +1211,6 @@ pub(super) mod tests {
                     .with_id(id)
                     .with_metadata(metadata.clone())
                     .build(),
-                &embeddings(),
             )
             .await
             .unwrap();
@@ -1745,7 +1222,6 @@ pub(super) mod tests {
                     name: "after".to_string(),
                     ..metadata
                 },
-                None,
             )
             .await
             .unwrap();
@@ -1928,380 +1404,5 @@ pub(super) mod tests {
                 .unwrap(),
             None
         );
-    }
-
-    const MODEL: &str = "e5.onnx";
-
-    /// Saves `metadata` with one chunk per vector of `vectors`, embedded by
-    /// `model`, returning its id.
-    async fn save_embedded(
-        storage: &SqliteStorage,
-        metadata: FakeMetadata,
-        model: &str,
-        vectors: &[&[f32]],
-    ) -> Uuid {
-        let metadata = metadata.build();
-        let id = metadata.id;
-        let embeddings = FakeDocumentEmbeddings::new()
-            .with_model(model)
-            .with_chunks(
-                vectors
-                    .iter()
-                    .map(|vector| {
-                        FakeChunkEmbedding::new()
-                            .with_vector(vector.to_vec())
-                            .build()
-                    })
-                    .collect(),
-            )
-            .build();
-        storage
-            .save_document(
-                &FakeDocument::new()
-                    .with_id(id)
-                    .with_metadata(metadata)
-                    .build(),
-                &embeddings,
-            )
-            .await
-            .unwrap();
-        id
-    }
-
-    async fn similar(
-        storage: &SqliteStorage,
-        query: &[f32],
-        filters: &SearchFilters,
-        limit: usize,
-    ) -> Vec<(Uuid, f32)> {
-        storage
-            .rank_by_similarity(query, MODEL, filters, limit)
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn rank_by_similarity_scores_a_document_by_its_best_chunk() {
-        let storage = setup().await;
-        let one_good_chunk = save_embedded(
-            &storage,
-            searchable("one-good-chunk", 1),
-            MODEL,
-            &[&[0.0, 1.0], &[1.0, 0.0], &[-1.0, 0.0]],
-        )
-        .await;
-        // Unnormalized: its cosine is 0.6 whatever its length.
-        let fair = save_embedded(&storage, searchable("fair", 2), MODEL, &[&[6.0, 8.0]]).await;
-
-        let ranked = similar(&storage, &[2.0, 0.0], &SearchFilters::default(), 10).await;
-
-        assert_eq!(
-            ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            [one_good_chunk, fair]
-        );
-        assert!((ranked[0].1 - 1.0).abs() < 1e-6, "{ranked:?}");
-        assert!((ranked[1].1 - 0.6).abs() < 1e-6, "{ranked:?}");
-    }
-
-    #[tokio::test]
-    async fn rank_by_similarity_keeps_only_documents_matching_every_filter() {
-        let storage = setup().await;
-        let embedded = |metadata| save_embedded(&storage, metadata, MODEL, &[&[1.0, 0.0]]);
-        let matching = embedded(
-            searchable("match", 10)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
-                .with_type(DocumentType::Receipt),
-        )
-        .await;
-        // Each differs from "match" in exactly one filtered field.
-        embedded(
-            searchable("wrong-category", 10)
-                .with_category(Category::Money)
-                .with_subcategory(Subcategory::Banking)
-                .with_type(DocumentType::Receipt),
-        )
-        .await;
-        embedded(
-            searchable("wrong-subcategory", 10)
-                .with_category(Category::Health)
-                .with_type(DocumentType::Receipt),
-        )
-        .await;
-        embedded(
-            searchable("wrong-type", 10)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
-                .with_type(DocumentType::Statement),
-        )
-        .await;
-        embedded(
-            searchable("wrong-content-type", 10)
-                .with_content_type("text/plain")
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
-                .with_type(DocumentType::Receipt),
-        )
-        .await;
-        embedded(
-            searchable("too-old", 1)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
-                .with_type(DocumentType::Receipt),
-        )
-        .await;
-        embedded(
-            searchable("too-new", 100)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
-                .with_type(DocumentType::Receipt),
-        )
-        .await;
-        let filters = SearchFilters {
-            categories: vec![Category::Health],
-            subcategories: vec![Subcategory::Banking],
-            types: vec![DocumentType::Receipt],
-            content_types: vec!["application/pdf".to_string()],
-            created_from: Some(10),
-            created_until: Some(10),
-        };
-
-        let ranked = similar(&storage, &[1.0, 0.0], &filters, 10).await;
-
-        assert_eq!(
-            ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            [matching]
-        );
-        assert_eq!(
-            similar(&storage, &[1.0, 0.0], &SearchFilters::default(), 10)
-                .await
-                .len(),
-            7
-        );
-    }
-
-    #[tokio::test]
-    async fn rank_by_similarity_skips_documents_without_embeddings_from_the_model() {
-        let storage = setup().await;
-        let embedded = save_embedded(&storage, searchable("e5", 1), MODEL, &[&[1.0, 0.0]]).await;
-        save_embedded(
-            &storage,
-            searchable("other-model", 2),
-            "other.onnx",
-            &[&[1.0, 0.0]],
-        )
-        .await;
-        save_embedded(&storage, searchable("no-chunks", 3), MODEL, &[]).await;
-        save_embedded(
-            &storage,
-            searchable("zero-vector", 4),
-            MODEL,
-            &[&[0.0, 0.0]],
-        )
-        .await;
-
-        let ranked = similar(&storage, &[1.0, 0.0], &SearchFilters::default(), 10).await;
-
-        assert_eq!(
-            ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            [embedded]
-        );
-        assert!(
-            similar(&storage, &[0.0, 0.0], &SearchFilters::default(), 10)
-                .await
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn rank_by_similarity_returns_at_most_limit_most_similar_first_ties_by_id() {
-        let storage = setup().await;
-        let mut tied = Vec::new();
-        for name in ["a", "b", "c"] {
-            tied.push(save_embedded(&storage, searchable(name, 1), MODEL, &[&[1.0, 0.0]]).await);
-        }
-        tied.sort_unstable();
-        save_embedded(&storage, searchable("worse", 1), MODEL, &[&[0.0, 1.0]]).await;
-
-        let ranked = similar(&storage, &[1.0, 0.0], &SearchFilters::default(), 2).await;
-
-        assert_eq!(
-            ranked.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            tied[..2]
-        );
-    }
-
-    #[tokio::test]
-    async fn rank_by_similarity_fails_on_an_embedding_of_another_length() {
-        let storage = setup().await;
-        save_embedded(
-            &storage,
-            searchable("longer", 1),
-            MODEL,
-            &[&[1.0, 0.0, 0.0]],
-        )
-        .await;
-
-        let err = storage
-            .rank_by_similarity(&[1.0, 0.0], MODEL, &SearchFilters::default(), 10)
-            .await
-            .unwrap_err();
-
-        assert!(err.has_context());
-    }
-
-    #[tokio::test]
-    async fn rank_by_terms_ranks_ids_as_search_documents_does_by_relevance() {
-        let storage = setup().await;
-        // Newer, so it would come first if relevance weren't ranked.
-        save(
-            &storage,
-            searchable("in-transcript", 2).with_transcript("contains the word quittance"),
-        )
-        .await;
-        save(&storage, searchable("quittance", 1)).await;
-        save(
-            &storage,
-            searchable("quittance-health", 1).with_category(Category::Health),
-        )
-        .await;
-        save(&storage, searchable("unrelated", 3)).await;
-        let terms = ["quittance".to_string()];
-        let filters = SearchFilters::default();
-        let expected = storage
-            .search_documents(&terms, &filters, SearchOrder::Relevance, 0, 10)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|metadata| metadata.id)
-            .collect::<Vec<_>>();
-
-        let ranked = storage.rank_by_terms(&terms, &filters, 10).await.unwrap();
-        let first = storage.rank_by_terms(&terms, &filters, 1).await.unwrap();
-        let health = storage
-            .rank_by_terms(
-                &terms,
-                &SearchFilters {
-                    categories: vec![Category::Health],
-                    ..Default::default()
-                },
-                10,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(expected.len(), 3);
-        assert_eq!(ranked, expected);
-        assert_eq!(first, expected[..1]);
-        assert_eq!(health.len(), 1);
-        assert_eq!(
-            storage.get_metadata(health[0]).await.unwrap().unwrap().name,
-            "quittance-health"
-        );
-    }
-
-    #[tokio::test]
-    async fn get_metadatas_returns_the_listed_documents_skipping_unknown_ids() {
-        let storage = setup().await;
-        let listed = FakeMetadata::new().build();
-        let id = listed.id;
-        storage
-            .save_document(
-                &FakeDocument::new()
-                    .with_id(id)
-                    .with_content(vec![1, 2, 3])
-                    .with_metadata(listed.clone())
-                    .build(),
-                &embeddings(),
-            )
-            .await
-            .unwrap();
-        save(&storage, searchable("not-listed", 1)).await;
-
-        let found = storage.get_metadatas(&[Uuid::new_v4(), id]).await.unwrap();
-
-        assert_eq!(found, [Metadata { size: 3, ..listed }]);
-        assert!(storage.get_metadatas(&[]).await.unwrap().is_empty());
-    }
-
-    async fn save_ids(storage: &SqliteStorage, metadata: Vec<FakeMetadata>) -> Vec<Uuid> {
-        let mut ids = Vec::new();
-        for metadata in metadata {
-            ids.push(save_embedded(storage, metadata, MODEL, &[]).await);
-        }
-        ids
-    }
-
-    #[tokio::test]
-    async fn count_documents_among_counts_only_the_listed_documents() {
-        let storage = setup().await;
-        let ids = save_ids(
-            &storage,
-            vec![
-                searchable("a", 1)
-                    .with_category(Category::Housing)
-                    .with_subcategory(Subcategory::Banking)
-                    .with_type(DocumentType::Invoice),
-                searchable("b", 2)
-                    .with_category(Category::Money)
-                    .with_content_type("image/png"),
-                searchable("c", 3).with_category(Category::Money),
-                searchable("unclassified", 4),
-                searchable("not-listed", 5).with_category(Category::Health),
-            ],
-        )
-        .await;
-        let listed = &ids[..4];
-        let among = async |field| {
-            storage
-                .count_documents_among(listed, field)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|facet| (facet.value, facet.count))
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(
-            among(FacetField::Category).await,
-            counts(&[("money", 2), ("housing", 1)])
-        );
-        assert_eq!(
-            among(FacetField::Subcategory).await,
-            counts(&[("banking", 1)])
-        );
-        assert_eq!(among(FacetField::Type).await, counts(&[("invoice", 1)]));
-        assert_eq!(
-            among(FacetField::ContentType).await,
-            counts(&[("application/pdf", 3), ("image/png", 1)])
-        );
-        assert!(
-            storage
-                .count_documents_among(&[], FacetField::Category)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
-    async fn created_at_range_among_spans_the_listed_documents_only() {
-        let storage = setup().await;
-        let ids = save_ids(
-            &storage,
-            vec![
-                searchable("oldest", 1),
-                searchable("a", 5),
-                searchable("b", 7),
-                searchable("newest", 9),
-            ],
-        )
-        .await;
-
-        assert_eq!(
-            storage.created_at_range_among(&ids[1..3]).await.unwrap(),
-            Some((5, 7))
-        );
-        assert_eq!(storage.created_at_range_among(&[]).await.unwrap(), None);
     }
 }
