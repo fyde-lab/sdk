@@ -1,11 +1,9 @@
 //! A sub-domain of `documents` owning everything about document attributes:
-//! their typed values ([`Attribute`], with the Lua conversions scripts use
-//! in [`lua`]), the definitions those values are checked against
-//! ([`AttributeDefinition`], kept on the fyde server: the shared defaults
-//! plus each user's own), and the checks themselves.
+//! their typed values ([`Attribute`]), the definitions those values are
+//! checked against ([`AttributeDefinition`], kept on the fyde server: the
+//! shared defaults plus each user's own), and the checks themselves.
 
 mod grpc_client;
-pub(crate) mod lua;
 mod models;
 mod service;
 

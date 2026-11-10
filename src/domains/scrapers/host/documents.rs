@@ -7,7 +7,6 @@ use tokio::runtime::Handle;
 use crate::ErrorCode;
 
 use super::super::stop::StopSignal;
-use crate::domains::documents::attributes::lua::attributes_from_table;
 use crate::domains::documents::{
     Category, DocumentType, Service as DocumentsService, Subcategory, UploadRequest,
 };
@@ -21,12 +20,12 @@ use crate::domains::documents::{
 /// only extension `upload` currently accepts); it's otherwise just a hint,
 /// not the uploaded document's real identity (that's the id `upload`
 /// returns). The optional `fields` table lets a script set any of
-/// [`UploadRequest`]'s other metadata overrides up front (`name`, `type`,
-/// `category`, `subcategory`, and `attributes` —
-/// `{ price = { type = "float", value = 32.3 } }`, see
-/// `attributes_from_table`); left out, they stay empty. A document whose content is already saved locally is silently skipped,
-/// not an error, so re-running a scraper doesn't fail on what it already
-/// fetched.
+/// some of [`UploadRequest`]'s other metadata overrides up front (`name`,
+/// `type`, `category` and `subcategory`); left out, they stay empty.
+/// Scripts can't set attributes: any other key, `attributes` included, is
+/// ignored. A document whose content is already saved locally is silently
+/// skipped, not an error, so re-running a scraper doesn't fail on what it
+/// already fetched.
 pub(super) fn save_document_fn(
     lua: &Lua,
     documents: Arc<dyn DocumentsService>,
@@ -104,10 +103,6 @@ fn apply_upload_fields(request: &mut UploadRequest, fields: &Table) -> mlua::Res
     if let Some(subcategory) = fields.get::<Option<String>>("subcategory")? {
         request.subcategory =
             Some(Subcategory::from_str(&subcategory).map_err(mlua::Error::external)?);
-    }
-    if let Some(attributes) = fields.get::<Option<Table>>("attributes")? {
-        request.attributes =
-            attributes_from_table(Some(attributes)).map_err(mlua::Error::external)?;
     }
 
     Ok(())
@@ -197,11 +192,6 @@ mod tests {
                     && request.r#type == Some(crate::domains::documents::DocumentType::Payslip)
                     && request.category == Some(crate::domains::documents::Category::Work)
                     && request.subcategory == Some(crate::domains::documents::Subcategory::Payslips)
-                    && request.attributes
-                        == std::collections::BTreeMap::from([(
-                            "net_pay".to_string(),
-                            crate::domains::documents::Attribute::Float(2150.5),
-                        )])
             })
             .times(1)
             .returning(move |_| Ok(id));
@@ -224,6 +214,36 @@ mod tests {
                 type = "payslip",
                 category = "work",
                 subcategory = "payslips",
+            })"#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn save_document_ignores_attributes_set_by_the_script() {
+        let id = Uuid::now_v7();
+        let mut documents = MockDocumentsService::new();
+        documents
+            .expect_upload()
+            .withf(|request| request.attributes.is_empty())
+            .times(1)
+            .returning(move |_| Ok(id));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let lua = Lua::new();
+        let f = save_document_fn(
+            &lua,
+            Arc::new(documents),
+            "didaxis",
+            runtime.handle().clone(),
+            StopSignal::new(),
+        )
+        .unwrap();
+        lua.globals().set("save_document", f).unwrap();
+
+        lua.load(
+            r#"save_document("january.pdf", "the pdf content", {
                 attributes = { net_pay = { type = "float", value = 2150.5 } },
             })"#,
         )
