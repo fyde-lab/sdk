@@ -10,7 +10,7 @@ use crate::{Error, ErrorKind};
 
 /// The part of life a document is about — where it would be filed — rather
 /// than who issued it: a bank's tax form is [`Self::Taxes`], an internet
-/// box's invoice [`Self::Housing`].
+/// box's invoice [`Self::Telecom`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Category {
@@ -21,8 +21,13 @@ pub enum Category {
     Health,
     Work,
     Family,
+    Identity,
+    Legal,
     Transport,
+    Pets,
     Shopping,
+    Leisure,
+    Education,
     Subscriptions,
     Donations,
 }
@@ -36,8 +41,13 @@ impl Category {
         Self::Health,
         Self::Work,
         Self::Family,
+        Self::Identity,
+        Self::Legal,
         Self::Transport,
+        Self::Pets,
         Self::Shopping,
+        Self::Leisure,
+        Self::Education,
         Self::Subscriptions,
         Self::Donations,
     ];
@@ -51,8 +61,13 @@ impl Category {
             Self::Health => "health",
             Self::Work => "work",
             Self::Family => "family",
+            Self::Identity => "identity",
+            Self::Legal => "legal",
             Self::Transport => "transport",
+            Self::Pets => "pets",
             Self::Shopping => "shopping",
+            Self::Leisure => "leisure",
+            Self::Education => "education",
             Self::Subscriptions => "subscriptions",
             Self::Donations => "donations",
         }
@@ -84,102 +99,198 @@ impl FromStr for Category {
 pub enum Subcategory {
     Energy,
     Water,
-    Internet,
     HomeInsurance,
     HomeServices,
+    Rent,
+    Property,
+    Works,
     Mobile,
+    Internet,
     Banking,
     Savings,
+    Investments,
+    Loans,
     Gaming,
     IncomeTax,
     TaxCertificates,
+    PropertyTax,
+    HousingTax,
     HealthInsurance,
     ComplementaryHealth,
     Care,
+    DeathDisabilityCover,
     Payslips,
     Employment,
     HouseholdEmployer,
+    Freelance,
+    Unemployment,
+    Retirement,
     Benefits,
-    ChildcareSchool,
+    Childcare,
+    IdDocuments,
+    CivilStatus,
+    InheritanceGifts,
+    Company,
+    Justice,
     Train,
     Flight,
     Road,
     Ride,
     Travel,
+    Vehicle,
+    VehicleInsurance,
+    Veterinary,
+    PetCare,
+    PetInsurance,
+    PetSupplies,
     Online,
-    Pets,
     Groceries,
     FoodDelivery,
+    Electronics,
+    HomeEquipment,
+    Clothing,
+    Secondhand,
+    Sports,
+    Events,
+    Associations,
+    School,
+    HigherEducation,
+    Training,
     Media,
     CloudSoftware,
+    Press,
 }
 
 impl Subcategory {
     pub(crate) const ALL: &'static [Subcategory] = &[
         Self::Energy,
         Self::Water,
-        Self::Internet,
         Self::HomeInsurance,
         Self::HomeServices,
+        Self::Rent,
+        Self::Property,
+        Self::Works,
         Self::Mobile,
+        Self::Internet,
         Self::Banking,
         Self::Savings,
+        Self::Investments,
+        Self::Loans,
         Self::Gaming,
         Self::IncomeTax,
         Self::TaxCertificates,
+        Self::PropertyTax,
+        Self::HousingTax,
         Self::HealthInsurance,
         Self::ComplementaryHealth,
         Self::Care,
+        Self::DeathDisabilityCover,
         Self::Payslips,
         Self::Employment,
         Self::HouseholdEmployer,
+        Self::Freelance,
+        Self::Unemployment,
+        Self::Retirement,
         Self::Benefits,
-        Self::ChildcareSchool,
+        Self::Childcare,
+        Self::IdDocuments,
+        Self::CivilStatus,
+        Self::InheritanceGifts,
+        Self::Company,
+        Self::Justice,
         Self::Train,
         Self::Flight,
         Self::Road,
         Self::Ride,
         Self::Travel,
+        Self::Vehicle,
+        Self::VehicleInsurance,
+        Self::Veterinary,
+        Self::PetCare,
+        Self::PetInsurance,
+        Self::PetSupplies,
         Self::Online,
-        Self::Pets,
         Self::Groceries,
         Self::FoodDelivery,
+        Self::Electronics,
+        Self::HomeEquipment,
+        Self::Clothing,
+        Self::Secondhand,
+        Self::Sports,
+        Self::Events,
+        Self::Associations,
+        Self::School,
+        Self::HigherEducation,
+        Self::Training,
         Self::Media,
         Self::CloudSoftware,
+        Self::Press,
     ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Energy => "energy",
             Self::Water => "water",
-            Self::Internet => "internet",
             Self::HomeInsurance => "home_insurance",
             Self::HomeServices => "home_services",
+            Self::Rent => "rent",
+            Self::Property => "property",
+            Self::Works => "works",
             Self::Mobile => "mobile",
+            Self::Internet => "internet",
             Self::Banking => "banking",
             Self::Savings => "savings",
+            Self::Investments => "investments",
+            Self::Loans => "loans",
             Self::Gaming => "gaming",
             Self::IncomeTax => "income_tax",
             Self::TaxCertificates => "tax_certificates",
+            Self::PropertyTax => "property_tax",
+            Self::HousingTax => "housing_tax",
             Self::HealthInsurance => "health_insurance",
             Self::ComplementaryHealth => "complementary_health",
             Self::Care => "care",
+            Self::DeathDisabilityCover => "death_disability_cover",
             Self::Payslips => "payslips",
             Self::Employment => "employment",
             Self::HouseholdEmployer => "household_employer",
+            Self::Freelance => "freelance",
+            Self::Unemployment => "unemployment",
+            Self::Retirement => "retirement",
             Self::Benefits => "benefits",
-            Self::ChildcareSchool => "childcare_school",
+            Self::Childcare => "childcare",
+            Self::IdDocuments => "id_documents",
+            Self::CivilStatus => "civil_status",
+            Self::InheritanceGifts => "inheritance_gifts",
+            Self::Company => "company",
+            Self::Justice => "justice",
             Self::Train => "train",
             Self::Flight => "flight",
             Self::Road => "road",
             Self::Ride => "ride",
             Self::Travel => "travel",
+            Self::Vehicle => "vehicle",
+            Self::VehicleInsurance => "vehicle_insurance",
+            Self::Veterinary => "veterinary",
+            Self::PetCare => "pet_care",
+            Self::PetInsurance => "pet_insurance",
+            Self::PetSupplies => "pet_supplies",
             Self::Online => "online",
-            Self::Pets => "pets",
             Self::Groceries => "groceries",
             Self::FoodDelivery => "food_delivery",
+            Self::Electronics => "electronics",
+            Self::HomeEquipment => "home_equipment",
+            Self::Clothing => "clothing",
+            Self::Secondhand => "secondhand",
+            Self::Sports => "sports",
+            Self::Events => "events",
+            Self::Associations => "associations",
+            Self::School => "school",
+            Self::HigherEducation => "higher_education",
+            Self::Training => "training",
             Self::Media => "media",
             Self::CloudSoftware => "cloud_software",
+            Self::Press => "press",
         }
     }
 
@@ -188,20 +299,51 @@ impl Subcategory {
         match self {
             Self::Energy
             | Self::Water
-            | Self::Internet
             | Self::HomeInsurance
-            | Self::HomeServices => Category::Housing,
-            Self::Mobile => Category::Telecom,
-            Self::Banking | Self::Savings | Self::Gaming => Category::Money,
-            Self::IncomeTax | Self::TaxCertificates => Category::Taxes,
-            Self::HealthInsurance | Self::ComplementaryHealth | Self::Care => Category::Health,
-            Self::Payslips | Self::Employment | Self::HouseholdEmployer => Category::Work,
-            Self::Benefits | Self::ChildcareSchool => Category::Family,
-            Self::Train | Self::Flight | Self::Road | Self::Ride | Self::Travel => {
-                Category::Transport
+            | Self::HomeServices
+            | Self::Rent
+            | Self::Property
+            | Self::Works => Category::Housing,
+            Self::Mobile | Self::Internet => Category::Telecom,
+            Self::Banking | Self::Savings | Self::Investments | Self::Loans | Self::Gaming => {
+                Category::Money
             }
-            Self::Online | Self::Pets | Self::Groceries | Self::FoodDelivery => Category::Shopping,
-            Self::Media | Self::CloudSoftware => Category::Subscriptions,
+            Self::IncomeTax | Self::TaxCertificates | Self::PropertyTax | Self::HousingTax => {
+                Category::Taxes
+            }
+            Self::HealthInsurance
+            | Self::ComplementaryHealth
+            | Self::Care
+            | Self::DeathDisabilityCover => Category::Health,
+            Self::Payslips
+            | Self::Employment
+            | Self::HouseholdEmployer
+            | Self::Freelance
+            | Self::Unemployment
+            | Self::Retirement => Category::Work,
+            Self::Benefits | Self::Childcare => Category::Family,
+            Self::IdDocuments | Self::CivilStatus => Category::Identity,
+            Self::InheritanceGifts | Self::Company | Self::Justice => Category::Legal,
+            Self::Train
+            | Self::Flight
+            | Self::Road
+            | Self::Ride
+            | Self::Travel
+            | Self::Vehicle
+            | Self::VehicleInsurance => Category::Transport,
+            Self::Veterinary | Self::PetCare | Self::PetInsurance | Self::PetSupplies => {
+                Category::Pets
+            }
+            Self::Online
+            | Self::Groceries
+            | Self::FoodDelivery
+            | Self::Electronics
+            | Self::HomeEquipment
+            | Self::Clothing
+            | Self::Secondhand => Category::Shopping,
+            Self::Sports | Self::Events | Self::Associations => Category::Leisure,
+            Self::School | Self::HigherEducation | Self::Training => Category::Education,
+            Self::Media | Self::CloudSoftware | Self::Press => Category::Subscriptions,
         }
     }
 }
@@ -248,6 +390,26 @@ pub enum DocumentType {
     FeeSummary,
     Booking,
     MedicalDocument,
+    Quote,
+    IdDocument,
+    CivilStatusRecord,
+    Letter,
+    Acknowledgement,
+    Form,
+    PaymentSchedule,
+    Mandate,
+    TermsAndConditions,
+    Brochure,
+    Timesheet,
+    InspectionReport,
+    NotarialDeed,
+    Attestation,
+    PaymentReminder,
+    Fine,
+    Warranty,
+    Resume,
+    Minutes,
+    Diploma,
     Other,
 }
 
@@ -271,6 +433,26 @@ impl DocumentType {
         Self::FeeSummary,
         Self::Booking,
         Self::MedicalDocument,
+        Self::Quote,
+        Self::IdDocument,
+        Self::CivilStatusRecord,
+        Self::Letter,
+        Self::Acknowledgement,
+        Self::Form,
+        Self::PaymentSchedule,
+        Self::Mandate,
+        Self::TermsAndConditions,
+        Self::Brochure,
+        Self::Timesheet,
+        Self::InspectionReport,
+        Self::NotarialDeed,
+        Self::Attestation,
+        Self::PaymentReminder,
+        Self::Fine,
+        Self::Warranty,
+        Self::Resume,
+        Self::Minutes,
+        Self::Diploma,
         Self::Other,
     ];
 
@@ -294,6 +476,26 @@ impl DocumentType {
             Self::FeeSummary => "fee_summary",
             Self::Booking => "booking",
             Self::MedicalDocument => "medical_document",
+            Self::Quote => "quote",
+            Self::IdDocument => "id_document",
+            Self::CivilStatusRecord => "civil_status_record",
+            Self::Letter => "letter",
+            Self::Acknowledgement => "acknowledgement",
+            Self::Form => "form",
+            Self::PaymentSchedule => "payment_schedule",
+            Self::Mandate => "mandate",
+            Self::TermsAndConditions => "terms_and_conditions",
+            Self::Brochure => "brochure",
+            Self::Timesheet => "timesheet",
+            Self::InspectionReport => "inspection_report",
+            Self::NotarialDeed => "notarial_deed",
+            Self::Attestation => "attestation",
+            Self::PaymentReminder => "payment_reminder",
+            Self::Fine => "fine",
+            Self::Warranty => "warranty",
+            Self::Resume => "resume",
+            Self::Minutes => "minutes",
+            Self::Diploma => "diploma",
             Self::Other => "other",
         }
     }

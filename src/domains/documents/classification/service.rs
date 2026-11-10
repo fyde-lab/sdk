@@ -30,9 +30,8 @@ const fn label(
     }
 }
 
-/// Every label a document can be classified under. Two mappings are
-/// deliberate: local taxes are [`Category::Taxes`] alone, and rent and
-/// co-ownership charges [`Category::Housing`] alone.
+/// Every label a document can be classified under: one per subcategory,
+/// plus one for each category that has none.
 pub(super) const LABELS: &[Label] = &[
     label(
         Category::Housing,
@@ -46,28 +45,38 @@ pub(super) const LABELS: &[Label] = &[
     ),
     label(
         Category::Housing,
-        Some(Subcategory::Internet),
-        &["abonnement box internet"],
-    ),
-    label(
-        Category::Housing,
         Some(Subcategory::HomeInsurance),
         &["assurance habitation"],
     ),
     label(
         Category::Housing,
         Some(Subcategory::HomeServices),
-        &["travaux ou service à domicile"],
+        &["ménage ou entretien à domicile"],
     ),
     label(
         Category::Housing,
-        None,
-        &["loyer ou charges de copropriété"],
+        Some(Subcategory::Rent),
+        &["loyer ou charges locatives"],
+    ),
+    label(
+        Category::Housing,
+        Some(Subcategory::Property),
+        &["vente ou achat d'un bien immobilier"],
+    ),
+    label(
+        Category::Housing,
+        Some(Subcategory::Works),
+        &["travaux de rénovation ou d'installation"],
     ),
     label(
         Category::Telecom,
         Some(Subcategory::Mobile),
         &["forfait mobile"],
+    ),
+    label(
+        Category::Telecom,
+        Some(Subcategory::Internet),
+        &["abonnement box internet"],
     ),
     label(
         Category::Money,
@@ -77,7 +86,17 @@ pub(super) const LABELS: &[Label] = &[
     label(
         Category::Money,
         Some(Subcategory::Savings),
-        &["livret d'épargne ou assurance vie"],
+        &["livret d'épargne"],
+    ),
+    label(
+        Category::Money,
+        Some(Subcategory::Investments),
+        &["assurance vie, PEA ou SCPI"],
+    ),
+    label(
+        Category::Money,
+        Some(Subcategory::Loans),
+        &["prêt immobilier ou crédit"],
     ),
     label(
         Category::Money,
@@ -96,8 +115,13 @@ pub(super) const LABELS: &[Label] = &[
     ),
     label(
         Category::Taxes,
-        None,
-        &["taxe foncière ou taxe d'habitation"],
+        Some(Subcategory::PropertyTax),
+        &["taxe foncière"],
+    ),
+    label(
+        Category::Taxes,
+        Some(Subcategory::HousingTax),
+        &["taxe d'habitation"],
     ),
     label(
         Category::Health,
@@ -110,6 +134,11 @@ pub(super) const LABELS: &[Label] = &[
         &["remboursement de la mutuelle"],
     ),
     label(Category::Health, Some(Subcategory::Care), &["acte médical"]),
+    label(
+        Category::Health,
+        Some(Subcategory::DeathDisabilityCover),
+        &["garantie prévoyance décès ou invalidité"],
+    ),
     label(
         Category::Work,
         Some(Subcategory::Payslips),
@@ -126,14 +155,54 @@ pub(super) const LABELS: &[Label] = &[
         &["salaire d'un employé à domicile"],
     ),
     label(
+        Category::Work,
+        Some(Subcategory::Freelance),
+        &["portage salarial ou activité indépendante"],
+    ),
+    label(
+        Category::Work,
+        Some(Subcategory::Unemployment),
+        &["allocation chômage"],
+    ),
+    label(
+        Category::Work,
+        Some(Subcategory::Retirement),
+        &["pension de retraite"],
+    ),
+    label(
         Category::Family,
         Some(Subcategory::Benefits),
         &["prestation de la CAF"],
     ),
     label(
         Category::Family,
-        Some(Subcategory::ChildcareSchool),
-        &["frais de crèche, de cantine ou de scolarité"],
+        Some(Subcategory::Childcare),
+        &["frais de crèche ou de garde d'enfant"],
+    ),
+    label(
+        Category::Identity,
+        Some(Subcategory::IdDocuments),
+        &["carte d'identité ou passeport"],
+    ),
+    label(
+        Category::Identity,
+        Some(Subcategory::CivilStatus),
+        &["acte de naissance ou de mariage"],
+    ),
+    label(
+        Category::Legal,
+        Some(Subcategory::InheritanceGifts),
+        &["succession ou donation"],
+    ),
+    label(
+        Category::Legal,
+        Some(Subcategory::Company),
+        &["assemblée générale d'une société"],
+    ),
+    label(
+        Category::Legal,
+        Some(Subcategory::Justice),
+        &["tribunal ou procédure judiciaire"],
     ),
     label(
         Category::Transport,
@@ -161,14 +230,39 @@ pub(super) const LABELS: &[Label] = &[
         &["réservation d'hôtel ou de séjour"],
     ),
     label(
-        Category::Shopping,
-        Some(Subcategory::Online),
-        &["commande en ligne"],
+        Category::Transport,
+        Some(Subcategory::Vehicle),
+        &["certificat d'immatriculation du véhicule"],
+    ),
+    label(
+        Category::Transport,
+        Some(Subcategory::VehicleInsurance),
+        &["assurance automobile"],
+    ),
+    label(
+        Category::Pets,
+        Some(Subcategory::Veterinary),
+        &["consultation vétérinaire"],
+    ),
+    label(
+        Category::Pets,
+        Some(Subcategory::PetCare),
+        &["pension pour chien ou chat"],
+    ),
+    label(
+        Category::Pets,
+        Some(Subcategory::PetInsurance),
+        &["assurance pour animal"],
+    ),
+    label(
+        Category::Pets,
+        Some(Subcategory::PetSupplies),
+        &["nourriture ou accessoire pour animal"],
     ),
     label(
         Category::Shopping,
-        Some(Subcategory::Pets),
-        &["soin vétérinaire ou produit pour animal"],
+        Some(Subcategory::Online),
+        &["commande en ligne"],
     ),
     label(
         Category::Shopping,
@@ -181,14 +275,69 @@ pub(super) const LABELS: &[Label] = &[
         &["livraison de repas"],
     ),
     label(
+        Category::Shopping,
+        Some(Subcategory::Electronics),
+        &["appareil électronique"],
+    ),
+    label(
+        Category::Shopping,
+        Some(Subcategory::HomeEquipment),
+        &["meuble ou électroménager"],
+    ),
+    label(
+        Category::Shopping,
+        Some(Subcategory::Clothing),
+        &["vêtements ou chaussures"],
+    ),
+    label(
+        Category::Shopping,
+        Some(Subcategory::Secondhand),
+        &["vente entre particuliers"],
+    ),
+    label(
+        Category::Leisure,
+        Some(Subcategory::Sports),
+        &["licence ou club de sport"],
+    ),
+    label(
+        Category::Leisure,
+        Some(Subcategory::Events),
+        &["billet de spectacle ou d'événement"],
+    ),
+    label(
+        Category::Leisure,
+        Some(Subcategory::Associations),
+        &["adhésion à une association"],
+    ),
+    label(
+        Category::Education,
+        Some(Subcategory::School),
+        &["frais de cantine ou de scolarité"],
+    ),
+    label(
+        Category::Education,
+        Some(Subcategory::HigherEducation),
+        &["inscription à l'université"],
+    ),
+    label(
+        Category::Education,
+        Some(Subcategory::Training),
+        &["formation professionnelle"],
+    ),
+    label(
         Category::Subscriptions,
         Some(Subcategory::Media),
-        &["abonnement streaming ou presse"],
+        &["abonnement streaming"],
     ),
     label(
         Category::Subscriptions,
         Some(Subcategory::CloudSoftware),
         &["hébergement, nom de domaine ou logiciel"],
+    ),
+    label(
+        Category::Subscriptions,
+        Some(Subcategory::Press),
+        &["abonnement presse ou magazine"],
     ),
     label(Category::Donations, None, &["don à une association"]),
 ];
@@ -246,6 +395,32 @@ pub(super) const TYPES: &[TypeLabel] = &[
     ),
     type_label(DocumentType::Booking, &["numéro de réservation"]),
     type_label(DocumentType::MedicalDocument, &["ordonnance médicale"]),
+    type_label(DocumentType::Quote, &["devis"]),
+    type_label(DocumentType::IdDocument, &["pièce d'identité"]),
+    type_label(
+        DocumentType::CivilStatusRecord,
+        &["extrait d'acte d'état civil"],
+    ),
+    type_label(DocumentType::Letter, &["formule de politesse"]),
+    type_label(DocumentType::Acknowledgement, &["accusé de réception"]),
+    type_label(DocumentType::Form, &["formulaire à remplir"]),
+    type_label(DocumentType::PaymentSchedule, &["échéancier de paiement"]),
+    type_label(
+        DocumentType::Mandate,
+        &["mandat de prélèvement ou procuration"],
+    ),
+    type_label(DocumentType::TermsAndConditions, &["conditions générales"]),
+    type_label(DocumentType::Brochure, &["brochure commerciale"]),
+    type_label(DocumentType::Timesheet, &["compte rendu d'activité"]),
+    type_label(DocumentType::InspectionReport, &["rapport de diagnostic"]),
+    type_label(DocumentType::NotarialDeed, &["acte notarié"]),
+    type_label(DocumentType::Attestation, &["atteste sur l'honneur"]),
+    type_label(DocumentType::PaymentReminder, &["relance de paiement"]),
+    type_label(DocumentType::Fine, &["avis de contravention"]),
+    type_label(DocumentType::Warranty, &["certificat de garantie"]),
+    type_label(DocumentType::Resume, &["expérience professionnelle"]),
+    type_label(DocumentType::Minutes, &["procès-verbal de réunion"]),
+    type_label(DocumentType::Diploma, &["diplôme"]),
 ];
 
 /// The lowest span score a cue counts at: below it, the cue isn't in the
@@ -587,13 +762,35 @@ mod tests {
     }
 
     #[test]
-    fn classify_files_local_taxes_under_taxes_alone() {
+    fn classify_files_a_category_without_subcategories_alone() {
         let labels = scores(
             LABELS.len(),
             &[
-                (label_index(Category::Taxes, None), 0.9),
+                (label_index(Category::Donations, None), 0.9),
                 (
-                    label_index(Category::Taxes, Some(Subcategory::IncomeTax)),
+                    label_index(Category::Leisure, Some(Subcategory::Associations)),
+                    0.6,
+                ),
+            ],
+        );
+
+        let classification = classify(&labels, &vec![None; TYPES.len()]);
+
+        assert_eq!(classification.category, Some(Category::Donations));
+        assert_eq!(classification.subcategory, None);
+    }
+
+    #[test]
+    fn classify_tells_property_tax_from_housing_tax() {
+        let labels = scores(
+            LABELS.len(),
+            &[
+                (
+                    label_index(Category::Taxes, Some(Subcategory::PropertyTax)),
+                    0.85,
+                ),
+                (
+                    label_index(Category::Taxes, Some(Subcategory::HousingTax)),
                     0.6,
                 ),
             ],
@@ -602,7 +799,7 @@ mod tests {
         let classification = classify(&labels, &vec![None; TYPES.len()]);
 
         assert_eq!(classification.category, Some(Category::Taxes));
-        assert_eq!(classification.subcategory, None);
+        assert_eq!(classification.subcategory, Some(Subcategory::PropertyTax));
     }
 
     #[test]

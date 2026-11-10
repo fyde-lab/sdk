@@ -164,8 +164,9 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     facture"), looked for in the transcript's first `MAX_WORDS` (300, one window) at
     `THRESHOLD` (0.4); two model runs, labels' cues then types'. A label scores its best cue's
     best span; labels with no span don't compete. Category = argmax over each category's best
-    label, subcategory = argmax among that category's labels (a `None`-subcategory label
-    included: local taxes are `Taxes` alone, rent `Housing` alone), type = flat argmax; each
+    label, subcategory = argmax among that category's labels (one label per subcategory, plus a
+    `None`-subcategory one only for a category without any, `Donations`), type = flat argmax
+    (`Other` has no cue); each
     needs `*_MARGIN` (0.05) over the runner-up, else `None`. Cues and margins are untuned
     guesses: tune them with the `#[ignore]`d sample test. `upload` classifies only if the
     request set no category/subcategory (a scraper's choice is never overridden; the type is
