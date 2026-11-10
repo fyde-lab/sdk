@@ -1,9 +1,5 @@
 pub(crate) mod attributes;
-mod chunk;
-mod classification;
 mod dev;
-mod embedder;
-mod embedding_cache;
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "not wired into any document flow yet")
@@ -23,20 +19,13 @@ pub use attributes::{
     SetAttributeRequest,
 };
 #[cfg(test)]
-pub(crate) use embedder::MockEmbedder;
-#[cfg(test)]
-pub(crate) use models::FakeCachedEmbeddings;
-#[cfg(test)]
 pub(crate) use models::FakeSearchFacets;
-pub(crate) use models::{CachedEmbeddings, ChunkEmbedding, DocumentEmbeddings, EmbeddingKey};
 pub use models::{
     Category, Document, DocumentType, FacetCount, Metadata, SearchFacets, SearchFilters,
     SearchOrder, SearchQuery, Subcategory, UploadRequest, UploadSource,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use models::{FakeDocument, FakeMetadata};
-#[cfg(test)]
-pub(crate) use service::DocumentIndexer;
 #[cfg(test)]
 pub(crate) use storage::MockStorage;
 pub(crate) use storage::Storage;
@@ -50,9 +39,8 @@ use mockall::automock;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+use crate::Result;
 use crate::domains::changelog;
-use crate::tools::models::ModelStore;
-use crate::{ErrorCode, Result};
 
 /// Uploads documents by publishing them as encrypted changelog events, and
 /// reads back documents materialized locally from consumed events (see
@@ -67,12 +55,8 @@ pub trait Service: Send + Sync {
     /// generated id. Metadata fields set on `request` (`name`, `type`,
     /// `category`, `subcategory`, `attributes`) override whatever would
     /// otherwise be derived from the document itself: its name comes from
-    /// the source's file name, its attributes are left empty, and its
-    /// category, subcategory and type are guessed from its text, on device,
-    /// unless `request` sets a category (or a subcategory): those are then
-    /// the caller's, and so is the type, set or not. A guess the classifier
-    /// isn't sure of is left `None`, and so is everything if the embedding
-    /// model isn't available. Attributes that aren't valid — see
+    /// the source's file name, and its type, category, subcategory and
+    /// attributes are left empty. Attributes that aren't valid — see
     /// [`AttributesService::check`] — are rejected with
     /// [`crate::ErrorCode::InvalidAttribute`].
     ///
@@ -101,8 +85,7 @@ pub trait Service: Send + Sync {
     /// matched against and how), keeping only those matching every one of
     /// `query.filters`, one page at a time in `query.order`, returning their
     /// metadata. Like [`Self::list`], never talks to the server nor loads
-    /// their content. [`SearchOrder::Relevance`] also matches by meaning,
-    /// but never downloads the model for it, nor fails without it.
+    /// their content.
     ///
     /// Fails with [`crate::ErrorCode::InvalidSearchQuery`] for a negative
     /// `offset`, a non-positive `limit`, or a `created_from` later than
@@ -114,9 +97,7 @@ pub trait Service: Send + Sync {
     /// (see [`SearchFacets`]): each field's values come from the documents
     /// [`Self::search`] would match with every filter *but that field's
     /// own*, so a UI can propose only the choices — and sub-choices, once a
-    /// parent filter is picked — that actually lead to documents. Counts
-    /// what a [`SearchOrder::Relevance`] search finds, documents close in
-    /// meaning included.
+    /// parent filter is picked — that actually lead to documents.
     ///
     /// Fails with [`crate::ErrorCode::InvalidSearchQuery`] for a
     /// `created_from` later than `created_until`.
@@ -133,7 +114,7 @@ pub trait Service: Send + Sync {
     /// Publishes a "deleted" changelog event for the document `id`. Like
     /// [`Self::upload`]'s, its effect is local only once the sync job
     /// consumes it back (on this device as on every other): the document
-    /// then disappears from local storage, embeddings and search index
+    /// then disappears from local storage, search index
     /// included, and `on_document_change` gets the event. Doesn't check that
     /// `id` is cached, so a document uploaded but not synced yet can be
     /// deleted too; deleting an unknown or already deleted document is a
@@ -146,13 +127,10 @@ pub trait Service: Send + Sync {
     /// history, then continuing with the live tail). Resumes from the
     /// cursor persisted locally by a previous call, or from the beginning
     /// of the changelog if it's never been consumed before. For each
-    /// "created"/"update metadata"/"deleted" event, updates local storage, indexing
-    /// the document's text along the way (about a second per document on a
-    /// desktop CPU), before invoking the `on_document_change` callback
-    /// configured on the client (see [`crate::ClientConfig`]), so it's
-    /// already visible via [`Self::get`]/[`Self::list`] by the time that
-    /// callback runs. Until the indexing model can be fetched, syncing
-    /// waits (see [`Self::indexing_model_error`]).
+    /// "created"/"update metadata"/"deleted" event, updates local storage
+    /// before invoking the `on_document_change` callback configured on the
+    /// client (see [`crate::ClientConfig`]), so it's already visible via
+    /// [`Self::get`]/[`Self::list`] by the time that callback runs.
     /// [`crate::domains::users::Service::create`]/`login` call this
     /// automatically once a session is open; most callers never need to
     /// call it directly.
@@ -176,95 +154,30 @@ pub trait Service: Send + Sync {
     /// `stop_consume_job` — see [`Self::start_sync`]'s own doc comment for
     /// why that's the only way to reach it.
     fn stop_sync(&self);
-
-    /// Why documents can't be indexed right now, if they can't: the model
-    /// indexing needs couldn't be fetched or loaded (e.g.
-    /// [`ErrorCode::ModelDownloadFailed`] while offline). Syncing is paused
-    /// meanwhile, since a document is never cached without being indexed,
-    /// and resumes by itself once the model is available, which clears
-    /// this. A UI can poll it to tell the user why new documents don't
-    /// show up.
-    fn indexing_model_error(&self) -> Option<ErrorCode>;
 }
 
-/// Caches the documents consumed changelog events carry, each with the
-/// embeddings of its text (title included), written together: a document
-/// is never cached without being indexed.
+/// Caches the documents consumed changelog events carry: the changelog
+/// consumer applies document events through it.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(crate) trait Indexer: Send + Sync {
-    /// Fetches and loads the indexing model, unless that's already done,
-    /// failing if it can't (see [`Service::indexing_model_error`]).
-    async fn prepare(&self) -> Result<()>;
-
-    /// Caches `document`, unencrypted, with the embeddings of its text.
+    /// Caches `document`, unencrypted.
     async fn save_document(&self, document: &Document) -> Result<()>;
 
-    /// Called instead of [`Self::save_document`] for a document that won't
-    /// be cached (a duplicate): drops anything held for it.
-    fn skip_document(&self, id: Uuid);
-
-    /// Replaces the metadata of the cached document `id`, and its
-    /// embeddings too if that changes the text they embed. Does nothing if
+    /// Replaces the metadata of the cached document `id`. Does nothing if
     /// no document `id` is cached.
     async fn update_metadata(&self, id: Uuid, metadata: &Metadata) -> Result<()>;
 
-    /// Removes the cached document `id` with its embeddings. Does nothing if
-    /// no document `id` is cached.
+    /// Removes the cached document `id`. Does nothing if no document `id`
+    /// is cached.
     async fn delete_document(&self, id: Uuid) -> Result<()>;
-
-    /// Why the last [`Self::prepare`] failed, if it did.
-    fn model_error(&self) -> Option<ErrorCode>;
-}
-
-/// Holds the embeddings [`Service::upload`] computes until the changelog
-/// consumer caches the document, so it reuses them instead of embedding the
-/// same text twice. Plaintext-derived, so in memory only, and cleared on
-/// logout.
-#[cfg_attr(test, automock)]
-pub(crate) trait EmbeddingCache: Send + Sync {
-    fn get(&self, document_id: Uuid) -> Option<Arc<CachedEmbeddings>>;
-
-    /// Stores `embeddings` under their `key.document_id`.
-    fn put(&self, embeddings: Arc<CachedEmbeddings>);
-
-    fn remove(&self, document_id: Uuid);
-
-    fn clear(&self);
-}
-
-/// How much memory the [`EmbeddingCache`] may hold: a scraper can upload
-/// hundreds of documents before sync consumes them.
-const EMBEDDING_CACHE_BYTES: usize = 64 * 1024 * 1024;
-
-/// Initializes the [`EmbeddingCache`] shared by the documents [`Service`],
-/// its [`Indexer`] and logout.
-pub(crate) fn init_embedding_cache() -> Arc<dyn EmbeddingCache> {
-    Arc::new(embedding_cache::MemoryEmbeddingCache::new(
-        EMBEDDING_CACHE_BYTES,
-    ))
-}
-
-/// Initializes the on-device embedding model `models` holds, shared by the
-/// [`Indexer`] (which fetches it on the first [`Indexer::prepare`]) and the
-/// documents [`Service`]'s searches, so it's loaded once.
-pub(crate) fn init_embedder(models: Arc<ModelStore>) -> Arc<dyn embedder::Embedder> {
-    Arc::new(embedder::OnnxEmbedder::new(models))
 }
 
 /// Initializes the [`Indexer`] the changelog consumer caches documents
-/// through, into the database behind `pool`, embedding them with
-/// `embedder` (see [`init_embedder`]), unless `cache` holds the embeddings
-/// their upload computed.
-pub(crate) fn init_indexer(
-    pool: SqlitePool,
-    embedder: Arc<dyn embedder::Embedder>,
-    cache: Arc<dyn EmbeddingCache>,
-) -> Arc<dyn Indexer> {
+/// through, into the database behind `pool`.
+pub(crate) fn init_indexer(pool: SqlitePool) -> Arc<dyn Indexer> {
     Arc::new(service::DocumentIndexer::new(
         storage_sqlite::SqliteStorage::new(pool),
-        embedder,
-        cache,
     ))
 }
 
@@ -274,16 +187,11 @@ pub(crate) fn init_indexer(
 /// `changelog::init`), wires up local SQLite-backed reads (via `pool`) of
 /// the documents it cached, and calls `on_document_change` (see
 /// [`crate::ClientConfig`]) for every event [`Service::start_sync`]
-/// consumes. Uploads and searches embed their text with `embedder` (see
-/// [`init_embedder`]), uploads leaving theirs in `cache` for `indexer`, and
-/// are classified with it.
+/// consumes.
 pub(crate) fn init(
     pool: SqlitePool,
     changelog: Arc<dyn changelog::Service>,
     attributes: Arc<dyn AttributesService>,
-    indexer: Arc<dyn Indexer>,
-    embedder: Arc<dyn embedder::Embedder>,
-    cache: Arc<dyn EmbeddingCache>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Arc<dyn Service> {
     let storage = storage_sqlite::SqliteStorage::new(pool);
@@ -293,10 +201,6 @@ pub(crate) fn init(
         changelog,
         on_document_change,
         attributes,
-        indexer,
-        embedder.clone(),
-        cache,
-        classification::init(embedder),
     ))
 }
 

@@ -106,7 +106,7 @@ pub(crate) trait Service: Send + Sync {
 }
 
 /// Initializes the changelog service: connects to the fyde server over the
-/// shared `channel`, and uses `indexer` to cache (and index) the documents
+/// shared `channel`, and uses `indexer` to cache the documents
 /// materialized from consumed events, `pool` to spot the ones already
 /// cached (and to save installed
 /// scripts into the `scripts` domain's `installed_scripts` table, clearing

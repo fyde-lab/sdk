@@ -54,9 +54,9 @@ pub(super) fn save_document_fn(
                 apply_upload_fields(&mut request, &fields)?;
             }
 
-            // Stopping gives up on an upload under way: it may wait minutes
-            // for the embedding model's download. One given up on while
-            // publishing may still have been published.
+            // Stopping gives up on an upload under way: publishing it may
+            // wait on the server. One given up on while publishing may still
+            // have been published.
             //
             // A scraper re-run typically finds documents it already saved:
             // that's not a failure, just nothing to do.
@@ -402,7 +402,7 @@ mod tests {
     }
 
     /// A [`DocumentsService`] whose upload stops `stop`, then never
-    /// finishes, as one waiting for the embedding model's download would.
+    /// finishes, as one waiting on an unresponsive server would.
     /// Every other method is unused, so left unimplemented.
     struct StoppingDocuments {
         stop: StopSignal,
@@ -461,10 +461,6 @@ mod tests {
         }
 
         fn stop_sync(&self) {
-            unimplemented!()
-        }
-
-        fn indexing_model_error(&self) -> Option<ErrorCode> {
             unimplemented!()
         }
     }

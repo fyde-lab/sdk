@@ -23,9 +23,9 @@ RUSTFLAGS="--cfg tokio_unstable" cargo build --features tokio-console  # serve t
   `FYDE_PROTO_DIR` is set.
 - On static-ONNX-Runtime targets (see "ONNX Runtime" below), `ort-sys` downloads pyke's prebuilt
   library on the first build (network, then cached); `ORT_LIB_PATH` points it at a local build.
-- `FYDE_TEST_MODELS_DIR=/some/dir cargo test -- --ignored multilingual_e5` runs the real-model
-  tests (`tools::onnx` and `documents::embedder`; downloads ~135 MB from Hugging Face; the directory keeps them for the next run).
-  `-- --ignored gliner_x_small` runs `documents::gliner`'s (~190 MB).
+- `FYDE_TEST_MODELS_DIR=/some/dir cargo test -- --ignored gliner_x_small` runs
+  `documents::gliner`'s real-model test (downloads ~190 MB from Hugging Face; the directory keeps
+  them for the next run).
 
 ## Non-negotiable rules
 
@@ -65,10 +65,7 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
 - `logout` always clears secrets, wipes the database and deletes every other file in the
   client's directory (`tools::client_dir`; only the open database's files and the changelog
   lock stay), whether or not the server answers. Anything a domain writes to disk must live
-  in that directory, or logout leaves it behind. Plaintext-derived data held in memory (the
-  documents `EmbeddingCache`) is cleared by `users`' `clear_local_state` (logout and session
-  expiry), after the secrets: an upload caching its embeddings later can't publish, and
-  drops them. Never log embedding vectors or document text.
+  in that directory, or logout leaves it behind. Never log document text.
 - Every Lua VM is built with `tools::sandbox::new_vm` and scripts loaded with
   `sandbox::load_source` — never `Lua::new*` / `lua.load` (that would run precompiled bytecode).
 - Scraper debug reports never record request headers, request/download bodies, form values or
@@ -92,8 +89,7 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   `Arc<Mutex<_>>` capture is fine when a test must read back a generated value.
 - Exceptions, which test real adapters: `grpc_client.rs`, `crypto.rs`, `tools/sql/sqlite.rs`, `tools/client_dir.rs`,
   `tools/models` (a local `TcpListener` HTTP server), `tools/onnx` (a hand-encoded ONNX model; the
-  real-model test is `#[ignore]`), `documents/embedder.rs` (pooling on hand-built outputs; the
-  real-model ranking test is `#[ignore]`), `documents/gliner.rs` (splitting, windows, inputs and
+  real-model test is `#[ignore]`), `documents/gliner.rs` (splitting, windows, inputs and
   logit decoding are pure functions tested directly; the real-model test is `#[ignore]`),
   `storage_sqlite.rs` files, `secrets/storage_keystore.rs` (keyring's in-memory mock),
   `changelog/storage_settings.rs`. `changelog::Service` can't be automocked (its
@@ -143,7 +139,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   publishes an encrypted `SaveDocument` event; the document reaches the local cache only when
   the sync job consumes it back. `delete` likewise only publishes a `Deleted` event (id only,
   no local check, so an unsynced upload can be deleted); consuming it removes the cached
-  document through `Indexer::delete_document` (embeddings cascade, FTS triggers follow), a
+  document through `Indexer::delete_document` (FTS triggers follow), a
   no-op if it isn't cached. `get`/`list`/`search`/`search_facets` are local-only
   (`storage_sqlite.rs`, FTS5 `bm25` ranking over contentless `documents_fts`). `list`/`search`
   return `Metadata` only (their query never selects `content`; `size` is `length(content)`):
@@ -157,57 +153,10 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     upload and `update_metadata`. Promote anything that needs filtering/sorting to a real
     `Metadata` field instead of querying attributes JSON.
   - `transcript.rs` — extracts a PDF's text into `Metadata::transcript` on upload (and for `fyde.pdf`, whole or within a rectangle).
-  - Indexing: a document is never cached without its embeddings. The changelog consumer
-    applies `SaveDocument`/`UpdateMetadata` through the `Indexer` trait (`DocumentIndexer` in
-    `service.rs`), which embeds then writes document + embeddings in one transaction. Rules:
-    `chunk.rs` splits the transcript (pages, then paragraphs, then lines; no overlap), each
-    passage is `"{title}\n{chunk}"` (title = name without extension); a blank transcript is
-    indexed with zero chunks; `update_metadata` re-embeds only if the title or transcript
-    changed. `embedder.rs` is the ONNX adapter (multilingual-e5-small, `passage: `/`query: `
-    prefixes, mean pooling, L2-normalized, 384 dims, 512-token truncation, `spawn_blocking`
-    on ≤4 threads, loaded lazily once; a failed load is retried). Table `document_embeddings`
-    (`(document_id, chunk)` key, `vector` = 384 little-endian `f32`, cascades with its
-    document, cleared by `wipe`). `Indexer::prepare` fetches/loads the model; its last failure
-    is `Service::indexing_model_error` (for the UI). One `OnnxEmbedder` (`init_embedder`) is
-    shared by the indexer and searches.
-  - Upload-time embeddings: `upload` embeds the document (same `passages`, chunker and
-    embedder as the indexer, waiting for the model like it) before publishing, so the upload
-    flow has the vectors before emission. They never travel in the event, and `upload` writes
-    no table: it `put`s them in the in-memory `EmbeddingCache` (`init_embedding_cache`, one per
-    `Client`, shared by the documents service, the indexer and `users`; `embedding_cache.rs`
-    only stores: 64 MiB of entries, oldest put evicted first, never persisted) and removes
-    them unless it published (`CachedUntilPublished`: a failed publish, or an upload dropped
-    while publishing). A blank transcript or a failed embed (logged, never fatal)
-    publishes without caching; after a failed embed, uploads skip embedding for
-    `UPLOAD_EMBED_RETRY_AFTER` (5 min) rather than each wait for the model again. A
-    duplicate the consumer skips goes through `Indexer::skip_document`, which drops its
-    entry. Entries are keyed by `embedding_key`: document id + model +
-    `CHUNKER_VERSION` + SHA-256 of the length-prefixed passages (**bump `CHUNKER_VERSION`
-    whenever `chunk.rs` or the passage format changes**). The indexer's `save_document` stores a
-    matching entry's vectors as-is, else embeds inline, and removes the entry only once the
-    transaction committed (a failed pass retries with it).
-  - Hybrid search: `search` with `Relevance` and non-blank text fuses (in `service.rs`) two
-    storage rankings over the filtered documents, top `CANDIDATES` (200) each: `rank_by_terms`
-    (bm25) and `rank_by_similarity` (cosine to the query, each document scored by its best
-    chunk, kept only at or above `SIMILARITY_FLOOR`, 0.85, tuned on a real corpus: e5 puts
-    unrelated text around 0.8). Fusion is RRF (Σ 1/(60 + rank)), then the page is cut and only
-    its `Metadata` loaded (`get_metadatas`). `Embedder::embed_query` (`query: ` prefix) uses
-    `ModelStore::find`, which never downloads; if it fails the search logs and falls back to
-    bm25 alone, never failing over the model. `search_facets` with non-blank text counts the
-    same hybrid set (`count_documents_among`/`created_at_range_among`). `Newest`/`Oldest` and
-    blank text stay bm25/filters only.
-  - `classification/` — zero-shot `Category`/`Subcategory`/`DocumentType` guess at upload
-    (ported from `doc-ai-poc`'s `classify.rs`): the whitespace-collapsed transcript (first 16 KiB)
-    embedded as one passage, against `query: `-embedded French descriptions per label
-    (`LABELS`, `TYPES`: business data, kept there; a label scores its best description).
-    Category = argmax over each category's best label, subcategory = argmax among that
-    category's labels (a `None`-subcategory label included: local taxes are `Taxes` alone, rent
-    `Housing` alone), type = flat argmax; each needs `*_MARGIN` over the runner-up, else `None`.
-    Descriptions are embedded lazily, once per process and model (`DESCRIPTIONS`). `upload`
-    classifies only after its embedding succeeded (model at hand) and only if the request set no
-    category/subcategory (a scraper's choice is never overridden; the type is then left to it
-    too); a request's type wins over the guessed one. A failure publishes unclassified. Never
-    run on consumption.
+  - Caching: the changelog consumer applies `SaveDocument`/`UpdateMetadata`/`Deleted` through
+    the `Indexer` trait (`DocumentIndexer` in `service.rs`), which writes them to storage (the
+    FTS triggers keep the search index in step). Search is bm25 only: nothing is embedded
+    (`0022_drop_document_embeddings` dropped the table older versions filled).
   - `gliner.rs` — `SpanFinder` (`OnnxGliner`, GLiNER-X small; ported from `doc-ai-poc`'s
     `gliner.rs`), a pure adapter not wired into any flow yet: `spans(text, labels, threshold,
     max_words)` returns every span (byte range, label index, sigmoid score) scoring at least
@@ -230,9 +179,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   retried after a backoff (500 ms doubling to 30 s, reset by a clean pass); a stream that ends
   cleanly is reopened after 1 s, never at once. Applied events are
   recorded by ciphertext digest (`applied_changelog_events`), so one the server serves again is skipped.
-  Documents are applied through `documents::Indexer` (a checksum duplicate is skipped, never
-  embedded); before a pass's first document event it calls `prepare`, so a missing model
-  fails the pass (retried) rather than letting the cursor pass an unindexed document. An
+  Documents are applied through `documents::Indexer` (a checksum duplicate is skipped). An
   event failing `POISON_PILL_PASSES` (5) passes in a row is logged at error level on each
   further failure; it's never skipped (ask before adding any skip mechanism).
 - **users** — OPAQUE (RFC 9807, `opaque-ke`); the password never leaves the SDK.
@@ -315,7 +262,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     blocking host call (`StopSignal::block_on` instead of a bare `Handle::block_on` — keep it
     that way in new host functions), a pending `fyde.input.ask` (its handler runs on the
     blocking pool and is abandoned) and an upload (`save_document` is given up on, even
-    while it waits for the embedding model or publishes: one given up on while publishing
+    while it publishes: one given up on while publishing
     may still be published). The run ends with `ScraperRunStopped` unless its script
     finished first.
   - `allowed_domains` fails closed: an empty list allows no host; an IP literal only matches
@@ -340,19 +287,17 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
 
 ### On-device models (`src/tools/models/`, `src/tools/onnx/`)
 
-Used by `documents::embedder` and `documents::gliner`. `tools::models` is the registry: each `Model`
+Used by `documents::gliner`. `tools::models` is the registry: each `Model`
 is one file (name, URL at a fixed Hugging Face revision, size, SHA-256); today
-`MULTILINGUAL_E5_SMALL` (MIT) and `GLINER_X_SMALL` (Apache-2.0, `knowledgator/gliner-x-small`),
-both int8 ONNX, each with its `_TOKENIZER`. `ModelStore::ensure` returns `<models_dir>/<sha256[..16]>-<name>`. A file
+`GLINER_X_SMALL` (Apache-2.0, `knowledgator/gliner-x-small`), int8 ONNX, with its
+`_TOKENIZER`. `ModelStore::ensure` returns `<models_dir>/<sha256[..16]>-<name>`. A file
 already there is SHA-256-checked the first time the store sees it (replaced on mismatch), then
 trusted by size. Otherwise it's downloaded over `wreq` (client built on the first download;
 redirects followed) into a `.<file>.<uuid>.part` beside it, removed on any failure or
 cancellation, then renamed. A per-file lock makes concurrent `ensure`s download once. Before
 downloading, `ensure` removes the model's other revisions (`<other hash>-<name>`) and its stale
-partials of any revision (10 min untouched; vanished files are fine). `find` returns a model
-already fully there (same checks) or `None`, never downloading nor waiting on a download's lock.
-Errors: `ModelDownloadFailed` (1201, transport, 408/429/5xx, and `ModelNotDownloaded` for a
-model `find` lacks), `ModelUnavailable` (1204, any other HTTP
+partials of any revision (10 min untouched; vanished files are fine).
+Errors: `ModelDownloadFailed` (1201, transport, 408/429/5xx), `ModelUnavailable` (1204, any other HTTP
 status: only an update helps), `ModelCorrupted` (1202, wrong size/hash), `ModelLoadFailed`
 (1203, `tools::onnx`, and `ErrorKind::InvalidModel` for a model whose inputs/outputs don't match).
 `tools::onnx` is a thin port of `doc-ai-poc`'s loaders: `session(path, threads)` (Level3
