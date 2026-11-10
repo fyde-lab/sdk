@@ -1,9 +1,6 @@
 pub(crate) mod attributes;
+mod classification;
 mod dev;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "not wired into any document flow yet")
-)]
 mod gliner;
 mod models;
 mod service;
@@ -41,6 +38,7 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::domains::changelog;
+use crate::tools::models::ModelStore;
 
 /// Uploads documents by publishing them as encrypted changelog events, and
 /// reads back documents materialized locally from consumed events (see
@@ -55,8 +53,13 @@ pub trait Service: Send + Sync {
     /// generated id. Metadata fields set on `request` (`name`, `type`,
     /// `category`, `subcategory`, `attributes`) override whatever would
     /// otherwise be derived from the document itself: its name comes from
-    /// the source's file name, and its type, category, subcategory and
-    /// attributes are left empty. Attributes that aren't valid — see
+    /// the source's file name, its attributes are left empty, and its
+    /// category, subcategory and type are guessed from its text, on device
+    /// (fetching the GLiNER model on first use), unless `request` sets a
+    /// category (or a subcategory): those are then the caller's, and so is
+    /// the type, set or not. A guess the classifier isn't sure of is left
+    /// `None`, and so is everything if the model isn't available. Attributes
+    /// that aren't valid — see
     /// [`AttributesService::check`] — are rejected with
     /// [`crate::ErrorCode::InvalidAttribute`].
     ///
@@ -187,20 +190,23 @@ pub(crate) fn init_indexer(pool: SqlitePool) -> Arc<dyn Indexer> {
 /// `changelog::init`), wires up local SQLite-backed reads (via `pool`) of
 /// the documents it cached, and calls `on_document_change` (see
 /// [`crate::ClientConfig`]) for every event [`Service::start_sync`]
-/// consumes.
+/// consumes. Uploads are classified with the GLiNER model `models` holds.
 pub(crate) fn init(
     pool: SqlitePool,
     changelog: Arc<dyn changelog::Service>,
     attributes: Arc<dyn AttributesService>,
+    models: Arc<ModelStore>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Arc<dyn Service> {
     let storage = storage_sqlite::SqliteStorage::new(pool);
+    let classifier = classification::init(Arc::new(gliner::OnnxGliner::new(models)));
 
     Arc::new(service::DocumentsClient::new(
         storage,
         changelog,
         on_document_change,
         attributes,
+        classifier,
     ))
 }
 

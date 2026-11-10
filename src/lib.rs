@@ -124,11 +124,6 @@ pub struct Client {
     settings: Arc<dyn SettingsService>,
     usage: Arc<dyn UsageService>,
     users: Arc<dyn UsersService>,
-    #[expect(
-        dead_code,
-        reason = "foundation for the on-device document analysis to come"
-    )]
-    models: Arc<tools::models::ModelStore>,
     /// The locked handle to [`instance_lock_path`] (see [`lock_instance`]),
     /// held for as long as this `Client` lives. Never read: it only exists
     /// so dropping the `Client` releases the lock.
@@ -185,6 +180,7 @@ impl Client {
             sqlite.pool().clone(),
             changelog,
             attributes.clone(),
+            models,
             config.on_document_change,
         );
         let users = domains::users::init(
@@ -227,7 +223,6 @@ impl Client {
             settings: domains::settings::public(settings),
             usage,
             users,
-            models,
             _instance_lock: instance_lock,
         })
     }

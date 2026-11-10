@@ -23,9 +23,10 @@ RUSTFLAGS="--cfg tokio_unstable" cargo build --features tokio-console  # serve t
   `FYDE_PROTO_DIR` is set.
 - On static-ONNX-Runtime targets (see "ONNX Runtime" below), `ort-sys` downloads pyke's prebuilt
   library on the first build (network, then cached); `ORT_LIB_PATH` points it at a local build.
-- `FYDE_TEST_MODELS_DIR=/some/dir cargo test -- --ignored gliner_x_small` runs
-  `documents::gliner`'s real-model test (downloads ~190 MB from Hugging Face; the directory keeps
-  them for the next run).
+- `FYDE_TEST_MODELS_DIR=/some/dir cargo test -- --ignored gliner_x_small` runs the real-model
+  tests (`documents::gliner`, and `documents::classification`'s sample documents, which print
+  each label's score for tuning; downloads ~190 MB from Hugging Face; the directory keeps them
+  for the next run).
 
 ## Non-negotiable rules
 
@@ -157,8 +158,22 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     the `Indexer` trait (`DocumentIndexer` in `service.rs`), which writes them to storage (the
     FTS triggers keep the search index in step). Search is bm25 only: nothing is embedded
     (`0022_drop_document_embeddings` dropped the table older versions filled).
+  - `classification/` — zero-shot `Category`/`Subcategory`/`DocumentType` guess at upload with
+    GLiNER (`gliner.rs`): each label (`LABELS`, `TYPES`: business data, kept there) has short
+    French *cues* phrased as entity labels ("consommation d'électricité ou de gaz", "numéro de
+    facture"), looked for in the transcript's first `MAX_WORDS` (300, one window) at
+    `THRESHOLD` (0.4); two model runs, labels' cues then types'. A label scores its best cue's
+    best span; labels with no span don't compete. Category = argmax over each category's best
+    label, subcategory = argmax among that category's labels (a `None`-subcategory label
+    included: local taxes are `Taxes` alone, rent `Housing` alone), type = flat argmax; each
+    needs `*_MARGIN` (0.05) over the runner-up, else `None`. Cues and margins are untuned
+    guesses: tune them with the `#[ignore]`d sample test. `upload` classifies only if the
+    request set no category/subcategory (a scraper's choice is never overridden; the type is
+    then left to it too); a request's type wins over the guessed one. It waits for the model's
+    first download; a failure publishes unclassified and uploads then skip classifying for
+    `CLASSIFY_RETRY_AFTER` (5 min). Never run on consumption.
   - `gliner.rs` — `SpanFinder` (`OnnxGliner`, GLiNER-X small; ported from `doc-ai-poc`'s
-    `gliner.rs`), a pure adapter not wired into any flow yet: `spans(text, labels, threshold,
+    `gliner.rs`), the adapter `classification/` runs: `spans(text, labels, threshold,
     max_words)` returns every span (byte range, label index, sigmoid score) scoring at least
     `threshold`, best first, overlaps and window-boundary duplicates included. Keep the model's
     details as they are: `<<ENT>>` = 250100 / `<<SEP>>` = 250101 (not in `tokenizer.json`),
@@ -262,7 +277,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     blocking host call (`StopSignal::block_on` instead of a bare `Handle::block_on` — keep it
     that way in new host functions), a pending `fyde.input.ask` (its handler runs on the
     blocking pool and is abandoned) and an upload (`save_document` is given up on, even
-    while it publishes: one given up on while publishing
+    while it waits for the classification model or publishes: one given up on while publishing
     may still be published). The run ends with `ScraperRunStopped` unless its script
     finished first.
   - `allowed_domains` fails closed: an empty list allows no host; an IP literal only matches
@@ -287,7 +302,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
 
 ### On-device models (`src/tools/models/`, `src/tools/onnx/`)
 
-Used by `documents::gliner`. `tools::models` is the registry: each `Model`
+Used by `documents::gliner` (through `documents::classification`). `tools::models` is the registry: each `Model`
 is one file (name, URL at a fixed Hugging Face revision, size, SHA-256); today
 `GLINER_X_SMALL` (Apache-2.0, `knowledgator/gliner-x-small`), int8 ONNX, with its
 `_TOKENIZER`. `ModelStore::ensure` returns `<models_dir>/<sha256[..16]>-<name>`. A file

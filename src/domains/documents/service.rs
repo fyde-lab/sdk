@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -15,6 +15,7 @@ use crate::domains::changelog::{
 };
 
 use super::attributes::{self, Service as AttributesService};
+use super::classification::Service as ClassificationService;
 use super::storage::{FacetField, Storage};
 use super::transcript;
 use super::{
@@ -35,25 +36,39 @@ pub(super) struct DocumentsClient<S: Storage> {
     /// set — see [`crate::ClientConfig::on_document_change`].
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
     attributes: Arc<dyn AttributesService>,
+    /// What guesses uploads' category, subcategory and type.
+    classifier: Arc<dyn ClassificationService>,
+    /// When classifying an upload last failed (see
+    /// [`CLASSIFY_RETRY_AFTER`]).
+    classify_failed_at: Mutex<Option<tokio::time::Instant>>,
 }
+
+/// How long uploads skip classification after it failed: failing usually
+/// means the model couldn't be downloaded (a timeout, say), which every
+/// upload would otherwise wait for again. The documents uploaded meanwhile
+/// are published unclassified.
+const CLASSIFY_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 impl<S: Storage> DocumentsClient<S> {
     /// Creates a documents client using `storage` to read cached documents,
     /// `changelog` to publish new ones and drive [`Service::start_sync`],
     /// `on_document_change` as the callback [`Service::start_sync`] invokes
-    /// per consumed event, and `attributes` to check the attributes of every
-    /// document before it's published.
+    /// per consumed event, `attributes` to check the attributes of every
+    /// document before it's published, and `classifier` to classify uploads.
     pub(super) fn new(
         storage: S,
         changelog: Arc<dyn ChangelogService>,
         on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
         attributes: Arc<dyn AttributesService>,
+        classifier: Arc<dyn ClassificationService>,
     ) -> Self {
         Self {
             storage,
             changelog,
             on_document_change,
             attributes,
+            classifier,
+            classify_failed_at: Mutex::new(None),
         }
     }
 }
@@ -67,6 +82,44 @@ impl<S: Storage> DocumentsClient<S> {
             .check(&metadata.attributes)
             .await
             .context("invalid document attributes")
+    }
+
+    /// Sets `metadata`'s category, subcategory and, unless it has one, type
+    /// to what its text looks like (each left `None` where the classifier
+    /// can't tell), or leaves them as they are if that fails, or failed less
+    /// than [`CLASSIFY_RETRY_AFTER`] ago: the document is then published
+    /// unclassified rather than not at all.
+    async fn classify_upload(&self, metadata: &mut Metadata) {
+        let failed_at = *self
+            .classify_failed_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if failed_at.is_some_and(|at| at.elapsed() < CLASSIFY_RETRY_AFTER) {
+            tracing::debug!(
+                "not classifying document {}, classifying failed recently",
+                metadata.id
+            );
+            return;
+        }
+
+        match self.classifier.classify(&metadata.transcript).await {
+            Ok(classification) => {
+                metadata.category = classification.category;
+                metadata.subcategory = classification.subcategory;
+                metadata.r#type = metadata.r#type.or(classification.r#type);
+            }
+            Err(err) => {
+                *self
+                    .classify_failed_at
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(tokio::time::Instant::now());
+                tracing::warn!(
+                    code = ?err.code(),
+                    "failed to classify document {}, publishing it unclassified: {err}",
+                    metadata.id
+                );
+            }
+        }
     }
 
     /// Counts the documents matching `terms` and `filters` — minus
@@ -203,6 +256,14 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .instrument(tracing::debug_span!("check_metadata"))
             .await
             .with_context(|| format!("invalid metadata for document {original_name:?}"))?;
+
+        // Never over a category the caller (a scraper, say) chose: the type
+        // is then theirs too, set or not.
+        if metadata.category.is_none() {
+            self.classify_upload(&mut metadata)
+                .instrument(tracing::debug_span!("classify_document"))
+                .await;
+        }
 
         let id = metadata.id;
         self.changelog
@@ -506,11 +567,34 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::super::attributes::MockService as MockAttributesService;
+    use super::super::classification::{
+        Classification, FakeClassification, MockService as MockClassificationService,
+    };
     use super::super::storage::MockStorage;
     use super::super::transcript::tests::build_pdf;
     use super::super::{Attribute, DocumentType};
     use super::super::{FakeDocument, FakeMetadata};
     use super::*;
+
+    /// A classifier whose every call panics: for tests that never classify
+    /// an upload.
+    fn unused_classifier() -> Arc<dyn ClassificationService> {
+        Arc::new(MockClassificationService::new())
+    }
+
+    /// A classifier expected to classify exactly `times` uploads, each as
+    /// `classification`.
+    fn classifier_returning(
+        classification: Classification,
+        times: usize,
+    ) -> Arc<dyn ClassificationService> {
+        let mut classifier = MockClassificationService::new();
+        classifier
+            .expect_classify()
+            .times(times)
+            .returning(move |_| Ok(classification));
+        Arc::new(classifier)
+    }
 
     fn accepting_attributes() -> Arc<dyn AttributesService> {
         let mut attributes = MockAttributesService::new();
@@ -538,8 +622,13 @@ mod tests {
         });
         // `MockStorage` panics on any call, proving `upload` never reaches
         // the duplicate check (or anything after it) once this check fails.
-        let client =
-            DocumentsClient::new(MockStorage::new(), changelog, None, accepting_attributes());
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            changelog,
+            None,
+            accepting_attributes(),
+            unused_classifier(),
+        );
 
         let err = client
             .upload(UploadRequest::from_path(file.path()))
@@ -659,7 +748,13 @@ mod tests {
             .returning(|_| Ok(None));
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(storage, changelog.clone(), None, accepting_attributes());
+        let client = DocumentsClient::new(
+            storage,
+            changelog.clone(),
+            None,
+            accepting_attributes(),
+            classifier_returning(Classification::default(), 1),
+        );
 
         let id = client
             .upload(UploadRequest::from_path(file.path()))
@@ -707,7 +802,13 @@ mod tests {
             .returning(move |_| Ok(Some(existing)));
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(storage, changelog.clone(), None, accepting_attributes());
+        let client = DocumentsClient::new(
+            storage,
+            changelog.clone(),
+            None,
+            accepting_attributes(),
+            unused_classifier(),
+        );
 
         let err = client
             .upload(UploadRequest::from_path(file.path()))
@@ -730,6 +831,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
 
         let result = client.upload(UploadRequest::from_path(file.path())).await;
@@ -747,6 +849,7 @@ mod tests {
             changelog.clone(),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
 
         let err = client
@@ -772,7 +875,13 @@ mod tests {
             .returning(|_| Ok(None));
 
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(storage, changelog.clone(), None, accepting_attributes());
+        let client = DocumentsClient::new(
+            storage,
+            changelog.clone(),
+            None,
+            accepting_attributes(),
+            unused_classifier(),
+        );
 
         let request = UploadRequest {
             source: super::super::UploadSource::Raw {
@@ -801,13 +910,21 @@ mod tests {
     /// Uploads a PDF with `request`'s overrides, returning the metadata it
     /// was published with.
     async fn upload_with(mut request: UploadRequest) -> Metadata {
+        // Classified only when the request leaves the category to it.
+        let classified = request.category.is_none() && request.subcategory.is_none();
         let mut storage = MockStorage::new();
         storage
             .expect_find_document_by_checksum()
             .times(1)
             .returning(|_| Ok(None));
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(storage, changelog.clone(), None, accepting_attributes());
+        let client = DocumentsClient::new(
+            storage,
+            changelog.clone(),
+            None,
+            accepting_attributes(),
+            classifier_returning(Classification::default(), usize::from(classified)),
+        );
 
         request.source = super::super::UploadSource::Raw {
             name: "raw.pdf".to_string(),
@@ -839,6 +956,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
         let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
         request.category = Some(Category::Money);
@@ -856,7 +974,13 @@ mod tests {
             .expect_find_document_by_checksum()
             .returning(|_| Ok(None));
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(storage, changelog.clone(), None, rejecting_attributes());
+        let client = DocumentsClient::new(
+            storage,
+            changelog.clone(),
+            None,
+            rejecting_attributes(),
+            unused_classifier(),
+        );
         let mut request = UploadRequest::from_raw("raw.pdf", build_pdf("hello world"));
         request.attributes = BTreeMap::from([("price".to_string(), Attribute::Integer(1))]);
 
@@ -889,6 +1013,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
         let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
         request.attributes = BTreeMap::from([("price".to_string(), Attribute::Float(f64::NAN))]);
@@ -906,6 +1031,7 @@ mod tests {
             changelog.clone(),
             None,
             rejecting_attributes(),
+            unused_classifier(),
         );
         let metadata = super::super::FakeMetadata::new()
             .with_attributes([("price".to_string(), Attribute::Integer(1))])
@@ -925,6 +1051,7 @@ mod tests {
             changelog.clone(),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
         let attributes = BTreeMap::from([("price".to_string(), Attribute::Float(32.3))]);
         let metadata = super::super::FakeMetadata::new()
@@ -945,6 +1072,7 @@ mod tests {
             changelog.clone(),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
         let metadata = super::super::FakeMetadata::new()
             .with_category(Category::Money)
@@ -992,6 +1120,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
 
         assert_eq!(client.get(id).await.unwrap(), Some(document));
@@ -1017,6 +1146,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
 
         let page = client.list(1, 2).await.unwrap();
@@ -1059,6 +1189,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
 
         let documents = client
@@ -1089,6 +1220,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
 
         client.search(SearchQuery::new(" - ", 0, 10)).await.unwrap();
@@ -1111,6 +1243,7 @@ mod tests {
                 Arc::new(RecordingChangelog::default()),
                 None,
                 accepting_attributes(),
+                unused_classifier(),
             );
 
             let err = client.search(query.clone()).await.unwrap_err();
@@ -1225,6 +1358,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
 
         let facets = client.search_facets(" facture ", &filters).await.unwrap();
@@ -1254,6 +1388,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
 
         let err = client
@@ -1271,6 +1406,7 @@ mod tests {
             Arc::new(RecordingChangelog::default()),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
 
         let err = client
@@ -1301,6 +1437,7 @@ mod tests {
             changelog.clone(),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
 
         client.update_metadata(metadata).await.unwrap();
@@ -1333,6 +1470,7 @@ mod tests {
             changelog,
             Some(on_document_change),
             accepting_attributes(),
+            unused_classifier(),
         );
 
         client.start_sync().await.unwrap();
@@ -1348,8 +1486,13 @@ mod tests {
             to_consume: Mutex::new(vec![event]),
             ..Default::default()
         });
-        let client =
-            DocumentsClient::new(MockStorage::new(), changelog, None, accepting_attributes());
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            changelog,
+            None,
+            accepting_attributes(),
+            unused_classifier(),
+        );
 
         client.start_sync().await.unwrap();
     }
@@ -1362,6 +1505,7 @@ mod tests {
             changelog.clone(),
             None,
             accepting_attributes(),
+            unused_classifier(),
         );
 
         client.stop_sync();
@@ -1377,6 +1521,7 @@ mod tests {
             changelog,
             None,
             Arc::new(MockAttributesService::new()),
+            unused_classifier(),
         )
     }
 
@@ -1475,5 +1620,218 @@ mod tests {
             .delete_document(id)
             .await
             .unwrap();
+    }
+
+    fn storage_for_a_new_upload() -> MockStorage {
+        let mut storage = MockStorage::new();
+        storage
+            .expect_find_document_by_checksum()
+            .times(1)
+            .returning(|_| Ok(None));
+        storage
+    }
+
+    fn client_classifying_with(
+        changelog: Arc<RecordingChangelog>,
+        classifier: Arc<dyn ClassificationService>,
+    ) -> DocumentsClient<MockStorage> {
+        DocumentsClient::new(
+            storage_for_a_new_upload(),
+            changelog,
+            None,
+            accepting_attributes(),
+            classifier,
+        )
+    }
+
+    /// The metadata of the only document `changelog` published.
+    fn published_metadata(changelog: &RecordingChangelog) -> Metadata {
+        let sent = changelog.sent.lock().unwrap();
+        let [(EventType::SaveDocument, _, _, Some(metadata))] = &sent[..] else {
+            panic!("unexpected events: {sent:?}");
+        };
+        metadata.clone()
+    }
+
+    #[tokio::test]
+    async fn upload_publishes_the_document_classified_from_its_transcript() {
+        let classification = FakeClassification::new().build();
+        let mut classifier = MockClassificationService::new();
+        classifier
+            .expect_classify()
+            .withf(|text| text.contains("Montant : 42 €"))
+            .times(1)
+            .returning(move |_| Ok(classification));
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_classifying_with(changelog.clone(), Arc::new(classifier));
+
+        client
+            .upload(UploadRequest::from_raw(
+                "a.pdf",
+                build_pdf("Montant : 42 €"),
+            ))
+            .await
+            .unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(
+            (metadata.category, metadata.subcategory, metadata.r#type),
+            (
+                classification.category,
+                classification.subcategory,
+                classification.r#type
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_leaves_unclassified_what_the_classifier_can_t_tell() {
+        let classification = FakeClassification::new()
+            .with_subcategory(None)
+            .with_type(None)
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client =
+            client_classifying_with(changelog.clone(), classifier_returning(classification, 1));
+
+        client
+            .upload(UploadRequest::from_raw(
+                "a.pdf",
+                build_pdf("Montant : 42 €"),
+            ))
+            .await
+            .unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(metadata.category, classification.category);
+        assert_eq!((metadata.subcategory, metadata.r#type), (None, None));
+    }
+
+    #[tokio::test]
+    async fn upload_never_classifies_a_document_given_a_category() {
+        let changelog = Arc::new(RecordingChangelog::default());
+        // Strict: classifying panics.
+        let client = client_classifying_with(changelog.clone(), unused_classifier());
+        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
+        request.category = Some(Category::Housing);
+
+        client.upload(request).await.unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(metadata.category, Some(Category::Housing));
+        assert_eq!((metadata.subcategory, metadata.r#type), (None, None));
+    }
+
+    #[tokio::test]
+    async fn upload_never_classifies_a_document_given_a_subcategory_alone() {
+        let changelog = Arc::new(RecordingChangelog::default());
+        // Strict: classifying panics.
+        let client = client_classifying_with(changelog.clone(), unused_classifier());
+        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
+        request.subcategory = Some(Subcategory::Water);
+
+        client.upload(request).await.unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(
+            (metadata.category, metadata.subcategory),
+            (Some(Category::Housing), Some(Subcategory::Water))
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_classifies_a_document_given_a_type_alone_but_keeps_its_type() {
+        let classification = FakeClassification::new()
+            .with_category(Category::Work)
+            .with_subcategory(Subcategory::Payslips)
+            .with_type(DocumentType::Payslip)
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client =
+            client_classifying_with(changelog.clone(), classifier_returning(classification, 1));
+        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
+        request.r#type = Some(DocumentType::Contract);
+
+        client.upload(request).await.unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(
+            (metadata.category, metadata.subcategory, metadata.r#type),
+            (
+                Some(Category::Work),
+                Some(Subcategory::Payslips),
+                Some(DocumentType::Contract)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_publishes_the_document_unclassified_when_classifying_fails() {
+        let mut classifier = MockClassificationService::new();
+        classifier
+            .expect_classify()
+            .times(1)
+            .returning(|_| Err(ErrorKind::ModelDownloadStatus(503).into()));
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_classifying_with(changelog.clone(), Arc::new(classifier));
+
+        client
+            .upload(UploadRequest::from_raw(
+                "a.pdf",
+                build_pdf("Montant : 42 €"),
+            ))
+            .await
+            .unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(
+            (metadata.category, metadata.subcategory, metadata.r#type),
+            (None, None, None)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn upload_skips_classifying_for_a_while_after_classifying_failed() {
+        let mut classifier = MockClassificationService::new();
+        let mut sequence = mockall::Sequence::new();
+        classifier
+            .expect_classify()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Err(ErrorKind::ModelDownloadStatus(503).into()));
+        let classification = FakeClassification::new().build();
+        classifier
+            .expect_classify()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(move |_| Ok(classification));
+        let mut storage = MockStorage::new();
+        storage
+            .expect_find_document_by_checksum()
+            .times(3)
+            .returning(|_| Ok(None));
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = DocumentsClient::new(
+            storage,
+            changelog.clone(),
+            None,
+            accepting_attributes(),
+            Arc::new(classifier),
+        );
+        let upload = |text: &str| UploadRequest::from_raw("a.pdf", build_pdf(text));
+
+        client.upload(upload("un")).await.unwrap();
+        // Within the delay: published without asking the classifier.
+        tokio::time::advance(CLASSIFY_RETRY_AFTER / 2).await;
+        client.upload(upload("deux")).await.unwrap();
+        tokio::time::advance(CLASSIFY_RETRY_AFTER).await;
+        client.upload(upload("trois")).await.unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        let categories: Vec<_> = sent
+            .iter()
+            .map(|(_, _, _, metadata)| metadata.as_ref().unwrap().category)
+            .collect();
+        assert_eq!(categories, vec![None, None, classification.category]);
     }
 }
