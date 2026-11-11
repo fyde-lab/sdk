@@ -925,7 +925,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::super::super::embedder::MockEmbedder;
-    use super::super::super::service::check_categories;
     use super::*;
     use crate::ErrorCode;
 
@@ -998,7 +997,9 @@ mod tests {
     #[test]
     fn every_label_is_a_valid_category_and_subcategory_pair() {
         for label in LABELS {
-            check_categories(Some(label.category), label.subcategory).unwrap();
+            if let Some(subcategory) = label.subcategory {
+                assert_eq!(subcategory.category(), label.category, "{subcategory:?}");
+            }
         }
     }
 
@@ -1019,13 +1020,13 @@ mod tests {
     fn every_category_and_subcategory_has_exactly_one_label() {
         for category in Category::ALL {
             let labels = LABELS.iter().filter(|label| label.category == *category);
-            assert!(labels.count() >= 1, "{category} has no label");
+            assert!(labels.count() >= 1, "{category:?} has no label");
         }
         for subcategory in Subcategory::ALL {
             let labels = LABELS
                 .iter()
                 .filter(|label| label.subcategory == Some(*subcategory));
-            assert_eq!(labels.count(), 1, "{subcategory}");
+            assert_eq!(labels.count(), 1, "{subcategory:?}");
         }
         for category in Category::ALL {
             let labels = LABELS
@@ -1033,7 +1034,7 @@ mod tests {
                 .filter(|label| label.category == *category && label.subcategory.is_none());
             assert!(
                 labels.count() <= 1,
-                "{category} has two labels without a subcategory"
+                "{category:?} has two labels without a subcategory"
             );
         }
     }
@@ -1046,7 +1047,7 @@ mod tests {
                 Subcategory::ALL
                     .iter()
                     .all(|subcategory| subcategory.category() != category),
-                "{category} has subcategories"
+                "{category:?} has subcategories"
             );
         }
     }

@@ -142,10 +142,8 @@ macro_rules! for_each_error_code {
             UnreadablePdf = 4003,
             /// A changelog event was malformed.
             InvalidChangelogEvent = 4004,
-            /// A document's category is unknown.
-            InvalidCategory = 4005,
-            /// A document's subcategory is unknown.
-            InvalidSubcategory = 4006,
+            // 4005 (InvalidCategory) is retired: never reuse it.
+            // 4006 (InvalidSubcategory) is retired: never reuse it.
             // 4007 (InvalidPurpose) is retired: never reuse it.
             /// A document search's parameters were invalid.
             InvalidSearchQuery = 4008,
@@ -153,8 +151,7 @@ macro_rules! for_each_error_code {
             DuplicateDocument = 4009,
             /// A document's type is unknown.
             InvalidDocumentType = 4010,
-            /// A document's subcategory doesn't belong to its category.
-            MismatchedSubcategory = 4011,
+            // 4011 (MismatchedSubcategory) is retired: never reuse it.
             // 4012 (InvalidSubject) is retired: never reuse it.
             /// A document's attribute has an unknown type, a value that
             /// doesn't match its type, or an invalid name; or a document
@@ -176,6 +173,8 @@ macro_rules! for_each_error_code {
             /// A top-level folder lacks its colour and icon, or a subfolder
             /// was given one (it shows its top-level folder's).
             InvalidFolderAppearance = 4020,
+            /// No such document (it may not have synced to this device yet).
+            DocumentNotFound = 4021,
             /// No such script.
             ScriptNotFound = 5001,
             /// A script was run without one of its required parameters.
@@ -310,14 +309,8 @@ pub(crate) enum ErrorKind {
     },
     #[error("invalid changelog event: {0}")]
     InvalidChangelogEvent(String),
-    #[error("invalid category: {0:?}")]
-    InvalidCategory(String),
-    #[error("invalid subcategory: {0:?}")]
-    InvalidSubcategory(String),
     #[error("invalid document type: {0:?}")]
     InvalidDocumentType(String),
-    #[error("mismatched subcategory: {0}")]
-    MismatchedSubcategory(String),
     #[error("invalid document attribute: {0}")]
     InvalidAttribute(String),
     #[error("{what} is {size} bytes, over the {max} byte limit")]
@@ -334,6 +327,8 @@ pub(crate) enum ErrorKind {
     FolderNameTaken(String),
     #[error("folder {0} not found")]
     FolderNotFound(uuid::Uuid),
+    #[error("document {0} not found")]
+    DocumentNotFound(uuid::Uuid),
     #[error("invalid folder move: {0}")]
     InvalidFolderMove(String),
     #[error("invalid folder description: {0}")]
@@ -428,10 +423,8 @@ impl ErrorKind {
             ErrorKind::ScriptNotInstalled(_) => ErrorCode::ScriptNotInstalled,
             ErrorKind::MissingScriptParameter { .. } => ErrorCode::MissingScriptParameter,
             ErrorKind::InvalidChangelogEvent(_) => ErrorCode::InvalidChangelogEvent,
-            ErrorKind::InvalidCategory(_) => ErrorCode::InvalidCategory,
-            ErrorKind::InvalidSubcategory(_) => ErrorCode::InvalidSubcategory,
             ErrorKind::InvalidDocumentType(_) => ErrorCode::InvalidDocumentType,
-            ErrorKind::MismatchedSubcategory(_) => ErrorCode::MismatchedSubcategory,
+            ErrorKind::DocumentNotFound(_) => ErrorCode::DocumentNotFound,
             ErrorKind::InvalidFolderName(_) => ErrorCode::InvalidFolderName,
             ErrorKind::FolderNameTaken(_) => ErrorCode::FolderNameTaken,
             ErrorKind::FolderNotFound(_) => ErrorCode::FolderNotFound,

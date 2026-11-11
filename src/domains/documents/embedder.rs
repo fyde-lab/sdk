@@ -315,6 +315,7 @@ mod tests {
     use super::*;
     use crate::ErrorCode;
     use crate::domains::changelog::Service as ChangelogService;
+    use crate::domains::folders::no_folders;
 
     /// A `[1, tokens.len(), DIMENSIONS]` output whose token `i` is
     /// `tokens[i]` followed by zeros.
@@ -628,6 +629,7 @@ mod tests {
             embedder,
             Arc::new(MemoryEmbeddingCache::new(0)),
             Arc::new(MockClassifier::new()),
+            no_folders(),
         );
         let text = "combien j'ai payé au fisc l'an dernier";
 
@@ -767,6 +769,7 @@ mod tests {
             embedder.clone(),
             cache.clone(),
             Arc::new(classifier),
+            no_folders(),
         );
         // Pages are never chunked together.
         let pdf = build_pdf_pages(&[

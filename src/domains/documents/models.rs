@@ -10,10 +10,10 @@ use crate::{Error, ErrorKind};
 
 /// The part of life a document is about — where it would be filed — rather
 /// than who issued it: a bank's tax form is [`Self::Taxes`], an internet
-/// box's invoice [`Self::Telecom`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Category {
+/// box's invoice [`Self::Telecom`]. No longer part of a document's metadata
+/// (folders replaced it): only names the classifier's label descriptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Category {
     Housing,
     Telecom,
     Money,
@@ -32,6 +32,7 @@ pub enum Category {
     Donations,
 }
 
+#[cfg(test)]
 impl Category {
     pub(crate) const ALL: &'static [Category] = &[
         Self::Housing,
@@ -51,52 +52,12 @@ impl Category {
         Self::Subscriptions,
         Self::Donations,
     ];
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Housing => "housing",
-            Self::Telecom => "telecom",
-            Self::Money => "money",
-            Self::Taxes => "taxes",
-            Self::Health => "health",
-            Self::Work => "work",
-            Self::Family => "family",
-            Self::Identity => "identity",
-            Self::Legal => "legal",
-            Self::Transport => "transport",
-            Self::Pets => "pets",
-            Self::Shopping => "shopping",
-            Self::Leisure => "leisure",
-            Self::Education => "education",
-            Self::Subscriptions => "subscriptions",
-            Self::Donations => "donations",
-        }
-    }
-}
-
-impl fmt::Display for Category {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Category {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|value| value.as_str() == s)
-            .ok_or_else(|| ErrorKind::InvalidCategory(s.to_string()).into())
-    }
 }
 
 /// A finer-grained classification within one [`Category`] (see
 /// [`Self::category`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Subcategory {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Subcategory {
     Energy,
     Water,
     HomeInsurance,
@@ -161,6 +122,7 @@ pub enum Subcategory {
     Press,
 }
 
+#[cfg(test)]
 impl Subcategory {
     pub(crate) const ALL: &'static [Subcategory] = &[
         Self::Energy,
@@ -227,75 +189,8 @@ impl Subcategory {
         Self::Press,
     ];
 
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Energy => "energy",
-            Self::Water => "water",
-            Self::HomeInsurance => "home_insurance",
-            Self::HomeServices => "home_services",
-            Self::Rent => "rent",
-            Self::Property => "property",
-            Self::Works => "works",
-            Self::Mobile => "mobile",
-            Self::Internet => "internet",
-            Self::Banking => "banking",
-            Self::Savings => "savings",
-            Self::Investments => "investments",
-            Self::Loans => "loans",
-            Self::Gaming => "gaming",
-            Self::IncomeTax => "income_tax",
-            Self::TaxCertificates => "tax_certificates",
-            Self::PropertyTax => "property_tax",
-            Self::HousingTax => "housing_tax",
-            Self::HealthInsurance => "health_insurance",
-            Self::ComplementaryHealth => "complementary_health",
-            Self::Care => "care",
-            Self::DeathDisabilityCover => "death_disability_cover",
-            Self::Payslips => "payslips",
-            Self::Employment => "employment",
-            Self::HouseholdEmployer => "household_employer",
-            Self::Freelance => "freelance",
-            Self::Unemployment => "unemployment",
-            Self::Retirement => "retirement",
-            Self::Benefits => "benefits",
-            Self::Childcare => "childcare",
-            Self::IdDocuments => "id_documents",
-            Self::CivilStatus => "civil_status",
-            Self::InheritanceGifts => "inheritance_gifts",
-            Self::Company => "company",
-            Self::Justice => "justice",
-            Self::Train => "train",
-            Self::Flight => "flight",
-            Self::Road => "road",
-            Self::Ride => "ride",
-            Self::Travel => "travel",
-            Self::Vehicle => "vehicle",
-            Self::VehicleInsurance => "vehicle_insurance",
-            Self::Veterinary => "veterinary",
-            Self::PetCare => "pet_care",
-            Self::PetInsurance => "pet_insurance",
-            Self::PetSupplies => "pet_supplies",
-            Self::Online => "online",
-            Self::Groceries => "groceries",
-            Self::FoodDelivery => "food_delivery",
-            Self::Electronics => "electronics",
-            Self::HomeEquipment => "home_equipment",
-            Self::Clothing => "clothing",
-            Self::Secondhand => "secondhand",
-            Self::Sports => "sports",
-            Self::Events => "events",
-            Self::Associations => "associations",
-            Self::School => "school",
-            Self::HigherEducation => "higher_education",
-            Self::Training => "training",
-            Self::Media => "media",
-            Self::CloudSoftware => "cloud_software",
-            Self::Press => "press",
-        }
-    }
-
     /// The [`Category`] this subcategory narrows down.
-    pub fn category(&self) -> Category {
+    pub(crate) fn category(&self) -> Category {
         match self {
             Self::Energy
             | Self::Water
@@ -345,24 +240,6 @@ impl Subcategory {
             Self::School | Self::HigherEducation | Self::Training => Category::Education,
             Self::Media | Self::CloudSoftware | Self::Press => Category::Subscriptions,
         }
-    }
-}
-
-impl fmt::Display for Subcategory {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Subcategory {
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|value| value.as_str() == s)
-            .ok_or_else(|| ErrorKind::InvalidSubcategory(s.to_string()).into())
     }
 }
 
@@ -537,26 +414,26 @@ pub struct Metadata {
     /// Plaintext transcript of the document's PDF text content, extracted
     /// on upload.
     pub transcript: String,
-    /// `None` unless the uploader, or a later metadata update, sets it.
+    /// Guessed from the text at upload (`None` when the classifier can't
+    /// tell), or set by a later metadata update.
     pub r#type: Option<DocumentType>,
-    /// `None` unless the uploader, or a later metadata update, sets it.
-    pub category: Option<Category>,
-    pub subcategory: Option<Subcategory>,
+    /// The folder holding the document (see `folders`), `None` for one at
+    /// the root of the vault, in À classer. A document whose folder was
+    /// deleted on another device meanwhile also shows there.
+    pub folder_id: Option<Uuid>,
     /// Every unstructured piece of data a document carries beyond the
     /// fields above (e.g. `"reference"` → `Attribute::String("F-42")`),
     /// keyed by a `snake_case` name — one of the user's attribute
     /// definitions ([`super::attributes::Service::list`]) whenever one
     /// fits. A piece of data that needs to be filtered,
     /// faceted or sorted on across documents belongs in a field of its
-    /// own instead, the way `category` is.
+    /// own instead, the way `folder_id` is.
     pub attributes: BTreeMap<String, Attribute>,
 }
 
-/// [`Metadata`]'s serialized form. Changelog events are MessagePack-encoded
-/// positionally (a struct is an array of its fields), so a removed field
-/// keeps its slot: `subjects` and `purpose` are written empty and ignored
-/// on read, so events recorded before they were removed still decode, and
-/// devices still running a version that has them still decode new ones.
+/// [`Metadata`]'s serialized form: changelog events are MessagePack-encoded
+/// positionally (a struct is an array of its fields), so fields are only
+/// ever added at the end, with `#[serde(default)]`.
 #[derive(Serialize, Deserialize)]
 struct MetadataWire {
     id: Uuid,
@@ -568,15 +445,7 @@ struct MetadataWire {
     checksum: String,
     transcript: String,
     r#type: Option<DocumentType>,
-    category: Option<Category>,
-    subcategory: Option<Subcategory>,
-    /// Removed: always written empty, ignored on read.
-    subjects: Vec<String>,
-    /// Removed: always written `None`, ignored on read.
-    purpose: Option<String>,
-    /// Defaults to empty so metadata encrypted before this field existed
-    /// still decodes.
-    #[serde(default)]
+    folder_id: Option<Uuid>,
     attributes: BTreeMap<String, Attribute>,
 }
 
@@ -592,8 +461,7 @@ impl From<MetadataWire> for Metadata {
             checksum: wire.checksum,
             transcript: wire.transcript,
             r#type: wire.r#type,
-            category: wire.category,
-            subcategory: wire.subcategory,
+            folder_id: wire.folder_id,
             attributes: wire.attributes,
         }
     }
@@ -611,10 +479,7 @@ impl From<Metadata> for MetadataWire {
             checksum: metadata.checksum,
             transcript: metadata.transcript,
             r#type: metadata.r#type,
-            category: metadata.category,
-            subcategory: metadata.subcategory,
-            subjects: Vec::new(),
-            purpose: None,
+            folder_id: metadata.folder_id,
             attributes: metadata.attributes,
         }
     }
@@ -657,12 +522,8 @@ impl Metadata {
         self.r#type
     }
 
-    pub fn category(&self) -> Option<Category> {
-        self.category
-    }
-
-    pub fn subcategory(&self) -> Option<Subcategory> {
-        self.subcategory
+    pub fn folder_id(&self) -> Option<Uuid> {
+        self.folder_id
     }
 
     pub fn attributes(&self) -> &BTreeMap<String, Attribute> {
@@ -722,38 +583,26 @@ pub enum UploadSource {
 }
 
 /// Parameters for [`super::Service::upload`]: where to read the document's
-/// content from, plus any of the modifiable [`Metadata`] fields to set
-/// up front. Every field besides `source` is optional — left `None`, it's
-/// derived from the document itself and whatever scripts run against it;
-/// set, it overrides that derived value. `attributes` is merged over the
-/// ones derived instead, name by name: an attribute set here replaces a
-/// script's attribute of the same name, and leaves the others in place.
-#[derive(Debug, Clone, PartialEq)]
+/// content from (its file name becomes the document's `original_name`),
+/// and the name to give it, if not that one. Everything else (type,
+/// folder) is derived from the document itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadRequest {
     pub source: UploadSource,
     pub name: Option<String>,
-    pub r#type: Option<DocumentType>,
-    pub category: Option<Category>,
-    pub subcategory: Option<Subcategory>,
-    pub attributes: BTreeMap<String, Attribute>,
 }
 
 impl UploadRequest {
-    /// Builds a request to upload the file at `path`, with no metadata
-    /// overrides.
+    /// Builds a request to upload the file at `path`, under its own name.
     pub fn from_path(path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             source: UploadSource::Path(path.into()),
             name: None,
-            r#type: None,
-            category: None,
-            subcategory: None,
-            attributes: BTreeMap::new(),
         }
     }
 
-    /// Builds a request to upload `content` directly, named `name`, with no
-    /// metadata overrides.
+    /// Builds a request to upload `content` directly, its original name
+    /// being `name`.
     pub fn from_raw(name: impl Into<String>, content: impl Into<Vec<u8>>) -> Self {
         Self {
             source: UploadSource::Raw {
@@ -761,10 +610,6 @@ impl UploadRequest {
                 content: content.into(),
             },
             name: None,
-            r#type: None,
-            category: None,
-            subcategory: None,
-            attributes: BTreeMap::new(),
         }
     }
 }
@@ -777,8 +622,9 @@ impl UploadRequest {
 /// `SearchFilters::default()` matches every document.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchFilters {
-    pub categories: Vec<Category>,
-    pub subcategories: Vec<Subcategory>,
+    /// Restricts the search to a folder (subfolders included) or to À
+    /// classer.
+    pub folder: Option<FolderFilter>,
     pub types: Vec<DocumentType>,
     /// Matched exactly against [`Metadata::content_type`].
     pub content_types: Vec<String>,
@@ -786,6 +632,16 @@ pub struct SearchFilters {
     pub created_from: Option<i64>,
     /// Inclusive upper bound on [`Metadata::created_at`].
     pub created_until: Option<i64>,
+}
+
+/// Where [`SearchFilters::folder`] restricts a search to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderFilter {
+    /// The documents at the root of the vault (no folder, or one deleted
+    /// meanwhile): À classer.
+    Unfiled,
+    /// The documents of this folder and every folder below it.
+    Within(Uuid),
 }
 
 /// How many documents carry one value of a field, as listed in
@@ -800,17 +656,20 @@ pub struct FacetCount<T> {
 /// [`super::Service::search_facets`]: for each field [`SearchFilters`] can
 /// filter on, every value carried by at least one document the search would
 /// match, most common first — so a UI only ever proposes choices that lead
-/// somewhere. Unclassified documents (no category, type...) and empty
-/// values are left out.
+/// somewhere. Untyped documents and empty values are left out.
 ///
 /// Each field's values ignore that field's *own* filter (but honor every
-/// other one), so picking a category narrows the subcategories, types...
-/// on offer to that category's, while every category still compatible with
-/// the rest of the search stays available to switch to.
+/// other one), so picking a type narrows the folders on offer to those
+/// holding that type, while every type still compatible with the rest of
+/// the search stays available to switch to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchFacets {
-    pub categories: Vec<FacetCount<Category>>,
-    pub subcategories: Vec<FacetCount<Subcategory>>,
+    /// Every folder holding at least one matching document, itself or in a
+    /// subfolder, with that count (its subfolders' documents included),
+    /// most first.
+    pub folders: Vec<FacetCount<Uuid>>,
+    /// How many matching documents are in À classer.
+    pub unfiled: u64,
     pub types: Vec<FacetCount<DocumentType>>,
     pub content_types: Vec<FacetCount<String>>,
     /// The oldest matching [`Metadata::created_at`], ignoring the
@@ -839,7 +698,7 @@ pub enum SearchOrder {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchQuery {
     /// Free text matched against a document's name, original name,
-    /// transcript, type and category/subcategory. Every word must match one of those fields, as a
+    /// transcript and type. Every word must match one of those fields, as a
     /// case- and accent-insensitive prefix ("fact" matches "Facturé").
     /// Blank matches every document, leaving only `filters` to narrow it.
     pub text: String,
@@ -883,8 +742,6 @@ impl Default for FakeMetadata {
 impl FakeMetadata {
     pub fn new() -> Self {
         let name = format!("{}.pdf", crate::tools::testing::random_word());
-        let subcategory = Subcategory::ALL
-            [crate::tools::testing::random_u64(Subcategory::ALL.len() as u64) as usize];
         Self {
             metadata: Metadata {
                 id: Uuid::now_v7(),
@@ -903,8 +760,7 @@ impl FakeMetadata {
                         DocumentType::ALL.len() as u64
                     ) as usize],
                 ),
-                category: Some(subcategory.category()),
-                subcategory: Some(subcategory),
+                folder_id: None,
                 attributes: BTreeMap::from([(
                     crate::tools::testing::random_word().to_string(),
                     Attribute::Integer(crate::tools::testing::random_u64(1000) as i64),
@@ -958,13 +814,8 @@ impl FakeMetadata {
         self
     }
 
-    pub fn with_category(mut self, category: impl Into<Option<Category>>) -> Self {
-        self.metadata.category = category.into();
-        self
-    }
-
-    pub fn with_subcategory(mut self, subcategory: impl Into<Option<Subcategory>>) -> Self {
-        self.metadata.subcategory = subcategory.into();
+    pub fn with_folder(mut self, folder_id: impl Into<Option<Uuid>>) -> Self {
+        self.metadata.folder_id = folder_id.into();
         self
     }
 
@@ -1040,16 +891,11 @@ impl FakeSearchFacets {
         let earliest = crate::tools::testing::random_past_timestamp();
         Self {
             facets: SearchFacets {
-                categories: vec![FacetCount {
-                    value: Category::ALL
-                        [crate::tools::testing::random_u64(Category::ALL.len() as u64) as usize],
+                folders: vec![FacetCount {
+                    value: Uuid::now_v7(),
                     count: count(),
                 }],
-                subcategories: vec![FacetCount {
-                    value: Subcategory::ALL
-                        [crate::tools::testing::random_u64(Subcategory::ALL.len() as u64) as usize],
-                    count: count(),
-                }],
+                unfiled: count(),
                 types: vec![FacetCount {
                     value: DocumentType::ALL[crate::tools::testing::random_u64(
                         DocumentType::ALL.len() as u64,
@@ -1068,16 +914,9 @@ impl FakeSearchFacets {
         }
     }
 
-    pub(crate) fn with_categories(mut self, categories: Vec<FacetCount<Category>>) -> Self {
-        self.facets.categories = categories;
-        self
-    }
-
-    pub(crate) fn with_subcategories(
-        mut self,
-        subcategories: Vec<FacetCount<Subcategory>>,
-    ) -> Self {
-        self.facets.subcategories = subcategories;
+    pub(crate) fn with_folders(mut self, folders: Vec<FacetCount<Uuid>>, unfiled: u64) -> Self {
+        self.facets.folders = folders;
+        self.facets.unfiled = unfiled;
         self
     }
 
@@ -1294,6 +1133,7 @@ mod tests {
     #[test]
     fn fake_metadata_with_methods_override_defaults() {
         let id = Uuid::now_v7();
+        let folder_id = Uuid::now_v7();
         let metadata = FakeMetadata::new()
             .with_id(id)
             .with_name("report.pdf")
@@ -1304,8 +1144,7 @@ mod tests {
             .with_checksum("deadbeef")
             .with_transcript("hello world")
             .with_type(DocumentType::Invoice)
-            .with_category(Category::Money)
-            .with_subcategory(Subcategory::Banking)
+            .with_folder(folder_id)
             .with_attributes([("price".to_string(), Attribute::Float(32.3))])
             .build();
 
@@ -1318,8 +1157,7 @@ mod tests {
         assert_eq!(metadata.checksum, "deadbeef");
         assert_eq!(metadata.transcript, "hello world");
         assert_eq!(metadata.r#type, Some(DocumentType::Invoice));
-        assert_eq!(metadata.category, Some(Category::Money));
-        assert_eq!(metadata.subcategory, Some(Subcategory::Banking));
+        assert_eq!(metadata.folder_id, Some(folder_id));
         assert_eq!(
             metadata.attributes,
             BTreeMap::from([("price".to_string(), Attribute::Float(32.3))])
@@ -1361,79 +1199,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_encoded_as_messagepack_before_attributes_existed_still_decodes() {
-        // Changelog events are MessagePack-encoded positionally (a struct is
-        // an array of its fields), so an event recorded before `attributes`
-        // existed is the same array minus its last element: here, a
-        // fixarray header one shorter and no trailing empty map.
-        let metadata = FakeMetadata::new().with_attributes(BTreeMap::new()).build();
-        let mut legacy = rmp_serde::to_vec(&metadata).unwrap();
-        assert_eq!(legacy[0], 0x9e, "expected a 14-field fixarray");
-        assert_eq!(legacy.pop(), Some(0x80), "expected a trailing empty map");
-        legacy[0] = 0x9d;
-
-        let decoded: Metadata = rmp_serde::from_slice(&legacy).unwrap();
-
-        assert!(decoded.attributes.is_empty());
-        assert_eq!(decoded.name, metadata.name);
-    }
-
-    #[test]
-    fn metadata_encoded_with_subjects_and_purpose_still_decodes() {
-        // The layout `Metadata` had before `subjects`/`purpose` were
-        // removed, with both set.
-        #[derive(Serialize)]
-        struct Legacy {
-            id: Uuid,
-            name: String,
-            original_name: String,
-            content_type: String,
-            created_at: i64,
-            size: u64,
-            checksum: String,
-            transcript: String,
-            r#type: Option<DocumentType>,
-            category: Option<Category>,
-            subcategory: Option<Subcategory>,
-            subjects: Vec<String>,
-            purpose: Option<String>,
-            attributes: BTreeMap<String, Attribute>,
-        }
-        let metadata = FakeMetadata::new().build();
-        let legacy = rmp_serde::to_vec(&Legacy {
-            id: metadata.id,
-            name: metadata.name.clone(),
-            original_name: metadata.original_name.clone(),
-            content_type: metadata.content_type.clone(),
-            created_at: metadata.created_at,
-            size: metadata.size,
-            checksum: metadata.checksum.clone(),
-            transcript: metadata.transcript.clone(),
-            r#type: metadata.r#type,
-            category: metadata.category,
-            subcategory: metadata.subcategory,
-            subjects: vec!["person:alice".to_string()],
-            purpose: Some("invoice".to_string()),
-            attributes: metadata.attributes.clone(),
-        })
-        .unwrap();
-
-        let decoded: Metadata = rmp_serde::from_slice(&legacy).unwrap();
-
-        assert_eq!(decoded, metadata);
-    }
-
-    #[test]
-    fn metadata_without_attributes_still_deserializes() {
-        let mut json = serde_json::to_value(FakeMetadata::new().build()).unwrap();
-        json.as_object_mut().unwrap().remove("attributes");
-
-        let metadata: Metadata = serde_json::from_value(json).unwrap();
-
-        assert!(metadata.attributes.is_empty());
-    }
-
-    #[test]
     fn document_type_round_trips_through_its_string_form() {
         for r#type in DocumentType::ALL {
             assert_eq!(r#type.as_str().parse::<DocumentType>().unwrap(), *r#type);
@@ -1448,20 +1213,6 @@ mod tests {
             rmp_serde::from_slice(&rmp_serde::to_vec(&metadata).unwrap()).unwrap();
 
         assert_eq!(decoded, metadata);
-    }
-
-    #[test]
-    fn every_category_but_donations_has_a_subcategory() {
-        for category in Category::ALL {
-            let has_subcategory = Subcategory::ALL
-                .iter()
-                .any(|subcategory| subcategory.category() == *category);
-            assert_eq!(
-                has_subcategory,
-                *category != Category::Donations,
-                "{category}"
-            );
-        }
     }
 
     #[test]
@@ -1492,8 +1243,8 @@ mod tests {
     fn fake_search_facets_builds_with_plausible_defaults() {
         let facets = FakeSearchFacets::new().build();
 
-        assert!(!facets.categories.is_empty());
-        assert!(facets.categories.iter().all(|facet| facet.count > 0));
+        assert!(!facets.folders.is_empty());
+        assert!(facets.folders.iter().all(|facet| facet.count > 0));
         assert!(facets.earliest_created_at <= facets.latest_created_at);
     }
 
@@ -1503,12 +1254,15 @@ mod tests {
             value: value.to_string(),
             count: 1,
         };
+        let folder_id = Uuid::now_v7();
         let facets = FakeSearchFacets::new()
-            .with_categories(vec![FacetCount {
-                value: Category::Money,
-                count: 2,
-            }])
-            .with_subcategories(Vec::new())
+            .with_folders(
+                vec![FacetCount {
+                    value: folder_id,
+                    count: 2,
+                }],
+                3,
+            )
             .with_types(vec![FacetCount {
                 value: DocumentType::Payslip,
                 count: 1,
@@ -1520,11 +1274,11 @@ mod tests {
         assert_eq!(
             facets,
             SearchFacets {
-                categories: vec![FacetCount {
-                    value: Category::Money,
+                folders: vec![FacetCount {
+                    value: folder_id,
                     count: 2
                 }],
-                subcategories: Vec::new(),
+                unfiled: 3,
                 types: vec![FacetCount {
                     value: DocumentType::Payslip,
                     count: 1

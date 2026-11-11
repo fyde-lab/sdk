@@ -14,17 +14,18 @@ use crate::{ErrorCode, ErrorContext as _, ErrorKind, Result};
 use crate::domains::changelog::{
     ChangelogEvent, EventType, MAX_EVENT_BYTES, Service as ChangelogService,
 };
+use crate::domains::folders::{Folder, Service as FoldersService};
 
-use super::attributes::{self, Service as AttributesService};
+use super::attributes::Service as AttributesService;
 use super::chunk;
 use super::classification::Service as ClassificationService;
 use super::embedder::Embedder;
-use super::storage::{FacetField, Storage};
+use super::storage::{FacetField, Storage, UNFILED};
 use super::transcript;
 use super::{
-    CachedEmbeddings, Category, ChunkEmbedding, Document, DocumentEmbeddings, EmbeddingCache,
-    EmbeddingKey, FacetCount, Indexer, Metadata, SearchFacets, SearchFilters, SearchOrder,
-    SearchQuery, Service, Subcategory, UploadRequest, UploadSource,
+    CachedEmbeddings, ChunkEmbedding, Document, DocumentEmbeddings, EmbeddingCache, EmbeddingKey,
+    FacetCount, Indexer, Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery, Service,
+    UploadRequest, UploadSource,
 };
 
 /// The only content type [`Service::upload`] currently accepts.
@@ -73,8 +74,10 @@ pub(super) struct DocumentsClient<S: Storage> {
     /// Where uploads leave the embeddings they computed, for `indexer` to
     /// reuse.
     cache: Arc<dyn EmbeddingCache>,
-    /// What guesses uploads' category, subcategory and type.
+    /// What guesses uploads' type.
     classifier: Arc<dyn ClassificationService>,
+    /// The folders documents are filed in.
+    folders: Arc<dyn FoldersService>,
     /// When embedding an upload last failed (see [`UPLOAD_EMBED_RETRY_AFTER`]).
     embed_failed_at: Mutex<Option<tokio::time::Instant>>,
 }
@@ -113,8 +116,9 @@ impl<S: Storage> DocumentsClient<S> {
     /// per consumed event, `attributes` to check the attributes of every
     /// document before it's published, `indexer` as what that job caches
     /// documents through, `embedder` to embed uploads' and searches' text,
-    /// `cache` to hand uploads' embeddings over to `indexer`, and
-    /// `classifier` to classify uploads.
+    /// `cache` to hand uploads' embeddings over to `indexer`, `classifier`
+    /// to classify uploads, and `folders` to check the folders documents are
+    /// moved to and count documents per folder.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         storage: S,
@@ -125,6 +129,7 @@ impl<S: Storage> DocumentsClient<S> {
         embedder: Arc<dyn Embedder>,
         cache: Arc<dyn EmbeddingCache>,
         classifier: Arc<dyn ClassificationService>,
+        folders: Arc<dyn FoldersService>,
     ) -> Self {
         Self {
             storage,
@@ -135,16 +140,30 @@ impl<S: Storage> DocumentsClient<S> {
             embedder,
             cache,
             classifier,
+            folders,
             embed_failed_at: Mutex::new(None),
         }
     }
 }
 
 impl<S: Storage> DocumentsClient<S> {
-    /// Rejects metadata whose fields contradict each other, or whose
+    /// The folders synced to this device.
+    async fn folders(&self) -> Result<Vec<Folder>> {
+        self.folders.list().await.context("failed to list folders")
+    }
+
+    /// Rejects metadata filed in a folder this device doesn't know, or whose
     /// attributes aren't valid (see [`AttributesService::check`]).
     async fn check_metadata(&self, metadata: &Metadata) -> Result<()> {
-        check_categories(metadata.category, metadata.subcategory)?;
+        if let Some(folder_id) = metadata.folder_id
+            && !self
+                .folders()
+                .await?
+                .iter()
+                .any(|folder| folder.id == folder_id)
+        {
+            return Err(ErrorKind::FolderNotFound(folder_id).into());
+        }
         self.attributes
             .check(&metadata.attributes)
             .await
@@ -194,16 +213,13 @@ impl<S: Storage> DocumentsClient<S> {
         }
     }
 
-    /// Sets `metadata`'s category, subcategory and, unless it has one, type
-    /// to what its text looks like (each left `None` where the classifier
-    /// can't tell), or leaves them as they are if that fails: the document
-    /// is then published unclassified rather than not at all.
+    /// Sets `metadata`'s type to what its text looks like (`None` where the
+    /// classifier can't tell), or leaves it as it is if that fails: the
+    /// document is then published untyped rather than not at all.
     async fn classify_upload(&self, metadata: &mut Metadata) {
         match self.classifier.classify(&metadata.transcript).await {
             Ok(classification) => {
-                metadata.category = classification.category;
-                metadata.subcategory = classification.subcategory;
-                metadata.r#type = metadata.r#type.or(classification.r#type);
+                metadata.r#type = classification.r#type;
             }
             Err(err) => tracing::warn!(
                 code = ?err.code(),
@@ -283,8 +299,7 @@ impl<S: Storage> DocumentsClient<S> {
     ) -> Result<Vec<FacetCount<String>>> {
         let mut filters = filters.clone();
         match field {
-            FacetField::Category => filters.categories.clear(),
-            FacetField::Subcategory => filters.subcategories.clear(),
+            FacetField::Folder => filters.folder = None,
             FacetField::Type => filters.types.clear(),
             FacetField::ContentType => filters.content_types.clear(),
         }
@@ -342,7 +357,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
     /// being sent alongside the ciphertext. Only the wrapped DEK and
     /// ciphertext ever leave this process.
     #[tracing::instrument(level = "debug", skip_all)]
-    async fn upload(&self, mut request: UploadRequest) -> Result<Uuid> {
+    async fn upload(&self, request: UploadRequest) -> Result<Uuid> {
         // Checked before anything else: publishing the event needs a
         // session, so a caller who never logged in gets this specific,
         // recognizable error before any time is spent reading and parsing
@@ -351,8 +366,6 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .ensure_master_key()
             .await
             .context("cannot upload a document before logging in")?;
-
-        resolve_upload_request(&mut request)?;
 
         let (content, original_name) = match request.source {
             UploadSource::Path(path) => {
@@ -408,14 +421,6 @@ impl<S: Storage> Service for DocumentsClient<S> {
         if let Some(name) = request.name {
             metadata.name = name;
         }
-        if let Some(r#type) = request.r#type {
-            metadata.r#type = Some(r#type);
-        }
-        if let Some(category) = request.category {
-            metadata.category = Some(category);
-            metadata.subcategory = request.subcategory;
-        }
-        metadata.attributes.extend(request.attributes);
 
         self.check_metadata(&metadata)
             .instrument(tracing::debug_span!("check_metadata"))
@@ -433,10 +438,8 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .await;
 
         // Only with the model at hand (the document's just been embedded),
-        // so an upload never waits for its download twice, and never over a
-        // category the caller (a scraper, say) chose: the type is then
-        // theirs too, set or not.
-        if embeddings.is_some() && metadata.category.is_none() {
+        // so an upload never waits for its download twice.
+        if embeddings.is_some() {
             self.classify_upload(&mut metadata)
                 .instrument(tracing::debug_span!("classify_document"))
                 .await;
@@ -540,11 +543,8 @@ impl<S: Storage> Service for DocumentsClient<S> {
         // offer for it are every alternative compatible with the *rest* of
         // the search, not only the one(s) already picked — while every other
         // field narrows to what's left under the picked ones.
-        let categories = self
-            .count_documents_by(&terms, vector, filters, FacetField::Category)
-            .await?;
-        let subcategories = self
-            .count_documents_by(&terms, vector, filters, FacetField::Subcategory)
+        let folders = self
+            .count_documents_by(&terms, vector, filters, FacetField::Folder)
             .await?;
         let types = self
             .count_documents_by(&terms, vector, filters, FacetField::Type)
@@ -554,9 +554,11 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .await?;
         let created_at_range = self.created_at_range(&terms, vector, filters).await?;
 
+        let (folders, unfiled) = folder_facets(&self.folders().await?, folders);
+
         Ok(SearchFacets {
-            categories: parse_facet(categories, "category")?,
-            subcategories: parse_facet(subcategories, "subcategory")?,
+            folders,
+            unfiled,
             types: parse_facet(types, "document type")?,
             content_types,
             earliest_created_at: created_at_range.map(|(earliest, _)| earliest),
@@ -576,6 +578,20 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .with_context(|| format!("failed to publish changelog event for document {id}"))?;
 
         Ok(())
+    }
+
+    async fn move_document(&self, id: Uuid, folder_id: Option<Uuid>) -> Result<()> {
+        let mut metadata = self
+            .storage
+            .get_metadata(id)
+            .await
+            .with_context(|| format!("failed to load document {id}'s metadata"))?
+            .ok_or(ErrorKind::DocumentNotFound(id))?;
+        if metadata.folder_id == folder_id {
+            return Ok(());
+        }
+        metadata.folder_id = folder_id;
+        self.update_metadata(metadata).await
     }
 
     async fn delete(&self, id: Uuid) -> Result<()> {
@@ -700,7 +716,7 @@ impl<S: Storage> Indexer for DocumentIndexer<S> {
             .with_context(|| format!("failed to read cached document {id}"))?;
 
         // Re-embedding takes about a second per document: only when the
-        // text it embeds changes, not for a new category or attribute.
+        // text it embeds changes, not for a new folder or attribute.
         let embeddings = match previous {
             Some(previous)
                 if title(&previous.name) != title(&metadata.name)
@@ -876,42 +892,6 @@ fn title(name: &str) -> &str {
     }
 }
 
-/// Completes `request` with what its fields imply — a subcategory alone
-/// implies its category — and rejects one whose fields contradict each
-/// other. Shared with the dev [`Service`] (see `super::dev`), so a scraper
-/// run without a server fails on the same requests a real upload would.
-pub(super) fn resolve_upload_request(request: &mut UploadRequest) -> Result<()> {
-    if request.category.is_none() {
-        request.category = request
-            .subcategory
-            .map(|subcategory| subcategory.category());
-    }
-    check_categories(request.category, request.subcategory)?;
-    // Only what can be checked without a server: the dev `Service` has none
-    // to fetch attribute definitions from. `upload` checks them in full once
-    // the document is parsed.
-    attributes::check_values(&request.attributes)
-}
-
-/// Rejects a subcategory that doesn't narrow down `category` (or that's
-/// set without any category).
-pub(super) fn check_categories(
-    category: Option<Category>,
-    subcategory: Option<Subcategory>,
-) -> Result<()> {
-    if let Some(subcategory) = subcategory
-        && Some(subcategory.category()) != category
-    {
-        return Err(ErrorKind::MismatchedSubcategory(format!(
-            "subcategory {subcategory} belongs to {}, not {}",
-            subcategory.category(),
-            category.map_or("no category".to_string(), |category| category.to_string())
-        ))
-        .into());
-    }
-    Ok(())
-}
-
 /// Rejects a `created_from` later than `created_until`, a range no
 /// document can fall in.
 fn check_created_range(filters: &SearchFilters) -> Result<()> {
@@ -924,6 +904,63 @@ fn check_created_range(filters: &SearchFilters) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+/// Folds the counts of documents directly in each folder (by id, or
+/// [`UNFILED`]) into [`SearchFacets::folders`] and
+/// [`SearchFacets::unfiled`]: each of `folders` with the documents in it or
+/// below, most first (ties by name), and the documents with no folder or
+/// one that's gone.
+fn folder_facets(
+    folders: &[Folder],
+    direct: Vec<FacetCount<String>>,
+) -> (Vec<FacetCount<Uuid>>, u64) {
+    let parents: HashMap<Uuid, Option<Uuid>> = folders
+        .iter()
+        .map(|folder| (folder.id, folder.parent_id))
+        .collect();
+    let mut totals: HashMap<Uuid, u64> = HashMap::new();
+    let mut unfiled = 0;
+    for facet in direct {
+        let folder_id = (facet.value != UNFILED)
+            .then(|| Uuid::parse_str(&facet.value).ok())
+            .flatten()
+            .filter(|id| parents.contains_key(id));
+        let Some(folder_id) = folder_id else {
+            unfiled += facet.count;
+            continue;
+        };
+        // Up to the top level, guarding against a cycle a corrupt table
+        // could hold.
+        let mut seen = std::collections::HashSet::new();
+        let mut current = Some(folder_id);
+        while let Some(id) = current
+            && seen.insert(id)
+        {
+            *totals.entry(id).or_default() += facet.count;
+            current = parents.get(&id).copied().flatten();
+        }
+    }
+
+    let names: HashMap<Uuid, &str> = folders
+        .iter()
+        .map(|folder| (folder.id, folder.name.as_str()))
+        .collect();
+    let mut counts: Vec<FacetCount<Uuid>> = totals
+        .into_iter()
+        .map(|(value, count)| FacetCount { value, count })
+        .collect();
+    counts.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| {
+                names[&a.value]
+                    .to_lowercase()
+                    .cmp(&names[&b.value].to_lowercase())
+            })
+            .then_with(|| a.value.cmp(&b.value))
+    });
+    (counts, unfiled)
 }
 
 /// Parses the canonical string form [`Storage::count_documents_by`] returns
@@ -981,8 +1018,7 @@ fn checksum(content: &[u8]) -> String {
 /// Builds the [`Metadata`] of a freshly uploaded PDF `content`, originally
 /// named `original_name`, whose [`checksum`] is `checksum`: a new id, its
 /// name (the file name without extension), size and transcript. Its type,
-/// classification and attributes are left empty, for the upload request to
-/// fill in.
+/// folder and attributes are left empty.
 #[tracing::instrument(level = "debug", skip(content, checksum), fields(size = content.len()))]
 fn parse_content(content: &[u8], original_name: &str, checksum: String) -> Result<Metadata> {
     let name = Path::new(original_name)
@@ -1009,8 +1045,7 @@ fn parse_content(content: &[u8], original_name: &str, checksum: String) -> Resul
         checksum,
         transcript,
         r#type: None,
-        category: None,
-        subcategory: None,
+        folder_id: None,
         attributes: BTreeMap::new(),
     })
 }
@@ -1033,6 +1068,7 @@ mod tests {
     use super::super::{Attribute, DocumentType};
     use super::super::{FakeDocument, FakeMetadata, MockEmbeddingCache, MockIndexer};
     use super::*;
+    use crate::domains::folders::{FakeFolder, folders_listing, no_folders};
 
     /// An [`Indexer`] fake for tests that never sync.
     fn unused_indexer() -> Arc<dyn Indexer> {
@@ -1118,6 +1154,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         let err = client
@@ -1247,6 +1284,7 @@ mod tests {
             embedder_without_model(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         let id = client
@@ -1273,8 +1311,7 @@ mod tests {
             sent_metadata.transcript
         );
         assert_eq!(sent_metadata.r#type, None);
-        assert_eq!(sent_metadata.category, None);
-        assert_eq!(sent_metadata.subcategory, None);
+        assert_eq!(sent_metadata.folder_id, None);
         assert!(sent_metadata.attributes.is_empty());
     }
 
@@ -1304,6 +1341,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         let err = client
@@ -1331,6 +1369,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         let result = client.upload(UploadRequest::from_path(file.path())).await;
@@ -1352,6 +1391,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         let err = client
@@ -1367,7 +1407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_applies_metadata_overrides_from_the_request() {
+    async fn upload_names_the_document_as_requested() {
         let raw = build_pdf("hello world");
 
         let mut storage = MockStorage::new();
@@ -1386,6 +1426,7 @@ mod tests {
             embedder_without_model(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         let request = UploadRequest {
@@ -1394,10 +1435,6 @@ mod tests {
                 content: raw.clone(),
             },
             name: Some("overridden.pdf".to_string()),
-            r#type: Some(DocumentType::Payslip),
-            category: Some(super::super::Category::Work),
-            subcategory: None,
-            attributes: BTreeMap::new(),
         };
 
         client.upload(request).await.unwrap();
@@ -1408,134 +1445,6 @@ mod tests {
         let sent_metadata = sent_metadata.as_ref().unwrap();
         assert_eq!(sent_metadata.original_name, "raw.pdf");
         assert_eq!(sent_metadata.name, "overridden.pdf");
-        assert_eq!(sent_metadata.r#type, Some(DocumentType::Payslip));
-        assert_eq!(sent_metadata.category, Some(super::super::Category::Work));
-    }
-
-    /// Uploads a PDF with `request`'s overrides, returning the metadata it
-    /// was published with.
-    async fn upload_with(mut request: UploadRequest) -> Metadata {
-        let mut storage = MockStorage::new();
-        storage
-            .expect_find_document_by_checksum()
-            .times(1)
-            .returning(|_| Ok(None));
-        let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            storage,
-            changelog.clone(),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            embedder_without_model(),
-            unused_cache(),
-            unused_classifier(),
-        );
-
-        request.source = super::super::UploadSource::Raw {
-            name: "raw.pdf".to_string(),
-            content: build_pdf("hello world"),
-        };
-        client.upload(request).await.unwrap();
-
-        let sent = changelog.sent.lock().unwrap();
-        sent[0].3.clone().unwrap()
-    }
-
-    #[tokio::test]
-    async fn upload_infers_the_category_of_a_lone_subcategory() {
-        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
-        request.subcategory = Some(Subcategory::Energy);
-
-        let metadata = upload_with(request).await;
-
-        assert_eq!(metadata.category, Some(Category::Housing));
-        assert_eq!(metadata.subcategory, Some(Subcategory::Energy));
-    }
-
-    #[tokio::test]
-    async fn upload_rejects_a_subcategory_of_another_category_before_parsing() {
-        // `MockStorage` panics on any call, proving the request is rejected
-        // before the duplicate check and parsing.
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            Arc::new(RecordingChangelog::default()),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
-        );
-        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
-        request.category = Some(Category::Money);
-        request.subcategory = Some(Subcategory::Energy);
-
-        let err = client.upload(request).await.unwrap_err();
-
-        assert_eq!(err.code(), crate::ErrorCode::MismatchedSubcategory);
-    }
-
-    #[tokio::test]
-    async fn upload_rejects_attributes_the_attributes_service_rejects() {
-        let mut storage = MockStorage::new();
-        storage
-            .expect_find_document_by_checksum()
-            .returning(|_| Ok(None));
-        let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            storage,
-            changelog.clone(),
-            None,
-            rejecting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
-        );
-        let mut request = UploadRequest::from_raw("raw.pdf", build_pdf("hello world"));
-        request.attributes = BTreeMap::from([("price".to_string(), Attribute::Integer(1))]);
-
-        let err = client.upload(request).await.unwrap_err();
-
-        assert_eq!(err.code(), crate::ErrorCode::InvalidAttribute);
-        assert!(changelog.sent.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn upload_keeps_the_requested_attributes() {
-        let attributes = BTreeMap::from([
-            ("price".to_string(), Attribute::Float(32.3)),
-            ("paid".to_string(), Attribute::Boolean(true)),
-        ]);
-        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
-        request.attributes = attributes.clone();
-
-        let metadata = upload_with(request).await;
-
-        assert_eq!(metadata.attributes, attributes);
-    }
-
-    #[tokio::test]
-    async fn upload_rejects_a_requested_non_finite_attribute_before_parsing() {
-        // `MockStorage` panics on any call, proving the request is rejected
-        // before the duplicate check and parsing.
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            Arc::new(RecordingChangelog::default()),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
-        );
-        let mut request = UploadRequest::from_raw("raw.pdf", Vec::new());
-        request.attributes = BTreeMap::from([("price".to_string(), Attribute::Float(f64::NAN))]);
-
-        let err = client.upload(request).await.unwrap_err();
-
-        assert_eq!(err.code(), crate::ErrorCode::InvalidAttribute);
     }
 
     #[tokio::test]
@@ -1550,6 +1459,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
         let metadata = super::super::FakeMetadata::new()
             .with_attributes([("price".to_string(), Attribute::Integer(1))])
@@ -1573,6 +1483,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
         let attributes = BTreeMap::from([("price".to_string(), Attribute::Float(32.3))]);
         let metadata = super::super::FakeMetadata::new()
@@ -1586,7 +1497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_metadata_rejects_a_subcategory_of_another_category() {
+    async fn update_metadata_rejects_a_folder_not_synced_here() {
         let changelog = Arc::new(RecordingChangelog::default());
         let client = DocumentsClient::new(
             MockStorage::new(),
@@ -1597,16 +1508,143 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            folders_listing(vec![FakeFolder::new().build()]),
         );
         let metadata = super::super::FakeMetadata::new()
-            .with_category(Category::Money)
-            .with_subcategory(Subcategory::Energy)
+            .with_folder(Uuid::now_v7())
             .build();
 
         let err = client.update_metadata(metadata).await.unwrap_err();
 
-        assert_eq!(err.code(), crate::ErrorCode::MismatchedSubcategory);
+        assert_eq!(err.code(), crate::ErrorCode::FolderNotFound);
         assert!(changelog.sent.lock().unwrap().is_empty());
+    }
+
+    /// A documents client whose storage holds `metadata` and whose folders
+    /// are `folders`, publishing to `changelog`.
+    fn client_moving(
+        metadata: Metadata,
+        folders: Vec<Folder>,
+        changelog: Arc<RecordingChangelog>,
+    ) -> DocumentsClient<MockStorage> {
+        let mut storage = MockStorage::new();
+        let id = metadata.id;
+        storage
+            .expect_get_metadata()
+            .withf(move |queried| *queried == id)
+            .returning(move |_| Ok(Some(metadata.clone())));
+        DocumentsClient::new(
+            storage,
+            changelog,
+            None,
+            accepting_attributes(),
+            unused_indexer(),
+            unused_embedder(),
+            unused_cache(),
+            unused_classifier(),
+            folders_listing(folders),
+        )
+    }
+
+    #[tokio::test]
+    async fn move_document_publishes_its_metadata_in_the_new_folder() {
+        let folder = FakeFolder::new().build();
+        let metadata = super::super::FakeMetadata::new().with_folder(None).build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_moving(metadata.clone(), vec![folder.clone()], changelog.clone());
+
+        client
+            .move_document(metadata.id, Some(folder.id))
+            .await
+            .unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, EventType::UpdateMetadata);
+        assert_eq!(
+            sent[0].3.as_ref().unwrap(),
+            &Metadata {
+                folder_id: Some(folder.id),
+                ..metadata
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn move_document_to_the_root_needs_no_folder() {
+        let folder = FakeFolder::new().build();
+        let metadata = super::super::FakeMetadata::new()
+            .with_folder(folder.id)
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_moving(metadata.clone(), Vec::new(), changelog.clone());
+
+        client.move_document(metadata.id, None).await.unwrap();
+
+        assert_eq!(
+            changelog.sent.lock().unwrap()[0]
+                .3
+                .as_ref()
+                .unwrap()
+                .folder_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn move_document_where_it_already_is_publishes_nothing() {
+        let folder = FakeFolder::new().build();
+        let metadata = super::super::FakeMetadata::new()
+            .with_folder(folder.id)
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_moving(metadata.clone(), vec![folder.clone()], changelog.clone());
+
+        client
+            .move_document(metadata.id, Some(folder.id))
+            .await
+            .unwrap();
+
+        assert!(changelog.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn move_document_rejects_a_folder_not_synced_here() {
+        let metadata = super::super::FakeMetadata::new().with_folder(None).build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_moving(metadata.clone(), Vec::new(), changelog.clone());
+
+        let err = client
+            .move_document(metadata.id, Some(Uuid::now_v7()))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::FolderNotFound);
+        assert!(changelog.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn move_document_rejects_a_document_not_synced_here() {
+        let mut storage = MockStorage::new();
+        storage.expect_get_metadata().returning(|_| Ok(None));
+        let client = DocumentsClient::new(
+            storage,
+            Arc::new(RecordingChangelog::default()),
+            None,
+            accepting_attributes(),
+            unused_indexer(),
+            unused_embedder(),
+            unused_cache(),
+            unused_classifier(),
+            no_folders(),
+        );
+
+        let err = client
+            .move_document(Uuid::now_v7(), None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::DocumentNotFound);
     }
 
     #[tokio::test]
@@ -1625,8 +1663,7 @@ mod tests {
                 checksum: "deadbeef".to_string(),
                 transcript: String::new(),
                 r#type: None,
-                category: None,
-                subcategory: None,
+                folder_id: None,
                 attributes: BTreeMap::new(),
             },
         };
@@ -1648,6 +1685,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         assert_eq!(client.get(id).await.unwrap(), Some(document));
@@ -1677,6 +1715,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         let page = client.list(1, 2).await.unwrap();
@@ -1692,7 +1731,7 @@ mod tests {
     #[tokio::test]
     async fn search_splits_the_text_into_terms_and_forwards_the_query_to_storage() {
         let filters = super::super::SearchFilters {
-            categories: vec![super::super::Category::Money],
+            folder: Some(super::super::FolderFilter::Within(Uuid::now_v7())),
             created_from: Some(1),
             created_until: Some(2),
             ..Default::default()
@@ -1723,6 +1762,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         let documents = client
@@ -1757,6 +1797,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         client.search(SearchQuery::new(" - ", 0, 10)).await.unwrap();
@@ -1783,6 +1824,7 @@ mod tests {
                 unused_embedder(),
                 unused_cache(),
                 unused_classifier(),
+                no_folders(),
             );
 
             let err = client.search(query.clone()).await.unwrap_err();
@@ -1803,8 +1845,7 @@ mod tests {
     ) -> super::super::SearchFilters {
         let mut filters = filters.clone();
         match field {
-            FacetField::Category => filters.categories.clear(),
-            FacetField::Subcategory => filters.subcategories.clear(),
+            FacetField::Folder => filters.folder = None,
             FacetField::Type => filters.types.clear(),
             FacetField::ContentType => filters.content_types.clear(),
         }
@@ -1813,17 +1854,24 @@ mod tests {
 
     #[tokio::test]
     async fn search_facets_counts_term_matches_when_the_text_cant_be_embedded() {
-        use super::super::{Category, SearchFilters, Subcategory};
+        use super::super::{FolderFilter, SearchFilters};
 
+        let folder = FakeFolder::new().build();
         let filters = SearchFilters {
-            categories: vec![Category::Money],
-            subcategories: vec![Subcategory::Banking],
+            folder: Some(FolderFilter::Within(folder.id)),
             types: vec![DocumentType::Statement],
             content_types: vec!["application/pdf".to_string()],
             created_from: Some(1),
             created_until: Some(2),
         };
         let expected = super::super::FakeSearchFacets::new()
+            .with_folders(
+                vec![FacetCount {
+                    value: folder.id,
+                    count: 4,
+                }],
+                2,
+            )
             .with_created_at_range(Some((10, 20)))
             .build();
         let as_strings = |values: Vec<String>, counts: Vec<u64>| -> Vec<FacetCount<String>> {
@@ -1835,26 +1883,8 @@ mod tests {
         };
         let per_field = [
             (
-                FacetField::Category,
-                as_strings(
-                    expected
-                        .categories
-                        .iter()
-                        .map(|f| f.value.as_str().to_string())
-                        .collect(),
-                    expected.categories.iter().map(|f| f.count).collect(),
-                ),
-            ),
-            (
-                FacetField::Subcategory,
-                as_strings(
-                    expected
-                        .subcategories
-                        .iter()
-                        .map(|f| f.value.as_str().to_string())
-                        .collect(),
-                    expected.subcategories.iter().map(|f| f.count).collect(),
-                ),
+                FacetField::Folder,
+                as_strings(vec![folder.id.to_string(), UNFILED.to_string()], vec![4, 2]),
             ),
             (
                 FacetField::Type,
@@ -1901,6 +1931,7 @@ mod tests {
             unembeddable_queries(),
             unused_cache(),
             unused_classifier(),
+            folders_listing(vec![folder.clone()]),
         );
 
         let facets = client.search_facets(" facture ", &filters).await.unwrap();
@@ -1909,14 +1940,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_facets_fails_on_an_unknown_classification_value() {
+    async fn search_facets_fails_on_an_unknown_document_type() {
         let mut storage = MockStorage::new();
         storage
             .expect_count_documents_by()
             .returning(|_, _, field| {
-                Ok(if field == FacetField::Category {
+                Ok(if field == FacetField::Type {
                     vec![FacetCount {
-                        value: "not-a-category".to_string(),
+                        value: "not-a-type".to_string(),
                         count: 1,
                     }]
                 } else {
@@ -1934,6 +1965,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         let err = client
@@ -1941,7 +1973,81 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(err.code(), crate::ErrorCode::InvalidCategory);
+        assert_eq!(err.code(), crate::ErrorCode::InvalidDocumentType);
+    }
+
+    fn direct(counts: &[(String, u64)]) -> Vec<FacetCount<String>> {
+        counts
+            .iter()
+            .map(|(value, count)| FacetCount {
+                value: value.clone(),
+                count: *count,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn folder_facets_count_each_folder_with_everything_below_it() {
+        let top = FakeFolder::new().with_name("Logement").build();
+        let child = FakeFolder::new()
+            .with_parent(top.id)
+            .with_name("Eau")
+            .build();
+        let grandchild = FakeFolder::new()
+            .with_parent(child.id)
+            .with_name("Factures")
+            .build();
+        let other = FakeFolder::new().with_name("Argent").build();
+        let folders = vec![
+            top.clone(),
+            child.clone(),
+            grandchild.clone(),
+            other.clone(),
+        ];
+
+        let (counts, unfiled) = folder_facets(
+            &folders,
+            direct(&[
+                (top.id.to_string(), 1),
+                (grandchild.id.to_string(), 2),
+                (other.id.to_string(), 3),
+            ]),
+        );
+
+        assert_eq!(
+            counts,
+            [
+                // Ties by name: Argent before Logement, Eau before Factures.
+                FacetCount {
+                    value: other.id,
+                    count: 3
+                },
+                FacetCount {
+                    value: top.id,
+                    count: 3
+                },
+                FacetCount {
+                    value: child.id,
+                    count: 2
+                },
+                FacetCount {
+                    value: grandchild.id,
+                    count: 2
+                },
+            ]
+        );
+        assert_eq!(unfiled, 0);
+    }
+
+    #[test]
+    fn folder_facets_count_documents_of_a_folder_gone_as_unfiled() {
+        let (counts, unfiled) = folder_facets(
+            &[],
+            direct(&[(Uuid::now_v7().to_string(), 2), (UNFILED.to_string(), 3)]),
+        );
+
+        assert!(counts.is_empty());
+        assert_eq!(unfiled, 5);
     }
 
     #[tokio::test]
@@ -1955,6 +2061,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         let err = client
@@ -2066,6 +2173,7 @@ mod tests {
             embedder,
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         )
     }
 
@@ -2113,7 +2221,7 @@ mod tests {
     async fn search_by_relevance_fuses_both_rankings_and_loads_only_the_requested_page() {
         let [both, by_terms, by_similarity] = ids(3).try_into().unwrap();
         let filters = super::super::SearchFilters {
-            categories: vec![super::super::Category::Money],
+            folder: Some(super::super::FolderFilter::Unfiled),
             ..Default::default()
         };
         let mut storage = MockStorage::new();
@@ -2285,10 +2393,11 @@ mod tests {
 
     #[tokio::test]
     async fn search_facets_counts_what_a_hybrid_search_finds_when_the_text_embeds() {
-        use super::super::{Category, SearchFilters};
+        use super::super::{FolderFilter, SearchFilters};
 
+        let folder = FakeFolder::new().build();
         let filters = SearchFilters {
-            categories: vec![Category::Money],
+            folder: Some(FolderFilter::Within(folder.id)),
             types: vec![DocumentType::Statement],
             created_from: Some(1),
             created_until: Some(2),
@@ -2298,8 +2407,7 @@ mod tests {
         let mut found = vec![by_terms, both, by_similarity];
         found.sort_unstable();
         let lifted = [
-            without_own_filter(&filters, FacetField::Category),
-            without_own_filter(&filters, FacetField::Subcategory),
+            without_own_filter(&filters, FacetField::Folder),
             without_own_filter(&filters, FacetField::Type),
             without_own_filter(&filters, FacetField::ContentType),
             SearchFilters {
@@ -2325,9 +2433,9 @@ mod tests {
                     Ok(vec![(both, 0.9), (by_similarity, 0.9), (weak, 0.1)])
                 });
         }
+        let folder_id = folder.id;
         for field in [
-            FacetField::Category,
-            FacetField::Subcategory,
+            FacetField::Folder,
             FacetField::Type,
             FacetField::ContentType,
         ] {
@@ -2337,9 +2445,9 @@ mod tests {
                 .withf(move |ids, queried| ids == found && *queried == field)
                 .times(1)
                 .returning(move |_, field| {
-                    Ok(if field == FacetField::Category {
+                    Ok(if field == FacetField::Folder {
                         vec![FacetCount {
-                            value: Category::Money.as_str().to_string(),
+                            value: folder_id.to_string(),
                             count: 3,
                         }]
                     } else {
@@ -2353,19 +2461,31 @@ mod tests {
             .times(1)
             .returning(|_| Ok(Some((10, 20))));
 
-        let facets = searching(storage, query_embedder("impôts", vec![1.0]))
-            .search_facets(" impôts ", &filters)
-            .await
-            .unwrap();
+        let facets = DocumentsClient::new(
+            storage,
+            Arc::new(RecordingChangelog::default()),
+            None,
+            accepting_attributes(),
+            unused_indexer(),
+            query_embedder("impôts", vec![1.0]),
+            unused_cache(),
+            unused_classifier(),
+            folders_listing(vec![folder.clone()]),
+        )
+        .search_facets(" impôts ", &filters)
+        .await
+        .unwrap();
 
         assert_eq!(
             facets,
             super::super::FakeSearchFacets::new()
-                .with_categories(vec![FacetCount {
-                    value: Category::Money,
-                    count: 3
-                }])
-                .with_subcategories(Vec::new())
+                .with_folders(
+                    vec![FacetCount {
+                        value: folder.id,
+                        count: 3
+                    }],
+                    0
+                )
                 .with_types(Vec::new())
                 .with_content_types(Vec::new())
                 .with_created_at_range(Some((10, 20)))
@@ -2390,6 +2510,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         client.update_metadata(metadata).await.unwrap();
@@ -2426,6 +2547,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         client.start_sync().await.unwrap();
@@ -2450,6 +2572,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         client.start_sync().await.unwrap();
@@ -2467,6 +2590,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         client.stop_sync();
@@ -2486,6 +2610,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         )
     }
 
@@ -2809,7 +2934,7 @@ mod tests {
             .build();
         let updated = Metadata {
             name: "a.PDF".to_string(),
-            category: Some(Category::Housing),
+            folder_id: Some(Uuid::now_v7()),
             attributes: BTreeMap::from([("paid".to_string(), Attribute::Boolean(true))]),
             ..previous.clone()
         };
@@ -2890,6 +3015,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         assert_eq!(
@@ -3104,6 +3230,7 @@ mod tests {
             Arc::new(embedder),
             Arc::new(cache),
             classifier_returning(Classification::default(), 1),
+            no_folders(),
         );
 
         let id = client
@@ -3149,6 +3276,7 @@ mod tests {
             embedder_without_model(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         let id = client
@@ -3177,6 +3305,7 @@ mod tests {
             unused_embedder(),
             unused_cache(),
             unused_classifier(),
+            no_folders(),
         );
 
         client
@@ -3211,6 +3340,7 @@ mod tests {
             Arc::new(embedder),
             Arc::new(cache),
             classifier_returning(Classification::default(), 1),
+            no_folders(),
         );
 
         let err = client
@@ -3251,6 +3381,7 @@ mod tests {
             Arc::new(embedder),
             Arc::new(cache),
             classifier_returning(Classification::default(), 1),
+            no_folders(),
         );
 
         let upload = client.upload(UploadRequest::from_raw(
@@ -3303,6 +3434,7 @@ mod tests {
             Arc::new(embedder),
             Arc::new(cache),
             classifier_returning(Classification::default(), 1),
+            no_folders(),
         );
         let upload = |text| client.upload(UploadRequest::from_raw("a.pdf", build_pdf(text)));
 
@@ -3336,6 +3468,7 @@ mod tests {
             Arc::new(embedder),
             Arc::new(cache),
             classifier,
+            no_folders(),
         )
     }
 
@@ -3349,7 +3482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_publishes_the_document_classified_from_its_transcript() {
+    async fn upload_publishes_the_document_typed_from_its_transcript_at_the_root() {
         let classification = FakeClassification::new().build();
         let mut classifier = MockClassificationService::new();
         classifier
@@ -3370,21 +3503,14 @@ mod tests {
 
         let metadata = published_metadata(&changelog);
         assert_eq!(
-            (metadata.category, metadata.subcategory, metadata.r#type),
-            (
-                classification.category,
-                classification.subcategory,
-                classification.r#type
-            )
+            (metadata.r#type, metadata.folder_id),
+            (classification.r#type, None)
         );
     }
 
     #[tokio::test]
-    async fn upload_leaves_unclassified_what_the_classifier_can_t_tell() {
-        let classification = FakeClassification::new()
-            .with_subcategory(None)
-            .with_type(None)
-            .build();
+    async fn upload_leaves_untyped_what_the_classifier_can_t_tell() {
+        let classification = FakeClassification::new().with_type(None).build();
         let changelog = Arc::new(RecordingChangelog::default());
         let client =
             client_classifying_with(changelog.clone(), classifier_returning(classification, 1));
@@ -3397,67 +3523,7 @@ mod tests {
             .await
             .unwrap();
 
-        let metadata = published_metadata(&changelog);
-        assert_eq!(metadata.category, classification.category);
-        assert_eq!((metadata.subcategory, metadata.r#type), (None, None));
-    }
-
-    #[tokio::test]
-    async fn upload_never_classifies_a_document_given_a_category() {
-        let changelog = Arc::new(RecordingChangelog::default());
-        // Strict: classifying panics.
-        let client = client_classifying_with(changelog.clone(), unused_classifier());
-        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
-        request.category = Some(Category::Housing);
-
-        client.upload(request).await.unwrap();
-
-        let metadata = published_metadata(&changelog);
-        assert_eq!(metadata.category, Some(Category::Housing));
-        assert_eq!((metadata.subcategory, metadata.r#type), (None, None));
-    }
-
-    #[tokio::test]
-    async fn upload_never_classifies_a_document_given_a_subcategory_alone() {
-        let changelog = Arc::new(RecordingChangelog::default());
-        // Strict: classifying panics.
-        let client = client_classifying_with(changelog.clone(), unused_classifier());
-        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
-        request.subcategory = Some(Subcategory::Water);
-
-        client.upload(request).await.unwrap();
-
-        let metadata = published_metadata(&changelog);
-        assert_eq!(
-            (metadata.category, metadata.subcategory),
-            (Some(Category::Housing), Some(Subcategory::Water))
-        );
-    }
-
-    #[tokio::test]
-    async fn upload_classifies_a_document_given_a_type_alone_but_keeps_its_type() {
-        let classification = FakeClassification::new()
-            .with_category(Category::Work)
-            .with_subcategory(Subcategory::Payslips)
-            .with_type(DocumentType::Payslip)
-            .build();
-        let changelog = Arc::new(RecordingChangelog::default());
-        let client =
-            client_classifying_with(changelog.clone(), classifier_returning(classification, 1));
-        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
-        request.r#type = Some(DocumentType::Contract);
-
-        client.upload(request).await.unwrap();
-
-        let metadata = published_metadata(&changelog);
-        assert_eq!(
-            (metadata.category, metadata.subcategory, metadata.r#type),
-            (
-                Some(Category::Work),
-                Some(Subcategory::Payslips),
-                Some(DocumentType::Contract)
-            )
-        );
+        assert_eq!(published_metadata(&changelog).r#type, None);
     }
 
     #[tokio::test]
@@ -3478,11 +3544,7 @@ mod tests {
             .await
             .unwrap();
 
-        let metadata = published_metadata(&changelog);
-        assert_eq!(
-            (metadata.category, metadata.subcategory, metadata.r#type),
-            (None, None, None)
-        );
+        assert_eq!(published_metadata(&changelog).r#type, None);
     }
 
     /// Uploads a document with a mocked model, then has an indexer over a
@@ -3503,6 +3565,7 @@ mod tests {
             Arc::new(embedder),
             Arc::new(cache),
             classifier_returning(Classification::default(), 1),
+            no_folders(),
         );
         let id = client
             .upload(UploadRequest::from_raw("Facture mars.pdf", pdf))

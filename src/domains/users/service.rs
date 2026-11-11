@@ -830,6 +830,14 @@ mod tests {
             unimplemented!()
         }
 
+        async fn move_document(
+            &self,
+            _id: uuid::Uuid,
+            _folder_id: Option<uuid::Uuid>,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+
         async fn delete(&self, _id: uuid::Uuid) -> Result<()> {
             unimplemented!()
         }

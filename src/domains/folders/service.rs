@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::domains::changelog::{EventType, Service as ChangelogService};
+use crate::domains::documents::Storage as DocumentStorage;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
 use super::storage::Storage;
@@ -143,14 +144,16 @@ impl<S: Storage> Service for FoldersClient<S> {
 }
 
 /// Implements [`Applier`]: materializes consumed folder events into
-/// `storage`.
-pub(super) struct FolderApplier<S: Storage> {
+/// `storage`, and their consequences for the documents they held into
+/// `documents`.
+pub(super) struct FolderApplier<S: Storage, D: DocumentStorage> {
     storage: S,
+    documents: D,
 }
 
-impl<S: Storage> FolderApplier<S> {
-    pub(super) fn new(storage: S) -> Self {
-        Self { storage }
+impl<S: Storage, D: DocumentStorage> FolderApplier<S, D> {
+    pub(super) fn new(storage: S, documents: D) -> Self {
+        Self { storage, documents }
     }
 
     async fn folders(&self) -> Result<Vec<Folder>> {
@@ -162,7 +165,7 @@ impl<S: Storage> FolderApplier<S> {
 }
 
 #[async_trait]
-impl<S: Storage> Applier for FolderApplier<S> {
+impl<S: Storage, D: DocumentStorage> Applier for FolderApplier<S, D> {
     async fn apply_save(&self, folder: Folder) -> Result<()> {
         let folders = self.folders().await?;
         let mut folder = folder;
@@ -198,9 +201,18 @@ impl<S: Storage> Applier for FolderApplier<S> {
             FolderContents::Delete => {
                 let mut delete = descendants(&folders, id);
                 delete.push(id);
+                self.documents
+                    .delete_folder_documents(&delete)
+                    .await
+                    .with_context(|| format!("failed to delete the documents of folder {id}"))?;
                 (Vec::new(), delete)
             }
             FolderContents::Keep => {
+                self.documents
+                    .move_folder_documents(&[id], folder.parent_id)
+                    .await
+                    .with_context(|| format!("failed to move the documents of folder {id} up"))?;
+
                 // Name clashes are checked against the folders that stay,
                 // in order, so two children can't take the same new name.
                 let mut remaining: Vec<Folder> = folders
@@ -389,6 +401,7 @@ mod tests {
     use crate::ErrorCode;
     use crate::domains::changelog::ChangelogEvent;
     use crate::domains::documents::Metadata;
+    use crate::domains::documents::MockStorage as MockDocumentStorage;
     use crate::domains::folders::FakeFolder;
     use crate::domains::folders::storage::MockStorage;
 
@@ -800,8 +813,27 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::FolderNotFound);
     }
 
-    fn applier(storage: MockStorage) -> FolderApplier<MockStorage> {
-        FolderApplier::new(storage)
+    fn applier(storage: MockStorage) -> FolderApplier<MockStorage, MockDocumentStorage> {
+        applier_with_documents(storage, MockDocumentStorage::new())
+    }
+
+    fn applier_with_documents(
+        storage: MockStorage,
+        documents: MockDocumentStorage,
+    ) -> FolderApplier<MockStorage, MockDocumentStorage> {
+        FolderApplier::new(storage, documents)
+    }
+
+    /// Documents storage expecting the documents of `folder` to move to
+    /// `to`.
+    fn documents_moving(folder: Uuid, to: Option<Uuid>) -> MockDocumentStorage {
+        let mut documents = MockDocumentStorage::new();
+        documents
+            .expect_move_folder_documents()
+            .withf(move |folders, target| folders == [folder] && *target == to)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        documents
     }
 
     fn storage_expecting(
@@ -891,11 +923,15 @@ mod tests {
             parent_id: Some(top.id),
             ..child.clone()
         };
-        let client = applier(storage_expecting(
-            vec![top, deleted.clone(), child],
-            vec![expected],
-            vec![deleted.id],
-        ));
+        let documents = documents_moving(deleted.id, Some(top.id));
+        let client = applier_with_documents(
+            storage_expecting(
+                vec![top, deleted.clone(), child],
+                vec![expected],
+                vec![deleted.id],
+            ),
+            documents,
+        );
 
         client
             .apply_delete(deleted.id, FolderContents::Keep)
@@ -913,11 +949,15 @@ mod tests {
             appearance: Some(APPEARANCE),
             ..child.clone()
         };
-        let client = applier(storage_expecting(
-            vec![deleted.clone(), child],
-            vec![expected],
-            vec![deleted.id],
-        ));
+        let documents = documents_moving(deleted.id, None);
+        let client = applier_with_documents(
+            storage_expecting(
+                vec![deleted.clone(), child],
+                vec![expected],
+                vec![deleted.id],
+            ),
+            documents,
+        );
 
         client
             .apply_delete(deleted.id, FolderContents::Keep)
@@ -942,11 +982,15 @@ mod tests {
             name: "Eau (2)".to_string(),
             ..child.clone()
         };
-        let client = applier(storage_expecting(
-            vec![parent, sibling, deleted.clone(), child],
-            vec![expected],
-            vec![deleted.id],
-        ));
+        let documents = documents_moving(deleted.id, Some(parent.id));
+        let client = applier_with_documents(
+            storage_expecting(
+                vec![parent, sibling, deleted.clone(), child],
+                vec![expected],
+                vec![deleted.id],
+            ),
+            documents,
+        );
 
         client
             .apply_delete(deleted.id, FolderContents::Keep)
@@ -968,6 +1012,15 @@ mod tests {
             other,
         ]);
         let expected: HashSet<Uuid> = [deleted.id, child.id, grandchild.id].into();
+        let mut documents = MockDocumentStorage::new();
+        let expected_documents = expected.clone();
+        documents
+            .expect_delete_folder_documents()
+            .withf(move |folders| {
+                folders.iter().copied().collect::<HashSet<_>>() == expected_documents
+            })
+            .times(1)
+            .returning(|_| Ok(()));
         storage
             .expect_apply()
             .withf(move |save, delete| {
@@ -975,7 +1028,7 @@ mod tests {
             })
             .times(1)
             .returning(|_, _| Ok(()));
-        let client = applier(storage);
+        let client = applier_with_documents(storage, documents);
 
         client
             .apply_delete(deleted.id, FolderContents::Delete)

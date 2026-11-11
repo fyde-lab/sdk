@@ -29,9 +29,10 @@ pub(crate) use models::FakeCachedEmbeddings;
 #[cfg(test)]
 pub(crate) use models::FakeSearchFacets;
 pub(crate) use models::{CachedEmbeddings, ChunkEmbedding, DocumentEmbeddings, EmbeddingKey};
+pub(crate) use models::{Category, Subcategory};
 pub use models::{
-    Category, Document, DocumentType, FacetCount, Metadata, SearchFacets, SearchFilters,
-    SearchOrder, SearchQuery, Subcategory, UploadRequest, UploadSource,
+    Document, DocumentType, FacetCount, FolderFilter, Metadata, SearchFacets, SearchFilters,
+    SearchOrder, SearchQuery, UploadRequest, UploadSource,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use models::{FakeDocument, FakeMetadata};
@@ -64,17 +65,11 @@ pub trait Service: Send + Sync {
     /// Reads the content described by `request.source` (either a file on
     /// disk or already-in-memory bytes), encrypts it and its metadata, then
     /// publishes it as a "created" changelog event, returning its
-    /// generated id. Metadata fields set on `request` (`name`, `type`,
-    /// `category`, `subcategory`, `attributes`) override whatever would
-    /// otherwise be derived from the document itself: its name comes from
-    /// the source's file name, its attributes are left empty, and its
-    /// category, subcategory and type are guessed from its text, on device,
-    /// unless `request` sets a category (or a subcategory): those are then
-    /// the caller's, and so is the type, set or not. A guess the classifier
-    /// isn't sure of is left `None`, and so is everything if the embedding
-    /// model isn't available. Attributes that aren't valid — see
-    /// [`AttributesService::check`] — are rejected with
-    /// [`crate::ErrorCode::InvalidAttribute`].
+    /// generated id. Its original name is the source's file name, its name
+    /// `request.name` or, without one, that file name without its
+    /// extension; it lands at the root (À classer) with no attribute, and
+    /// its type is guessed from its text, on device (`None` when the
+    /// classifier isn't sure, or the embedding model isn't available).
     ///
     /// The file type is determined from the source's name's extension;
     /// only `.pdf` is currently accepted, anything else is rejected with
@@ -129,6 +124,14 @@ pub trait Service: Send + Sync {
     /// for this purpose), `attributes` included: an attribute left out of
     /// it is removed. Rejects invalid attributes like [`Self::upload`].
     async fn update_metadata(&self, metadata: Metadata) -> Result<()>;
+
+    /// Moves the document `id` into the folder `folder_id` (`None` for the
+    /// root, À classer), publishing its metadata as [`Self::update_metadata`]
+    /// does. Fails with [`crate::ErrorCode::DocumentNotFound`] for a
+    /// document not synced here, and [`crate::ErrorCode::FolderNotFound`]
+    /// for a folder not synced here. Moving it where it already is
+    /// publishes nothing.
+    async fn move_document(&self, id: Uuid, folder_id: Option<Uuid>) -> Result<()>;
 
     /// Publishes a "deleted" changelog event for the document `id`. Like
     /// [`Self::upload`]'s, its effect is local only once the sync job
@@ -277,6 +280,7 @@ pub(crate) fn init_indexer(
 /// consumes. Uploads and searches embed their text with `embedder` (see
 /// [`init_embedder`]), uploads leaving theirs in `cache` for `indexer`, and
 /// are classified with it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn init(
     pool: SqlitePool,
     changelog: Arc<dyn changelog::Service>,
@@ -284,6 +288,7 @@ pub(crate) fn init(
     indexer: Arc<dyn Indexer>,
     embedder: Arc<dyn embedder::Embedder>,
     cache: Arc<dyn EmbeddingCache>,
+    folders: Arc<dyn crate::domains::folders::Service>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Arc<dyn Service> {
     let storage = storage_sqlite::SqliteStorage::new(pool);
@@ -297,6 +302,7 @@ pub(crate) fn init(
         embedder.clone(),
         cache,
         classification::init(embedder),
+        folders,
     ))
 }
 

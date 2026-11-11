@@ -1,4 +1,3 @@
-use std::str::FromStr as _;
 use std::sync::Arc;
 
 use mlua::{Function, Lua, Table, Value};
@@ -7,9 +6,7 @@ use tokio::runtime::Handle;
 use crate::ErrorCode;
 
 use super::super::stop::StopSignal;
-use crate::domains::documents::{
-    Category, DocumentType, Service as DocumentsService, Subcategory, UploadRequest,
-};
+use crate::domains::documents::{Service as DocumentsService, UploadRequest};
 
 /// `fyde.save_document(name, content, [fields])`: uploads `content` (raw
 /// bytes, as returned by `fyde.http.download`'s `body`) directly through the
@@ -19,10 +16,9 @@ use crate::domains::documents::{
 /// synced like any other document. `name` only needs to end in `.pdf` (the
 /// only extension `upload` currently accepts); it's otherwise just a hint,
 /// not the uploaded document's real identity (that's the id `upload`
-/// returns). The optional `fields` table lets a script set any of
-/// some of [`UploadRequest`]'s other metadata overrides up front (`name`,
-/// `type`, `category` and `subcategory`); left out, they stay empty.
-/// Scripts can't set attributes: any other key, `attributes` included, is
+/// returns) but it is its original name. The optional `fields` table lets a
+/// script propose the name to show instead (`name`). Everything else (its
+/// type, its folder) is derived from the document: any other key is
 /// ignored. A document whose content is already saved locally is silently
 /// skipped, not an error, so re-running a scraper doesn't fail on what it
 /// already fetched.
@@ -86,23 +82,11 @@ pub(super) fn save_document_fn(
     )
 }
 
-/// Applies the optional metadata overrides a script passed as
-/// `fyde.save_document`'s third argument onto `request`. Any key not
-/// present in `fields` leaves the corresponding `request` field untouched
-/// (still `None`, as set by [`UploadRequest::from_raw`]).
+/// Applies the name a script proposed in `fyde.save_document`'s third
+/// argument onto `request`, if it did.
 fn apply_upload_fields(request: &mut UploadRequest, fields: &Table) -> mlua::Result<()> {
     if let Some(name) = fields.get::<Option<String>>("name")? {
         request.name = Some(name);
-    }
-    if let Some(r#type) = fields.get::<Option<String>>("type")? {
-        request.r#type = Some(DocumentType::from_str(&r#type).map_err(mlua::Error::external)?);
-    }
-    if let Some(category) = fields.get::<Option<String>>("category")? {
-        request.category = Some(Category::from_str(&category).map_err(mlua::Error::external)?);
-    }
-    if let Some(subcategory) = fields.get::<Option<String>>("subcategory")? {
-        request.subcategory =
-            Some(Subcategory::from_str(&subcategory).map_err(mlua::Error::external)?);
     }
 
     Ok(())
@@ -182,16 +166,17 @@ mod tests {
     }
 
     #[test]
-    fn save_document_applies_optional_fields_onto_the_upload_request() {
+    fn save_document_applies_the_proposed_name_and_ignores_any_other_field() {
         let id = Uuid::now_v7();
         let mut documents = MockDocumentsService::new();
         documents
             .expect_upload()
             .withf(|request| {
-                request.name.as_deref() == Some("January payslip")
-                    && request.r#type == Some(crate::domains::documents::DocumentType::Payslip)
-                    && request.category == Some(crate::domains::documents::Category::Work)
-                    && request.subcategory == Some(crate::domains::documents::Subcategory::Payslips)
+                *request
+                    == UploadRequest {
+                        name: Some("January payslip".to_string()),
+                        ..UploadRequest::from_raw("january.pdf", b"the pdf content".to_vec())
+                    }
             })
             .times(1)
             .returning(move |_| Ok(id));
@@ -214,36 +199,6 @@ mod tests {
                 type = "payslip",
                 category = "work",
                 subcategory = "payslips",
-            })"#,
-        )
-        .exec()
-        .unwrap();
-    }
-
-    #[test]
-    fn save_document_ignores_attributes_set_by_the_script() {
-        let id = Uuid::now_v7();
-        let mut documents = MockDocumentsService::new();
-        documents
-            .expect_upload()
-            .withf(|request| request.attributes.is_empty())
-            .times(1)
-            .returning(move |_| Ok(id));
-
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let lua = Lua::new();
-        let f = save_document_fn(
-            &lua,
-            Arc::new(documents),
-            "didaxis",
-            runtime.handle().clone(),
-            StopSignal::new(),
-        )
-        .unwrap();
-        lua.globals().set("save_document", f).unwrap();
-
-        lua.load(
-            r#"save_document("january.pdf", "the pdf content", {
                 attributes = { net_pay = { type = "float", value = 2150.5 } },
             })"#,
         )
@@ -297,52 +252,6 @@ mod tests {
 
         let result = lua
             .load(r#"save_document("january.pdf", "the pdf content")"#)
-            .exec();
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn save_document_rejects_an_invalid_category() {
-        let documents = MockDocumentsService::new();
-
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let lua = Lua::new();
-        let f = save_document_fn(
-            &lua,
-            Arc::new(documents),
-            "didaxis",
-            runtime.handle().clone(),
-            StopSignal::new(),
-        )
-        .unwrap();
-        lua.globals().set("save_document", f).unwrap();
-
-        let result = lua
-            .load(r#"save_document("a.pdf", "content", {category = "not_a_category"})"#)
-            .exec();
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn save_document_rejects_an_invalid_type() {
-        let documents = MockDocumentsService::new();
-
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let lua = Lua::new();
-        let f = save_document_fn(
-            &lua,
-            Arc::new(documents),
-            "didaxis",
-            runtime.handle().clone(),
-            StopSignal::new(),
-        )
-        .unwrap();
-        lua.globals().set("save_document", f).unwrap();
-
-        let result = lua
-            .load(r#"save_document("a.pdf", "content", {type = "energy_invoice"})"#)
             .exec();
 
         assert!(result.is_err());
@@ -469,6 +378,10 @@ mod tests {
             &self,
             _metadata: crate::domains::documents::Metadata,
         ) -> crate::Result<()> {
+            unimplemented!()
+        }
+
+        async fn move_document(&self, _id: Uuid, _folder_id: Option<Uuid>) -> crate::Result<()> {
             unimplemented!()
         }
 

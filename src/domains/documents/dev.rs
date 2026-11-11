@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -8,8 +7,8 @@ use uuid::Uuid;
 use crate::{ErrorCode, ErrorContext as _, Result};
 
 use super::{
-    Attribute, Category, Document, DocumentType, Metadata, SearchFacets, SearchFilters,
-    SearchQuery, Service, Subcategory, UploadRequest, UploadSource,
+    Document, Metadata, SearchFacets, SearchFilters, SearchQuery, Service, UploadRequest,
+    UploadSource,
 };
 
 /// A [`Service`] implementation for standalone/dev use (see
@@ -39,8 +38,7 @@ impl DevDocumentsClient {
 
 #[async_trait]
 impl Service for DevDocumentsClient {
-    async fn upload(&self, mut request: UploadRequest) -> Result<Uuid> {
-        super::service::resolve_upload_request(&mut request)?;
+    async fn upload(&self, request: UploadRequest) -> Result<Uuid> {
         let id = Uuid::new_v4();
 
         let (name, content) = match request.source {
@@ -61,10 +59,6 @@ impl Service for DevDocumentsClient {
             id,
             original_name: &name,
             name: request.name.as_deref(),
-            r#type: request.r#type,
-            category: request.category,
-            subcategory: request.subcategory,
-            attributes: &request.attributes,
         };
         let metadata = serde_json::to_vec_pretty(&metadata)
             .with_context(|| format!("serializing metadata for scraped document {name}"))?;
@@ -118,6 +112,10 @@ impl Service for DevDocumentsClient {
         Ok(())
     }
 
+    async fn move_document(&self, _id: Uuid, _folder_id: Option<Uuid>) -> Result<()> {
+        Ok(())
+    }
+
     async fn delete(&self, _id: Uuid) -> Result<()> {
         Ok(())
     }
@@ -135,16 +133,12 @@ impl Service for DevDocumentsClient {
 
 /// The metadata [`DevDocumentsClient::upload`] writes as JSON next to each
 /// saved document: only what the caller set on the [`UploadRequest`], since
-/// there is no parser (and so no transcript or script-derived fields) here.
+/// there is no parser (and so no transcript or classification) here.
 #[derive(Debug, Serialize)]
 struct DevMetadata<'a> {
     id: Uuid,
     original_name: &'a str,
     name: Option<&'a str>,
-    r#type: Option<DocumentType>,
-    category: Option<Category>,
-    subcategory: Option<Subcategory>,
-    attributes: &'a BTreeMap<String, Attribute>,
 }
 
 #[cfg(test)]
@@ -195,21 +189,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_rejects_a_subcategory_of_another_category() {
-        let tmp = tempfile::tempdir().unwrap();
-        let client = DevDocumentsClient::new(tmp.path().to_path_buf(), "didaxis");
-
-        let mut request = UploadRequest::from_raw("payslip.pdf", b"the pdf content".to_vec());
-        request.category = Some(Category::Money);
-        request.subcategory = Some(Subcategory::Payslips);
-
-        assert_eq!(
-            client.upload(request).await.unwrap_err().code(),
-            crate::ErrorCode::MismatchedSubcategory
-        );
-    }
-
-    #[tokio::test]
     async fn upload_writes_the_request_metadata_as_json_next_to_the_document() {
         let tmp = tempfile::tempdir().unwrap();
         let out_dir = tmp.path().join("out");
@@ -217,14 +196,6 @@ mod tests {
 
         let mut request = UploadRequest::from_raw("payslip.pdf", b"the pdf content".to_vec());
         request.name = Some("Payslip January".to_string());
-        request.category = Some(Category::Work);
-        request.attributes = BTreeMap::from([(
-            "net_pay".to_string(),
-            Attribute::Amount {
-                minor_units: 215050,
-                currency: "EUR".to_string(),
-            },
-        )]);
         let id = client.upload(request).await.unwrap();
 
         let json: serde_json::Value = serde_json::from_slice(
@@ -239,12 +210,6 @@ mod tests {
                 "id": id,
                 "original_name": "payslip.pdf",
                 "name": "Payslip January",
-                "type": null,
-                "category": "work",
-                "subcategory": null,
-                "attributes": {
-                    "net_pay": {"type": "amount", "value": {"minor_units": 215050, "currency": "EUR"}},
-                },
             })
         );
     }

@@ -201,21 +201,9 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "A change received from the server couldn't be applied.",
             "Une modification reçue du serveur n'a pas pu être appliquée.",
         ),
-        ErrorCode::InvalidCategory => (
-            "The document's category is not recognized.",
-            "La catégorie du document n'est pas reconnue.",
-        ),
-        ErrorCode::InvalidSubcategory => (
-            "The document's subcategory is not recognized.",
-            "La sous-catégorie du document n'est pas reconnue.",
-        ),
         ErrorCode::InvalidDocumentType => (
             "The document's type is not recognized.",
             "Le type du document n'est pas reconnu.",
-        ),
-        ErrorCode::MismatchedSubcategory => (
-            "The document's subcategory doesn't belong to its category.",
-            "La sous-catégorie du document n'appartient pas à sa catégorie.",
         ),
         ErrorCode::InvalidAttribute => (
             "One of the document's attributes is not valid.",
@@ -232,6 +220,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
         ErrorCode::FolderNameTaken => (
             "A folder with this name already exists here.",
             "Un dossier porte déjà ce nom ici.",
+        ),
+        ErrorCode::DocumentNotFound => (
+            "This document couldn't be found.",
+            "Ce document est introuvable.",
         ),
         ErrorCode::FolderNotFound => (
             "This folder couldn't be found.",

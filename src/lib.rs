@@ -9,10 +9,9 @@ pub(crate) use error::ErrorKind;
 use std::sync::Arc;
 
 pub use domains::documents::{
-    Attribute, AttributeDefinition, AttributeType, AttributesService, Category, ChangelogEvent,
-    Document, DocumentType, EventType, FacetCount, Metadata, SearchFacets, SearchFilters,
-    SearchOrder, SearchQuery, Service as DocumentsService, SetAttributeRequest, Subcategory,
-    UploadRequest,
+    Attribute, AttributeDefinition, AttributeType, AttributesService, ChangelogEvent, Document,
+    DocumentType, EventType, FacetCount, FolderFilter, Metadata, SearchFacets, SearchFilters,
+    SearchOrder, SearchQuery, Service as DocumentsService, SetAttributeRequest, UploadRequest,
 };
 pub use domains::folders::{
     CreateFolderRequest, Folder, FolderAppearance, FolderColor, FolderContents, FolderIcon,
@@ -199,6 +198,7 @@ impl Client {
             indexer,
             embedder,
             embedding_cache.clone(),
+            folders.clone(),
             config.on_document_change,
         );
         let users = domains::users::init(

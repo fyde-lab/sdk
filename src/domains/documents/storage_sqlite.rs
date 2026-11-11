@@ -9,10 +9,10 @@ use uuid::Uuid;
 
 use crate::{ErrorContext as _, ErrorKind, Result};
 
-use super::storage::{FacetField, Storage};
+use super::storage::{FacetField, Storage, UNFILED};
 use super::{
-    Attribute, Category, Document, DocumentEmbeddings, DocumentType, FacetCount, Metadata,
-    SearchFilters, SearchOrder, Subcategory,
+    Attribute, Document, DocumentEmbeddings, DocumentType, FacetCount, FolderFilter, Metadata,
+    SearchFilters, SearchOrder,
 };
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
@@ -41,8 +41,8 @@ impl Storage for SqliteStorage {
             .with_context(|| format!("failed to start saving document {}", document.id))?;
 
         sqlx::query(
-            "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, attributes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO documents (id, name, original_name, content_type, content, checksum, created_at, transcript, type, folder_id, attributes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .bind(document.id.to_string())
         .bind(&document.metadata.name)
@@ -53,10 +53,7 @@ impl Storage for SqliteStorage {
         .bind(document.metadata.created_at)
         .bind(&document.metadata.transcript)
         .bind(type_to_column(document.metadata.r#type))
-        .bind(category_to_column(document.metadata.category))
-        .bind(subcategory_to_column(
-            document.metadata.subcategory,
-        ))
+        .bind(document.metadata.folder_id.map(|id| id.to_string()))
         .bind(attributes_to_column(&document.metadata.attributes)?)
         .execute(&mut *tx)
         .await
@@ -71,7 +68,7 @@ impl Storage for SqliteStorage {
 
     async fn get_document(&self, id: Uuid) -> Result<Option<Document>> {
         let row = sqlx::query(
-            "SELECT name, original_name, content_type, content, checksum, created_at, transcript, type, category, subcategory, attributes FROM documents WHERE id = ?1",
+            "SELECT name, original_name, content_type, content, checksum, created_at, transcript, type, folder_id, attributes FROM documents WHERE id = ?1",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -96,8 +93,7 @@ impl Storage for SqliteStorage {
                 checksum: row.get("checksum"),
                 transcript: row.get("transcript"),
                 r#type: type_from_column(row.get("type"))?,
-                category: category_from_column(row.get("category"))?,
-                subcategory: subcategory_from_column(row.get("subcategory"))?,
+                folder_id: folder_from_column(row.get("folder_id"))?,
                 attributes: attributes_from_column(row.get("attributes"))?,
             },
             content,
@@ -126,7 +122,7 @@ impl Storage for SqliteStorage {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn list_documents(&self, offset: i64, limit: i64) -> Result<Vec<Metadata>> {
         let rows = sqlx::query(
-            "SELECT id, name, original_name, content_type, length(content) AS size, checksum, created_at, transcript, type, category, subcategory, attributes FROM documents
+            "SELECT id, name, original_name, content_type, length(content) AS size, checksum, created_at, transcript, type, folder_id, attributes FROM documents
              ORDER BY created_at ASC, id ASC
              LIMIT ?1 OFFSET ?2",
         )
@@ -150,7 +146,7 @@ impl Storage for SqliteStorage {
         limit: i64,
     ) -> Result<Vec<Metadata>> {
         let mut query = QueryBuilder::<Sqlite>::new(
-            "SELECT d.id, d.name, d.original_name, d.content_type, length(d.content) AS size, d.checksum, d.created_at, d.transcript, d.type, d.category, d.subcategory, d.attributes",
+            "SELECT d.id, d.name, d.original_name, d.content_type, length(d.content) AS size, d.checksum, d.created_at, d.transcript, d.type, d.folder_id, d.attributes",
         );
         push_matching(&mut query, terms, filters);
 
@@ -307,7 +303,7 @@ impl Storage for SqliteStorage {
 
     async fn get_metadatas(&self, ids: &[Uuid]) -> Result<Vec<Metadata>> {
         let rows = sqlx::query(
-            "SELECT id, name, original_name, content_type, length(content) AS size, checksum, created_at, transcript, type, category, subcategory, attributes FROM documents
+            "SELECT id, name, original_name, content_type, length(content) AS size, checksum, created_at, transcript, type, folder_id, attributes FROM documents
              WHERE id IN (SELECT value FROM json_each(?1))",
         )
         .bind(ids_to_json(ids)?)
@@ -358,7 +354,7 @@ impl Storage for SqliteStorage {
 
     async fn get_metadata(&self, id: Uuid) -> Result<Option<Metadata>> {
         let row = sqlx::query(
-            "SELECT id, name, original_name, content_type, length(content) AS size, checksum, created_at, transcript, type, category, subcategory, attributes FROM documents WHERE id = ?1",
+            "SELECT id, name, original_name, content_type, length(content) AS size, checksum, created_at, transcript, type, folder_id, attributes FROM documents WHERE id = ?1",
         )
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -382,8 +378,8 @@ impl Storage for SqliteStorage {
 
         sqlx::query(
             "UPDATE documents
-             SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6, type = ?7, category = ?8, subcategory = ?9, attributes = ?10
-             WHERE id = ?11",
+             SET name = ?1, original_name = ?2, content_type = ?3, checksum = ?4, created_at = ?5, transcript = ?6, type = ?7, folder_id = ?8, attributes = ?9
+             WHERE id = ?10",
         )
         .bind(&metadata.name)
         .bind(&metadata.original_name)
@@ -392,10 +388,7 @@ impl Storage for SqliteStorage {
         .bind(metadata.created_at)
         .bind(&metadata.transcript)
         .bind(type_to_column(metadata.r#type))
-        .bind(category_to_column(metadata.category))
-        .bind(subcategory_to_column(
-            metadata.subcategory,
-        ))
+        .bind(metadata.folder_id.map(|id| id.to_string()))
         .bind(attributes_to_column(&metadata.attributes)?)
         .bind(id.to_string())
         .execute(&mut *tx)
@@ -424,6 +417,37 @@ impl Storage for SqliteStorage {
             .execute(&self.pool)
             .await
             .with_context(|| format!("failed to delete document {id} from local database"))?;
+
+        Ok(())
+    }
+
+    async fn move_folder_documents(&self, folders: &[Uuid], to: Option<Uuid>) -> Result<()> {
+        sqlx::query(
+            "UPDATE documents SET folder_id = ?1
+             WHERE folder_id IN (SELECT value FROM json_each(?2))",
+        )
+        .bind(to.map(|id| id.to_string()))
+        .bind(ids_to_json(folders)?)
+        .execute(&self.pool)
+        .await
+        .with_context(|| format!("failed to move the documents of {} folders", folders.len()))?;
+
+        Ok(())
+    }
+
+    async fn delete_folder_documents(&self, folders: &[Uuid]) -> Result<()> {
+        // Their embeddings cascade, and the `documents_fts` triggers drop
+        // them from the full-text index.
+        sqlx::query("DELETE FROM documents WHERE folder_id IN (SELECT value FROM json_each(?1))")
+            .bind(ids_to_json(folders)?)
+            .execute(&self.pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to delete the documents of {} folders",
+                    folders.len()
+                )
+            })?;
 
         Ok(())
     }
@@ -458,13 +482,11 @@ async fn insert_embeddings(
 /// The column holding `field`, its table aliased as `alias` (`"d."`, or
 /// `""` for none).
 fn facet_column(field: FacetField, alias: &str) -> String {
-    let column = match field {
-        FacetField::Category => "category",
-        FacetField::Subcategory => "subcategory",
-        FacetField::Type => "type",
-        FacetField::ContentType => "content_type",
-    };
-    format!("{alias}{column}")
+    match field {
+        FacetField::Folder => format!("COALESCE({alias}folder_id, '{UNFILED}')"),
+        FacetField::Type => format!("{alias}type"),
+        FacetField::ContentType => format!("{alias}content_type"),
+    }
 }
 
 fn facet_count_from_row(row: &SqliteRow) -> FacetCount<String> {
@@ -531,33 +553,11 @@ fn vector_from_column(column: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// The `category` column has no NULL state (`NOT NULL DEFAULT ''`),
-/// so an unclassified document is stored as an empty string.
-fn category_to_column(category: Option<Category>) -> String {
-    category.map_or_else(String::new, |category| category.as_str().to_string())
-}
-
-fn category_from_column(column: String) -> Result<Option<Category>> {
-    if column.is_empty() {
-        return Ok(None);
-    }
-
-    column
-        .parse()
-        .map(Some)
-        .with_context(|| format!("invalid category in local database: {column}"))
-}
-
-fn subcategory_to_column(subcategory: Option<Subcategory>) -> Option<String> {
-    subcategory.map(|category| category.as_str().to_string())
-}
-
-fn subcategory_from_column(column: Option<String>) -> Result<Option<Subcategory>> {
+fn folder_from_column(column: Option<String>) -> Result<Option<Uuid>> {
     column
         .map(|column| {
-            column
-                .parse()
-                .with_context(|| format!("invalid subcategory in local database: {column}"))
+            Uuid::parse_str(&column)
+                .with_context(|| format!("invalid folder id in local database: {column}"))
         })
         .transpose()
 }
@@ -612,23 +612,20 @@ fn metadata_from_row(row: &SqliteRow) -> Result<Metadata> {
         checksum: row.get("checksum"),
         transcript: row.get("transcript"),
         r#type: type_from_column(row.get("type"))?,
-        category: category_from_column(row.get("category"))?,
-        subcategory: subcategory_from_column(row.get("subcategory"))?,
+        folder_id: folder_from_column(row.get("folder_id"))?,
         attributes: attributes_from_column(row.get("attributes"))?,
     })
 }
 
 /// Orders `documents_fts` matches best first (`bm25` scores lower for a
 /// better match), weighting each column in its declaration order in the
-/// `0018_drop_subjects_and_purpose_from_documents` migration: a hit in the
+/// `0023_move_documents_into_folders` migration: a hit in the
 /// name counts the most, one in the (long, noisy) transcript the least.
 const FTS_RANK: &str = "bm25(documents_fts,
     10.0, -- name
     5.0,  -- original_name
     1.0,  -- transcript
-    4.0,  -- type
-    4.0,  -- category
-    4.0   -- subcategory
+    4.0   -- type
 )";
 
 /// Builds an FTS5 query matching documents containing every one of `terms`
@@ -678,16 +675,21 @@ fn push_matching(query: &mut QueryBuilder<Sqlite>, terms: &[String], filters: &S
         query.push_bind(fts_match_expression(terms));
     }
 
-    push_any_of(
-        query,
-        "d.category",
-        filters.categories.iter().map(Category::as_str),
-    );
-    push_any_of(
-        query,
-        "d.subcategory",
-        filters.subcategories.iter().map(Subcategory::as_str),
-    );
+    match filters.folder {
+        None => {}
+        Some(FolderFilter::Unfiled) => {
+            query.push(" AND (d.folder_id IS NULL OR d.folder_id NOT IN (SELECT id FROM folders))");
+        }
+        Some(FolderFilter::Within(folder_id)) => {
+            query
+                .push(" AND d.folder_id IN (WITH RECURSIVE within(id) AS (SELECT ")
+                .push_bind(folder_id.to_string())
+                .push(
+                    " UNION SELECT f.id FROM folders f JOIN within ON f.parent_id = within.id) \
+                     SELECT id FROM within)",
+                );
+        }
+    }
     push_any_of(
         query,
         "d.type",
@@ -724,9 +726,33 @@ pub(super) mod tests {
             .unwrap();
 
         sqlx::migrate!().run(&pool).await.unwrap();
+        for (id, parent) in [
+            (HOUSING, None),
+            (MONEY, None),
+            (TELECOM, None),
+            (HEALTH, None),
+            (BANKING, Some(HEALTH)),
+        ] {
+            sqlx::query(
+                "INSERT INTO folders (id, parent_id, name, description) VALUES (?1, ?2, ?1, '')",
+            )
+            .bind(id.to_string())
+            .bind(parent.map(|parent: Uuid| parent.to_string()))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
 
         SqliteStorage::new(pool)
     }
+
+    // Folders every test database holds: `BANKING` is a subfolder of
+    // `HEALTH`, the others are at the top level.
+    const HOUSING: Uuid = Uuid::from_u128(1);
+    const MONEY: Uuid = Uuid::from_u128(2);
+    const TELECOM: Uuid = Uuid::from_u128(3);
+    const HEALTH: Uuid = Uuid::from_u128(4);
+    const BANKING: Uuid = Uuid::from_u128(5);
 
     fn embeddings() -> DocumentEmbeddings {
         FakeDocumentEmbeddings::new().build()
@@ -1073,8 +1099,7 @@ pub(super) mod tests {
                         checksum: "deadbeef".to_string(),
                         transcript: "hello".to_string(),
                         r#type: None,
-                        category: None,
-                        subcategory: None,
+                        folder_id: None,
                         attributes: BTreeMap::new(),
                     },
                 },
@@ -1100,8 +1125,7 @@ pub(super) mod tests {
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
                     r#type: None,
-                    category: None,
-                    subcategory: None,
+                    folder_id: None,
                     attributes: BTreeMap::new(),
                 },
             }
@@ -1154,8 +1178,7 @@ pub(super) mod tests {
                         checksum: "checksum-one".to_string(),
                         transcript: String::new(),
                         r#type: None,
-                        category: None,
-                        subcategory: None,
+                        folder_id: None,
                         attributes: BTreeMap::new(),
                     },
                 },
@@ -1178,8 +1201,7 @@ pub(super) mod tests {
                         checksum: "checksum-two".to_string(),
                         transcript: String::new(),
                         r#type: None,
-                        category: None,
-                        subcategory: None,
+                        folder_id: None,
                         attributes: BTreeMap::new(),
                     },
                 },
@@ -1212,8 +1234,7 @@ pub(super) mod tests {
                             checksum: String::new(),
                             transcript: String::new(),
                             r#type: None,
-                            category: None,
-                            subcategory: None,
+                            folder_id: None,
                             attributes: BTreeMap::new(),
                         },
                     },
@@ -1305,8 +1326,7 @@ pub(super) mod tests {
                         checksum: "deadbeef".to_string(),
                         transcript: "hello".to_string(),
                         r#type: None,
-                        category: None,
-                        subcategory: None,
+                        folder_id: None,
                         attributes: BTreeMap::new(),
                     },
                 },
@@ -1328,8 +1348,7 @@ pub(super) mod tests {
                     checksum: "deadbeef".to_string(),
                     transcript: "hello".to_string(),
                     r#type: None,
-                    category: None,
-                    subcategory: None,
+                    folder_id: None,
                     attributes: BTreeMap::new(),
                 },
                 None,
@@ -1359,8 +1378,7 @@ pub(super) mod tests {
                     checksum: String::new(),
                     transcript: String::new(),
                     r#type: None,
-                    category: None,
-                    subcategory: None,
+                    folder_id: None,
                     attributes: BTreeMap::new(),
                 },
                 None,
@@ -1382,8 +1400,7 @@ pub(super) mod tests {
             .with_created_at(created_at)
             .with_transcript("")
             .with_type(None)
-            .with_category(None)
-            .with_subcategory(None)
+            .with_folder(None)
     }
 
     async fn save(storage: &SqliteStorage, metadata: FakeMetadata) {
@@ -1486,23 +1503,11 @@ pub(super) mod tests {
             searchable("by-type", 3).with_type(DocumentType::Payslip),
         )
         .await;
-        save(
-            &storage,
-            searchable("by-category", 4).with_category(Category::Housing),
-        )
-        .await;
-        save(
-            &storage,
-            searchable("by-subcategory", 5).with_subcategory(Subcategory::Mobile),
-        )
-        .await;
 
         for (term, expected) in [
             ("originalname", "by-original"),
             ("euros", "by-transcript"),
             ("payslip", "by-type"),
-            ("housing", "by-category"),
-            ("mobile", "by-subcategory"),
         ] {
             let names = search_names(
                 &storage,
@@ -1554,32 +1559,50 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn search_documents_keeps_documents_matching_any_value_within_a_filter() {
+    async fn search_documents_keeps_the_documents_within_a_folder_and_its_subfolders() {
         let storage = setup().await;
-        save(
-            &storage,
-            searchable("bank", 1).with_category(Category::Money),
-        )
-        .await;
-        save(
-            &storage,
-            searchable("energy", 2).with_category(Category::Housing),
-        )
-        .await;
-        save(&storage, searchable("unclassified", 3)).await;
+        save(&storage, searchable("health", 1).with_folder(HEALTH)).await;
+        save(&storage, searchable("banking", 2).with_folder(BANKING)).await;
+        save(&storage, searchable("money", 3).with_folder(MONEY)).await;
+        save(&storage, searchable("unfiled", 4)).await;
 
         let names = search_names(
             &storage,
             &[],
             &SearchFilters {
-                categories: vec![Category::Money, Category::Housing],
+                folder: Some(FolderFilter::Within(HEALTH)),
                 ..Default::default()
             },
             SearchOrder::Oldest,
         )
         .await;
 
-        assert_eq!(names, vec!["bank", "energy"]);
+        assert_eq!(names, vec!["health", "banking"]);
+    }
+
+    #[tokio::test]
+    async fn search_documents_keeps_unfiled_documents_including_those_whose_folder_is_gone() {
+        let storage = setup().await;
+        save(&storage, searchable("filed", 1).with_folder(MONEY)).await;
+        save(&storage, searchable("unfiled", 2)).await;
+        save(
+            &storage,
+            searchable("folder-gone", 3).with_folder(Uuid::now_v7()),
+        )
+        .await;
+
+        let names = search_names(
+            &storage,
+            &[],
+            &SearchFilters {
+                folder: Some(FolderFilter::Unfiled),
+                ..Default::default()
+            },
+            SearchOrder::Oldest,
+        )
+        .await;
+
+        assert_eq!(names, vec!["unfiled", "folder-gone"]);
     }
 
     #[tokio::test]
@@ -1588,32 +1611,29 @@ pub(super) mod tests {
         save(
             &storage,
             searchable("match", 10)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
+                .with_folder(BANKING)
                 .with_type(DocumentType::Receipt),
         )
         .await;
         // Each differs from "match" in exactly one filtered field.
         save(
             &storage,
-            searchable("wrong-category", 10)
-                .with_category(Category::Money)
-                .with_subcategory(Subcategory::Banking)
+            searchable("wrong-folder", 10)
+                .with_folder(MONEY)
                 .with_type(DocumentType::Receipt),
         )
         .await;
         save(
             &storage,
-            searchable("wrong-subcategory", 10)
-                .with_category(Category::Health)
+            searchable("parent-folder", 10)
+                .with_folder(HEALTH)
                 .with_type(DocumentType::Receipt),
         )
         .await;
         save(
             &storage,
             searchable("wrong-type", 10)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
+                .with_folder(BANKING)
                 .with_type(DocumentType::Statement),
         )
         .await;
@@ -1621,24 +1641,21 @@ pub(super) mod tests {
             &storage,
             searchable("wrong-content-type", 10)
                 .with_content_type("text/plain")
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
+                .with_folder(BANKING)
                 .with_type(DocumentType::Receipt),
         )
         .await;
         save(
             &storage,
             searchable("too-old", 1)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
+                .with_folder(BANKING)
                 .with_type(DocumentType::Receipt),
         )
         .await;
         save(
             &storage,
             searchable("too-new", 100)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
+                .with_folder(BANKING)
                 .with_type(DocumentType::Receipt),
         )
         .await;
@@ -1647,8 +1664,7 @@ pub(super) mod tests {
             &storage,
             &[],
             &SearchFilters {
-                categories: vec![Category::Health],
-                subcategories: vec![Subcategory::Banking],
+                folder: Some(FolderFilter::Within(BANKING)),
                 types: vec![DocumentType::Receipt],
                 content_types: vec!["application/pdf".to_string()],
                 created_from: Some(10),
@@ -1664,27 +1680,19 @@ pub(super) mod tests {
     #[tokio::test]
     async fn search_documents_combines_terms_with_filters() {
         let storage = setup().await;
+        save(&storage, searchable("facture bank", 1).with_folder(MONEY)).await;
         save(
             &storage,
-            searchable("facture bank", 1).with_category(Category::Money),
+            searchable("facture telecom", 2).with_folder(TELECOM),
         )
         .await;
-        save(
-            &storage,
-            searchable("facture telecom", 2).with_category(Category::Telecom),
-        )
-        .await;
-        save(
-            &storage,
-            searchable("releve bank", 3).with_category(Category::Money),
-        )
-        .await;
+        save(&storage, searchable("releve bank", 3).with_folder(MONEY)).await;
 
         let names = search_names(
             &storage,
             &["facture"],
             &SearchFilters {
-                categories: vec![Category::Money],
+                folder: Some(FolderFilter::Within(MONEY)),
                 ..Default::default()
             },
             SearchOrder::Relevance,
@@ -1827,34 +1835,34 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn count_documents_by_counts_each_value_most_common_first_skipping_unset_ones() {
+    async fn count_documents_by_counts_each_value_most_common_first_skipping_unset_ones_but_unfiled()
+     {
         let storage = setup().await;
         save(
             &storage,
             searchable("a", 1)
-                .with_category(Category::Housing)
-                .with_subcategory(Subcategory::Banking)
+                .with_folder(HOUSING)
                 .with_type(DocumentType::Invoice),
         )
         .await;
         save(
             &storage,
             searchable("b", 2)
-                .with_category(Category::Money)
+                .with_folder(MONEY)
                 .with_content_type("image/png"),
         )
         .await;
-        save(&storage, searchable("c", 3).with_category(Category::Money)).await;
+        save(&storage, searchable("c", 3).with_folder(MONEY)).await;
         save(&storage, searchable("unclassified", 4)).await;
         let filters = SearchFilters::default();
 
         assert_eq!(
-            facet(&storage, &[], &filters, FacetField::Category).await,
-            counts(&[("money", 2), ("housing", 1)])
-        );
-        assert_eq!(
-            facet(&storage, &[], &filters, FacetField::Subcategory).await,
-            counts(&[("banking", 1)])
+            facet(&storage, &[], &filters, FacetField::Folder).await,
+            counts(&[
+                (&MONEY.to_string(), 2),
+                (&HOUSING.to_string(), 1),
+                (UNFILED, 1)
+            ])
         );
         assert_eq!(
             facet(&storage, &[], &filters, FacetField::Type).await,
@@ -1872,21 +1880,21 @@ pub(super) mod tests {
         save(
             &storage,
             searchable("facture edf", 1)
-                .with_category(Category::Housing)
+                .with_folder(HOUSING)
                 .with_type(DocumentType::Invoice),
         )
         .await;
         save(
             &storage,
             searchable("facture orange", 2)
-                .with_category(Category::Telecom)
+                .with_folder(TELECOM)
                 .with_type(DocumentType::Contract),
         )
         .await;
         save(
             &storage,
             searchable("releve", 3)
-                .with_category(Category::Money)
+                .with_folder(MONEY)
                 .with_type(DocumentType::Invoice),
         )
         .await;
@@ -1899,10 +1907,10 @@ pub(super) mod tests {
                     types: vec![DocumentType::Invoice],
                     ..Default::default()
                 },
-                FacetField::Category,
+                FacetField::Folder,
             )
             .await,
-            counts(&[("housing", 1)])
+            counts(&[(&HOUSING.to_string(), 1)])
         );
     }
 
@@ -2009,57 +2017,50 @@ pub(super) mod tests {
         let embedded = |metadata| save_embedded(&storage, metadata, MODEL, &[&[1.0, 0.0]]);
         let matching = embedded(
             searchable("match", 10)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
+                .with_folder(BANKING)
                 .with_type(DocumentType::Receipt),
         )
         .await;
         // Each differs from "match" in exactly one filtered field.
         embedded(
-            searchable("wrong-category", 10)
-                .with_category(Category::Money)
-                .with_subcategory(Subcategory::Banking)
+            searchable("wrong-folder", 10)
+                .with_folder(MONEY)
                 .with_type(DocumentType::Receipt),
         )
         .await;
         embedded(
-            searchable("wrong-subcategory", 10)
-                .with_category(Category::Health)
+            searchable("parent-folder", 10)
+                .with_folder(HEALTH)
                 .with_type(DocumentType::Receipt),
         )
         .await;
         embedded(
             searchable("wrong-type", 10)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
+                .with_folder(BANKING)
                 .with_type(DocumentType::Statement),
         )
         .await;
         embedded(
             searchable("wrong-content-type", 10)
                 .with_content_type("text/plain")
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
+                .with_folder(BANKING)
                 .with_type(DocumentType::Receipt),
         )
         .await;
         embedded(
             searchable("too-old", 1)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
+                .with_folder(BANKING)
                 .with_type(DocumentType::Receipt),
         )
         .await;
         embedded(
             searchable("too-new", 100)
-                .with_category(Category::Health)
-                .with_subcategory(Subcategory::Banking)
+                .with_folder(BANKING)
                 .with_type(DocumentType::Receipt),
         )
         .await;
         let filters = SearchFilters {
-            categories: vec![Category::Health],
-            subcategories: vec![Subcategory::Banking],
+            folder: Some(FolderFilter::Within(BANKING)),
             types: vec![DocumentType::Receipt],
             content_types: vec!["application/pdf".to_string()],
             created_from: Some(10),
@@ -2162,7 +2163,7 @@ pub(super) mod tests {
         save(&storage, searchable("quittance", 1)).await;
         save(
             &storage,
-            searchable("quittance-health", 1).with_category(Category::Health),
+            searchable("quittance-health", 1).with_folder(HEALTH),
         )
         .await;
         save(&storage, searchable("unrelated", 3)).await;
@@ -2182,7 +2183,7 @@ pub(super) mod tests {
             .rank_by_terms(
                 &terms,
                 &SearchFilters {
-                    categories: vec![Category::Health],
+                    folder: Some(FolderFilter::Within(HEALTH)),
                     ..Default::default()
                 },
                 10,
@@ -2197,6 +2198,84 @@ pub(super) mod tests {
         assert_eq!(
             storage.get_metadata(health[0]).await.unwrap().unwrap().name,
             "quittance-health"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_folder_documents_moves_only_the_documents_directly_in_those_folders() {
+        let storage = setup().await;
+        save(&storage, searchable("health", 1).with_folder(HEALTH)).await;
+        save(&storage, searchable("banking", 2).with_folder(BANKING)).await;
+        save(&storage, searchable("money", 3).with_folder(MONEY)).await;
+
+        storage
+            .move_folder_documents(&[HEALTH, MONEY], Some(HOUSING))
+            .await
+            .unwrap();
+
+        let folders: Vec<(String, Option<Uuid>)> = storage
+            .list_documents(0, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|metadata| (metadata.name, metadata.folder_id))
+            .collect();
+        assert_eq!(
+            folders,
+            [
+                ("health".to_string(), Some(HOUSING)),
+                ("banking".to_string(), Some(BANKING)),
+                ("money".to_string(), Some(HOUSING)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn move_folder_documents_can_move_them_to_the_root() {
+        let storage = setup().await;
+        save(&storage, searchable("health", 1).with_folder(HEALTH)).await;
+
+        storage
+            .move_folder_documents(&[HEALTH], None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.list_documents(0, 10).await.unwrap()[0].folder_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_folder_documents_deletes_only_the_documents_in_those_folders() {
+        let storage = setup().await;
+        save(&storage, searchable("health", 1).with_folder(HEALTH)).await;
+        save(&storage, searchable("banking", 2).with_folder(BANKING)).await;
+        save(&storage, searchable("money", 3).with_folder(MONEY)).await;
+        save(&storage, searchable("unfiled", 4)).await;
+
+        storage
+            .delete_folder_documents(&[HEALTH, BANKING])
+            .await
+            .unwrap();
+
+        let names: Vec<String> = storage
+            .list_documents(0, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|metadata| metadata.name)
+            .collect();
+        assert_eq!(names, ["money", "unfiled"]);
+        assert!(
+            search_names(
+                &storage,
+                &["health"],
+                &SearchFilters::default(),
+                SearchOrder::Relevance
+            )
+            .await
+            .is_empty()
         );
     }
 
@@ -2239,15 +2318,14 @@ pub(super) mod tests {
             &storage,
             vec![
                 searchable("a", 1)
-                    .with_category(Category::Housing)
-                    .with_subcategory(Subcategory::Banking)
+                    .with_folder(HOUSING)
                     .with_type(DocumentType::Invoice),
                 searchable("b", 2)
-                    .with_category(Category::Money)
+                    .with_folder(MONEY)
                     .with_content_type("image/png"),
-                searchable("c", 3).with_category(Category::Money),
+                searchable("c", 3).with_folder(MONEY),
                 searchable("unclassified", 4),
-                searchable("not-listed", 5).with_category(Category::Health),
+                searchable("not-listed", 5).with_folder(HEALTH),
             ],
         )
         .await;
@@ -2263,12 +2341,12 @@ pub(super) mod tests {
         };
 
         assert_eq!(
-            among(FacetField::Category).await,
-            counts(&[("money", 2), ("housing", 1)])
-        );
-        assert_eq!(
-            among(FacetField::Subcategory).await,
-            counts(&[("banking", 1)])
+            among(FacetField::Folder).await,
+            counts(&[
+                (&MONEY.to_string(), 2),
+                (&HOUSING.to_string(), 1),
+                (UNFILED, 1)
+            ])
         );
         assert_eq!(among(FacetField::Type).await, counts(&[("invoice", 1)]));
         assert_eq!(
@@ -2277,7 +2355,7 @@ pub(super) mod tests {
         );
         assert!(
             storage
-                .count_documents_among(&[], FacetField::Category)
+                .count_documents_among(&[], FacetField::Folder)
                 .await
                 .unwrap()
                 .is_empty()
