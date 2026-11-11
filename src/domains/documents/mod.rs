@@ -29,7 +29,6 @@ pub(crate) use models::FakeCachedEmbeddings;
 #[cfg(test)]
 pub(crate) use models::FakeSearchFacets;
 pub(crate) use models::{CachedEmbeddings, ChunkEmbedding, DocumentEmbeddings, EmbeddingKey};
-pub(crate) use models::{Category, Subcategory};
 pub use models::{
     Document, DocumentType, FacetCount, FolderFilter, Metadata, SearchFacets, SearchFilters,
     SearchOrder, SearchQuery, UploadRequest, UploadSource,
@@ -67,9 +66,11 @@ pub trait Service: Send + Sync {
     /// publishes it as a "created" changelog event, returning its
     /// generated id. Its original name is the source's file name, its name
     /// `request.name` or, without one, that file name without its
-    /// extension; it lands at the root (À classer) with no attribute, and
-    /// its type is guessed from its text, on device (`None` when the
-    /// classifier isn't sure, or the embedding model isn't available).
+    /// extension; it has no attribute, and its type and folder are guessed
+    /// from its text, on device: the folder is the one whose description it
+    /// reads like (see the `folders` domain). Each is `None` when the
+    /// classifier isn't sure (the document then lands at the root, À
+    /// classer), and both when the embedding model isn't available.
     ///
     /// The file type is determined from the source's name's extension;
     /// only `.pdf` is currently accepted, anything else is rejected with

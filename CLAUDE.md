@@ -203,18 +203,19 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     bm25 alone, never failing over the model. `search_facets` with non-blank text counts the
     same hybrid set (`count_documents_among`/`created_at_range_among`). `Newest`/`Oldest` and
     blank text stay bm25/filters only.
-  - `classification/` — zero-shot `Category`/`Subcategory`/`DocumentType` guess at upload
-    (ported from `doc-ai-poc`'s `classify.rs`): the whitespace-collapsed transcript (first 16 KiB)
-    embedded as one passage, against `query: `-embedded French descriptions per label
-    (`LABELS`, `TYPES`: business data, kept there; a label scores its best description).
-    Category = argmax over each category's best label, subcategory = argmax among that
-    category's labels (one label per subcategory, plus a `None`-subcategory one only for a
-    category without any, `Donations`), type = flat argmax (`Other` has no description); each
-    needs `*_MARGIN` over the runner-up, else `None`.
-    Descriptions are embedded lazily, once per process and model (`DESCRIPTIONS`). `upload`
-    classifies only after its embedding succeeded (model at hand) and keeps only the type
-    (categories no longer file documents); a failure publishes untyped. Never run on
-    consumption.
+  - `classification/` — zero-shot `DocumentType` and folder guess at upload (ported from
+    `doc-ai-poc`'s `classify.rs`): the whitespace-collapsed transcript (first 16 KiB) embedded
+    as one passage, against `query: `-embedded texts. Types: French descriptions per type
+    (`TYPES`: business data, kept there; a type scores its best description), flat argmax
+    (`Other` has no description) needing `TYPE_MARGIN` over the runner-up. Folders: each
+    described folder's `"{name} : {description}"` (a folder without a description is never
+    picked), the best one needing `FOLDER_MARGIN` over the runner-up and at least
+    `FOLDER_FLOOR` (0.85, the search floor: not yet tuned on real folders; the `#[ignore]`d
+    real-model test files synthetic documents in the French proposed layout). Type descriptions
+    are embedded lazily, once per process and model (`DESCRIPTIONS`); folder texts are cached
+    per model, keeping only the latest classification's. `upload` classifies only after its
+    embedding succeeded (model at hand), against the folders synced here; a failure publishes
+    untyped at the root. Never run on consumption.
   - `gliner.rs` — `SpanFinder` (`OnnxGliner`, GLiNER-X small; ported from `doc-ai-poc`'s
     `gliner.rs`), a pure adapter not wired into any flow yet: `spans(text, labels, threshold,
     max_words)` returns every span (byte range, label index, sigmoid score) scoring at least

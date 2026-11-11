@@ -127,3 +127,37 @@ pub(crate) fn folders_listing(folders: Vec<Folder>) -> Arc<dyn Service> {
     service.expect_list().returning(move || Ok(folders.clone()));
     Arc::new(service)
 }
+
+/// The proposed layout in `language` (see
+/// [`Service::create_proposed_layout`]) as folders with fresh ids, for
+/// tests filing documents in it.
+#[cfg(test)]
+pub(crate) fn proposed_layout_folders(language: &str) -> Vec<Folder> {
+    fn add(
+        proposed: &'static [layout::ProposedFolder],
+        parent_id: Option<Uuid>,
+        french: bool,
+        into: &mut Vec<Folder>,
+    ) {
+        for folder in proposed {
+            let (name, description) = if french { folder.fr } else { folder.en };
+            let id = Uuid::now_v7();
+            into.push(Folder {
+                id,
+                parent_id,
+                name: name.to_string(),
+                description: description.to_string(),
+                appearance: folder.appearance,
+            });
+            add(folder.children, Some(id), french, into);
+        }
+    }
+    let mut folders = Vec::new();
+    add(
+        layout::PROPOSED_LAYOUT,
+        None,
+        crate::error::Language::parse(language) == crate::error::Language::French,
+        &mut folders,
+    );
+    folders
+}

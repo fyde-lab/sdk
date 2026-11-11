@@ -2,461 +2,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use uuid::Uuid;
 
+use super::super::DocumentType;
 use super::super::embedder::Embedder;
-use super::super::{Category, DocumentType, Subcategory};
 use super::{Classification, Service};
+use crate::domains::folders::Folder;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
-/// A `(Category, Subcategory)` pair, described the way such documents read.
-pub(super) struct Label {
-    pub(super) category: Category,
-    /// `None` where no subcategory fits (a category alone is allowed).
-    pub(super) subcategory: Option<Subcategory>,
-    /// What such documents contain, phrased like them: e5 matches on
-    /// content, not on label names. A label scores its best description.
-    pub(super) descriptions: &'static [&'static str],
-}
-
-const fn label(
-    category: Category,
-    subcategory: Option<Subcategory>,
-    descriptions: &'static [&'static str],
-) -> Label {
-    Label {
-        category,
-        subcategory,
-        descriptions,
-    }
-}
-
-/// Every label a document can be classified under: one per subcategory,
-/// plus one for each category that has none.
-pub(super) const LABELS: &[Label] = &[
-    label(
-        Category::Housing,
-        Some(Subcategory::Energy),
-        &[
-            "facture d'électricité ou de gaz : consommation en kWh, abonnement, relevé du compteur, fournisseur d'énergie",
-            "échéancier de paiement électricité et gaz, mensualisation, contrat de fourniture d'énergie",
-        ],
-    ),
-    label(
-        Category::Housing,
-        Some(Subcategory::Water),
-        &[
-            "facture d'eau : consommation en m³, abonnement eau potable et assainissement, relevé du compteur d'eau",
-        ],
-    ),
-    label(
-        Category::Housing,
-        Some(Subcategory::HomeInsurance),
-        &[
-            "assurance habitation multirisque : attestation d'assurance du logement, avis d'échéance, cotisation annuelle",
-        ],
-    ),
-    label(
-        Category::Housing,
-        Some(Subcategory::HomeServices),
-        &[
-            "services à domicile : ménage, repassage, jardinage, entretien de la maison, petit bricolage",
-        ],
-    ),
-    label(
-        Category::Housing,
-        Some(Subcategory::Rent),
-        &[
-            "quittance de loyer, bail de location, charges locatives, charges de copropriété, appel de fonds du syndic",
-        ],
-    ),
-    label(
-        Category::Housing,
-        Some(Subcategory::Property),
-        &[
-            "achat ou vente d'un bien immobilier : compromis de vente, acte de vente, diagnostics, agence immobilière, notaire",
-        ],
-    ),
-    label(
-        Category::Housing,
-        Some(Subcategory::Works),
-        &[
-            "travaux dans le logement : devis ou facture d'artisan, rénovation, plomberie, électricité, installation de chauffage",
-        ],
-    ),
-    label(
-        Category::Telecom,
-        Some(Subcategory::Mobile),
-        &[
-            "facture de forfait mobile : téléphone portable, appels, SMS, données internet mobile en Go",
-        ],
-    ),
-    label(
-        Category::Telecom,
-        Some(Subcategory::Internet),
-        &["facture box internet : abonnement fibre ou ADSL, téléphone fixe et télévision"],
-    ),
-    label(
-        Category::Money,
-        Some(Subcategory::Banking),
-        &[
-            "relevé de compte bancaire : solde, opérations, virements, prélèvements, paiements par carte",
-            "RIB, convention de compte, frais bancaires, mandat de prélèvement SEPA",
-        ],
-    ),
-    label(
-        Category::Money,
-        Some(Subcategory::Savings),
-        &["épargne sur livret : livret A, LDDS, LEP, PEL, relevé du livret, intérêts annuels"],
-    ),
-    label(
-        Category::Money,
-        Some(Subcategory::Investments),
-        &[
-            "placements financiers : assurance vie, PEA, compte-titres, SCPI, relevé de portefeuille, valorisation",
-        ],
-    ),
-    label(
-        Category::Money,
-        Some(Subcategory::Loans),
-        &[
-            "prêt immobilier ou crédit à la consommation : offre de prêt, tableau d'amortissement, échéances, taux, capital restant dû",
-        ],
-    ),
-    label(
-        Category::Money,
-        Some(Subcategory::Gaming),
-        &["jeux d'argent : paris sportifs, poker, loterie, casino en ligne, relevé des gains"],
-    ),
-    label(
-        Category::Taxes,
-        Some(Subcategory::IncomeTax),
-        &[
-            "avis d'impôt sur le revenu : revenu fiscal de référence, impôt net, prélèvement à la source",
-            "déclaration des revenus en ligne, accusé de réception de télédéclaration, avis de situation déclarative",
-            "formulaire 2042 de déclaration des revenus : traitements et salaires, pensions, revenus de capitaux mobiliers, revenus fonciers, charges déductibles, situation du foyer fiscal",
-        ],
-    ),
-    label(
-        Category::Taxes,
-        Some(Subcategory::TaxCertificates),
-        &[
-            "imprimé fiscal unique (IFU), attestation fiscale annuelle à reporter sur la déclaration de revenus",
-            "attestation fiscale de services à la personne ouvrant droit à crédit d'impôt",
-        ],
-    ),
-    label(
-        Category::Taxes,
-        Some(Subcategory::PropertyTax),
-        &[
-            "avis de taxe foncière : propriétés bâties ou non bâties, base d'imposition, taux communal, taxe d'enlèvement des ordures ménagères",
-        ],
-    ),
-    label(
-        Category::Taxes,
-        Some(Subcategory::HousingTax),
-        &[
-            "avis de taxe d'habitation : résidence secondaire, valeur locative, taux voté par la commune, avis de dégrèvement",
-        ],
-    ),
-    label(
-        Category::Health,
-        Some(Subcategory::HealthInsurance),
-        &[
-            "Assurance maladie (CPAM, ameli) : relevé des remboursements de soins, attestation de droits, carte Vitale",
-            "détail des versements de la caisse d'assurance maladie : dates des soins, nature des prestations, base de remboursement, taux, montant versé, franchise",
-        ],
-    ),
-    label(
-        Category::Health,
-        Some(Subcategory::ComplementaryHealth),
-        &[
-            "mutuelle santé complémentaire : décompte de la mutuelle, part complémentaire remboursée, cotisation, garanties du contrat",
-        ],
-    ),
-    label(
-        Category::Health,
-        Some(Subcategory::Care),
-        &[
-            "soins médicaux : ordonnance, compte rendu médical, facture de médecin, dentiste, pharmacie, hôpital, analyses",
-        ],
-    ),
-    label(
-        Category::Health,
-        Some(Subcategory::DeathDisabilityCover),
-        &[
-            "contrat de prévoyance : garantie décès, invalidité, incapacité de travail, capital versé aux bénéficiaires",
-        ],
-    ),
-    label(
-        Category::Work,
-        Some(Subcategory::Payslips),
-        &[
-            "bulletin de salaire : salaire brut, cotisations sociales, net à payer, net imposable, employeur",
-        ],
-    ),
-    label(
-        Category::Work,
-        Some(Subcategory::Employment),
-        &[
-            "contrat de travail, attestation employeur, certificat de travail, solde de tout compte",
-            "contrat de travail à durée indéterminée ou déterminée entre l'employeur et le salarié : engagement, poste occupé, période d'essai, rémunération, durée du travail, convention collective",
-        ],
-    ),
-    label(
-        Category::Work,
-        Some(Subcategory::HouseholdEmployer),
-        &[
-            "particulier employeur : CESU, Pajemploi, salaire d'un employé à domicile ou d'une assistante maternelle",
-        ],
-    ),
-    label(
-        Category::Work,
-        Some(Subcategory::Freelance),
-        &[
-            "activité indépendante ou portage salarial : auto-entrepreneur, URSSAF, facturation de missions, chiffre d'affaires",
-            "compte rendu d'activité (CRA) mensuel d'un consultant : jours travaillés sur la mission, client, signature",
-        ],
-    ),
-    label(
-        Category::Work,
-        Some(Subcategory::Unemployment),
-        &[
-            "France Travail (Pôle emploi) : allocation chômage, avis de paiement, attestation de droits, inscription comme demandeur d'emploi",
-        ],
-    ),
-    label(
-        Category::Work,
-        Some(Subcategory::Retirement),
-        &[
-            "retraite : pension de retraite de base ou complémentaire, relevé de carrière, trimestres validés, caisse de retraite",
-        ],
-    ),
-    label(
-        Category::Family,
-        Some(Subcategory::Benefits),
-        &[
-            "prestations familiales de la CAF : allocations familiales, aide au logement, prime d'activité, congé parental",
-        ],
-    ),
-    label(
-        Category::Family,
-        Some(Subcategory::Childcare),
-        &[
-            "garde d'enfant : crèche, halte-garderie, assistante maternelle, centre de loisirs, frais de garde",
-        ],
-    ),
-    label(
-        Category::Identity,
-        Some(Subcategory::IdDocuments),
-        &[
-            "pièce d'identité : carte nationale d'identité, passeport, titre de séjour, permis de conduire, date de validité",
-        ],
-    ),
-    label(
-        Category::Identity,
-        Some(Subcategory::CivilStatus),
-        &[
-            "état civil : acte de naissance, de mariage ou de décès, livret de famille, PACS, mairie",
-        ],
-    ),
-    label(
-        Category::Legal,
-        Some(Subcategory::InheritanceGifts),
-        &[
-            "succession ou donation : notaire, héritiers, défunt, acte de donation, déclaration de succession, partage",
-        ],
-    ),
-    label(
-        Category::Legal,
-        Some(Subcategory::Company),
-        &[
-            "société : statuts, extrait Kbis, assemblée générale des associés, procès-verbal, approbation des comptes",
-        ],
-    ),
-    label(
-        Category::Legal,
-        Some(Subcategory::Justice),
-        &[
-            "procédure judiciaire : tribunal, jugement, avocat, huissier de justice, assignation, convocation à une audience",
-        ],
-    ),
-    label(
-        Category::Transport,
-        Some(Subcategory::Train),
-        &["billet de train : trajet, gare de départ et d'arrivée, voiture, place, TGV, TER"],
-    ),
-    label(
-        Category::Transport,
-        Some(Subcategory::Flight),
-        &["billet d'avion, carte d'embarquement, réservation de vol, compagnie aérienne, aéroport"],
-    ),
-    label(
-        Category::Transport,
-        Some(Subcategory::Road),
-        &["route : péage d'autoroute, carburant, stationnement, recharge électrique, amende"],
-    ),
-    label(
-        Category::Transport,
-        Some(Subcategory::Ride),
-        &[
-            "course de VTC ou de taxi, location de trottinette ou de vélo en libre-service, autopartage",
-        ],
-    ),
-    label(
-        Category::Transport,
-        Some(Subcategory::Travel),
-        &["voyage : réservation d'hôtel, location de vacances, séjour, agence de voyage"],
-    ),
-    label(
-        Category::Transport,
-        Some(Subcategory::Vehicle),
-        &[
-            "véhicule : certificat d'immatriculation (carte grise), achat d'une voiture, entretien, révision, contrôle technique",
-        ],
-    ),
-    label(
-        Category::Transport,
-        Some(Subcategory::VehicleInsurance),
-        &[
-            "assurance automobile ou deux-roues : attestation d'assurance, carte verte, avis d'échéance, bonus-malus",
-        ],
-    ),
-    label(
-        Category::Pets,
-        Some(Subcategory::Veterinary),
-        &[
-            "vétérinaire : consultation, vaccination, soins pour chien ou chat, facture de la clinique vétérinaire",
-        ],
-    ),
-    label(
-        Category::Pets,
-        Some(Subcategory::PetCare),
-        &["garde d'animaux : pension pour chien ou chat, toilettage, promenade, pet-sitter"],
-    ),
-    label(
-        Category::Pets,
-        Some(Subcategory::PetInsurance),
-        &["assurance santé pour chien ou chat : cotisation, remboursement des frais vétérinaires"],
-    ),
-    label(
-        Category::Pets,
-        Some(Subcategory::PetSupplies),
-        &[
-            "animalerie : nourriture pour chien ou chat, croquettes, litière, accessoires pour animaux",
-        ],
-    ),
-    label(
-        Category::Shopping,
-        Some(Subcategory::Online),
-        &[
-            "commande en ligne : facture d'achat sur un site marchand, articles commandés, livraison",
-        ],
-    ),
-    label(
-        Category::Shopping,
-        Some(Subcategory::Groceries),
-        &["courses alimentaires : ticket de caisse de supermarché, drive, épicerie"],
-    ),
-    label(
-        Category::Shopping,
-        Some(Subcategory::FoodDelivery),
-        &["livraison de repas : commande à un restaurant livrée à domicile"],
-    ),
-    label(
-        Category::Shopping,
-        Some(Subcategory::Electronics),
-        &[
-            "achat d'appareil électronique : ordinateur, smartphone, tablette, télévision, numéro de série",
-        ],
-    ),
-    label(
-        Category::Shopping,
-        Some(Subcategory::HomeEquipment),
-        &[
-            "équipement de la maison : meuble, électroménager, lave-linge, réfrigérateur, literie, décoration",
-        ],
-    ),
-    label(
-        Category::Shopping,
-        Some(Subcategory::Clothing),
-        &["vêtements et chaussures : achat en magasin ou en ligne, taille, coloris, retour"],
-    ),
-    label(
-        Category::Shopping,
-        Some(Subcategory::Secondhand),
-        &[
-            "achat ou vente d'occasion entre particuliers : Vinted, Leboncoin, bordereau d'envoi, protection acheteur",
-        ],
-    ),
-    label(
-        Category::Leisure,
-        Some(Subcategory::Sports),
-        &[
-            "sport : licence sportive, adhésion à un club, abonnement à une salle de sport, certificat médical",
-        ],
-    ),
-    label(
-        Category::Leisure,
-        Some(Subcategory::Events),
-        &["billet de spectacle, concert, cinéma, musée ou événement : date, salle, placement"],
-    ),
-    label(
-        Category::Leisure,
-        Some(Subcategory::Associations),
-        &["adhésion à une association : cotisation annuelle, carte de membre, bulletin d'adhésion"],
-    ),
-    label(
-        Category::Education,
-        Some(Subcategory::School),
-        &[
-            "école, collège ou lycée : inscription scolaire, cantine, frais de scolarité, bulletin scolaire, périscolaire",
-        ],
-    ),
-    label(
-        Category::Education,
-        Some(Subcategory::HigherEducation),
-        &[
-            "études supérieures : inscription à l'université ou en école, frais de scolarité, certificat de scolarité, CVEC",
-        ],
-    ),
-    label(
-        Category::Education,
-        Some(Subcategory::Training),
-        &[
-            "formation professionnelle : CPF, organisme de formation, convention de formation, attestation de fin de formation",
-        ],
-    ),
-    label(
-        Category::Subscriptions,
-        Some(Subcategory::Media),
-        &["abonnement média : streaming vidéo ou musique, plateforme de séries et de films"],
-    ),
-    label(
-        Category::Subscriptions,
-        Some(Subcategory::CloudSoftware),
-        &[
-            "abonnement logiciel ou cloud : hébergement web, serveur, nom de domaine, stockage en ligne, licence",
-            "facture d'hébergeur ou de registrar : nom de domaine, zone DNS, serveur VPS ou dédié, certificat SSL, renouvellement pour 12 mois",
-        ],
-    ),
-    label(
-        Category::Subscriptions,
-        Some(Subcategory::Press),
-        &[
-            "abonnement presse : journal, magazine, quotidien en ligne, numéros papier ou numériques",
-        ],
-    ),
-    label(
-        Category::Donations,
-        None,
-        &[
-            "reçu fiscal de don à une association ou une fondation, ouvrant droit à réduction d'impôt",
-        ],
-    ),
-];
-
-/// A [`DocumentType`], described the way such documents read (see
-/// [`Label::descriptions`]).
+/// A [`DocumentType`], described the way such documents read: e5 matches
+/// on content, not on label names. A type scores its best description.
 pub(super) struct TypeLabel {
     pub(super) r#type: DocumentType,
     pub(super) descriptions: &'static [&'static str],
@@ -704,36 +259,46 @@ pub(super) const TYPES: &[TypeLabel] = &[
     ),
 ];
 
-/// How much a category's best label must score above every other
-/// category's for the document to be filed under it.
-const CATEGORY_MARGIN: f32 = 0.005;
-
-/// How much the best label within the chosen category must score above
-/// that category's other labels for its subcategory to be kept.
-const SUBCATEGORY_MARGIN: f32 = 0.005;
-
 /// How much the best type must score above every other type to be kept.
 const TYPE_MARGIN: f32 = 0.005;
+
+/// How much the best folder must score above every other described folder
+/// for a document to be filed in it: the margin categories were tuned with.
+const FOLDER_MARGIN: f32 = 0.005;
+
+/// The similarity to its description below which a folder isn't a match,
+/// even as the only one described: the floor searches use, where e5 put
+/// unrelated text around 0.8 and matching text at 0.85–0.91 (see
+/// `SIMILARITY_FLOOR`). Not yet tuned on real folders.
+const FOLDER_FLOOR: f32 = 0.85;
 
 /// How much of a transcript is embedded, in bytes of whitespace-collapsed
 /// text: the model only reads its first 512 tokens anyway, well within it,
 /// so a huge transcript isn't tokenized whole for nothing.
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 
-/// The embedding of every description in [`LABELS`] and [`TYPES`], in
-/// their order.
+/// A folder's id with the embedding of its text (see [`folder_text`]).
+pub(super) type FolderVector = (Uuid, Arc<Vec<f32>>);
+
+/// Embedded texts by model, then text.
+type EmbeddedTexts = HashMap<String, HashMap<String, Arc<Vec<f32>>>>;
+
+/// The embedding of every description in [`TYPES`], in their order.
 pub(super) struct Embedded {
-    pub(super) labels: Vec<Vec<Vec<f32>>>,
     pub(super) types: Vec<Vec<Vec<f32>>>,
 }
 
-/// [`Embedded`] descriptions per model (see [`Embedder::model`]), each
-/// computed on the first classification needing it.
+/// [`Embedded`] type descriptions per model (see [`Embedder::model`]), each
+/// computed on the first classification needing it, and the folder texts
+/// embedded so far (see [`folder_text`]) per model.
 #[derive(Default)]
 pub(super) struct DescriptionVectors {
     /// Held while embedding, so concurrent first classifications embed the
     /// descriptions once.
     by_model: tokio::sync::Mutex<HashMap<String, Arc<Embedded>>>,
+    /// By model, then text. Only the folders of the latest classification
+    /// are kept, so renamed or deleted ones don't pile up.
+    folders: tokio::sync::Mutex<EmbeddedTexts>,
 }
 
 /// The default [`Service`]: embeds a document's text with an injected
@@ -752,55 +317,69 @@ impl Classifier {
         }
     }
 
-    /// The descriptions embedded with the embedder's model, embedding them
-    /// unless that's already done: a failure is retried on the next call.
-    async fn descriptions(&self) -> Result<Arc<Embedded>> {
+    /// The type descriptions embedded with the embedder's model, embedding
+    /// them unless that's already done: a failure is retried on the next
+    /// call.
+    async fn type_descriptions(&self) -> Result<Arc<Embedded>> {
         let model = self.embedder.model();
         let mut by_model = self.descriptions.by_model.lock().await;
         if let Some(embedded) = by_model.get(&model) {
             return Ok(embedded.clone());
         }
 
-        let embedded = Arc::new(Embedded {
-            labels: self
-                .embed_descriptions(LABELS.iter().map(|label| label.descriptions))
-                .await
-                .context("failed to embed the category descriptions")?,
-            types: self
-                .embed_descriptions(TYPES.iter().map(|label| label.descriptions))
-                .await
-                .context("failed to embed the document type descriptions")?,
-        });
+        let mut types = Vec::new();
+        for label in TYPES {
+            let mut vectors = Vec::with_capacity(label.descriptions.len());
+            for description in label.descriptions {
+                vectors.push(self.embed_query(description).await.with_context(|| {
+                    "failed to embed the document type descriptions".to_string()
+                })?);
+            }
+            types.push(vectors);
+        }
+        let embedded = Arc::new(Embedded { types });
         by_model.insert(model, embedded.clone());
         Ok(embedded)
     }
 
-    /// Embeds each label's descriptions as queries, matched against
-    /// documents' passages.
-    async fn embed_descriptions(
-        &self,
-        labels: impl Iterator<Item = &'static [&'static str]>,
-    ) -> Result<Vec<Vec<Vec<f32>>>> {
-        let mut embedded = Vec::new();
-        for descriptions in labels {
-            let mut vectors = Vec::with_capacity(descriptions.len());
-            for description in descriptions {
-                vectors.push(
-                    self.embedder
-                        .embed_query(description.to_string())
+    /// Each described folder of `folders` with its text's embedding,
+    /// reusing what earlier classifications embedded with the same model.
+    async fn folder_vectors(&self, folders: &[Folder]) -> Result<Vec<FolderVector>> {
+        let model = self.embedder.model();
+        let mut cache = self.descriptions.folders.lock().await;
+        let previous = cache.remove(&model).unwrap_or_default();
+        let mut current = HashMap::new();
+        let mut vectors = Vec::new();
+        for folder in folders {
+            let Some(text) = folder_text(folder) else {
+                continue;
+            };
+            let vector = match previous.get(&text).or_else(|| current.get(&text)) {
+                Some(vector) => Arc::clone(vector),
+                None => Arc::new(
+                    self.embed_query(&text)
                         .await
-                        .with_context(|| format!("failed to embed description {description:?}"))?,
-                );
-            }
-            embedded.push(vectors);
+                        .with_context(|| format!("failed to embed folder {}", folder.id))?,
+                ),
+            };
+            current.insert(text, vector.clone());
+            vectors.push((folder.id, vector));
         }
-        Ok(embedded)
+        cache.insert(model, current);
+        Ok(vectors)
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embedder
+            .embed_query(text.to_string())
+            .await
+            .with_context(|| format!("failed to embed description {text:?}"))
     }
 }
 
 #[async_trait]
 impl Service for Classifier {
-    async fn classify(&self, text: &str) -> Result<Classification> {
+    async fn classify(&self, text: &str, folders: &[Folder]) -> Result<Classification> {
         let text = classified_text(text);
         if text.is_empty() {
             return Ok(Classification::default());
@@ -817,10 +396,18 @@ impl Service for Classifier {
             .ok_or_else(|| {
                 ErrorKind::InvalidModel("the embedding model returned no vector".to_string())
             })?;
-        let descriptions = self.descriptions().await?;
+        let types = self.type_descriptions().await?;
+        let folders = self.folder_vectors(folders).await?;
 
-        Ok(classify(&document, &descriptions))
+        Ok(classify(&document, &types, &folders))
     }
+}
+
+/// What a folder is matched on: its name and description, or `None` for a
+/// folder without a description, which nothing is filed in by itself.
+fn folder_text(folder: &Folder) -> Option<String> {
+    let description = folder.description.trim();
+    (!description.is_empty()).then(|| format!("{} : {description}", folder.name.trim()))
 }
 
 /// The part of `transcript` a document is classified from: its first
@@ -847,52 +434,48 @@ fn classified_text(transcript: &str) -> String {
     text
 }
 
-/// Classifies the `document` vector against the embedded `descriptions`:
-/// the category whose best label is clearly best, then the subcategory
-/// (or lack of one) of its clearly best label, and the clearly best type
-/// (see [`decide`]).
-pub(super) fn classify(document: &[f32], descriptions: &Embedded) -> Classification {
-    let labels: Vec<(&Label, f32)> = LABELS
-        .iter()
-        .zip(&descriptions.labels)
-        .map(|(label, vectors)| (label, best_similarity(document, vectors)))
-        .collect();
-
-    let category = decide(
-        labels.iter().map(|(label, score)| (label.category, *score)),
-        CATEGORY_MARGIN,
-    );
-    let subcategory = category.and_then(|category| {
-        decide(
-            labels
-                .iter()
-                .filter(|(label, _)| label.category == category)
-                .map(|(label, score)| (label.subcategory, *score)),
-            SUBCATEGORY_MARGIN,
-        )
-        .flatten()
-    });
+/// Classifies the `document` vector: the clearly best type against the
+/// embedded type descriptions, and the clearly best of the described
+/// `folders` (each with its text's embedding) if it scores at least
+/// [`FOLDER_FLOOR`] (see [`decide`]).
+pub(super) fn classify(
+    document: &[f32],
+    types: &Embedded,
+    folders: &[FolderVector],
+) -> Classification {
     let r#type = decide(
         TYPES
             .iter()
-            .zip(&descriptions.types)
+            .zip(&types.types)
             .map(|(label, vectors)| (label.r#type, best_similarity(document, vectors))),
         TYPE_MARGIN,
     );
 
-    Classification {
-        category,
-        subcategory,
-        r#type,
-    }
+    let scores: Vec<(Uuid, f32)> = folders
+        .iter()
+        .map(|(id, vector)| (*id, similarity(document, vector)))
+        .collect();
+    let folder_id = decide(scores.iter().copied(), FOLDER_MARGIN).filter(|chosen| {
+        scores
+            .iter()
+            .any(|(id, score)| id == chosen && *score >= FOLDER_FLOOR)
+    });
+
+    Classification { r#type, folder_id }
 }
 
-/// The highest cosine similarity of `document` to any of `descriptions`
-/// (all L2-normalized, so their dot product), or `f32::MIN` for none.
+/// The cosine similarity of `document` and `description` (both
+/// L2-normalized, so their dot product).
+fn similarity(document: &[f32], description: &[f32]) -> f32 {
+    description.iter().zip(document).map(|(a, b)| a * b).sum()
+}
+
+/// The highest cosine similarity of `document` to any of `descriptions`,
+/// or `f32::MIN` for none.
 pub(super) fn best_similarity(document: &[f32], descriptions: &[Vec<f32>]) -> f32 {
     descriptions
         .iter()
-        .map(|description| description.iter().zip(document).map(|(a, b)| a * b).sum())
+        .map(|description| similarity(document, description))
         .fold(f32::MIN, f32::max)
 }
 
@@ -919,7 +502,6 @@ pub(super) fn decide<T: Copy + PartialEq>(
         [(first, a), (_, b), ..] => (a > b && a - b >= margin).then_some(first),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -927,6 +509,7 @@ mod tests {
     use super::super::super::embedder::MockEmbedder;
     use super::*;
     use crate::ErrorCode;
+    use crate::domains::folders::FakeFolder;
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     enum Choice {
@@ -995,64 +578,6 @@ mod tests {
     }
 
     #[test]
-    fn every_label_is_a_valid_category_and_subcategory_pair() {
-        for label in LABELS {
-            if let Some(subcategory) = label.subcategory {
-                assert_eq!(subcategory.category(), label.category, "{subcategory:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn every_label_and_type_has_descriptions_none_blank() {
-        let labels = LABELS.iter().map(|label| label.descriptions);
-        let types = TYPES.iter().map(|label| label.descriptions);
-
-        for descriptions in labels.chain(types) {
-            assert!(!descriptions.is_empty());
-            for description in descriptions {
-                assert!(!description.trim().is_empty());
-            }
-        }
-    }
-
-    #[test]
-    fn every_category_and_subcategory_has_exactly_one_label() {
-        for category in Category::ALL {
-            let labels = LABELS.iter().filter(|label| label.category == *category);
-            assert!(labels.count() >= 1, "{category:?} has no label");
-        }
-        for subcategory in Subcategory::ALL {
-            let labels = LABELS
-                .iter()
-                .filter(|label| label.subcategory == Some(*subcategory));
-            assert_eq!(labels.count(), 1, "{subcategory:?}");
-        }
-        for category in Category::ALL {
-            let labels = LABELS
-                .iter()
-                .filter(|label| label.category == *category && label.subcategory.is_none());
-            assert!(
-                labels.count() <= 1,
-                "{category:?} has two labels without a subcategory"
-            );
-        }
-    }
-
-    #[test]
-    fn only_a_category_without_subcategories_has_a_label_without_one() {
-        for label in LABELS.iter().filter(|label| label.subcategory.is_none()) {
-            let category = label.category;
-            assert!(
-                Subcategory::ALL
-                    .iter()
-                    .all(|subcategory| subcategory.category() != category),
-                "{category:?} has subcategories"
-            );
-        }
-    }
-
-    #[test]
     fn every_type_but_other_has_exactly_one_entry() {
         for r#type in DocumentType::ALL {
             let entries = TYPES.iter().filter(|label| label.r#type == *r#type).count();
@@ -1095,191 +620,180 @@ mod tests {
         assert!(text.starts_with("mot mot"));
     }
 
-    /// Every description, labels' then types', in [`LABELS`]/[`TYPES`]
-    /// order: each is embedded along its own axis of this many dimensions.
-    fn descriptions() -> Vec<&'static str> {
-        let labels = LABELS.iter().flat_map(|label| label.descriptions.iter());
-        let types = TYPES.iter().flat_map(|label| label.descriptions.iter());
-        labels.chain(types).copied().collect()
-    }
-
-    fn axis_of(description: &str) -> usize {
-        descriptions()
+    /// Every type description, in [`TYPES`] order, then `extra` texts:
+    /// each is embedded along its own axis.
+    fn texts(extra: &[String]) -> Vec<String> {
+        TYPES
             .iter()
-            .position(|known| *known == description)
-            .unwrap()
+            .flat_map(|label| label.descriptions.iter())
+            .map(|description| description.to_string())
+            .chain(extra.iter().cloned())
+            .collect()
     }
 
-    /// A vector with `1.0` along each of `axes`.
-    fn along(axes: &[usize]) -> Vec<f32> {
-        let mut vector = vec![0.0; descriptions().len()];
-        for axis in axes {
-            vector[*axis] = 1.0;
+    /// A vector of `dimensions` with `score` along each of `axes`.
+    fn along(dimensions: usize, axes: &[(usize, f32)]) -> Vec<f32> {
+        let mut vector = vec![0.0; dimensions];
+        for (axis, score) in axes {
+            vector[*axis] = *score;
         }
         vector
     }
 
-    /// Every description embedded along its own axis.
-    fn embedded_along_axes() -> Embedded {
-        let embed = |labels: &mut dyn Iterator<Item = &'static [&'static str]>| {
-            labels
-                .map(|descriptions| {
-                    descriptions
+    fn type_axis(r#type: DocumentType) -> usize {
+        let label = TYPES.iter().find(|label| label.r#type == r#type).unwrap();
+        texts(&[])
+            .iter()
+            .position(|text| text == label.descriptions[0])
+            .unwrap()
+    }
+
+    /// The type descriptions embedded along their own axes, out of
+    /// `dimensions`.
+    fn embedded_types(dimensions: usize) -> Embedded {
+        let all = texts(&[]);
+        Embedded {
+            types: TYPES
+                .iter()
+                .map(|label| {
+                    label
+                        .descriptions
                         .iter()
-                        .map(|description| along(&[axis_of(description)]))
+                        .map(|description| {
+                            let axis = all.iter().position(|text| text == description).unwrap();
+                            along(dimensions, &[(axis, 1.0)])
+                        })
                         .collect()
                 })
-                .collect()
-        };
-        Embedded {
-            labels: embed(&mut LABELS.iter().map(|label| label.descriptions)),
-            types: embed(&mut TYPES.iter().map(|label| label.descriptions)),
+                .collect(),
         }
     }
 
-    /// The axis of `subcategory`'s label's description number `index`.
-    fn label_axis(category: Category, subcategory: Option<Subcategory>, index: usize) -> usize {
-        let label = LABELS
-            .iter()
-            .find(|label| label.category == category && label.subcategory == subcategory)
-            .unwrap();
-        axis_of(label.descriptions[index])
-    }
-
-    fn type_axis(r#type: DocumentType) -> usize {
-        let label = TYPES.iter().find(|label| label.r#type == r#type).unwrap();
-        axis_of(label.descriptions[0])
-    }
-
-    #[test]
-    fn classify_picks_the_best_label_and_type() {
-        let document = along(&[
-            label_axis(Category::Housing, Some(Subcategory::Energy), 0),
-            type_axis(DocumentType::Invoice),
-        ]);
-
-        let classification = classify(&document, &embedded_along_axes());
-
-        assert_eq!(
-            classification,
-            Classification {
-                category: Some(Category::Housing),
-                subcategory: Some(Subcategory::Energy),
-                r#type: Some(DocumentType::Invoice),
-            }
-        );
+    /// `count` folders, each embedded along its own axis past the type
+    /// descriptions'.
+    fn folder_axes(count: usize) -> (Vec<FolderVector>, usize) {
+        let first = texts(&[]).len();
+        let dimensions = first + count;
+        let folders = (0..count)
+            .map(|index| {
+                (
+                    Uuid::now_v7(),
+                    Arc::new(along(dimensions, &[(first + index, 1.0)])),
+                )
+            })
+            .collect();
+        (folders, dimensions)
     }
 
     #[test]
-    fn classify_scores_a_label_by_its_best_description() {
-        let document = along(&[label_axis(Category::Housing, Some(Subcategory::Energy), 1)]);
+    fn classify_picks_the_clearly_best_type() {
+        let dimensions = texts(&[]).len();
+        let document = along(dimensions, &[(type_axis(DocumentType::Invoice), 1.0)]);
 
-        let classification = classify(&document, &embedded_along_axes());
+        let classification = classify(&document, &embedded_types(dimensions), &[]);
 
-        assert_eq!(classification.subcategory, Some(Subcategory::Energy));
-    }
-
-    #[test]
-    fn classify_files_a_label_without_subcategory_under_its_category_alone() {
-        let document = along(&[label_axis(Category::Donations, None, 0)]);
-
-        let classification = classify(&document, &embedded_along_axes());
-
-        assert_eq!(classification.category, Some(Category::Donations));
-        assert_eq!(classification.subcategory, None);
-    }
-
-    #[test]
-    fn classify_keeps_the_category_but_no_subcategory_when_its_labels_tie() {
-        let document = along(&[
-            label_axis(Category::Housing, Some(Subcategory::Energy), 0),
-            label_axis(Category::Housing, Some(Subcategory::Water), 0),
-        ]);
-
-        let classification = classify(&document, &embedded_along_axes());
-
-        assert_eq!(classification.category, Some(Category::Housing));
-        assert_eq!(classification.subcategory, None);
-    }
-
-    #[test]
-    fn classify_gives_no_category_nor_subcategory_when_categories_tie() {
-        let document = along(&[
-            label_axis(Category::Housing, Some(Subcategory::Energy), 0),
-            label_axis(Category::Telecom, Some(Subcategory::Mobile), 0),
-        ]);
-
-        let classification = classify(&document, &embedded_along_axes());
-
-        assert_eq!(classification.category, None);
-        assert_eq!(classification.subcategory, None);
+        assert_eq!(classification.r#type, Some(DocumentType::Invoice));
+        assert_eq!(classification.folder_id, None);
     }
 
     #[test]
     fn classify_gives_no_type_when_types_tie() {
-        let document = along(&[
-            type_axis(DocumentType::Invoice),
-            type_axis(DocumentType::Receipt),
-        ]);
+        let dimensions = texts(&[]).len();
+        let document = along(
+            dimensions,
+            &[
+                (type_axis(DocumentType::Invoice), 1.0),
+                (type_axis(DocumentType::Receipt), 1.0),
+            ],
+        );
 
-        let classification = classify(&document, &embedded_along_axes());
+        let classification = classify(&document, &embedded_types(dimensions), &[]);
 
         assert_eq!(classification.r#type, None);
     }
 
     #[test]
-    fn classify_applies_each_margin() {
-        let scores = |category: f32, subcategory: f32, r#type: f32| {
-            let mut document = vec![0.0; descriptions().len()];
-            document[label_axis(Category::Housing, Some(Subcategory::Energy), 0)] = 0.5;
-            document[label_axis(Category::Housing, Some(Subcategory::Water), 0)] =
-                0.5 - subcategory;
-            document[label_axis(Category::Telecom, Some(Subcategory::Mobile), 0)] = 0.5 - category;
-            document[type_axis(DocumentType::Invoice)] = 0.5;
-            document[type_axis(DocumentType::Receipt)] = 0.5 - r#type;
-            classify(&document, &embedded_along_axes())
-        };
-        // Clear of the margin either way: `f32`s don't subtract exactly.
-        let above = |margin: f32| margin * 2.0;
-        let below = |margin: f32| margin * 0.5;
-        let (category, subcategory, r#type) = (
-            above(CATEGORY_MARGIN),
-            above(SUBCATEGORY_MARGIN),
-            above(TYPE_MARGIN),
-        );
+    fn classify_files_in_the_folder_clearly_closest_to_the_document() {
+        let (folders, dimensions) = folder_axes(2);
+        let first = texts(&[]).len();
+        let document = along(dimensions, &[(first, 0.9), (first + 1, 0.88)]);
 
-        let clear = scores(category, subcategory, r#type);
-        assert_eq!(clear.category, Some(Category::Housing));
-        assert_eq!(clear.subcategory, Some(Subcategory::Energy));
-        assert_eq!(clear.r#type, Some(DocumentType::Invoice));
+        let classification = classify(&document, &embedded_types(dimensions), &folders);
 
-        let close = scores(category, subcategory, below(TYPE_MARGIN));
-        assert_eq!(close.subcategory, Some(Subcategory::Energy));
-        assert_eq!(close.r#type, None);
-
-        let close = scores(category, below(SUBCATEGORY_MARGIN), r#type);
-        assert_eq!(close.category, Some(Category::Housing));
-        assert_eq!(close.subcategory, None);
-
-        let close = scores(below(CATEGORY_MARGIN), subcategory, r#type);
-        assert_eq!(close.category, None);
-        assert_eq!(close.r#type, Some(DocumentType::Invoice));
+        assert_eq!(classification.folder_id, Some(folders[0].0));
     }
 
-    /// An embedder embedding each description along its own axis, and
-    /// documents along `document`, expecting `queries` description
-    /// embeddings and `passages` document ones.
-    fn embedder_along_axes(document: Vec<f32>, passages: usize, queries: usize) -> MockEmbedder {
+    #[test]
+    fn classify_files_nowhere_when_two_folders_are_within_the_margin() {
+        let (folders, dimensions) = folder_axes(2);
+        let first = texts(&[]).len();
+        let document = along(
+            dimensions,
+            &[(first, 0.9), (first + 1, 0.9 - FOLDER_MARGIN * 0.5)],
+        );
+
+        let classification = classify(&document, &embedded_types(dimensions), &folders);
+
+        assert_eq!(classification.folder_id, None);
+    }
+
+    #[test]
+    fn classify_files_in_a_lone_folder_only_from_the_floor() {
+        let (folders, dimensions) = folder_axes(1);
+        let first = texts(&[]).len();
+        let filed = |score: f32| {
+            classify(
+                &along(dimensions, &[(first, score)]),
+                &embedded_types(dimensions),
+                &folders,
+            )
+            .folder_id
+        };
+
+        assert_eq!(filed(FOLDER_FLOOR + 0.01), Some(folders[0].0));
+        assert_eq!(filed(FOLDER_FLOOR - 0.01), None);
+    }
+
+    #[test]
+    fn folder_text_is_the_name_and_description_and_none_without_a_description() {
+        let described = FakeFolder::new()
+            .with_name("Voiture")
+            .with_description(" Carte grise, assurance ")
+            .build();
+        let undescribed = FakeFolder::new().with_description("  ").build();
+
+        assert_eq!(
+            folder_text(&described).as_deref(),
+            Some("Voiture : Carte grise, assurance")
+        );
+        assert_eq!(folder_text(&undescribed), None);
+    }
+
+    /// An embedder embedding each of `all` texts (see [`texts`]) along its
+    /// own axis, and documents as `document`, expecting `passages` document
+    /// embeddings and `queries` text ones.
+    fn embedder_along_axes(
+        all: Vec<String>,
+        document: Vec<f32>,
+        passages: usize,
+        queries: usize,
+    ) -> MockEmbedder {
         let mut embedder = MockEmbedder::new();
         embedder.expect_model().return_const("e5.onnx".to_string());
-        embedder
-            .expect_embed_passages()
-            .times(passages)
-            .returning(move |_| Ok(vec![document.clone()]));
+        if passages > 0 {
+            embedder
+                .expect_embed_passages()
+                .times(passages)
+                .returning(move |_| Ok(vec![document.clone()]));
+        }
+        let dimensions = all.len();
         embedder
             .expect_embed_query()
             .times(queries)
-            .returning(|query| Ok(along(&[axis_of(&query)])));
+            .returning(move |query| {
+                let axis = all.iter().position(|text| *text == query).unwrap();
+                Ok(along(dimensions, &[(axis, 1.0)]))
+            });
         embedder
     }
 
@@ -1287,37 +801,53 @@ mod tests {
         Classifier::new(Arc::new(embedder), descriptions.clone())
     }
 
+    /// Two described folders and one without a description, and every
+    /// text the classifier embeds for them.
+    fn folders_and_texts() -> (Vec<Folder>, Vec<String>) {
+        let folders = vec![
+            FakeFolder::new()
+                .with_name("Bulletins de paie")
+                .with_description("salaire net à payer")
+                .build(),
+            FakeFolder::new()
+                .with_name("Énergie")
+                .with_description("facture d'électricité")
+                .build(),
+            FakeFolder::new().with_description("").build(),
+        ];
+        let all = texts(&[
+            "Bulletins de paie : salaire net à payer".to_string(),
+            "Énergie : facture d'électricité".to_string(),
+        ]);
+        (folders, all)
+    }
+
     #[tokio::test]
-    async fn classifier_classifies_the_document_s_text() {
-        let mut embedder = MockEmbedder::new();
-        embedder.expect_model().return_const("e5.onnx".to_string());
+    async fn classifier_types_and_files_the_document_s_text() {
+        let (folders, all) = folders_and_texts();
+        let payslips = all.len() - 2;
+        let document = along(
+            all.len(),
+            &[(type_axis(DocumentType::Payslip), 1.0), (payslips, 0.9)],
+        );
+        let mut embedder = embedder_along_axes(all.clone(), Vec::new(), 0, all.len());
         embedder
             .expect_embed_passages()
             .withf(|passages| passages == &["Bulletin de paie net à payer".to_string()])
             .times(1)
-            .returning(move |_| {
-                Ok(vec![along(&[
-                    label_axis(Category::Work, Some(Subcategory::Payslips), 0),
-                    type_axis(DocumentType::Payslip),
-                ])])
-            });
-        embedder
-            .expect_embed_query()
-            .times(descriptions().len())
-            .returning(|query| Ok(along(&[axis_of(&query)])));
+            .returning(move |_| Ok(vec![document.clone()]));
         let classifier = classifier(embedder, &Arc::default());
 
         let classification = classifier
-            .classify("Bulletin de paie\n  net à payer")
+            .classify("Bulletin de paie\n  net à payer", &folders)
             .await
             .unwrap();
 
         assert_eq!(
             classification,
             Classification {
-                category: Some(Category::Work),
-                subcategory: Some(Subcategory::Payslips),
                 r#type: Some(DocumentType::Payslip),
+                folder_id: Some(folders[0].id),
             }
         );
     }
@@ -1326,52 +856,81 @@ mod tests {
     async fn classifier_leaves_a_blank_text_unclassified_without_embedding() {
         let classifier = classifier(MockEmbedder::new(), &Arc::default());
 
-        let classification = classifier.classify(" \n ").await.unwrap();
+        let classification = classifier
+            .classify(" \n ", &[FakeFolder::new().build()])
+            .await
+            .unwrap();
 
         assert_eq!(classification, Classification::default());
     }
 
     #[tokio::test]
-    async fn classifier_embeds_the_descriptions_once_across_classifications() {
-        let document = along(&[label_axis(Category::Donations, None, 0)]);
-        let embedder = embedder_along_axes(document, 2, descriptions().len());
+    async fn classifier_embeds_each_description_once_across_classifications() {
+        let (folders, all) = folders_and_texts();
+        let document = along(all.len(), &[(all.len() - 1, 0.9)]);
+        let embedder = embedder_along_axes(all.clone(), document, 2, all.len());
         let classifier = classifier(embedder, &Arc::default());
 
         for _ in 0..2 {
-            let classification = classifier.classify("Taxe foncière").await.unwrap();
-            assert_eq!(classification.category, Some(Category::Donations));
+            let classification = classifier.classify("Facture EDF", &folders).await.unwrap();
+            assert_eq!(classification.folder_id, Some(folders[1].id));
         }
     }
 
     #[tokio::test]
+    async fn classifier_embeds_a_folder_again_once_its_description_changed() {
+        let (mut folders, mut all) = folders_and_texts();
+        all.push("Énergie : gaz".to_string());
+        let document = along(all.len(), &[(all.len() - 1, 0.9)]);
+        // Every description once, the changed one included.
+        let embedder = embedder_along_axes(all.clone(), document, 2, all.len());
+        let classifier = classifier(embedder, &Arc::default());
+
+        classifier.classify("Facture", &folders).await.unwrap();
+        folders[1].description = "gaz".to_string();
+        let classification = classifier.classify("Facture", &folders).await.unwrap();
+
+        assert_eq!(classification.folder_id, Some(folders[1].id));
+    }
+
+    #[tokio::test]
     async fn classifiers_sharing_descriptions_embed_them_once_per_model() {
-        let descriptions_vectors = Arc::<DescriptionVectors>::default();
-        let document = along(&[label_axis(Category::Donations, None, 0)]);
+        let shared = Arc::<DescriptionVectors>::default();
+        let (folders, all) = folders_and_texts();
+        let document = along(all.len(), &[(all.len() - 1, 0.9)]);
         let first = classifier(
-            embedder_along_axes(document.clone(), 1, descriptions().len()),
-            &descriptions_vectors,
+            embedder_along_axes(all.clone(), document.clone(), 1, all.len()),
+            &shared,
         );
         let same_model = classifier(
-            embedder_along_axes(document.clone(), 1, 0),
-            &descriptions_vectors,
+            embedder_along_axes(all.clone(), document.clone(), 1, 0),
+            &shared,
         );
-        let mut other_model = MockEmbedder::new();
-        other_model
-            .expect_model()
-            .return_const("other.onnx".to_string());
-        other_model
-            .expect_embed_passages()
-            .times(1)
-            .returning(move |_| Ok(vec![document.clone()]));
-        other_model
-            .expect_embed_query()
-            .times(descriptions().len())
-            .returning(|query| Ok(along(&[axis_of(&query)])));
-        let other_model = classifier(other_model, &descriptions_vectors);
+        let other_model = {
+            let mut embedder = MockEmbedder::new();
+            embedder
+                .expect_model()
+                .return_const("other.onnx".to_string());
+            let document = along(all.len(), &[(all.len() - 1, 0.9)]);
+            embedder
+                .expect_embed_passages()
+                .times(1)
+                .returning(move |_| Ok(vec![document.clone()]));
+            let dimensions = all.len();
+            let texts = all.clone();
+            embedder
+                .expect_embed_query()
+                .times(all.len())
+                .returning(move |query| {
+                    let axis = texts.iter().position(|text| *text == query).unwrap();
+                    Ok(along(dimensions, &[(axis, 1.0)]))
+                });
+            classifier(embedder, &shared)
+        };
 
         for classifier in [first, same_model, other_model] {
-            let classification = classifier.classify("Taxe foncière").await.unwrap();
-            assert_eq!(classification.category, Some(Category::Donations));
+            let classification = classifier.classify("Facture EDF", &folders).await.unwrap();
+            assert_eq!(classification.folder_id, Some(folders[1].id));
         }
     }
 
@@ -1384,7 +943,7 @@ mod tests {
             .returning(|_| Err(ErrorKind::ModelDownloadStatus(503).into()));
         let classifier = classifier(embedder, &Arc::default());
 
-        let err = classifier.classify("Facture").await.unwrap_err();
+        let err = classifier.classify("Facture", &[]).await.unwrap_err();
 
         assert_eq!(err.code(), ErrorCode::ModelDownloadFailed);
         assert!(
@@ -1403,14 +962,16 @@ mod tests {
             .returning(|_| Ok(Vec::new()));
         let classifier = classifier(embedder, &Arc::default());
 
-        let err = classifier.classify("Facture").await.unwrap_err();
+        let err = classifier.classify("Facture", &[]).await.unwrap_err();
 
         assert_eq!(err.code(), ErrorCode::ModelLoadFailed);
     }
 
     #[tokio::test]
-    async fn classifier_retries_descriptions_that_failed_to_embed() {
-        let document = along(&[label_axis(Category::Donations, None, 0)]);
+    async fn classifier_retries_type_descriptions_that_failed_to_embed() {
+        let all = texts(&[]);
+        let dimensions = all.len();
+        let document = along(dimensions, &[(type_axis(DocumentType::Invoice), 1.0)]);
         let mut embedder = MockEmbedder::new();
         embedder.expect_model().return_const("e5.onnx".to_string());
         embedder
@@ -1420,50 +981,44 @@ mod tests {
         let queries = AtomicUsize::new(0);
         embedder
             .expect_embed_query()
-            .times(1 + descriptions().len())
+            .times(1 + all.len())
             .returning(move |query| {
                 if queries.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(ErrorKind::ModelNotDownloaded("e5".to_string()).into());
                 }
-                Ok(along(&[axis_of(&query)]))
+                let axis = all.iter().position(|text| *text == query).unwrap();
+                Ok(along(dimensions, &[(axis, 1.0)]))
             });
         let classifier = classifier(embedder, &Arc::default());
 
-        let err = classifier.classify("Taxe foncière").await.unwrap_err();
+        let err = classifier.classify("Facture", &[]).await.unwrap_err();
         assert!(
             err.to_string()
-                .contains("failed to embed the category descriptions"),
+                .contains("failed to embed the document type descriptions"),
             "{err}"
         );
-        let classification = classifier.classify("Taxe foncière").await.unwrap();
+        let classification = classifier.classify("Facture", &[]).await.unwrap();
 
-        assert_eq!(classification.category, Some(Category::Donations));
+        assert_eq!(classification.r#type, Some(DocumentType::Invoice));
     }
 
-    /// A synthetic document and how it should be classified (`r#type`
-    /// `None`: not checked, no type fitting it).
+    /// A synthetic document, the proposed layout's French folder it should
+    /// be filed in, and its type (`None`: not checked, no type fitting it).
     struct Case {
         text: &'static str,
-        category: Category,
-        subcategory: Option<Subcategory>,
+        folder: &'static str,
         r#type: Option<DocumentType>,
     }
 
-    const fn case(
-        text: &'static str,
-        category: Category,
-        subcategory: Option<Subcategory>,
-        r#type: Option<DocumentType>,
-    ) -> Case {
+    const fn case(text: &'static str, folder: &'static str, r#type: Option<DocumentType>) -> Case {
         Case {
             text,
-            category,
-            subcategory,
+            folder,
             r#type,
         }
     }
 
-    /// Made-up documents, one per category at least, plus the
+    /// Made-up documents, one per top-level folder at least, plus the
     /// `doc-ai-poc` corpus' weak spots: local taxes (filed under income tax
     /// half of the time) and employment contracts.
     const CASES: &[Case] = &[
@@ -1471,8 +1026,7 @@ mod tests {
             "Électricité de France — Facture n° 30012345678 du 14/03/2025. Période du 12/01/2025 au 11/03/2025. \
              Relevé du compteur Linky : index 45210 kWh. Consommation : 612 kWh. Abonnement option base 9 kVA : 31,46 €. \
              Consommation : 154,32 €. Taxes et contributions : 22,10 €. Montant total TTC : 207,88 €, prélevé le 28/03/2025.",
-            Category::Housing,
-            Some(Subcategory::Energy),
+            "Énergie",
             Some(DocumentType::Invoice),
         ),
         case(
@@ -1480,16 +1034,14 @@ mod tests {
              12 rue des Lilas, 69003 Lyon, déclare avoir reçu de Madame Claire Durand, locataire, la somme de \
              850,00 € au titre du paiement du loyer (780,00 €) et des charges (70,00 €) pour la période du 01/03/2025 \
              au 31/03/2025, et lui en donne quittance, sous réserve de tous mes droits.",
-            Category::Housing,
-            Some(Subcategory::Rent),
+            "Loyer et charges",
             None,
         ),
         case(
             "Free Mobile — Votre facture du mois de février 2025. Ligne 06 12 34 56 78. Forfait Free 5G 150 Go : \
              19,99 €. Appels, SMS et MMS illimités en France métropolitaine. Données consommées : 42,3 Go. \
              Communications hors forfait : 0,00 €. Total TTC : 19,99 €, prélevé sur votre compte le 05/03/2025.",
-            Category::Telecom,
-            Some(Subcategory::Mobile),
+            "Mobile",
             Some(DocumentType::Invoice),
         ),
         case(
@@ -1497,8 +1049,7 @@ mod tests {
              Solde créditeur au 01/02/2025 : 1 254,30 €. 03/02 CB CARREFOUR MARKET 54,20. 05/02 VIR SEPA SALAIRE \
              FEVRIER +2 310,00. 10/02 PRLV SEPA EDF 207,88. 15/02 CB SNCF 89,00. 20/02 RETRAIT DAB 60,00. \
              Total des opérations : débit 411,08, crédit 2 310,00. Nouveau solde créditeur au 28/02/2025 : 3 153,22 €.",
-            Category::Money,
-            Some(Subcategory::Banking),
+            "Banque",
             Some(DocumentType::Statement),
         ),
         case(
@@ -1506,8 +1057,7 @@ mod tests {
              Impôt sur le revenu. Nombre de parts : 2,5. Revenu fiscal de référence : 52 340 €. Revenu brut global : \
              58 120 €. Impôt sur le revenu net : 3 412 €. Retenue à la source prélevée en 2024 : 3 250 €. \
              Reste à payer : 162 €, prélevé en 4 fois à partir de septembre.",
-            Category::Taxes,
-            Some(Subcategory::IncomeTax),
+            "Impôt sur le revenu",
             Some(DocumentType::TaxNotice),
         ),
         case(
@@ -1515,16 +1065,14 @@ mod tests {
              Commune de Villeurbanne. Adresse du bien : 12 rue des Lilas. Base d'imposition : 2 140 €. \
              Taux communal 45,12 %, taxe d'enlèvement des ordures ménagères 8,10 %. Montant de votre impôt : \
              1 138 €. Date limite de paiement : 15/10/2025.",
-            Category::Taxes,
-            Some(Subcategory::PropertyTax),
+            "Taxe foncière",
             Some(DocumentType::TaxNotice),
         ),
         case(
             "Avis de taxe d'habitation 2024 sur les résidences secondaires et autres locaux meublés non affectés \
              à l'habitation principale. Commune d'Annecy. Valeur locative brute : 3 980 €. Taux voté par la \
              commune : 18,62 %. Majoration résidences secondaires : 60 %. Montant à payer : 1 186 €.",
-            Category::Taxes,
-            Some(Subcategory::HousingTax),
+            "Taxe d'habitation",
             Some(DocumentType::TaxNotice),
         ),
         case(
@@ -1532,16 +1080,14 @@ mod tests {
              Date des soins 04/02/2025, consultation médecin généraliste, base de remboursement 30,00 €, taux 70 %, \
              montant remboursé 20,00 €, participation forfaitaire 2,00 €. Date des soins 11/02/2025, pharmacie, \
              montant remboursé 12,45 €. Total versé sur votre compte le 14/02/2025 : 30,45 €.",
-            Category::Health,
-            Some(Subcategory::HealthInsurance),
+            "Assurance maladie",
             Some(DocumentType::ReimbursementStatement),
         ),
         case(
             "Dr Sophie Lambert, médecin généraliste, 3 place Bellecour, Lyon. Ordonnance du 04/02/2025 pour \
              Mme Claire Durand. Paracétamol 1 g : un comprimé trois fois par jour pendant 5 jours. \
              Ibuprofène 400 mg : si douleur, sans dépasser 3 par jour. À renouveler une fois.",
-            Category::Health,
-            Some(Subcategory::Care),
+            "Soins",
             Some(DocumentType::MedicalDocument),
         ),
         case(
@@ -1550,8 +1096,7 @@ mod tests {
              Sécurité sociale maladie, vieillesse, retraite complémentaire, CSG déductible et non déductible. \
              Total des cotisations salariales : 712,40 €. Net à payer avant impôt sur le revenu : 2 487,60 €. \
              Impôt sur le revenu prélevé à la source : 124,38 €. Net payé : 2 363,22 €. Net imposable : 2 581,20 €.",
-            Category::Work,
-            Some(Subcategory::Payslips),
+            "Bulletins de paie",
             Some(DocumentType::Payslip),
         ),
         case(
@@ -1561,40 +1106,35 @@ mod tests {
              1er avril 2025 en qualité d'ingénieure logiciel, statut cadre. Article 2 — Période d'essai de quatre mois. \
              Article 3 — Rémunération annuelle brute de 48 000 €. Article 4 — Durée du travail : forfait de 218 jours. \
              Article 5 — Convention collective Syntec. Fait à Lyon, le 15 mars 2025, en deux exemplaires originaux.",
-            Category::Work,
-            Some(Subcategory::Employment),
+            "Contrats et attestations",
             Some(DocumentType::Contract),
         ),
         case(
             "Caisse d'allocations familiales du Rhône — Notification de vos droits. Allocataire : Claire Durand. \
              À compter de mars 2025, vous bénéficiez des allocations familiales pour vos deux enfants à charge : \
              141,99 € par mois, et de l'aide personnalisée au logement : 112,00 € par mois, versées le 5 de chaque mois.",
-            Category::Family,
-            Some(Subcategory::Benefits),
+            "Prestations",
             None,
         ),
         case(
             "SNCF Connect — Votre e-billet. Aller simple le 18/04/2025. Départ Paris Gare de Lyon 08h04, arrivée \
              Lyon Part-Dieu 10h00. TGV INOUI n° 6603, voiture 12, place 45, 2nde classe, fenêtre. Passager : \
              Claire Durand, carte Avantage Adulte. Prix payé : 49,00 €. Référence de dossier : QWERTY.",
-            Category::Transport,
-            Some(Subcategory::Train),
+            "Train",
             Some(DocumentType::Booking),
         ),
         case(
             "Amazon.fr — Facture. Numéro de commande 402-1234567-8901234, passée le 02/03/2025. Articles commandés : \
              1 × Bouilloire électrique 1,7 L, 29,99 €. 2 × Câble USB-C, 9,99 €. Livraison gratuite à Claire Durand, \
              12 rue des Lilas, Lyon. Total HT 41,64 €, TVA 20 % 8,33 €, total TTC 49,97 €. Payé par carte Visa.",
-            Category::Shopping,
-            Some(Subcategory::Online),
+            "En ligne",
             Some(DocumentType::Invoice),
         ),
         case(
             "OVHcloud — Facture FR12345678 du 01/03/2025. Désignation : renouvellement du nom de domaine \
              exemple.fr pour 12 mois, 7,79 € HT. Serveur privé virtuel VPS Starter, 1 vCore, 2 Go, mars 2025, \
              4,20 € HT. Total HT 11,99 €, TVA 20 % 2,40 €, total TTC 14,39 €.",
-            Category::Subscriptions,
-            Some(Subcategory::CloudSoftware),
+            "Logiciels et cloud",
             Some(DocumentType::Invoice),
         ),
         case(
@@ -1602,17 +1142,17 @@ mod tests {
              général des impôts. Association Les Restaurants du Cœur, reconnue d'utilité publique. Donateur : \
              Claire Durand, Lyon. Somme de 150,00 € versée le 12/12/2024 par virement, au titre d'un don manuel. \
              Le bénéficiaire certifie sur l'honneur que les dons ouvrent droit à la réduction d'impôt.",
-            Category::Donations,
-            None,
+            "Dons",
             Some(DocumentType::TaxCertificate),
         ),
     ];
 
     /// Downloads multilingual-e5-small (see `FYDE_TEST_MODELS_DIR`) and
-    /// checks it classifies every one of [`CASES`] as expected.
+    /// checks it files every one of [`CASES`] in the French proposed layout
+    /// as expected.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "downloads a 135 MB model from Hugging Face"]
-    async fn multilingual_e5_classifies_synthetic_documents() {
+    async fn multilingual_e5_files_synthetic_documents_in_the_proposed_layout() {
         let temp = tempfile::tempdir().unwrap();
         let dir = std::env::var_os("FYDE_TEST_MODELS_DIR")
             .map(std::path::PathBuf::from)
@@ -1621,24 +1161,27 @@ mod tests {
             crate::tools::models::ModelStore::new(dir),
         ));
         let classifier = Classifier::new(embedder, Arc::default());
+        let folders = crate::domains::folders::proposed_layout_folders("fr");
+        let name_of = |id: Option<Uuid>| {
+            id.and_then(|id| folders.iter().find(|folder| folder.id == id))
+                .map(|folder| folder.name.as_str())
+        };
 
         let mut wrong = Vec::new();
         for case in CASES {
-            let classification = classifier.classify(case.text).await.unwrap();
-            let expected = Classification {
-                category: Some(case.category),
-                subcategory: case.subcategory,
-                r#type: case.r#type.or(classification.r#type),
-            };
+            let classification = classifier.classify(case.text, &folders).await.unwrap();
+            let filed = name_of(classification.folder_id);
+            let r#type = case.r#type.or(classification.r#type);
             println!(
-                "{:?} {:?} {:?} <- {}",
-                classification.category,
-                classification.subcategory,
+                "{filed:?} {:?} <- {}",
                 classification.r#type,
                 &case.text[..60]
             );
-            if classification != expected {
-                wrong.push(format!("{classification:?} instead of {expected:?}"));
+            if filed != Some(case.folder) || classification.r#type != r#type {
+                wrong.push(format!(
+                    "{filed:?} {:?} instead of {:?} {type:?}",
+                    classification.r#type, case.folder
+                ));
             }
         }
 
