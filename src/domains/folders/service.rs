@@ -6,8 +6,10 @@ use uuid::Uuid;
 
 use crate::domains::changelog::{EventType, Service as ChangelogService};
 use crate::domains::documents::Storage as DocumentStorage;
+use crate::error::Language;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
+use super::layout::{PROPOSED_LAYOUT, ProposedFolder};
 use super::storage::Storage;
 use super::{
     Applier, CreateFolderRequest, DeleteFolderEvent, Folder, FolderAppearance, FolderColor,
@@ -140,6 +142,49 @@ impl<S: Storage> Service for FoldersClient<S> {
             .send(EventType::DeleteFolder, id, Some(&content), None)
             .await
             .with_context(|| format!("failed to publish deletion of folder {id}"))
+    }
+
+    async fn create_proposed_layout(&self, language: &str) -> Result<Vec<Folder>> {
+        let language = Language::parse(language);
+        // Folders published so far count as taken too, so the layout can't
+        // clash with itself.
+        let mut folders = self.folders().await?;
+        let mut created = Vec::new();
+        let mut pending: Vec<(Option<Uuid>, &ProposedFolder)> = PROPOSED_LAYOUT
+            .iter()
+            .map(|proposed| (None, proposed))
+            .collect();
+        while !pending.is_empty() {
+            let mut next = Vec::new();
+            for (parent_id, proposed) in pending {
+                let (name, description) = match language {
+                    Language::French => proposed.fr,
+                    Language::English => proposed.en,
+                };
+                let existing = folders
+                    .iter()
+                    .find(|folder| folder.parent_id == parent_id && same_name(&folder.name, name));
+                let id = match existing {
+                    Some(existing) => existing.id,
+                    None => {
+                        let folder = Folder {
+                            id: Uuid::now_v7(),
+                            parent_id,
+                            name: name.to_string(),
+                            description: description.to_string(),
+                            appearance: proposed.appearance,
+                        };
+                        self.publish(&folder).await?;
+                        folders.push(folder.clone());
+                        created.push(folder.clone());
+                        folder.id
+                    }
+                };
+                next.extend(proposed.children.iter().map(|child| (Some(id), child)));
+            }
+            pending = next;
+        }
+        Ok(created)
     }
 }
 
@@ -403,6 +448,7 @@ mod tests {
     use crate::domains::documents::Metadata;
     use crate::domains::documents::MockStorage as MockDocumentStorage;
     use crate::domains::folders::FakeFolder;
+    use crate::domains::folders::layout::{PROPOSED_LAYOUT, ProposedFolder};
     use crate::domains::folders::storage::MockStorage;
 
     /// An event a [`RecordingChangelog`] was sent:
@@ -799,6 +845,137 @@ mod tests {
         assert_eq!(*subject_id, folder.id);
         let event: DeleteFolderEvent = serde_json::from_slice(content.as_deref().unwrap()).unwrap();
         assert_eq!(event.contents, FolderContents::Delete);
+    }
+
+    /// Every folder of the proposed layout, depth first.
+    fn proposed_folders() -> Vec<&'static ProposedFolder> {
+        fn walk(folders: &'static [ProposedFolder], into: &mut Vec<&'static ProposedFolder>) {
+            for folder in folders {
+                into.push(folder);
+                walk(folder.children, into);
+            }
+        }
+        let mut all = Vec::new();
+        walk(PROPOSED_LAYOUT, &mut all);
+        all
+    }
+
+    #[test]
+    fn the_proposed_layout_passes_the_rules_a_user_s_folders_do() {
+        for proposed in proposed_folders() {
+            for (name, description) in [proposed.fr, proposed.en] {
+                assert_eq!(valid_name(name).unwrap(), name);
+                assert_eq!(valid_description(description).unwrap(), description);
+            }
+        }
+        for top in PROPOSED_LAYOUT {
+            check_appearance(None, top.appearance).unwrap();
+            for child in top.children {
+                check_appearance(Some(Uuid::nil()), child.appearance).unwrap();
+                assert!(
+                    child.children.is_empty(),
+                    "{}: two levels at most",
+                    child.fr.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_proposed_layout_has_no_sibling_names_clashing() {
+        let check = |folders: &[ProposedFolder]| {
+            for pick in [|f: &ProposedFolder| f.fr.0, |f: &ProposedFolder| f.en.0] {
+                let names: HashSet<String> = folders
+                    .iter()
+                    .map(|folder| pick(folder).to_lowercase())
+                    .collect();
+                assert_eq!(names.len(), folders.len());
+            }
+        };
+        check(PROPOSED_LAYOUT);
+        for top in PROPOSED_LAYOUT {
+            check(top.children);
+        }
+    }
+
+    #[test]
+    fn the_proposed_layout_describes_what_documents_are_filed_by_only() {
+        for top in PROPOSED_LAYOUT {
+            // A top-level folder with subfolders is left undescribed, so
+            // documents land in its subfolders rather than in it.
+            assert_eq!(
+                top.children.is_empty(),
+                !top.fr.1.is_empty(),
+                "{}",
+                top.fr.0
+            );
+            assert_eq!(top.fr.1.is_empty(), top.en.1.is_empty(), "{}", top.fr.0);
+            for child in top.children {
+                assert!(
+                    !child.fr.1.is_empty() && !child.en.1.is_empty(),
+                    "{}",
+                    child.fr.0
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_proposed_layout_publishes_every_folder_parents_first_in_the_language() {
+        let (client, changelog) = client(storage_with(Vec::new()));
+
+        let created = client.create_proposed_layout("fr-FR").await.unwrap();
+
+        let published: Vec<Folder> = changelog
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(event_type, _, content)| {
+                assert_eq!(*event_type, EventType::SaveFolder);
+                serde_json::from_slice(content.as_deref().unwrap()).unwrap()
+            })
+            .collect();
+        assert_eq!(published, created);
+        assert_eq!(created.len(), proposed_folders().len());
+        let logement = created
+            .iter()
+            .find(|folder| folder.name == "Logement")
+            .unwrap();
+        assert_eq!(logement.parent_id, None);
+        let energie = created
+            .iter()
+            .find(|folder| folder.name == "Énergie")
+            .unwrap();
+        assert_eq!(energie.parent_id, Some(logement.id));
+        let position = |id: Uuid| created.iter().position(|folder| folder.id == id).unwrap();
+        assert!(position(logement.id) < position(energie.id));
+    }
+
+    #[tokio::test]
+    async fn create_proposed_layout_names_folders_in_english_for_any_other_language() {
+        let (client, _) = client(storage_with(Vec::new()));
+
+        let created = client.create_proposed_layout("de").await.unwrap();
+
+        assert!(created.iter().any(|folder| folder.name == "Housing"));
+        assert!(!created.iter().any(|folder| folder.name == "Logement"));
+    }
+
+    #[tokio::test]
+    async fn create_proposed_layout_reuses_a_folder_already_named_like_one_it_proposes() {
+        let existing = FakeFolder::new().with_name("logement").build();
+        let (client, _) = client(storage_with(vec![existing.clone()]));
+
+        let created = client.create_proposed_layout("fr").await.unwrap();
+
+        assert!(!created.iter().any(|folder| folder.name == "Logement"));
+        let energie = created
+            .iter()
+            .find(|folder| folder.name == "Énergie")
+            .unwrap();
+        assert_eq!(energie.parent_id, Some(existing.id));
+        assert_eq!(created.len(), proposed_folders().len() - 1);
     }
 
     #[tokio::test]

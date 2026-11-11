@@ -1,3 +1,4 @@
+mod layout;
 mod models;
 mod service;
 mod storage;
@@ -61,6 +62,16 @@ pub trait Service: Send + Sync {
     /// Deletes a folder, keeping what it holds (moved up to its parent) or
     /// deleting it too (see [`FolderContents`]).
     async fn delete(&self, id: Uuid, contents: FolderContents) -> Result<()>;
+
+    /// Publishes the proposed layout: a folder per part of life (Logement,
+    /// Argent, Travail...) with a coloured icon, and a subfolder per kind of
+    /// paper, each described the way its documents read so new documents
+    /// are filed there. Named and described in `language` (a code or locale
+    /// like `"fr"` or `"fr-FR"`: French, anything else English). A folder
+    /// whose name is already taken where it would go is skipped, its
+    /// subfolders created in the existing one. Returns the folders created,
+    /// parents first.
+    async fn create_proposed_layout(&self, language: &str) -> Result<Vec<Folder>>;
 }
 
 /// Materializes consumed folder events into local storage, for the
