@@ -74,7 +74,7 @@ pub(super) struct DocumentsClient<S: Storage> {
     /// Where uploads leave the embeddings they computed, for `indexer` to
     /// reuse.
     cache: Arc<dyn EmbeddingCache>,
-    /// What guesses uploads' type.
+    /// What guesses uploads' type and folder.
     classifier: Arc<dyn ClassificationService>,
     /// The folders documents are filed in.
     folders: Arc<dyn FoldersService>,
@@ -213,13 +213,24 @@ impl<S: Storage> DocumentsClient<S> {
         }
     }
 
-    /// Sets `metadata`'s type to what its text looks like (`None` where the
-    /// classifier can't tell), or leaves it as it is if that fails: the
-    /// document is then published untyped rather than not at all.
+    /// Sets `metadata`'s type to what its text looks like, and files it in
+    /// the folder whose description it reads like (each `None` where the
+    /// classifier can't tell), or leaves them as they are if that fails: the
+    /// document is then published untyped, at the root, rather than not at
+    /// all.
     async fn classify_upload(&self, metadata: &mut Metadata) {
-        match self.classifier.classify(&metadata.transcript).await {
+        let classification = match self.folders().await {
+            Ok(folders) => {
+                self.classifier
+                    .classify(&metadata.transcript, &folders)
+                    .await
+            }
+            Err(err) => Err(err),
+        };
+        match classification {
             Ok(classification) => {
                 metadata.r#type = classification.r#type;
+                metadata.folder_id = classification.folder_id;
             }
             Err(err) => tracing::warn!(
                 code = ?err.code(),
@@ -1109,7 +1120,7 @@ mod tests {
         classifier
             .expect_classify()
             .times(times)
-            .returning(move |_| Ok(classification));
+            .returning(move |_, _| Ok(classification));
         Arc::new(classifier)
     }
 
@@ -3456,6 +3467,15 @@ mod tests {
         changelog: Arc<RecordingChangelog>,
         classifier: Arc<dyn ClassificationService>,
     ) -> DocumentsClient<MockStorage> {
+        client_classifying_with_folders(changelog, classifier, Vec::new())
+    }
+
+    /// Like [`client_classifying_with`], with `folders` synced.
+    fn client_classifying_with_folders(
+        changelog: Arc<RecordingChangelog>,
+        classifier: Arc<dyn ClassificationService>,
+        folders: Vec<Folder>,
+    ) -> DocumentsClient<MockStorage> {
         let (embedder, _) = embedder_embedding_once();
         let mut cache = MockEmbeddingCache::new();
         cache.expect_put().times(1).return_const(());
@@ -3468,7 +3488,7 @@ mod tests {
             Arc::new(embedder),
             Arc::new(cache),
             classifier,
-            no_folders(),
+            folders_listing(folders),
         )
     }
 
@@ -3482,16 +3502,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upload_publishes_the_document_typed_from_its_transcript_at_the_root() {
-        let classification = FakeClassification::new().build();
+    async fn upload_publishes_the_document_typed_and_filed_from_its_transcript() {
+        let folder = FakeFolder::new().build();
+        let classification = FakeClassification::new().with_folder(folder.id).build();
         let mut classifier = MockClassificationService::new();
+        let expected_folders = vec![folder.clone()];
         classifier
             .expect_classify()
-            .withf(|text| text.contains("Montant : 42 €"))
+            .withf(move |text, folders| {
+                text.contains("Montant : 42 €") && folders == expected_folders.as_slice()
+            })
             .times(1)
-            .returning(move |_| Ok(classification));
+            .returning(move |_, _| Ok(classification));
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = client_classifying_with(changelog.clone(), Arc::new(classifier));
+        let client = client_classifying_with_folders(
+            changelog.clone(),
+            Arc::new(classifier),
+            vec![folder.clone()],
+        );
 
         client
             .upload(UploadRequest::from_raw(
@@ -3504,13 +3532,16 @@ mod tests {
         let metadata = published_metadata(&changelog);
         assert_eq!(
             (metadata.r#type, metadata.folder_id),
-            (classification.r#type, None)
+            (classification.r#type, Some(folder.id))
         );
     }
 
     #[tokio::test]
-    async fn upload_leaves_untyped_what_the_classifier_can_t_tell() {
-        let classification = FakeClassification::new().with_type(None).build();
+    async fn upload_leaves_untyped_and_unfiled_what_the_classifier_can_t_tell() {
+        let classification = FakeClassification::new()
+            .with_type(None)
+            .with_folder(None)
+            .build();
         let changelog = Arc::new(RecordingChangelog::default());
         let client =
             client_classifying_with(changelog.clone(), classifier_returning(classification, 1));
@@ -3523,7 +3554,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(published_metadata(&changelog).r#type, None);
+        let metadata = published_metadata(&changelog);
+        assert_eq!((metadata.r#type, metadata.folder_id), (None, None));
     }
 
     #[tokio::test]
@@ -3532,7 +3564,7 @@ mod tests {
         classifier
             .expect_classify()
             .times(1)
-            .returning(|_| Err(ErrorKind::ModelNotDownloaded("e5".to_string()).into()));
+            .returning(|_, _| Err(ErrorKind::ModelNotDownloaded("e5".to_string()).into()));
         let changelog = Arc::new(RecordingChangelog::default());
         let client = client_classifying_with(changelog.clone(), Arc::new(classifier));
 
