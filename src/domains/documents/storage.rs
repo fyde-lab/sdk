@@ -10,11 +10,16 @@ use super::{Document, DocumentEmbeddings, FacetCount, Metadata, SearchFilters, S
 /// A document field [`Storage::count_documents_by`] can count values of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FacetField {
-    Category,
-    Subcategory,
+    /// The folder a document is directly in: its id, or [`UNFILED`] for
+    /// none.
+    Folder,
     Type,
     ContentType,
 }
+
+/// The value [`Storage::count_documents_by`] counts documents with no
+/// folder under, for [`FacetField::Folder`].
+pub(crate) const UNFILED: &str = "unfiled";
 
 /// Caches documents, unencrypted, locally, with their embeddings.
 /// Implementations are injected into [`super::service::DocumentsClient`]
@@ -138,4 +143,12 @@ pub(crate) trait Storage: Send + Sync {
     /// [`Self::save_document`], with its embeddings. Does nothing if there's
     /// none.
     async fn delete_document(&self, id: Uuid) -> Result<()>;
+
+    /// Moves every document directly in one of `folders` to `to` (`None`
+    /// for the root), locally only.
+    async fn move_folder_documents(&self, folders: &[Uuid], to: Option<Uuid>) -> Result<()>;
+
+    /// Deletes every document directly in one of `folders`, with their
+    /// embeddings, locally only.
+    async fn delete_folder_documents(&self, folders: &[Uuid]) -> Result<()>;
 }

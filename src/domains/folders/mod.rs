@@ -76,8 +76,10 @@ pub(crate) trait Applier: Send + Sync {
     async fn apply_save(&self, folder: Folder) -> Result<()>;
 
     /// Deletes folder `id` as a `DeleteFolder` event says: moving its
-    /// subfolders up to its parent, or deleting every folder below it. A
-    /// folder that isn't there is ignored.
+    /// subfolders and documents up to its parent, or deleting every folder
+    /// below it and every document in them, on this device only (every
+    /// device applies the same event). A folder that isn't there is
+    /// ignored.
     async fn apply_delete(&self, id: Uuid, contents: FolderContents) -> Result<()>;
 }
 
@@ -95,6 +97,22 @@ pub(crate) fn init(pool: SqlitePool, changelog: Arc<dyn ChangelogService>) -> Ar
 /// changelog service it's given to.
 pub(crate) fn init_applier(pool: SqlitePool) -> Arc<dyn Applier> {
     Arc::new(service::FolderApplier::new(
-        storage_sqlite::SqliteStorage::new(pool),
+        storage_sqlite::SqliteStorage::new(pool.clone()),
+        crate::domains::documents::SqliteStorage::new(pool),
     ))
+}
+
+/// A folders service holding no folder, for tests that don't file
+/// documents.
+#[cfg(test)]
+pub(crate) fn no_folders() -> Arc<dyn Service> {
+    folders_listing(Vec::new())
+}
+
+/// A folders service listing `folders`, and doing nothing else.
+#[cfg(test)]
+pub(crate) fn folders_listing(folders: Vec<Folder>) -> Arc<dyn Service> {
+    let mut service = MockService::new();
+    service.expect_list().returning(move || Ok(folders.clone()));
+    Arc::new(service)
 }

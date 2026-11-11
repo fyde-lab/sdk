@@ -6,6 +6,8 @@ use super::super::{Category, DocumentType, Subcategory};
 /// (local taxes are [`Category::Taxes`] alone).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Classification {
+    /// Unused by uploads since folders replaced categories (they only keep
+    /// the type).
     pub(crate) category: Option<Category>,
     /// Always one of `category`'s, and `None` without one.
     pub(crate) subcategory: Option<Subcategory>,

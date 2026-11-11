@@ -149,8 +149,15 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   return `Metadata` only (their query never selects `content`; `size` is `length(content)`):
   `get` is the only call that loads a document's content, for when it's actually shown.
   `search_facets` counts each field with its own filter lifted so UIs only offer reachable
-  choices. A `Subcategory` belongs to one `Category`; mismatches fail
-  (`MismatchedSubcategory`).
+  choices. A document's place is `Metadata::folder_id` (`None` = the root, À classer; a
+  folder deleted meanwhile counts as the root too): `upload` takes only the source and an
+  optional name (the classifier guesses the type, the document lands at the root),
+  `move_document`/`update_metadata` refuse a folder not synced here (`FolderNotFound`).
+  `SearchFilters::folder` is `FolderFilter::Unfiled` or `Within(id)` (subfolders included,
+  a recursive CTE over `folders`); `SearchFacets::folders` counts each folder with everything
+  below it (`folder_facets` folds storage's direct counts up the tree), plus `unfiled`. The
+  folders domain's `Applier` moves or deletes a deleted folder's documents locally
+  (`move_folder_documents`/`delete_folder_documents`).
   - `attributes/` — typed per-document values (`Metadata::attributes`, name → `Attribute`;
     amounts are `i64` minor units, never floats) and their server-side *definitions*
     (`AttributesService::list`/`set`/`check`). Checks (`check_values`, then defined types) run on
@@ -205,10 +212,9 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     category without any, `Donations`), type = flat argmax (`Other` has no description); each
     needs `*_MARGIN` over the runner-up, else `None`.
     Descriptions are embedded lazily, once per process and model (`DESCRIPTIONS`). `upload`
-    classifies only after its embedding succeeded (model at hand) and only if the request set no
-    category/subcategory (a scraper's choice is never overridden; the type is then left to it
-    too); a request's type wins over the guessed one. A failure publishes unclassified. Never
-    run on consumption.
+    classifies only after its embedding succeeded (model at hand) and keeps only the type
+    (categories no longer file documents); a failure publishes untyped. Never run on
+    consumption.
   - `gliner.rs` — `SpanFinder` (`OnnxGliner`, GLiNER-X small; ported from `doc-ai-poc`'s
     `gliner.rs`), a pure adapter not wired into any flow yet: `spans(text, labels, threshold,
     max_words)` returns every span (byte range, label index, sigmoid score) scoring at least
