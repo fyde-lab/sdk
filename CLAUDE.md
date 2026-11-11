@@ -201,8 +201,9 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     embedded as one passage, against `query: `-embedded French descriptions per label
     (`LABELS`, `TYPES`: business data, kept there; a label scores its best description).
     Category = argmax over each category's best label, subcategory = argmax among that
-    category's labels (a `None`-subcategory label included: local taxes are `Taxes` alone, rent
-    `Housing` alone), type = flat argmax; each needs `*_MARGIN` over the runner-up, else `None`.
+    category's labels (one label per subcategory, plus a `None`-subcategory one only for a
+    category without any, `Donations`), type = flat argmax (`Other` has no description); each
+    needs `*_MARGIN` over the runner-up, else `None`.
     Descriptions are embedded lazily, once per process and model (`DESCRIPTIONS`). `upload`
     classifies only after its embedding succeeded (model at hand) and only if the request set no
     category/subcategory (a scraper's choice is never overridden; the type is then left to it

@@ -30,9 +30,8 @@ const fn label(
     }
 }
 
-/// Every label a document can be classified under. Two mappings are
-/// deliberate: local taxes are [`Category::Taxes`] alone, and rent and
-/// co-ownership charges [`Category::Housing`] alone.
+/// Every label a document can be classified under: one per subcategory,
+/// plus one for each category that has none.
 pub(super) const LABELS: &[Label] = &[
     label(
         Category::Housing,
@@ -51,11 +50,6 @@ pub(super) const LABELS: &[Label] = &[
     ),
     label(
         Category::Housing,
-        Some(Subcategory::Internet),
-        &["facture box internet : abonnement fibre ou ADSL, téléphone fixe et télévision"],
-    ),
-    label(
-        Category::Housing,
         Some(Subcategory::HomeInsurance),
         &[
             "assurance habitation multirisque : attestation d'assurance du logement, avis d'échéance, cotisation annuelle",
@@ -65,13 +59,29 @@ pub(super) const LABELS: &[Label] = &[
         Category::Housing,
         Some(Subcategory::HomeServices),
         &[
-            "services pour le logement : ménage, jardinage, réparation, plomberie, travaux, déménagement",
+            "services à domicile : ménage, repassage, jardinage, entretien de la maison, petit bricolage",
         ],
     ),
     label(
         Category::Housing,
-        None,
-        &["quittance de loyer, bail de location, charges de copropriété, appel de fonds du syndic"],
+        Some(Subcategory::Rent),
+        &[
+            "quittance de loyer, bail de location, charges locatives, charges de copropriété, appel de fonds du syndic",
+        ],
+    ),
+    label(
+        Category::Housing,
+        Some(Subcategory::Property),
+        &[
+            "achat ou vente d'un bien immobilier : compromis de vente, acte de vente, diagnostics, agence immobilière, notaire",
+        ],
+    ),
+    label(
+        Category::Housing,
+        Some(Subcategory::Works),
+        &[
+            "travaux dans le logement : devis ou facture d'artisan, rénovation, plomberie, électricité, installation de chauffage",
+        ],
     ),
     label(
         Category::Telecom,
@@ -79,6 +89,11 @@ pub(super) const LABELS: &[Label] = &[
         &[
             "facture de forfait mobile : téléphone portable, appels, SMS, données internet mobile en Go",
         ],
+    ),
+    label(
+        Category::Telecom,
+        Some(Subcategory::Internet),
+        &["facture box internet : abonnement fibre ou ADSL, téléphone fixe et télévision"],
     ),
     label(
         Category::Money,
@@ -91,8 +106,20 @@ pub(super) const LABELS: &[Label] = &[
     label(
         Category::Money,
         Some(Subcategory::Savings),
+        &["épargne sur livret : livret A, LDDS, LEP, PEL, relevé du livret, intérêts annuels"],
+    ),
+    label(
+        Category::Money,
+        Some(Subcategory::Investments),
         &[
-            "épargne et placements : livret A, LDDS, PEL, assurance vie, PEA, relevé de portefeuille, intérêts",
+            "placements financiers : assurance vie, PEA, compte-titres, SCPI, relevé de portefeuille, valorisation",
+        ],
+    ),
+    label(
+        Category::Money,
+        Some(Subcategory::Loans),
+        &[
+            "prêt immobilier ou crédit à la consommation : offre de prêt, tableau d'amortissement, échéances, taux, capital restant dû",
         ],
     ),
     label(
@@ -119,8 +146,17 @@ pub(super) const LABELS: &[Label] = &[
     ),
     label(
         Category::Taxes,
-        None,
-        &["avis de taxe d'habitation ou de taxe foncière, impôts locaux, avis de dégrèvement"],
+        Some(Subcategory::PropertyTax),
+        &[
+            "avis de taxe foncière : propriétés bâties ou non bâties, base d'imposition, taux communal, taxe d'enlèvement des ordures ménagères",
+        ],
+    ),
+    label(
+        Category::Taxes,
+        Some(Subcategory::HousingTax),
+        &[
+            "avis de taxe d'habitation : résidence secondaire, valeur locative, taux voté par la commune, avis de dégrèvement",
+        ],
     ),
     label(
         Category::Health,
@@ -145,6 +181,13 @@ pub(super) const LABELS: &[Label] = &[
         ],
     ),
     label(
+        Category::Health,
+        Some(Subcategory::DeathDisabilityCover),
+        &[
+            "contrat de prévoyance : garantie décès, invalidité, incapacité de travail, capital versé aux bénéficiaires",
+        ],
+    ),
+    label(
         Category::Work,
         Some(Subcategory::Payslips),
         &[
@@ -155,8 +198,7 @@ pub(super) const LABELS: &[Label] = &[
         Category::Work,
         Some(Subcategory::Employment),
         &[
-            "contrat de travail, attestation employeur, certificat de travail, solde de tout compte, France Travail",
-            "compte rendu d'activité (CRA) mensuel d'un consultant : jours travaillés sur la mission, client, signature",
+            "contrat de travail, attestation employeur, certificat de travail, solde de tout compte",
             "contrat de travail à durée indéterminée ou déterminée entre l'employeur et le salarié : engagement, poste occupé, période d'essai, rémunération, durée du travail, convention collective",
         ],
     ),
@@ -168,6 +210,28 @@ pub(super) const LABELS: &[Label] = &[
         ],
     ),
     label(
+        Category::Work,
+        Some(Subcategory::Freelance),
+        &[
+            "activité indépendante ou portage salarial : auto-entrepreneur, URSSAF, facturation de missions, chiffre d'affaires",
+            "compte rendu d'activité (CRA) mensuel d'un consultant : jours travaillés sur la mission, client, signature",
+        ],
+    ),
+    label(
+        Category::Work,
+        Some(Subcategory::Unemployment),
+        &[
+            "France Travail (Pôle emploi) : allocation chômage, avis de paiement, attestation de droits, inscription comme demandeur d'emploi",
+        ],
+    ),
+    label(
+        Category::Work,
+        Some(Subcategory::Retirement),
+        &[
+            "retraite : pension de retraite de base ou complémentaire, relevé de carrière, trimestres validés, caisse de retraite",
+        ],
+    ),
+    label(
         Category::Family,
         Some(Subcategory::Benefits),
         &[
@@ -176,9 +240,44 @@ pub(super) const LABELS: &[Label] = &[
     ),
     label(
         Category::Family,
-        Some(Subcategory::ChildcareSchool),
+        Some(Subcategory::Childcare),
         &[
-            "crèche, garderie, cantine scolaire, inscription à l'école, frais de scolarité, centre de loisirs",
+            "garde d'enfant : crèche, halte-garderie, assistante maternelle, centre de loisirs, frais de garde",
+        ],
+    ),
+    label(
+        Category::Identity,
+        Some(Subcategory::IdDocuments),
+        &[
+            "pièce d'identité : carte nationale d'identité, passeport, titre de séjour, permis de conduire, date de validité",
+        ],
+    ),
+    label(
+        Category::Identity,
+        Some(Subcategory::CivilStatus),
+        &[
+            "état civil : acte de naissance, de mariage ou de décès, livret de famille, PACS, mairie",
+        ],
+    ),
+    label(
+        Category::Legal,
+        Some(Subcategory::InheritanceGifts),
+        &[
+            "succession ou donation : notaire, héritiers, défunt, acte de donation, déclaration de succession, partage",
+        ],
+    ),
+    label(
+        Category::Legal,
+        Some(Subcategory::Company),
+        &[
+            "société : statuts, extrait Kbis, assemblée générale des associés, procès-verbal, approbation des comptes",
+        ],
+    ),
+    label(
+        Category::Legal,
+        Some(Subcategory::Justice),
+        &[
+            "procédure judiciaire : tribunal, jugement, avocat, huissier de justice, assignation, convocation à une audience",
         ],
     ),
     label(
@@ -194,9 +293,7 @@ pub(super) const LABELS: &[Label] = &[
     label(
         Category::Transport,
         Some(Subcategory::Road),
-        &[
-            "voiture : péage d'autoroute, carburant, stationnement, amende, assurance auto, entretien, carte grise",
-        ],
+        &["route : péage d'autoroute, carburant, stationnement, recharge électrique, amende"],
     ),
     label(
         Category::Transport,
@@ -211,16 +308,49 @@ pub(super) const LABELS: &[Label] = &[
         &["voyage : réservation d'hôtel, location de vacances, séjour, agence de voyage"],
     ),
     label(
+        Category::Transport,
+        Some(Subcategory::Vehicle),
+        &[
+            "véhicule : certificat d'immatriculation (carte grise), achat d'une voiture, entretien, révision, contrôle technique",
+        ],
+    ),
+    label(
+        Category::Transport,
+        Some(Subcategory::VehicleInsurance),
+        &[
+            "assurance automobile ou deux-roues : attestation d'assurance, carte verte, avis d'échéance, bonus-malus",
+        ],
+    ),
+    label(
+        Category::Pets,
+        Some(Subcategory::Veterinary),
+        &[
+            "vétérinaire : consultation, vaccination, soins pour chien ou chat, facture de la clinique vétérinaire",
+        ],
+    ),
+    label(
+        Category::Pets,
+        Some(Subcategory::PetCare),
+        &["garde d'animaux : pension pour chien ou chat, toilettage, promenade, pet-sitter"],
+    ),
+    label(
+        Category::Pets,
+        Some(Subcategory::PetInsurance),
+        &["assurance santé pour chien ou chat : cotisation, remboursement des frais vétérinaires"],
+    ),
+    label(
+        Category::Pets,
+        Some(Subcategory::PetSupplies),
+        &[
+            "animalerie : nourriture pour chien ou chat, croquettes, litière, accessoires pour animaux",
+        ],
+    ),
+    label(
         Category::Shopping,
         Some(Subcategory::Online),
         &[
             "commande en ligne : facture d'achat sur un site marchand, articles commandés, livraison",
         ],
-    ),
-    label(
-        Category::Shopping,
-        Some(Subcategory::Pets),
-        &["animaux : vétérinaire, animalerie, nourriture pour chien ou chat, accessoires"],
     ),
     label(
         Category::Shopping,
@@ -233,9 +363,73 @@ pub(super) const LABELS: &[Label] = &[
         &["livraison de repas : commande à un restaurant livrée à domicile"],
     ),
     label(
+        Category::Shopping,
+        Some(Subcategory::Electronics),
+        &[
+            "achat d'appareil électronique : ordinateur, smartphone, tablette, télévision, numéro de série",
+        ],
+    ),
+    label(
+        Category::Shopping,
+        Some(Subcategory::HomeEquipment),
+        &[
+            "équipement de la maison : meuble, électroménager, lave-linge, réfrigérateur, literie, décoration",
+        ],
+    ),
+    label(
+        Category::Shopping,
+        Some(Subcategory::Clothing),
+        &["vêtements et chaussures : achat en magasin ou en ligne, taille, coloris, retour"],
+    ),
+    label(
+        Category::Shopping,
+        Some(Subcategory::Secondhand),
+        &[
+            "achat ou vente d'occasion entre particuliers : Vinted, Leboncoin, bordereau d'envoi, protection acheteur",
+        ],
+    ),
+    label(
+        Category::Leisure,
+        Some(Subcategory::Sports),
+        &[
+            "sport : licence sportive, adhésion à un club, abonnement à une salle de sport, certificat médical",
+        ],
+    ),
+    label(
+        Category::Leisure,
+        Some(Subcategory::Events),
+        &["billet de spectacle, concert, cinéma, musée ou événement : date, salle, placement"],
+    ),
+    label(
+        Category::Leisure,
+        Some(Subcategory::Associations),
+        &["adhésion à une association : cotisation annuelle, carte de membre, bulletin d'adhésion"],
+    ),
+    label(
+        Category::Education,
+        Some(Subcategory::School),
+        &[
+            "école, collège ou lycée : inscription scolaire, cantine, frais de scolarité, bulletin scolaire, périscolaire",
+        ],
+    ),
+    label(
+        Category::Education,
+        Some(Subcategory::HigherEducation),
+        &[
+            "études supérieures : inscription à l'université ou en école, frais de scolarité, certificat de scolarité, CVEC",
+        ],
+    ),
+    label(
+        Category::Education,
+        Some(Subcategory::Training),
+        &[
+            "formation professionnelle : CPF, organisme de formation, convention de formation, attestation de fin de formation",
+        ],
+    ),
+    label(
         Category::Subscriptions,
         Some(Subcategory::Media),
-        &["abonnement média : streaming vidéo ou musique, presse, magazine, journal"],
+        &["abonnement média : streaming vidéo ou musique, plateforme de séries et de films"],
     ),
     label(
         Category::Subscriptions,
@@ -243,6 +437,13 @@ pub(super) const LABELS: &[Label] = &[
         &[
             "abonnement logiciel ou cloud : hébergement web, serveur, nom de domaine, stockage en ligne, licence",
             "facture d'hébergeur ou de registrar : nom de domaine, zone DNS, serveur VPS ou dédié, certificat SSL, renouvellement pour 12 mois",
+        ],
+    ),
+    label(
+        Category::Subscriptions,
+        Some(Subcategory::Press),
+        &[
+            "abonnement presse : journal, magazine, quotidien en ligne, numéros papier ou numériques",
         ],
     ),
     label(
@@ -379,6 +580,126 @@ pub(super) const TYPES: &[TypeLabel] = &[
         DocumentType::MedicalDocument,
         &[
             "document médical : ordonnance, prescription, compte rendu de consultation, résultats d'analyses, patient",
+        ],
+    ),
+    type_label(
+        DocumentType::Quote,
+        &[
+            "devis : estimation du prix des travaux ou prestations proposés, validité de l'offre, bon pour accord",
+        ],
+    ),
+    type_label(
+        DocumentType::IdDocument,
+        &[
+            "pièce d'identité : nom, prénoms, date et lieu de naissance, nationalité, numéro du document, date d'expiration",
+        ],
+    ),
+    type_label(
+        DocumentType::CivilStatusRecord,
+        &[
+            "extrait ou copie intégrale d'acte d'état civil : acte de naissance, de mariage ou de décès, officier de l'état civil, mentions marginales",
+        ],
+    ),
+    type_label(
+        DocumentType::Letter,
+        &[
+            "courrier : Madame, Monsieur, objet de la lettre, nous vous prions d'agréer l'expression de nos salutations distinguées",
+        ],
+    ),
+    type_label(
+        DocumentType::Acknowledgement,
+        &[
+            "accusé de réception : nous avons bien reçu votre demande ou votre dossier, numéro de suivi, date de réception",
+        ],
+    ),
+    type_label(
+        DocumentType::Form,
+        &[
+            "formulaire à remplir : cases à cocher, champs à compléter, cadre réservé à l'administration, date et signature",
+        ],
+    ),
+    type_label(
+        DocumentType::PaymentSchedule,
+        &[
+            "échéancier de paiement : dates des prélèvements mensuels, montant de chaque échéance, mensualisation",
+        ],
+    ),
+    type_label(
+        DocumentType::Mandate,
+        &[
+            "mandat de prélèvement SEPA ou procuration : référence unique du mandat, identifiant créancier, le mandant autorise le mandataire",
+        ],
+    ),
+    type_label(
+        DocumentType::TermsAndConditions,
+        &[
+            "conditions générales de vente ou d'utilisation : articles, objet, durée, résiliation, responsabilité, données personnelles",
+        ],
+    ),
+    type_label(
+        DocumentType::Brochure,
+        &[
+            "brochure commerciale : présentation de l'offre, avantages, tarifs, découvrez nos services",
+        ],
+    ),
+    type_label(
+        DocumentType::Timesheet,
+        &[
+            "compte rendu d'activité ou feuille de temps : jours ou heures travaillés par date, mission, validation du client",
+        ],
+    ),
+    type_label(
+        DocumentType::InspectionReport,
+        &[
+            "rapport de diagnostic ou d'inspection : contrôle technique, diagnostic de performance énergétique, amiante, constatations, conclusions",
+        ],
+    ),
+    type_label(
+        DocumentType::NotarialDeed,
+        &[
+            "acte notarié : par-devant maître, notaire, les parties comparaissent, acte authentique, publicité foncière",
+        ],
+    ),
+    type_label(
+        DocumentType::Attestation,
+        &[
+            "attestation sur l'honneur : je soussigné atteste sur l'honneur, fait pour servir et valoir ce que de droit",
+        ],
+    ),
+    type_label(
+        DocumentType::PaymentReminder,
+        &[
+            "relance de paiement : facture impayée, sauf erreur de notre part, montant restant dû, mise en demeure de régler",
+        ],
+    ),
+    type_label(
+        DocumentType::Fine,
+        &[
+            "avis de contravention : amende forfaitaire, infraction constatée, excès de vitesse, stationnement, ANTAI, points retirés",
+        ],
+    ),
+    type_label(
+        DocumentType::Warranty,
+        &[
+            "certificat de garantie : produit garanti, durée de la garantie, numéro de série, conditions d'extension de garantie",
+        ],
+    ),
+    type_label(
+        DocumentType::Resume,
+        &[
+            "curriculum vitae : expérience professionnelle, formation, compétences, langues, centres d'intérêt",
+        ],
+    ),
+    type_label(
+        DocumentType::Minutes,
+        &[
+            "procès-verbal de réunion ou d'assemblée générale : présents, ordre du jour, résolutions adoptées, votes",
+        ],
+    ),
+    type_label(
+        DocumentType::Diploma,
+        &[
+            "diplôme : le titre est délivré à, a obtenu le grade, mention, session, université ou ministère",
         ],
     ),
 ];
@@ -718,19 +1039,16 @@ mod tests {
     }
 
     #[test]
-    fn local_taxes_and_rent_have_no_subcategory() {
-        let label_of = |needle: &str| {
-            LABELS
-                .iter()
-                .find(|label| label.descriptions.iter().any(|d| d.contains(needle)))
-                .map(|label| (label.category, label.subcategory))
-        };
-
-        assert_eq!(label_of("taxe foncière"), Some((Category::Taxes, None)));
-        assert_eq!(
-            label_of("quittance de loyer"),
-            Some((Category::Housing, None))
-        );
+    fn only_a_category_without_subcategories_has_a_label_without_one() {
+        for label in LABELS.iter().filter(|label| label.subcategory.is_none()) {
+            let category = label.category;
+            assert!(
+                Subcategory::ALL
+                    .iter()
+                    .all(|subcategory| subcategory.category() != category),
+                "{category} has subcategories"
+            );
+        }
     }
 
     #[test]
@@ -862,11 +1180,11 @@ mod tests {
 
     #[test]
     fn classify_files_a_label_without_subcategory_under_its_category_alone() {
-        let document = along(&[label_axis(Category::Taxes, None, 0)]);
+        let document = along(&[label_axis(Category::Donations, None, 0)]);
 
         let classification = classify(&document, &embedded_along_axes());
 
-        assert_eq!(classification.category, Some(Category::Taxes));
+        assert_eq!(classification.category, Some(Category::Donations));
         assert_eq!(classification.subcategory, None);
     }
 
@@ -1014,20 +1332,20 @@ mod tests {
 
     #[tokio::test]
     async fn classifier_embeds_the_descriptions_once_across_classifications() {
-        let document = along(&[label_axis(Category::Taxes, None, 0)]);
+        let document = along(&[label_axis(Category::Donations, None, 0)]);
         let embedder = embedder_along_axes(document, 2, descriptions().len());
         let classifier = classifier(embedder, &Arc::default());
 
         for _ in 0..2 {
             let classification = classifier.classify("Taxe foncière").await.unwrap();
-            assert_eq!(classification.category, Some(Category::Taxes));
+            assert_eq!(classification.category, Some(Category::Donations));
         }
     }
 
     #[tokio::test]
     async fn classifiers_sharing_descriptions_embed_them_once_per_model() {
         let descriptions_vectors = Arc::<DescriptionVectors>::default();
-        let document = along(&[label_axis(Category::Taxes, None, 0)]);
+        let document = along(&[label_axis(Category::Donations, None, 0)]);
         let first = classifier(
             embedder_along_axes(document.clone(), 1, descriptions().len()),
             &descriptions_vectors,
@@ -1052,7 +1370,7 @@ mod tests {
 
         for classifier in [first, same_model, other_model] {
             let classification = classifier.classify("Taxe foncière").await.unwrap();
-            assert_eq!(classification.category, Some(Category::Taxes));
+            assert_eq!(classification.category, Some(Category::Donations));
         }
     }
 
@@ -1091,7 +1409,7 @@ mod tests {
 
     #[tokio::test]
     async fn classifier_retries_descriptions_that_failed_to_embed() {
-        let document = along(&[label_axis(Category::Taxes, None, 0)]);
+        let document = along(&[label_axis(Category::Donations, None, 0)]);
         let mut embedder = MockEmbedder::new();
         embedder.expect_model().return_const("e5.onnx".to_string());
         embedder
@@ -1118,7 +1436,7 @@ mod tests {
         );
         let classification = classifier.classify("Taxe foncière").await.unwrap();
 
-        assert_eq!(classification.category, Some(Category::Taxes));
+        assert_eq!(classification.category, Some(Category::Donations));
     }
 
     /// A synthetic document and how it should be classified (`r#type`
@@ -1162,7 +1480,7 @@ mod tests {
              850,00 € au titre du paiement du loyer (780,00 €) et des charges (70,00 €) pour la période du 01/03/2025 \
              au 31/03/2025, et lui en donne quittance, sous réserve de tous mes droits.",
             Category::Housing,
-            None,
+            Some(Subcategory::Rent),
             None,
         ),
         case(
@@ -1197,7 +1515,7 @@ mod tests {
              Taux communal 45,12 %, taxe d'enlèvement des ordures ménagères 8,10 %. Montant de votre impôt : \
              1 138 €. Date limite de paiement : 15/10/2025.",
             Category::Taxes,
-            None,
+            Some(Subcategory::PropertyTax),
             Some(DocumentType::TaxNotice),
         ),
         case(
@@ -1205,7 +1523,7 @@ mod tests {
              à l'habitation principale. Commune d'Annecy. Valeur locative brute : 3 980 €. Taux voté par la \
              commune : 18,62 %. Majoration résidences secondaires : 60 %. Montant à payer : 1 186 €.",
             Category::Taxes,
-            None,
+            Some(Subcategory::HousingTax),
             Some(DocumentType::TaxNotice),
         ),
         case(
