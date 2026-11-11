@@ -759,7 +759,7 @@ mod tests {
         classifier
             .expect_classify()
             .times(1)
-            .returning(|_| Ok(Classification::default()));
+            .returning(|_, _| Ok(Classification::default()));
         let client = DocumentsClient::new(
             SqliteStorage::new(pool.clone()),
             changelog.clone(),

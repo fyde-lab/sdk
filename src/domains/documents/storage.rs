@@ -69,7 +69,7 @@ pub(crate) trait Storage: Send + Sync {
     /// Counts, per distinct non-empty value of `field`, how many documents
     /// [`Self::search_documents`] would match for `terms` and `filters`,
     /// most common first (ties by value). Each value is that field's
-    /// canonical string form (e.g. [`super::Category::as_str`]).
+    /// canonical string form (e.g. [`super::DocumentType::as_str`]).
     async fn count_documents_by(
         &self,
         terms: &[String],
