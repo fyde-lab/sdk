@@ -163,6 +163,19 @@ macro_rules! for_each_error_code {
             /// A document is too large to be saved: its encrypted event
             /// wouldn't fit in the largest message the server accepts.
             DocumentTooLarge = 4014,
+            /// A folder's name is empty, too long or has control characters.
+            InvalidFolderName = 4015,
+            /// Another folder in the same place already has this name.
+            FolderNameTaken = 4016,
+            /// No such folder (it may not have synced to this device yet).
+            FolderNotFound = 4017,
+            /// A folder can't move into itself or one of its subfolders.
+            InvalidFolderMove = 4018,
+            /// A folder's description is too long.
+            InvalidFolderDescription = 4019,
+            /// A top-level folder lacks its colour and icon, or a subfolder
+            /// was given one (it shows its top-level folder's).
+            InvalidFolderAppearance = 4020,
             /// No such script.
             ScriptNotFound = 5001,
             /// A script was run without one of its required parameters.
@@ -315,6 +328,18 @@ pub(crate) enum ErrorKind {
     },
     #[error("invalid search query: {0}")]
     InvalidSearchQuery(String),
+    #[error("invalid folder name: {0}")]
+    InvalidFolderName(String),
+    #[error("a folder named {0:?} already exists there")]
+    FolderNameTaken(String),
+    #[error("folder {0} not found")]
+    FolderNotFound(uuid::Uuid),
+    #[error("invalid folder move: {0}")]
+    InvalidFolderMove(String),
+    #[error("invalid folder description: {0}")]
+    InvalidFolderDescription(String),
+    #[error("invalid folder appearance: {0}")]
+    InvalidFolderAppearance(String),
     #[error("invalid script type: {0:?}")]
     InvalidScriptType(String),
     #[error("invalid progress step: {0:?}")]
@@ -407,6 +432,12 @@ impl ErrorKind {
             ErrorKind::InvalidSubcategory(_) => ErrorCode::InvalidSubcategory,
             ErrorKind::InvalidDocumentType(_) => ErrorCode::InvalidDocumentType,
             ErrorKind::MismatchedSubcategory(_) => ErrorCode::MismatchedSubcategory,
+            ErrorKind::InvalidFolderName(_) => ErrorCode::InvalidFolderName,
+            ErrorKind::FolderNameTaken(_) => ErrorCode::FolderNameTaken,
+            ErrorKind::FolderNotFound(_) => ErrorCode::FolderNotFound,
+            ErrorKind::InvalidFolderMove(_) => ErrorCode::InvalidFolderMove,
+            ErrorKind::InvalidFolderDescription(_) => ErrorCode::InvalidFolderDescription,
+            ErrorKind::InvalidFolderAppearance(_) => ErrorCode::InvalidFolderAppearance,
             ErrorKind::InvalidAttribute(_) => ErrorCode::InvalidAttribute,
             ErrorKind::DocumentTooLarge { .. } => ErrorCode::DocumentTooLarge,
             ErrorKind::InvalidSearchQuery(_) => ErrorCode::InvalidSearchQuery,

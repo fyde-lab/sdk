@@ -7,6 +7,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::domains::documents::{Document, Indexer, Metadata, Storage as DocumentStorage};
+use crate::domains::folders::{Applier as FolderApplier, DeleteFolderEvent, Folder};
 use crate::domains::scrapers::SessionStorage as ScraperSessionStorage;
 use crate::domains::scripts::{InstalledScript, Storage as ScriptStorage};
 use crate::domains::secrets::Service as SecretsService;
@@ -123,6 +124,7 @@ pub(super) struct ChangelogClient<
     indexer: Arc<dyn Indexer>,
     script_storage: S,
     scraper_session_storage: P,
+    folders: Arc<dyn FolderApplier>,
     cursor_storage: O,
     server_state: Arc<dyn ServerStateService>,
     secrets: Arc<dyn SecretsService>,
@@ -145,7 +147,8 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
     /// cached, `indexer` to cache (and index) the ones it materializes,
     /// `script_storage` to save the scripts it
     /// materializes, `scraper_session_storage` to clear the saved session
-    /// of a scraper whose script changes version, `cursor_storage` to track its progress through the
+    /// of a scraper whose script changes version, `folders` to apply folder
+    /// events, `cursor_storage` to track its progress through the
     /// changelog, `server_state` to wait for the server to be reachable
     /// before opening a changelog stream, `secrets` to read the account
     /// master key [`crypto`] derives every event's KEK from. Assumes it's
@@ -158,6 +161,7 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
         indexer: Arc<dyn Indexer>,
         script_storage: S,
         scraper_session_storage: P,
+        folders: Arc<dyn FolderApplier>,
         cursor_storage: O,
         server_state: Arc<dyn ServerStateService>,
         secrets: Arc<dyn SecretsService>,
@@ -168,6 +172,7 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
             indexer,
             script_storage,
             scraper_session_storage,
+            folders,
             cursor_storage,
             server_state,
             secrets,
@@ -326,6 +331,27 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperSessionStorage, O: CursorSt
                             event.subject_id
                         )
                     })
+            }
+            EventType::SaveFolder => {
+                let folder: Folder = decode_content(event, "save folder")?;
+                if folder.id != event.subject_id {
+                    return Err(ErrorKind::InvalidChangelogEvent(format!(
+                        "save folder event {} for folder {} carries folder {}",
+                        event.id, event.subject_id, folder.id
+                    ))
+                    .into());
+                }
+                self.folders
+                    .apply_save(folder)
+                    .await
+                    .with_context(|| format!("failed to apply changelog event {}", event.id))
+            }
+            EventType::DeleteFolder => {
+                let deletion: DeleteFolderEvent = decode_content(event, "delete folder")?;
+                self.folders
+                    .apply_delete(event.subject_id, deletion.contents)
+                    .await
+                    .with_context(|| format!("failed to apply changelog event {}", event.id))
             }
         }
     }
@@ -594,6 +620,25 @@ impl<
     }
 }
 
+/// Decodes the JSON `content` a `kind` event (e.g. `"save folder"`) must
+/// carry.
+fn decode_content<T: serde::de::DeserializeOwned>(event: &ChangelogEvent, kind: &str) -> Result<T> {
+    let Some(content) = &event.content else {
+        return Err(ErrorKind::InvalidChangelogEvent(format!(
+            "{kind} event {} for {} is missing content",
+            event.id, event.subject_id
+        ))
+        .into());
+    };
+    serde_json::from_slice(content).map_err(|err| {
+        ErrorKind::InvalidChangelogEvent(format!(
+            "{kind} event {} for {} carries invalid content: {err}",
+            event.id, event.subject_id
+        ))
+        .into()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -605,6 +650,7 @@ mod tests {
         DocumentIndexer, FakeCachedEmbeddings, FakeMetadata, MockEmbedder, MockEmbeddingCache,
         MockIndexer, MockStorage,
     };
+    use crate::domains::folders::{FakeFolder, FolderContents, MockApplier};
     use crate::domains::scrapers::MockSessionStorage;
     use crate::domains::scripts::{
         FakeInstalledScript, FakeScript, MockStorage as MockScriptStorage,
@@ -719,6 +765,7 @@ mod tests {
             Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -777,6 +824,7 @@ mod tests {
             Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -896,6 +944,7 @@ mod tests {
             )),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -940,6 +989,7 @@ mod tests {
             idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1008,6 +1058,7 @@ mod tests {
             Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1069,6 +1120,7 @@ mod tests {
             Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             Arc::new(server_state),
             fake_secrets(),
@@ -1178,6 +1230,7 @@ mod tests {
             idle_indexer(),
             script_storage,
             session_storage,
+            Arc::new(MockApplier::new()),
             cursor_storage_consuming(event_id),
             reachable_server_state(),
             fake_secrets(),
@@ -1260,6 +1313,7 @@ mod tests {
             idle_indexer(),
             script_storage,
             session_storage,
+            Arc::new(MockApplier::new()),
             cursor_storage_consuming(event_id),
             reachable_server_state(),
             fake_secrets(),
@@ -1307,6 +1361,7 @@ mod tests {
             idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1318,6 +1373,161 @@ mod tests {
             matches!(err.kind(), ErrorKind::InvalidChangelogEvent(_)),
             "unexpected error: {err}"
         );
+    }
+
+    /// A proto event of `event_type` about `subject_id` carrying `content`
+    /// as its (encrypted) payload.
+    fn content_proto_event(
+        id: Uuid,
+        event_type: EventType,
+        subject_id: Uuid,
+        content: &[u8],
+    ) -> ProtoChangelogEvent {
+        let encrypted_content = futures::executor::block_on(crypto::encrypt_event(
+            &*fake_secrets(),
+            event_type,
+            subject_id,
+            Some(content),
+            None,
+        ))
+        .unwrap();
+        ProtoChangelogEvent {
+            id: id.to_string(),
+            encrypted_content,
+            previous_id: String::new(),
+        }
+    }
+
+    /// A changelog client consuming the single `event`, applying folder
+    /// events through `folders` and nothing else.
+    fn client_applying_folders(
+        event: ProtoChangelogEvent,
+        cursor_storage: MockCursorStorage,
+        folders: MockApplier,
+    ) -> ChangelogClient<MockStorage, MockScriptStorage, MockSessionStorage, MockCursorStorage>
+    {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_consume_since()
+            .return_once(move |_| Ok(futures::stream::iter(vec![Ok(event)]).boxed()));
+        ChangelogClient::new(
+            mock_grpc,
+            MockStorage::new(),
+            idle_indexer(),
+            MockScriptStorage::new(),
+            MockSessionStorage::new(),
+            Arc::new(folders),
+            cursor_storage,
+            reachable_server_state(),
+            fake_secrets(),
+        )
+    }
+
+    #[tokio::test]
+    async fn consume_applies_a_save_folder_event() {
+        let folder = FakeFolder::new().build();
+        let event_id = Uuid::now_v7();
+        let event = content_proto_event(
+            event_id,
+            EventType::SaveFolder,
+            folder.id,
+            &serde_json::to_vec(&folder).unwrap(),
+        );
+        let mut folders = MockApplier::new();
+        let expected = folder.clone();
+        folders
+            .expect_apply_save()
+            .withf(move |saved| *saved == expected)
+            .times(1)
+            .returning(|_| Ok(()));
+        let client = client_applying_folders(event, cursor_storage_consuming(event_id), folders);
+
+        let received = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let received_in_callback = received.clone();
+        let mut callback = move |event| received_in_callback.lock().unwrap().push(event);
+        client.consume_once(&mut callback).await.unwrap();
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].event_type, EventType::SaveFolder);
+        assert_eq!(received[0].subject_id, folder.id);
+    }
+
+    #[tokio::test]
+    async fn consume_applies_a_delete_folder_event() {
+        let folder_id = Uuid::now_v7();
+        let event_id = Uuid::now_v7();
+        let event = content_proto_event(
+            event_id,
+            EventType::DeleteFolder,
+            folder_id,
+            &serde_json::to_vec(&DeleteFolderEvent {
+                contents: FolderContents::Keep,
+            })
+            .unwrap(),
+        );
+        let mut folders = MockApplier::new();
+        folders
+            .expect_apply_delete()
+            .with(
+                mockall::predicate::eq(folder_id),
+                mockall::predicate::eq(FolderContents::Keep),
+            )
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let client = client_applying_folders(event, cursor_storage_consuming(event_id), folders);
+
+        client.consume_once(&mut |_| {}).await.unwrap();
+    }
+
+    /// A cursor storage for a pass that fails on its single event: never
+    /// advanced.
+    fn cursor_storage_failing() -> MockCursorStorage {
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_is_applied()
+            .times(1)
+            .returning(|_| Ok(false));
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+        cursor_storage
+    }
+
+    #[tokio::test]
+    async fn consume_rejects_a_save_folder_event_for_another_folder_than_its_subject() {
+        let folder = FakeFolder::new().build();
+        let event = content_proto_event(
+            Uuid::now_v7(),
+            EventType::SaveFolder,
+            Uuid::now_v7(),
+            &serde_json::to_vec(&folder).unwrap(),
+        );
+        let client = client_applying_folders(event, cursor_storage_failing(), MockApplier::new());
+
+        let err = client.consume_once(&mut |_| {}).await.unwrap_err();
+
+        assert!(
+            matches!(err.kind(), ErrorKind::InvalidChangelogEvent(_)),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_rejects_a_folder_event_with_an_invalid_payload() {
+        for event_type in [EventType::SaveFolder, EventType::DeleteFolder] {
+            let event =
+                content_proto_event(Uuid::now_v7(), event_type, Uuid::now_v7(), b"not json");
+            let client =
+                client_applying_folders(event, cursor_storage_failing(), MockApplier::new());
+
+            let err = client.consume_once(&mut |_| {}).await.unwrap_err();
+
+            assert!(
+                matches!(err.kind(), ErrorKind::InvalidChangelogEvent(_)),
+                "unexpected error for {event_type:?}: {err}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1371,6 +1581,7 @@ mod tests {
             Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1420,6 +1631,7 @@ mod tests {
             Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1477,6 +1689,7 @@ mod tests {
             Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1528,6 +1741,7 @@ mod tests {
             Arc::new(ready_indexer()),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1590,6 +1804,7 @@ mod tests {
             Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1630,6 +1845,7 @@ mod tests {
             Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1727,6 +1943,7 @@ mod tests {
             idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1772,6 +1989,7 @@ mod tests {
             idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1824,6 +2042,7 @@ mod tests {
             idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1912,6 +2131,7 @@ mod tests {
             idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1948,6 +2168,7 @@ mod tests {
             idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -1986,6 +2207,7 @@ mod tests {
             idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -2031,6 +2253,7 @@ mod tests {
             idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             MockCursorStorage::new(),
             reachable_server_state(),
             fake_secrets(),
@@ -2057,6 +2280,7 @@ mod tests {
             idle_indexer(),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             MockCursorStorage::new(),
             reachable_server_state(),
             fake_secrets(),
@@ -2106,6 +2330,7 @@ mod tests {
             Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),
@@ -2166,6 +2391,7 @@ mod tests {
             Arc::new(indexer),
             MockScriptStorage::new(),
             MockSessionStorage::new(),
+            Arc::new(MockApplier::new()),
             cursor_storage,
             reachable_server_state(),
             fake_secrets(),

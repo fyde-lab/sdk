@@ -225,6 +225,30 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "This document is too large to be saved.",
             "Ce document est trop volumineux pour être enregistré.",
         ),
+        ErrorCode::InvalidFolderName => (
+            "A folder name must be 1 to 60 characters long.",
+            "Le nom d'un dossier doit faire de 1 à 60 caractères.",
+        ),
+        ErrorCode::FolderNameTaken => (
+            "A folder with this name already exists here.",
+            "Un dossier porte déjà ce nom ici.",
+        ),
+        ErrorCode::FolderNotFound => (
+            "This folder couldn't be found.",
+            "Ce dossier est introuvable.",
+        ),
+        ErrorCode::InvalidFolderMove => (
+            "A folder can't be moved into itself or one of its subfolders.",
+            "Un dossier ne peut pas être déplacé dans lui-même ni dans l'un de ses sous-dossiers.",
+        ),
+        ErrorCode::InvalidFolderDescription => (
+            "A folder description must be 300 characters at most.",
+            "La description d'un dossier doit faire 300 caractères au plus.",
+        ),
+        ErrorCode::InvalidFolderAppearance => (
+            "Only a top-level folder has its own colour and icon.",
+            "Seul un dossier principal a sa propre couleur et sa propre icône.",
+        ),
         ErrorCode::InvalidSearchQuery => (
             "This search isn't valid.",
             "Cette recherche n'est pas valide.",

@@ -21,12 +21,20 @@ pub enum EventType {
     /// `scripts::InstalledScript` (no `metadata`).
     #[serde(alias = "ScriptInstalled")]
     InstallScript,
+    /// A folder was created or changed (see `folders::Service`). The
+    /// event's `subject_id` is the folder's id, and its `content` the
+    /// JSON-serialized `folders::Folder`.
+    SaveFolder,
+    /// A folder was deleted (see `folders::Service::delete`). The event's
+    /// `subject_id` is the folder's id, and its `content` the
+    /// JSON-serialized `folders::DeleteFolderEvent`.
+    DeleteFolder,
 }
 
 /// A single recorded write, decrypted from the server's changelog.
 /// `subject_id` is the id of whatever the write is about, which depends on
 /// [`EventType`]: a document for `SaveDocument`/`UpdateMetadata`/`Deleted`, a
-/// script for `InstallScript`. Inlines a document's fields rather than
+/// script for `InstallScript`, a folder for `SaveFolder`/`DeleteFolder`. Inlines a document's fields rather than
 /// wrapping a [`crate::domains::documents::Document`], since not every
 /// event type carries all of them: `content` is `None` for a metadata-only
 /// update, and both `content` and `metadata` are `None` for a deletion
