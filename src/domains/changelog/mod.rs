@@ -28,7 +28,7 @@ use crate::domains::secrets::Service as SecretsService;
 use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
 use crate::domains::settings::Service as SettingsService;
-use crate::domains::{scrapers, scripts};
+use crate::domains::{folders, scrapers, scripts};
 
 /// Publishes and consumes the fyde server's changelog: a blind relay for
 /// opaque, client-encrypted write events — document writes, plus script
@@ -119,6 +119,7 @@ pub(crate) trait Service: Send + Sync {
 /// [`crate::domains::sessions::Service::authenticated_request`]). The
 /// caller must make sure no other client writes the database `pool` opens
 /// (see `Client::init`'s instance lock).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn init(
     channel: Channel,
     pool: SqlitePool,
@@ -127,6 +128,7 @@ pub(crate) async fn init(
     sessions: Arc<SessionsClient>,
     server_state: Arc<dyn ServerStateService>,
     indexer: Arc<dyn documents::Indexer>,
+    folders: Arc<dyn folders::Applier>,
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool.clone());
     let script_storage = scripts::SqliteStorage::new(pool.clone());
@@ -138,6 +140,7 @@ pub(crate) async fn init(
         indexer,
         script_storage,
         scraper_session_storage,
+        folders,
         cursor_storage,
         server_state,
         secrets,

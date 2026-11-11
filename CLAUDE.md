@@ -119,7 +119,7 @@ wires every domain. `client_name` must be a safe single path segment (`InvalidCl
 Before opening a disk database, `init` takes an exclusive `flock` on `fyde.db.lock` beside it,
 held by the `Client` until dropped: a second client on the same directory fails with
 `ClientAlreadyRunning` (one instance at a time, so every domain may write local storage freely).
-Public accessors: `documents()`, `attributes()`, `users()`, `settings()`, `server_state()`,
+Public accessors: `documents()`, `folders()`, `attributes()`, `users()`, `settings()`, `server_state()`,
 `scripts()`, `icons()`, `scrapers()`, `usage()`, `user_message(&err)`, `language()`, plus
 `save_new_session(token)`/`is_connected()` over the crate-private `sessions` domain.
 `ClientConfig::models_dir` is where on-device models are downloaded (see `tools::models`): `init`
@@ -220,7 +220,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     look for (a failure is retried), run on the blocking pool.
   - `dev.rs` — `DevDocumentsClient`, plain-file writes for `init_dev_scrapers`.
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
-  (`SaveDocument`, `UpdateMetadata`, `Deleted`, `InstallScript`). `crypto.rs`: AES-256-GCM, per-event DEK
+  (`SaveDocument`, `UpdateMetadata`, `Deleted`, `InstallScript`, `SaveFolder`, `DeleteFolder`). `crypto.rs`: AES-256-GCM, per-event DEK
   wrapped by a KEK derived from the master key. The consume job replays from the persisted
   cursor then tails live, materializing documents and installed scripts (an `InstallScript`
   whose script version differs from the installed one first deletes that scraper's saved
@@ -236,6 +236,17 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   fails the pass (retried) rather than letting the cursor pass an unindexed document. An
   event failing `POISON_PILL_PASSES` (5) passes in a row is logged at error level on each
   further failure; it's never skipped (ask before adding any skip mechanism).
+- **folders** — the vault's folders (`Folder`: parent, name, description, and a colour + icon
+  on top-level folders only). No gRPC transport: `Service` validates each change against the
+  folders synced so far (name trimmed, 1–60 chars, no control chars, unique among siblings
+  case-insensitively; description ≤ 300 chars; appearance required at the top level and refused
+  below; no move into itself or a descendant) and publishes a `SaveFolder` (the whole folder,
+  JSON) or `DeleteFolder` (`FolderContents::Keep`/`Delete`, JSON) event; `list` reads the local
+  `folders` table. The changelog consumer applies them through `Applier` (`FolderApplier`),
+  which resolves concurrent edits identically on every device: a missing parent or a cycle
+  puts the folder at the top level (default appearance if it has none), a sibling name clash
+  gets a `" (2)"` suffix; deleting keeps the children (moved up, taking the top-level
+  appearance when they land at the root) or removes every descendant.
 - **users** — OPAQUE (RFC 9807, `opaque-ke`); the password never leaves the SDK.
   `FydeCipherSuite` (ristretto255 + 3DH/SHA-512 + Argon2id 64 MiB/3 iters/4 lanes) must match
   `../server`'s. `crypto.rs`'s `OpaqueClient` trait exists so service tests skip real KSF cost. Its `finish_*`

@@ -14,6 +14,11 @@ pub use domains::documents::{
     SearchOrder, SearchQuery, Service as DocumentsService, SetAttributeRequest, Subcategory,
     UploadRequest,
 };
+pub use domains::folders::{
+    CreateFolderRequest, Folder, FolderAppearance, FolderColor, FolderContents, FolderIcon,
+    MAX_FOLDER_DESCRIPTION_CHARS, MAX_FOLDER_NAME_CHARS, Service as FoldersService,
+    UpdateFolderRequest,
+};
 pub use domains::icons::{Icon, Service as IconsService};
 pub use domains::scrapers::{
     HELPERS_LUA as SCRAPER_HELPERS_LUA, OnScraperProgress, OnScraperQuestion, ProgressEvent,
@@ -116,6 +121,7 @@ pub struct ClientConfig {
 pub struct Client {
     attributes: Arc<dyn AttributesService>,
     documents: Arc<dyn DocumentsService>,
+    folders: Arc<dyn FoldersService>,
     icons: Arc<dyn IconsService>,
     scrapers: Arc<dyn ScrapersService>,
     scripts: Arc<dyn ScriptsService>,
@@ -172,9 +178,11 @@ impl Client {
             sessions.clone(),
             server_state.clone(),
             indexer.clone(),
+            domains::folders::init_applier(sqlite.pool().clone()),
         )
         .await
         .context("failed to initialize changelog service")?;
+        let folders = domains::folders::init(sqlite.pool().clone(), changelog.clone());
         let icons = domains::icons::init(channel.clone(), sessions.clone(), sqlite.pool().clone());
         let scripts = domains::scripts::init(
             channel.clone(),
@@ -226,6 +234,7 @@ impl Client {
         Ok(Self {
             attributes,
             documents,
+            folders,
             icons,
             scrapers,
             scripts,
@@ -241,6 +250,11 @@ impl Client {
     /// Returns a reference to the client's documents service.
     pub fn documents(&self) -> &dyn DocumentsService {
         self.documents.as_ref()
+    }
+
+    /// Returns a reference to the client's folders service.
+    pub fn folders(&self) -> &dyn FoldersService {
+        self.folders.as_ref()
     }
 
     /// Returns a reference to the client's attributes service: the
@@ -605,6 +619,7 @@ pub fn use_in_process_keystore_for_tests() -> Result<()> {
 #[cfg(feature = "testing")]
 pub mod testing {
     pub use crate::domains::documents::{FakeChangelogEvent, FakeDocument, FakeMetadata};
+    pub use crate::domains::folders::FakeFolder;
     pub use crate::domains::scripts::FakeScript;
     pub use crate::domains::users::FakeOpenSession;
 }
