@@ -52,11 +52,6 @@ pub(crate) struct Span {
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(crate) trait SpanFinder: Send + Sync {
-    /// Fetches the model's files (see [`ModelStore::ensure`]) without
-    /// loading them, unless the model is already loaded, so a later
-    /// [`Self::spans`] needn't wait for a download.
-    async fn download(&self) -> Result<()>;
-
     /// Fetches the model (see [`ModelStore::ensure`]) and loads it, unless
     /// that's already done: a failure is retried on the next call.
     async fn load(&self) -> Result<()>;
@@ -127,23 +122,6 @@ impl OnnxGliner {
 
 #[async_trait]
 impl SpanFinder for OnnxGliner {
-    async fn download(&self) -> Result<()> {
-        if self.loaded.get().is_some() {
-            return Ok(());
-        }
-
-        self.models
-            .ensure(&GLINER_X_SMALL)
-            .await
-            .context("failed to fetch the GLiNER model")?;
-        self.models
-            .ensure(&GLINER_X_SMALL_TOKENIZER)
-            .await
-            .context("failed to fetch the GLiNER model's tokenizer")?;
-
-        Ok(())
-    }
-
     async fn load(&self) -> Result<()> {
         self.loaded().await.map(|_| ())
     }
@@ -915,14 +893,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_fails_with_context_when_the_model_cant_be_fetched() {
+    async fn load_fails_and_can_be_retried_when_the_model_cant_be_fetched() {
         let (_file, models) = unusable_models();
         let gliner = OnnxGliner::new(models);
 
-        let err = gliner.download().await.unwrap_err();
-
+        let err = gliner.load().await.unwrap_err();
         assert!(err.has_context());
         assert!(gliner.loaded.get().is_none());
+
+        let err = gliner.load().await.unwrap_err();
+        assert!(err.has_context());
     }
 
     #[tokio::test]
