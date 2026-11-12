@@ -274,10 +274,41 @@ pub(crate) fn init_embedding_cache() -> Arc<dyn EmbeddingCache> {
 }
 
 /// Initializes the on-device embedding model `models` holds, shared by the
-/// [`Indexer`] (which fetches it on the first [`Indexer::prepare`]) and the
-/// documents [`Service`]'s searches, so it's loaded once.
+/// [`Indexer`] (which fetches it on the first [`Indexer::prepare`], unless
+/// the [`ModelPreloader`] already did) and the documents [`Service`]'s
+/// searches, so it's loaded once.
 pub(crate) fn init_embedder(models: Arc<ModelStore>) -> Arc<dyn embedder::Embedder> {
     Arc::new(embedder::OnnxEmbedder::new(models))
+}
+
+/// Fetches and loads the on-device models in the background, ahead of their
+/// first use, so it doesn't wait minutes for them.
+#[cfg_attr(test, automock)]
+pub(crate) trait ModelPreloader: Send + Sync {
+    /// Starts downloading every model, each on its own task so they
+    /// download in parallel, without loading them. Returns at once, and
+    /// does nothing while a previous download is still under way.
+    fn start_download(&self);
+
+    /// Starts loading every model in memory (downloading it first if
+    /// needed), each on its own task. Returns at once, and does nothing
+    /// while a previous load is still under way. Loaded models stay in
+    /// memory for the `Client`'s lifetime.
+    fn start_loading(&self);
+}
+
+/// Initializes the [`ModelPreloader`] over `embedder` (see
+/// [`init_embedder`]) and the GLiNER model `models` holds (not used by any
+/// flow yet: only fetched and loaded ahead of its first use). Dropping it
+/// stops its downloads and loads.
+pub(crate) fn init_model_preloader(
+    models: Arc<ModelStore>,
+    embedder: Arc<dyn embedder::Embedder>,
+) -> Arc<dyn ModelPreloader> {
+    Arc::new(service::ModelPreloaderClient::new(
+        embedder,
+        Arc::new(gliner::OnnxGliner::new(models)),
+    ))
 }
 
 /// Initializes the [`Indexer`] the changelog consumer caches documents

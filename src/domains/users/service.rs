@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tonic::transport::Channel;
 use zeroize::Zeroizing;
 
-use crate::domains::documents::{EmbeddingCache, Service as DocumentsService};
+use crate::domains::documents::{EmbeddingCache, ModelPreloader, Service as DocumentsService};
 use crate::domains::secrets::{MASTER_KEY_SECRET, SecretLocation, Service as SecretsService};
 use crate::domains::sessions::{ExpiredSessionHandler, Service as SessionsService, SessionsClient};
 use crate::domains::settings::Service as SettingsService;
@@ -115,6 +115,9 @@ pub struct UsersClient {
     local_files: Arc<dyn LocalFiles>,
     documents: Arc<dyn DocumentsService>,
     embedding_cache: Arc<dyn EmbeddingCache>,
+    /// Loads the on-device models once an account is created, since its
+    /// user is about to add sources.
+    model_preloader: Arc<dyn ModelPreloader>,
 }
 
 impl UsersClient {
@@ -125,7 +128,8 @@ impl UsersClient {
     /// `secrets` and `embedding_cache` are cleared, `local_db` wiped and
     /// `local_files` deleted on `logout`; and changelog
     /// consumption on `documents` is started by `create`/`login` and stopped
-    /// by `logout`.
+    /// by `logout`; `model_preloader` loads the models once `create`
+    /// succeeded.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn new(
         channel: Channel,
@@ -136,6 +140,7 @@ impl UsersClient {
         local_files: Arc<dyn LocalFiles>,
         documents: Arc<dyn DocumentsService>,
         embedding_cache: Arc<dyn EmbeddingCache>,
+        model_preloader: Arc<dyn ModelPreloader>,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(channel, sessions.clone())),
@@ -147,6 +152,7 @@ impl UsersClient {
             local_files,
             documents,
             embedding_cache,
+            model_preloader,
         })
     }
 
@@ -154,7 +160,8 @@ impl UsersClient {
     /// [`OpaqueClient`] implementations, for testing against
     /// [`super::grpc_client::MockFydeClient`]/[`super::crypto::MockOpaqueClient`]
     /// instead of a live server and real cryptography. Its embedding cache
-    /// panics on any call (see [`Self::with_embedding_cache`]).
+    /// and model preloader panic on any call (see
+    /// [`Self::with_embedding_cache`]/[`Self::with_model_preloader`]).
     #[cfg(test)]
     fn with_deps(
         grpc: impl FydeClient + 'static,
@@ -175,7 +182,14 @@ impl UsersClient {
             local_files,
             documents,
             embedding_cache: Arc::new(crate::domains::documents::MockEmbeddingCache::new()),
+            model_preloader: Arc::new(crate::domains::documents::MockModelPreloader::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn with_model_preloader(mut self, model_preloader: impl ModelPreloader + 'static) -> Self {
+        self.model_preloader = Arc::new(model_preloader);
+        self
     }
 
     #[cfg(test)]
@@ -403,6 +417,9 @@ impl Service for UsersClient {
 
         self.open_session(username, &token, &raw_master_key, role, location)
             .await?;
+        // A new account's user is about to add sources, whose documents
+        // need the models: load them now rather than on the first upload.
+        self.model_preloader.start_loading();
 
         Ok(token)
     }
@@ -743,7 +760,7 @@ mod tests {
     use super::super::crypto::{MockOpaqueClient, fake_login_state, fake_registration_state};
     use super::super::grpc_client::MockFydeClient;
     use super::*;
-    use crate::domains::documents::MockEmbeddingCache;
+    use crate::domains::documents::{MockEmbeddingCache, MockModelPreloader};
     use crate::domains::secrets::{MockService as MockSecretsService, SESSION_TOKEN_SECRET};
     use crate::domains::settings::MockService as MockSettingsService;
     use crate::tools::client_dir::MockLocalFiles;
@@ -764,6 +781,14 @@ mod tests {
             Arc::new(MockLocalFiles::new()),
             Arc::new(RecordingDocuments::default()),
         )
+    }
+
+    /// A model preloader expecting to start loading exactly once, and
+    /// nothing else.
+    fn loading_models() -> MockModelPreloader {
+        let mut preloader = MockModelPreloader::new();
+        preloader.expect_start_loading().times(1).return_const(());
+        preloader
     }
 
     /// An embedding cache expecting to be cleared exactly once, and nothing
@@ -996,7 +1021,8 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets)
+            .with_model_preloader(loading_models());
 
         let token = client
             .create(
@@ -1065,7 +1091,8 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets)
+            .with_model_preloader(loading_models());
         client
             .create("alice", "correct horse battery staple", "device", false)
             .await
@@ -1137,7 +1164,8 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets)
+            .with_model_preloader(loading_models());
 
         client
             .create(
@@ -1208,7 +1236,8 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
 
-        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets)
+            .with_model_preloader(loading_models());
 
         client
             .create(
@@ -1742,7 +1771,8 @@ mod tests {
             })
             .times(1)
             .returning(|_, _, _| Ok(()));
-        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets)
+            .with_model_preloader(loading_models());
 
         client
             .create("alice", "correct horse battery staple", "device", true)
@@ -1770,7 +1800,8 @@ mod tests {
             .withf(|_, _, location| *location == SecretLocation::SecureStorage)
             .times(2)
             .returning(|_, _, _| Ok(()));
-        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets)
+            .with_model_preloader(loading_models());
 
         client
             .create("alice", "correct horse battery staple", "device", true)
