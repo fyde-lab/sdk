@@ -264,9 +264,9 @@ pub const MAX_INSTALLATION_LABEL_CHARS: usize = 60;
 
 /// What [`super::Service::install_script`] takes: which installation to
 /// write, the script to install, a label telling it apart from the user's
-/// other installations of the same script, and the values to run it with,
+/// other installations of the same script, the values to run it with,
 /// keyed by the same machine names as [`Script::parameters`] (e.g.
-/// `{"username": "alice"}`).
+/// `{"username": "alice"}`), and where the documents it downloads go.
 /// Its `Debug` output names the parameters but never shows their values,
 /// which include the user's credentials for the script's site, nor the
 /// label, often the user's username there.
@@ -285,6 +285,10 @@ pub struct InstallScriptRequest {
     /// `service::default_label`).
     pub label: String,
     pub parameters: HashMap<String, Value>,
+    /// The folder every document the script downloads is filed in. `None`
+    /// files each one where its text says it belongs (see
+    /// [`crate::DocumentsService::upload`]).
+    pub folder_id: Option<Uuid>,
 }
 
 impl std::fmt::Debug for InstallScriptRequest {
@@ -294,6 +298,7 @@ impl std::fmt::Debug for InstallScriptRequest {
             .field("script_id", &self.script_id)
             .field("label", &"[redacted]")
             .field("parameters", &RedactedValues(&self.parameters))
+            .field("folder_id", &self.folder_id)
             .finish()
     }
 }
@@ -302,18 +307,19 @@ impl std::fmt::Debug for InstallScriptRequest {
 /// locally once its `InstallScript` changelog event has been consumed (see
 /// [`super::Service::list_installed_scripts`]): its own id, its label, the
 /// full script, plus the parameter values it was installed with, so it can
-/// be run without asking for them again. A user can install the same
-/// script several times, once per account on its site: each installation
-/// has its own id, under which its scraper session and cookies are kept.
-/// Also the exact JSON payload carried, encrypted, by that changelog event.
-/// Its `Debug` output never shows the label or the parameters' values (see
-/// [`InstallScriptRequest`]).
+/// be run without asking for them again, and the folder its documents go
+/// to. A user can install the same script several times, once per account
+/// on its site: each installation has its own id, under which its scraper
+/// session and cookies are kept. Also the exact JSON payload carried,
+/// encrypted, by that changelog event. Its `Debug` output never shows the
+/// label or the parameters' values (see [`InstallScriptRequest`]).
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstalledScript {
     pub(super) installation_id: Uuid,
     pub(super) label: String,
     pub(super) script: Script,
     pub(super) parameters: HashMap<String, Value>,
+    pub(super) folder_id: Option<Uuid>,
 }
 
 impl std::fmt::Debug for InstalledScript {
@@ -323,6 +329,7 @@ impl std::fmt::Debug for InstalledScript {
             .field("label", &"[redacted]")
             .field("script", &self.script)
             .field("parameters", &RedactedValues(&self.parameters))
+            .field("folder_id", &self.folder_id)
             .finish()
     }
 }
@@ -363,6 +370,15 @@ impl InstalledScript {
     /// machine name.
     pub fn parameters(&self) -> &HashMap<String, Value> {
         &self.parameters
+    }
+
+    /// The folder every document [`Self::script`] downloads is filed in, or
+    /// `None` to file each one where its text says it belongs. Running the
+    /// script fails with [`crate::ErrorCode::FolderNotFound`] on its first
+    /// document once this folder is deleted: install it again to pick
+    /// another.
+    pub fn folder_id(&self) -> Option<Uuid> {
+        self.folder_id
     }
 }
 
@@ -470,6 +486,7 @@ impl FakeInstalledScript {
                     "username".to_string(),
                     Value::String(crate::tools::testing::random_word().to_string()),
                 )]),
+                folder_id: None,
             },
         }
     }
@@ -491,6 +508,11 @@ impl FakeInstalledScript {
 
     pub(crate) fn with_parameters(mut self, parameters: HashMap<String, Value>) -> Self {
         self.installed.parameters = parameters;
+        self
+    }
+
+    pub(crate) fn with_folder_id(mut self, folder_id: Uuid) -> Self {
+        self.installed.folder_id = Some(folder_id);
         self
     }
 
@@ -531,6 +553,20 @@ mod tests {
     }
 
     #[test]
+    fn installed_script_roundtrips_its_folder_through_json() {
+        let installed = FakeInstalledScript::new()
+            .with_folder_id(Uuid::now_v7())
+            .build();
+
+        let json = serde_json::to_vec(&installed).unwrap();
+
+        assert_eq!(
+            serde_json::from_slice::<InstalledScript>(&json).unwrap(),
+            installed
+        );
+    }
+
+    #[test]
     fn debug_output_never_shows_the_label_or_parameter_values() {
         let parameters = HashMap::from([
             ("username".to_string(), Value::from("alice")),
@@ -545,6 +581,7 @@ mod tests {
             script_id: Uuid::now_v7(),
             label: "alice".to_string(),
             parameters,
+            folder_id: None,
         };
 
         for debug in [format!("{installed:?}"), format!("{request:?}")] {

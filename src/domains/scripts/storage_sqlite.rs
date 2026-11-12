@@ -32,19 +32,22 @@ impl Storage for SqliteStorage {
         })?;
 
         sqlx::query(
-            "INSERT INTO installed_scripts (installation_id, script_id, label, script, parameters)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO installed_scripts
+                 (installation_id, script_id, label, script, parameters, folder_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(installation_id) DO UPDATE SET
                  script_id = excluded.script_id,
                  label = excluded.label,
                  script = excluded.script,
-                 parameters = excluded.parameters",
+                 parameters = excluded.parameters,
+                 folder_id = excluded.folder_id",
         )
         .bind(installation_id.to_string())
         .bind(installed.script.id.to_string())
         .bind(&installed.label)
         .bind(script)
         .bind(parameters)
+        .bind(installed.folder_id.map(|id| id.to_string()))
         .execute(&self.pool)
         .await
         .with_context(|| {
@@ -56,7 +59,7 @@ impl Storage for SqliteStorage {
 
     async fn list_installed_scripts(&self) -> Result<Vec<InstalledScript>> {
         let rows = sqlx::query(
-            "SELECT installation_id, label, script, parameters FROM installed_scripts
+            "SELECT installation_id, label, script, parameters, folder_id FROM installed_scripts
              ORDER BY installed_at, rowid",
         )
         .fetch_all(&self.pool)
@@ -71,7 +74,7 @@ impl Storage for SqliteStorage {
         installation_id: Uuid,
     ) -> Result<Option<InstalledScript>> {
         let row = sqlx::query(
-            "SELECT installation_id, label, script, parameters FROM installed_scripts
+            "SELECT installation_id, label, script, parameters, folder_id FROM installed_scripts
              WHERE installation_id = ?1",
         )
         .bind(installation_id.to_string())
@@ -101,6 +104,7 @@ fn installed_script_from_row(row: &SqliteRow) -> Result<InstalledScript> {
     let installation_id: String = row.get("installation_id");
     let script: String = row.get("script");
     let parameters: String = row.get("parameters");
+    let folder_id: Option<String> = row.get("folder_id");
 
     Ok(InstalledScript {
         installation_id: installation_id.parse().with_context(|| {
@@ -113,6 +117,12 @@ fn installed_script_from_row(row: &SqliteRow) -> Result<InstalledScript> {
         parameters: serde_json::from_str(&parameters).with_context(|| {
             format!("invalid parameters json in local database for installation {installation_id}")
         })?,
+        folder_id: folder_id
+            .map(|id| Uuid::parse_str(&id))
+            .transpose()
+            .with_context(|| {
+                format!("invalid folder id in local database for installation {installation_id}")
+            })?,
     })
 }
 
@@ -171,6 +181,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_installed_script_returns_its_folder() {
+        let storage = setup().await;
+        let installed = FakeInstalledScript::new()
+            .with_folder_id(Uuid::now_v7())
+            .build();
+        storage.save_installed_script(&installed).await.unwrap();
+
+        assert_eq!(
+            storage
+                .find_installed_script(installed.installation_id())
+                .await
+                .unwrap(),
+            Some(installed)
+        );
+    }
+
+    #[tokio::test]
     async fn list_installed_scripts_returns_saved_scripts_oldest_first() {
         let storage = setup().await;
         let first = FakeInstalledScript::new().build();
@@ -224,6 +251,7 @@ mod tests {
             )
             .with_label("renamed")
             .with_parameters(HashMap::from([("username".to_string(), json!("bob"))]))
+            .with_folder_id(Uuid::now_v7())
             .build();
 
         storage.save_installed_script(&first).await.unwrap();

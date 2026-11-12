@@ -29,7 +29,8 @@ pub(crate) trait Service: Send + Sync {
     /// Guesses the type of a document whose transcript is `text`, and the
     /// one of `folders` it belongs in by their descriptions (a folder
     /// without one is never picked), leaving each field it can't tell apart
-    /// from another choice `None`. Loads the embedding model if needed (see
+    /// from another choice `None`. No `folders` guesses the type alone.
+    /// Loads the embedding model if needed (see
     /// [`Embedder::embed_passages`]).
     async fn classify(&self, text: &str, folders: &[Folder]) -> Result<Classification>;
 }

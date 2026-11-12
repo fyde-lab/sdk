@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use mlua::{Lua, LuaSerdeExt, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use tokio::runtime::Handle;
+use uuid::Uuid;
 use wreq::cookie::Jar;
 
 use crate::domains::documents::Service as DocumentsService;
@@ -153,6 +154,9 @@ pub(super) struct HostConfig {
     /// soon as it's set (see [`StopSignal`]).
     pub(super) stop: StopSignal,
     pub(super) options: RunOptions,
+    /// The folder `fyde.save_document` files every document in, `None` to
+    /// let each one be classified (see [`DocumentsService::upload`]).
+    pub(super) folder_id: Option<Uuid>,
 }
 
 /// Wires every host capability a scraper script is allowed to use into a
@@ -197,6 +201,7 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
         runtime,
         stop,
         options,
+        folder_id,
     } = config;
     let scraper_name = scraper_name.as_str();
     let cookie_jar = build_jar(&cookies);
@@ -244,7 +249,14 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
     .context("installing fyde.input")?;
     fyde.set(
         "save_document",
-        documents::save_document_fn(lua, documents, scraper_name, runtime.clone(), stop.clone())?,
+        documents::save_document_fn(
+            lua,
+            documents,
+            scraper_name,
+            folder_id,
+            runtime.clone(),
+            stop.clone(),
+        )?,
     )
     .context("installing fyde.save_document")?;
     fyde.set(

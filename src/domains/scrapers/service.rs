@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use mlua::{Function, Lua, LuaSerdeExt as _, StdLib, Table};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
+use uuid::Uuid;
 
 use crate::domains::documents::Service as DocumentsService;
 use crate::domains::scripts::InstalledScript;
@@ -220,15 +221,18 @@ impl Service for ScrapersClient {
         let parameters = serde_json::to_value(installed.parameters()).with_context(|| {
             format!("failed to encode parameters of installation {installation_id}")
         })?;
-        self.run(
+        self.run_filing_in(
             &installation_id.to_string(),
             script.script(),
             parameters,
-            false,
-            INSTALLED_WREQ_EMULATION,
-            INSTALLED_FOLLOW_REDIRECTS,
-            script.allowed_domains().to_vec(),
-            false,
+            RunOptions {
+                debug_http_dump: false,
+                wreq_emulation: INSTALLED_WREQ_EMULATION,
+                follow_redirects: INSTALLED_FOLLOW_REDIRECTS,
+                allowed_domains: script.allowed_domains().to_vec(),
+                browser_visible: false,
+            },
+            installed.folder_id(),
         )
         .await
     }
@@ -243,6 +247,35 @@ impl Service for ScrapersClient {
         follow_redirects: bool,
         allowed_domains: Vec<String>,
         browser_visible: bool,
+    ) -> Result<()> {
+        self.run_filing_in(
+            name,
+            script,
+            parameters,
+            RunOptions {
+                debug_http_dump,
+                wreq_emulation,
+                follow_redirects,
+                allowed_domains,
+                browser_visible,
+            },
+            None,
+        )
+        .await
+    }
+}
+
+impl ScrapersClient {
+    /// [`Service::run`], filing every document the script saves in
+    /// `folder_id` (`None`: wherever each one's text says it belongs, see
+    /// [`DocumentsService::upload`]).
+    async fn run_filing_in(
+        &self,
+        name: &str,
+        script: &str,
+        parameters: Value,
+        options: RunOptions,
+        folder_id: Option<Uuid>,
     ) -> Result<()> {
         let stop_registration = self.register_stop(name);
         let signal = stop_registration.signal.clone();
@@ -288,13 +321,8 @@ impl Service for ScrapersClient {
             recorder: recorder.clone(),
             runtime: Handle::current(),
             stop: signal.clone(),
-            options: RunOptions {
-                debug_http_dump,
-                wreq_emulation,
-                follow_redirects,
-                allowed_domains,
-                browser_visible,
-            },
+            options,
+            folder_id,
         };
 
         // The guards ride along with the job and come back with its result:
@@ -367,6 +395,7 @@ struct ScraperJob {
     runtime: Handle,
     stop: StopSignal,
     options: RunOptions,
+    folder_id: Option<Uuid>,
 }
 
 /// Runs the whole blocking, synchronous half of a scraper run: builds a
@@ -391,6 +420,7 @@ fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
         runtime,
         stop,
         options,
+        folder_id,
     } = job;
 
     // Bound to this run's name, so the caller can tell its events and
@@ -435,6 +465,7 @@ fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
             runtime,
             stop,
             options,
+            folder_id,
         },
     )
     .context("installing host functions into the Lua VM")?;
@@ -754,6 +785,44 @@ mod tests {
         let client = client(cookies, session, MockDocumentsService::new());
 
         client.run_installed(&installed.build()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_installed_files_every_saved_document_in_the_installation_folder() {
+        let script = FakeScript::new()
+            .with_script(
+                r#"
+                local M = {}
+                function M.run(parameters)
+                    fyde.save_document("a.pdf", "first")
+                    fyde.save_document("b.pdf", "second")
+                end
+                return M
+            "#,
+            )
+            .build();
+        let folder_id = Uuid::now_v7();
+        let installed = FakeInstalledScript::new()
+            .with_script(script)
+            .with_folder_id(folder_id)
+            .build();
+
+        let mut cookies = MockCookiesService::new();
+        cookies.expect_load().returning(|_| Ok(Vec::new()));
+        cookies.expect_save().returning(|_, _| Ok(()));
+        let mut session = MockSessionService::new();
+        session.expect_load().returning(|_| Ok(json!({})));
+        session.expect_save().returning(|_, _| Ok(()));
+        let mut documents = MockDocumentsService::new();
+        documents
+            .expect_upload()
+            .withf(move |request| request.folder_id == Some(folder_id))
+            .times(2)
+            .returning(|_| Ok(Uuid::now_v7()));
+
+        let client = client(cookies, session, documents);
+
+        client.run_installed(&installed).await.unwrap();
     }
 
     #[tokio::test]

@@ -221,13 +221,18 @@ impl<S: Storage> DocumentsClient<S> {
         }
     }
 
-    /// Sets `metadata`'s type to what its text looks like, and files it in
-    /// the folder whose description it reads like (each `None` where the
-    /// classifier can't tell), or leaves them as they are if that fails: the
-    /// document is then published untyped, at the root, rather than not at
-    /// all.
-    async fn classify_upload(&self, metadata: &mut Metadata) {
-        let classification = match self.folders().await {
+    /// Sets `metadata`'s type to what its text looks like, and, if
+    /// `file_it`, files it in the folder whose description it reads like
+    /// (each `None` where the classifier can't tell), or leaves them as they
+    /// are if that fails: the document is then published untyped, at the
+    /// root (or in the folder it was given), rather than not at all.
+    async fn classify_upload(&self, metadata: &mut Metadata, file_it: bool) {
+        let folders = if file_it {
+            self.folders().await
+        } else {
+            Ok(Vec::new())
+        };
+        let classification = match folders {
             Ok(folders) => {
                 self.classifier
                     .classify(&metadata.transcript, &folders)
@@ -238,7 +243,9 @@ impl<S: Storage> DocumentsClient<S> {
         match classification {
             Ok(classification) => {
                 metadata.r#type = classification.r#type;
-                metadata.folder_id = classification.folder_id;
+                if file_it {
+                    metadata.folder_id = classification.folder_id;
+                }
             }
             Err(err) => tracing::warn!(
                 code = ?err.code(),
@@ -440,6 +447,9 @@ impl<S: Storage> Service for DocumentsClient<S> {
         if let Some(name) = request.name {
             metadata.name = name;
         }
+        // Checked with the rest of the metadata, so a folder not synced here
+        // fails before embedding.
+        metadata.folder_id = request.folder_id;
 
         self.check_metadata(&metadata)
             .instrument(tracing::debug_span!("check_metadata"))
@@ -459,7 +469,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
         // Only with the model at hand (the document's just been embedded),
         // so an upload never waits for its download twice.
         if embeddings.is_some() {
-            self.classify_upload(&mut metadata)
+            self.classify_upload(&mut metadata, request.folder_id.is_none())
                 .instrument(tracing::debug_span!("classify_document"))
                 .await;
         }
@@ -1620,6 +1630,7 @@ mod tests {
                 content: raw.clone(),
             },
             name: Some("overridden.pdf".to_string()),
+            folder_id: None,
         };
 
         client.upload(request).await.unwrap();
@@ -3891,6 +3902,85 @@ mod tests {
             (metadata.r#type, metadata.folder_id),
             (classification.r#type, Some(folder.id))
         );
+    }
+
+    #[tokio::test]
+    async fn upload_files_the_document_in_the_requested_folder_typing_it_only() {
+        let folder = FakeFolder::new().build();
+        let guessed = FakeFolder::new().build();
+        let classification = FakeClassification::new().with_folder(guessed.id).build();
+        let mut classifier = MockClassificationService::new();
+        classifier
+            .expect_classify()
+            .withf(|_, folders| folders.is_empty())
+            .times(1)
+            .returning(move |_, _| Ok(classification));
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_classifying_with_folders(
+            changelog.clone(),
+            Arc::new(classifier),
+            vec![folder.clone(), guessed],
+        );
+
+        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
+        request.folder_id = Some(folder.id);
+        client.upload(request).await.unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(
+            (metadata.r#type, metadata.folder_id),
+            (classification.r#type, Some(folder.id))
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_keeps_the_requested_folder_when_classifying_fails() {
+        let folder = FakeFolder::new().build();
+        let mut classifier = MockClassificationService::new();
+        classifier
+            .expect_classify()
+            .times(1)
+            .returning(|_, _| Err(ErrorKind::ModelNotDownloaded("e5".to_string()).into()));
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_classifying_with_folders(
+            changelog.clone(),
+            Arc::new(classifier),
+            vec![folder.clone()],
+        );
+
+        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
+        request.folder_id = Some(folder.id);
+        client.upload(request).await.unwrap();
+
+        assert_eq!(published_metadata(&changelog).folder_id, Some(folder.id));
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_a_requested_folder_not_synced_here_before_embedding_or_publishing() {
+        let folder_id = Uuid::now_v7();
+        let changelog = Arc::new(RecordingChangelog::default());
+        // Strict mocks: embedding, caching or classifying panics.
+        let client = DocumentsClient::new(
+            storage_for_a_new_upload(),
+            changelog.clone(),
+            None,
+            accepting_attributes(),
+            unused_indexer(),
+            unused_embedder(),
+            unused_cache(),
+            unused_classifier(),
+            folders_listing(vec![FakeFolder::new().build()]),
+        );
+
+        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
+        request.folder_id = Some(folder_id);
+        let err = client.upload(request).await.unwrap_err();
+
+        assert!(
+            matches!(err.kind(), ErrorKind::FolderNotFound(id) if *id == folder_id),
+            "unexpected error: {err}"
+        );
+        assert!(changelog.sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

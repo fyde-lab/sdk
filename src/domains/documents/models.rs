@@ -349,12 +349,16 @@ pub enum UploadSource {
 
 /// Parameters for [`super::Service::upload`]: where to read the document's
 /// content from (its file name becomes the document's `original_name`),
-/// and the name to give it, if not that one. Everything else (type,
-/// folder) is derived from the document itself.
+/// the name to give it, if not that one, and the folder to file it in, if
+/// not the one it's guessed to belong in. Everything else (its type) is
+/// derived from the document itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadRequest {
     pub source: UploadSource,
     pub name: Option<String>,
+    /// The folder to file the document in. `None` guesses one from its
+    /// text (see [`super::Service::upload`]).
+    pub folder_id: Option<Uuid>,
 }
 
 impl UploadRequest {
@@ -363,6 +367,7 @@ impl UploadRequest {
         Self {
             source: UploadSource::Path(path.into()),
             name: None,
+            folder_id: None,
         }
     }
 
@@ -375,6 +380,7 @@ impl UploadRequest {
                 content: content.into(),
             },
             name: None,
+            folder_id: None,
         }
     }
 }
