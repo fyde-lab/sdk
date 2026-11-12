@@ -71,11 +71,10 @@ pub struct ClientConfig {
     /// Which SQLite backend to persist local state to.
     pub storage: Storage,
     /// Where the on-device models' files are downloaded to, created if
-    /// missing. `Client::init` starts downloading every model there in the
-    /// background, in parallel, without loading them (see
-    /// [`Client::start_loading_models`]); stopped when the `Client` is
-    /// dropped; a failure is only logged, and retried when the model is
-    /// first needed. Never inside
+    /// missing. `Client::init` starts downloading every model there and
+    /// loading it in memory, in the background and in parallel (stopped
+    /// when the `Client` is dropped; a failure is only logged, and retried
+    /// when the model is first needed). Never inside
     /// the client's own directory (`<dir>/<client_name>` of a
     /// [`Storage::Disk`]): logout deletes every file there, and models
     /// aren't user data, so `init` fails with
@@ -134,10 +133,9 @@ pub struct Client {
     settings: Arc<dyn SettingsService>,
     usage: Arc<dyn UsageService>,
     users: Arc<dyn UsersService>,
-    /// Downloads (from `init`) and loads (see [`Self::start_loading_models`])
-    /// the on-device models in the background; dropping the `Client` stops
-    /// whatever it's still doing.
-    model_preloader: Arc<dyn domains::documents::ModelPreloader>,
+    /// The on-device models' background loading started by `init`. Never
+    /// read: it only exists so dropping the `Client` stops it.
+    _model_loading: domains::documents::ModelLoading,
     /// The locked handle to [`instance_lock_path`] (see [`lock_instance`]),
     /// held for as long as this `Client` lives. Never read: it only exists
     /// so dropping the `Client` releases the lock.
@@ -163,12 +161,10 @@ impl Client {
         let channel = lazy_channel(config.url)?;
         let models = Arc::new(tools::models::ModelStore::new(config.models_dir));
         let embedder = domains::documents::init_embedder(models.clone());
-        // Fetched as soon as the app starts, ahead of their first use (an
-        // upload or sync for the embedding model), which would otherwise
-        // wait for them. Loaded only when about to be needed (see
-        // `Client::start_loading_models`).
-        let model_preloader = domains::documents::init_model_preloader(models, embedder.clone());
-        model_preloader.start_download();
+        // Downloaded and loaded as soon as the app starts, so their first
+        // use (an upload or sync for the embedding model) doesn't wait for
+        // them.
+        let model_loading = domains::documents::start_model_loading(models, embedder.clone());
         // Shared by uploads (which fill it), the sync job (which empties
         // it) and logout (which clears it).
         let embedding_cache = domains::documents::init_embedding_cache();
@@ -225,7 +221,6 @@ impl Client {
             Arc::new(client_directory(&location)),
             documents.clone(),
             embedding_cache,
-            model_preloader.clone(),
         )
         .await
         .context("failed to initialize users service")?;
@@ -259,7 +254,7 @@ impl Client {
             settings: domains::settings::public(settings),
             usage,
             users,
-            model_preloader,
+            _model_loading: model_loading,
             _instance_lock: instance_lock,
         })
     }
@@ -318,18 +313,6 @@ impl Client {
     /// Returns a reference to the client's scrapers service.
     pub fn scrapers(&self) -> &dyn ScrapersService {
         self.scrapers.as_ref()
-    }
-
-    /// Starts loading the on-device models in memory in the background
-    /// (downloading any not there yet), and returns at once: call it when
-    /// the user is about to add documents, e.g. on opening the sources
-    /// page, so their first upload doesn't wait for the models.
-    /// [`UsersService::create`] already does it. Does nothing while a
-    /// previous load is still under way; a failure is only logged, the
-    /// models' first use trying again. Once loaded, they stay in memory for
-    /// this `Client`'s lifetime.
-    pub fn start_loading_models(&self) {
-        self.model_preloader.start_loading();
     }
 
     /// Returns `err`'s user-facing wording (see [`Error::user_message`]) in
@@ -691,7 +674,7 @@ pub async fn init_dev_scrapers(
 mod tests {
     use super::*;
 
-    /// A file to pass as a `models_dir`: the background model download
+    /// A file to pass as a `models_dir`: the background model loading
     /// `Client::init` starts can't create the directory there, so fails
     /// without touching the network.
     fn unusable_models_dir() -> tempfile::NamedTempFile {
