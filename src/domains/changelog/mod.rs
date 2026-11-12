@@ -32,7 +32,8 @@ use crate::domains::{folders, scrapers, scripts};
 
 /// Publishes and consumes the fyde server's changelog: a blind relay for
 /// opaque, client-encrypted write events — document writes, plus script
-/// installations (see [`EventType::InstallScript`]). `send`/`stop_consume_job`
+/// installations (see [`EventType::InstallScript`]/
+/// [`EventType::UninstallScript`]). `send`/`stop_consume_job`
 /// take `&self` so implementations can be shared behind `Arc<dyn Service>`;
 /// `start_consume_job` takes `self: Arc<Self>` since it spawns the consume
 /// loop onto its own background task, which needs an owned, `'static`
@@ -71,10 +72,11 @@ pub(crate) trait Service: Send + Sync {
     /// never been consumed before). For each `SaveDocument` event, caches the
     /// resulting document in local storage before invoking `callback`
     /// (removes it for a `Deleted` event, and
-    /// likewise saves the installed script for a `InstallScript` event,
+    /// likewise saves the installation for an `InstallScript` event,
     /// via the `scripts` domain's local storage, first clearing that
-    /// scraper's saved session if the event installs another version of the
-    /// script than the one installed so far); the
+    /// installation's saved scraper session if the event installs another
+    /// version of the script than the one installed so far, and deletes the
+    /// installation and all its scraper state for an `UninstallScript`); the
     /// cursor is persisted as each event is processed, so a later call
     /// resumes right after the last event seen.
     ///
@@ -82,8 +84,9 @@ pub(crate) trait Service: Send + Sync {
     /// The spawned task never exits on its own. If a pass over the stream
     /// fails — including with [`crate::ErrorCode::InvalidChangelogEvent`] if a
     /// `SaveDocument` event is missing its `content` or `metadata`, since a
-    /// `SaveDocument` event must carry both, or if a `InstallScript` event's
-    /// `content` is missing or isn't a valid installed script — the error is logged and
+    /// `SaveDocument` event must carry both, or if an `InstallScript` event's
+    /// `content` is missing, isn't a valid installation or names another
+    /// installation than its subject — the error is logged and
     /// consumption is retried immediately from the persisted cursor: the
     /// next pass's wait for
     /// [`crate::domains::server_state::Service::is_server_reachable`]
@@ -109,8 +112,10 @@ pub(crate) trait Service: Send + Sync {
 /// shared `channel`, and uses `indexer` to cache (and index) the documents
 /// materialized from consumed events, `pool` to spot the ones already
 /// cached (and to save installed
-/// scripts into the `scripts` domain's `installed_scripts` table, clearing
-/// a scraper's `scraper_sessions` row when its script changes version), `settings`
+/// script installations into the `scripts` domain's `installed_scripts`
+/// table, clearing an installation's `scraper_sessions` row when its
+/// script changes version and all its scraper state when it's
+/// uninstalled), `settings`
 /// to persist the changelog cursor consumed so far (see
 /// [`storage_settings::LocalCursorStorage`]), `secrets` to read the
 /// account master key `crypto` derives every event's KEK from, and `sessions` to
@@ -132,14 +137,14 @@ pub(crate) async fn init(
 ) -> Result<Arc<dyn Service>> {
     let document_storage = documents::SqliteStorage::new(pool.clone());
     let script_storage = scripts::SqliteStorage::new(pool.clone());
-    let scraper_session_storage = scrapers::SessionSqliteStorage::new(pool.clone());
+    let scraper_state_storage = scrapers::StateSqliteStorage::new(pool.clone());
     let cursor_storage = storage_settings::LocalCursorStorage::new(settings, pool);
     let client = service::ChangelogClient::new(
         grpc_client::GrpcClient::new(channel, sessions),
         document_storage,
         indexer,
         script_storage,
-        scraper_session_storage,
+        scraper_state_storage,
         folders,
         cursor_storage,
         server_state,

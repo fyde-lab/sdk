@@ -5,13 +5,14 @@ mod models;
 mod reports;
 mod service;
 mod session;
+mod state;
 mod stop;
 
 pub use host::helpers::SOURCE as HELPERS_LUA;
 pub use models::{ProgressEvent, ProgressStep};
 #[cfg(test)]
-pub(crate) use session::MockStorage as MockSessionStorage;
-pub(crate) use session::{SqliteStorage as SessionSqliteStorage, Storage as SessionStorage};
+pub(crate) use state::MockStateStorage;
+pub(crate) use state::{StateSqliteStorage, StateStorage};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -128,13 +129,16 @@ pub trait Service: Send + Sync {
         browser_visible: bool,
     ) -> Result<()>;
 
-    /// Runs an installed script (see `scripts::Service::fetch_installed_
-    /// script`) with the parameter values it was installed with, its own
-    /// allowed domains, and its id as the name its session/cookies are
-    /// kept under. The browser stays hidden and no HTTP bodies are dumped.
+    /// Runs an installation of a script (see `scripts::Service::
+    /// fetch_installed_script`) with the parameter values it was installed
+    /// with, its script's allowed domains, and its installation id as the
+    /// name its session/cookies/reports are kept under, so each of the
+    /// user's accounts on a site has its own, and runs of different
+    /// installations of the same script go in parallel. The browser stays
+    /// hidden and no HTTP bodies are dumped.
     async fn run_installed(&self, installed: &InstalledScript) -> Result<()>;
 
-    /// Stops the run going on under `name` (an installed script's id, for
+    /// Stops the run going on under `name` (an installation's id, for
     /// [`Self::run_installed`]), and any run of it waiting for its turn;
     /// returns whether there was one. Returns at once: the stopped `run`
     /// call itself returns once its script has really stopped, which takes

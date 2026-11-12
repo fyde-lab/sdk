@@ -216,10 +216,12 @@ impl Service for ScrapersClient {
 
     async fn run_installed(&self, installed: &InstalledScript) -> Result<()> {
         let script = installed.script();
-        let parameters = serde_json::to_value(installed.parameters())
-            .with_context(|| format!("failed to encode parameters of script {}", script.id()))?;
+        let installation_id = installed.installation_id();
+        let parameters = serde_json::to_value(installed.parameters()).with_context(|| {
+            format!("failed to encode parameters of installation {installation_id}")
+        })?;
         self.run(
-            &script.id().to_string(),
+            &installation_id.to_string(),
             script.script(),
             parameters,
             false,
@@ -556,6 +558,7 @@ mod tests {
     use crate::domains::documents::MockService as MockDocumentsService;
     use crate::domains::scripts::{FakeInstalledScript, FakeScript};
     use std::collections::HashMap;
+    use uuid::Uuid;
 
     const TRIVIAL_SCRIPT: &str = r#"
         local M = {}
@@ -712,7 +715,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_installed_runs_the_script_with_its_installed_parameters_under_its_id() {
+    async fn run_installed_runs_the_script_with_its_installed_parameters_under_its_installation_id()
+    {
         let script = FakeScript::new()
             .with_script(
                 r#"
@@ -724,8 +728,10 @@ mod tests {
             "#,
             )
             .build();
-        let name = script.id().to_string();
+        let installation_id = Uuid::now_v7();
+        let name = installation_id.to_string();
         let installed = FakeInstalledScript::new()
+            .with_installation_id(installation_id)
             .with_script(script)
             .with_parameters(HashMap::from([("username".to_string(), json!("alice"))]));
 

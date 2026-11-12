@@ -23,27 +23,32 @@ impl SqliteStorage {
 #[async_trait]
 impl Storage for SqliteStorage {
     async fn save_installed_script(&self, installed: &InstalledScript) -> Result<()> {
-        let script_id = installed.script.id;
-        let script = serde_json::to_string(&installed.script)
-            .with_context(|| format!("failed to serialize installed script {script_id}"))?;
+        let installation_id = installed.installation_id;
+        let script = serde_json::to_string(&installed.script).with_context(|| {
+            format!("failed to serialize the script of installation {installation_id}")
+        })?;
         let parameters = serde_json::to_string(&installed.parameters).with_context(|| {
-            format!("failed to serialize parameters of installed script {script_id}")
+            format!("failed to serialize parameters of installation {installation_id}")
         })?;
 
         sqlx::query(
-            "INSERT INTO installed_scripts (script_id, script, parameters) VALUES (?1, ?2, ?3)
-             ON CONFLICT(script_id) DO UPDATE SET
+            "INSERT INTO installed_scripts (installation_id, script_id, label, script, parameters)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(installation_id) DO UPDATE SET
+                 script_id = excluded.script_id,
+                 label = excluded.label,
                  script = excluded.script,
-                 parameters = excluded.parameters,
-                 installed_at = excluded.installed_at",
+                 parameters = excluded.parameters",
         )
-        .bind(script_id.to_string())
+        .bind(installation_id.to_string())
+        .bind(installed.script.id.to_string())
+        .bind(&installed.label)
         .bind(script)
         .bind(parameters)
         .execute(&self.pool)
         .await
         .with_context(|| {
-            format!("failed to save installed script {script_id} to local database")
+            format!("failed to save installation {installation_id} to local database")
         })?;
 
         Ok(())
@@ -51,7 +56,7 @@ impl Storage for SqliteStorage {
 
     async fn list_installed_scripts(&self) -> Result<Vec<InstalledScript>> {
         let rows = sqlx::query(
-            "SELECT script_id, script, parameters FROM installed_scripts
+            "SELECT installation_id, label, script, parameters FROM installed_scripts
              ORDER BY installed_at, rowid",
         )
         .fetch_all(&self.pool)
@@ -61,32 +66,52 @@ impl Storage for SqliteStorage {
         rows.iter().map(installed_script_from_row).collect()
     }
 
-    async fn find_installed_script(&self, script_id: Uuid) -> Result<Option<InstalledScript>> {
+    async fn find_installed_script(
+        &self,
+        installation_id: Uuid,
+    ) -> Result<Option<InstalledScript>> {
         let row = sqlx::query(
-            "SELECT script_id, script, parameters FROM installed_scripts WHERE script_id = ?1",
+            "SELECT installation_id, label, script, parameters FROM installed_scripts
+             WHERE installation_id = ?1",
         )
-        .bind(script_id.to_string())
+        .bind(installation_id.to_string())
         .fetch_optional(&self.pool)
         .await
         .with_context(|| {
-            format!("failed to fetch installed script {script_id} from local database")
+            format!("failed to fetch installation {installation_id} from local database")
         })?;
 
         row.as_ref().map(installed_script_from_row).transpose()
     }
+
+    async fn delete_installed_script(&self, installation_id: Uuid) -> Result<()> {
+        sqlx::query("DELETE FROM installed_scripts WHERE installation_id = ?1")
+            .bind(installation_id.to_string())
+            .execute(&self.pool)
+            .await
+            .with_context(|| {
+                format!("failed to delete installation {installation_id} from local database")
+            })?;
+
+        Ok(())
+    }
 }
 
 fn installed_script_from_row(row: &SqliteRow) -> Result<InstalledScript> {
-    let script_id: String = row.get("script_id");
+    let installation_id: String = row.get("installation_id");
     let script: String = row.get("script");
     let parameters: String = row.get("parameters");
 
     Ok(InstalledScript {
+        installation_id: installation_id.parse().with_context(|| {
+            format!("invalid installation id {installation_id:?} in local database")
+        })?,
+        label: row.get("label"),
         script: serde_json::from_str(&script).with_context(|| {
-            format!("invalid script json in local database for script {script_id}")
+            format!("invalid script json in local database for installation {installation_id}")
         })?,
         parameters: serde_json::from_str(&parameters).with_context(|| {
-            format!("invalid parameters json in local database for script {script_id}")
+            format!("invalid parameters json in local database for installation {installation_id}")
         })?,
     })
 }
@@ -123,7 +148,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_installed_script_returns_only_that_scripts_installation() {
+    async fn find_installed_script_returns_only_that_installation() {
         let storage = setup().await;
         let wanted = FakeInstalledScript::new().build();
         storage.save_installed_script(&wanted).await.unwrap();
@@ -134,7 +159,7 @@ mod tests {
 
         assert_eq!(
             storage
-                .find_installed_script(wanted.script().id())
+                .find_installed_script(wanted.installation_id())
                 .await
                 .unwrap(),
             Some(wanted)
@@ -161,24 +186,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_installed_script_replaces_a_previous_installation_of_the_same_script() {
+    async fn save_installed_script_keeps_every_installation_of_the_same_script() {
         let storage = setup().await;
         let script = FakeScript::new().build();
-        let first = FakeInstalledScript::new()
+        let alice = FakeInstalledScript::new()
             .with_script(script.clone())
+            .with_label("alice")
+            .build();
+        let bob = FakeInstalledScript::new()
+            .with_script(script)
+            .with_label("bob")
+            .build();
+
+        storage.save_installed_script(&alice).await.unwrap();
+        storage.save_installed_script(&bob).await.unwrap();
+
+        assert_eq!(
+            storage.list_installed_scripts().await.unwrap(),
+            vec![alice, bob]
+        );
+    }
+
+    #[tokio::test]
+    async fn save_installed_script_replaces_the_same_installation_in_place() {
+        let storage = setup().await;
+        let first = FakeInstalledScript::new()
             .with_parameters(HashMap::from([("username".to_string(), json!("alice"))]))
             .build();
-        let second = FakeInstalledScript::new()
-            .with_script(script)
+        let other = FakeInstalledScript::new().build();
+        let replacement = FakeInstalledScript::new()
+            .with_installation_id(first.installation_id())
+            .with_script(
+                FakeScript::new()
+                    .with_id(first.script().id())
+                    .with_version(2)
+                    .build(),
+            )
+            .with_label("renamed")
             .with_parameters(HashMap::from([("username".to_string(), json!("bob"))]))
             .build();
 
         storage.save_installed_script(&first).await.unwrap();
-        storage.save_installed_script(&second).await.unwrap();
+        storage.save_installed_script(&other).await.unwrap();
+        storage.save_installed_script(&replacement).await.unwrap();
 
         assert_eq!(
             storage.list_installed_scripts().await.unwrap(),
-            vec![second]
+            vec![replacement, other]
         );
+    }
+
+    #[tokio::test]
+    async fn delete_installed_script_deletes_only_that_installation() {
+        let storage = setup().await;
+        let script = FakeScript::new().build();
+        let deleted = FakeInstalledScript::new()
+            .with_script(script.clone())
+            .build();
+        let kept = FakeInstalledScript::new().with_script(script).build();
+        storage.save_installed_script(&deleted).await.unwrap();
+        storage.save_installed_script(&kept).await.unwrap();
+
+        storage
+            .delete_installed_script(deleted.installation_id())
+            .await
+            .unwrap();
+        storage
+            .delete_installed_script(Uuid::now_v7())
+            .await
+            .unwrap();
+
+        assert_eq!(storage.list_installed_scripts().await.unwrap(), vec![kept]);
     }
 }

@@ -238,11 +238,13 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     look for (a failure is retried), run on the blocking pool.
   - `dev.rs` — `DevDocumentsClient`, plain-file writes for `init_dev_scrapers`.
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
-  (`SaveDocument`, `UpdateMetadata`, `Deleted`, `InstallScript`, `SaveFolder`, `DeleteFolder`). `crypto.rs`: AES-256-GCM, per-event DEK
+  (`SaveDocument`, `UpdateMetadata`, `Deleted`, `InstallScript`, `UninstallScript`, `SaveFolder`, `DeleteFolder`). `crypto.rs`: AES-256-GCM, per-event DEK
   wrapped by a KEK derived from the master key. The consume job replays from the persisted
-  cursor then tails live, materializing documents and installed scripts (an `InstallScript`
-  whose script version differs from the installed one first deletes that scraper's saved
-  `scraper_sessions` row, keyed by script id, so the new version refetches everything). Each event's
+  cursor then tails live, materializing documents and script installations (an `InstallScript`
+  whose script version differs from the installation's previous one first deletes its saved
+  `scraper_sessions` row, keyed by installation id, so the new version refetches everything;
+  an `UninstallScript` deletes the installation and its sessions, cookies and reports through
+  `scrapers::StateStorage`). Each event's
   `previous_id` (the server chains a user's events, empty for their first) must equal the last
   event the pass went through (starting at the cursor), checked before decrypting: otherwise
   the pass fails rather than skip past a gap or apply another account's event. A failed pass is
@@ -307,8 +309,16 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
 - **scripts** — reads scripts from `scripts.v1` (`fetch_script`, `list_user_scripts`,
   `list_public_scripts`) and enables/disables them for the user. Writing scripts and icons is
   admin-only on the server (`admin.v1`) and not in this SDK: `../scripts`' `publish` calls the
-  admin API itself. `install_script` publishes an encrypted `InstallScript` event, and
-  installed scripts are read from the local `installed_scripts` table.
+  admin API itself. A user can install a script several times, once per account on its site:
+  each *installation* (`InstalledScript`) has its own id (a new one unless `install_script` is
+  given one to replace) and a label (trimmed, ≤ `MAX_INSTALLATION_LABEL_CHARS`, no control
+  chars, `InvalidInstallationLabel` 5012; a blank one defaults to the first non-blank
+  non-secret text parameter by name, else the script's name). `install_script` publishes an
+  encrypted `InstallScript` event (subject: the installation id), `uninstall_script` an
+  `UninstallScript`; installations are read from the local `installed_scripts` table (keyed
+  by installation id). Enabling/disabling (and the plan's `max_scripts` quota) stays per
+  script on the server, which never sees installations: callers enable on install and
+  disable once a script's last installation is gone.
 - **icons** — read-through cache over the server's `icons.v1.IconsService`: `fetch_icon(id)`
   serves the local `icons` table, else fetches and caches (icons never change, so never
   revalidated).
@@ -369,7 +379,9 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     / `error("MFA_FAILED", 0)` are `ScraperCredentialsRejected` / `ScraperVerificationFailed`;
     the sandbox's memory, instruction and body-size limits are `ScriptLimitExceeded`; a stopped
     run is `ScraperRunStopped`; anything else is `ScriptFailed`.
-  - `run_installed` runs an installed script (`wreq_emulation`/`follow_redirects` default on).
+  - `run_installed` runs an installation under its installation id as the run's `name`, so each
+    account has its own session, cookies and reports, and runs in parallel with the others
+    (`wreq_emulation`/`follow_redirects` default on).
   - `crate::init_dev_scrapers` builds a scrapers service without a `Client` (file storage +
     `DevDocumentsClient`); `../scripts` is its caller.
 

@@ -185,7 +185,7 @@ macro_rules! for_each_error_code {
             ScriptFailed = 5004,
             /// The embedded browser a scraper script drives failed.
             BrowserFailed = 5005,
-            /// No installation of this script has synced to this device.
+            /// This installation of a script hasn't synced to this device.
             ScriptNotInstalled = 5006,
             /// The site a scraper logs into refused its username or
             /// password (the script failed with `INVALID_CREDENTIALS`).
@@ -204,6 +204,9 @@ macro_rules! for_each_error_code {
             /// stop`) before it finished. Not a failure of the source:
             /// what it saved stays, and the next run starts as usual.
             ScraperRunStopped = 5011,
+            /// An installation's label is too long or has control
+            /// characters.
+            InvalidInstallationLabel = 5012,
         }
     };
 }
@@ -300,8 +303,10 @@ pub(crate) enum ErrorKind {
     UnsupportedDocumentExtension(String),
     #[error("a document with the same content is already saved locally as {0}")]
     DuplicateDocument(uuid::Uuid),
-    #[error("script {0} is not installed on this device")]
+    #[error("installation {0} is not on this device")]
     ScriptNotInstalled(uuid::Uuid),
+    #[error("invalid installation label: {0}")]
+    InvalidInstallationLabel(String),
     #[error("missing value for required parameter {parameter:?} of script {script_id}")]
     MissingScriptParameter {
         script_id: uuid::Uuid,
@@ -421,6 +426,7 @@ impl ErrorKind {
             ErrorKind::UnsupportedDocumentExtension(_) => ErrorCode::UnsupportedDocumentExtension,
             ErrorKind::DuplicateDocument(_) => ErrorCode::DuplicateDocument,
             ErrorKind::ScriptNotInstalled(_) => ErrorCode::ScriptNotInstalled,
+            ErrorKind::InvalidInstallationLabel(_) => ErrorCode::InvalidInstallationLabel,
             ErrorKind::MissingScriptParameter { .. } => ErrorCode::MissingScriptParameter,
             ErrorKind::InvalidChangelogEvent(_) => ErrorCode::InvalidChangelogEvent,
             ErrorKind::InvalidDocumentType(_) => ErrorCode::InvalidDocumentType,

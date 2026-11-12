@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::domains::changelog::{EventType, Service as ChangelogService};
@@ -9,7 +11,10 @@ use crate::{ErrorContext as _, ErrorKind, Result};
 
 use super::grpc_client::{FydeClient, ScriptMetadataPage};
 use super::storage::Storage;
-use super::{InstallScriptRequest, InstalledScript, Script, ScriptMetadata, Service};
+use super::{
+    InstallScriptRequest, InstalledScript, MAX_INSTALLATION_LABEL_CHARS, Script, ScriptMetadata,
+    ScriptParameterType, Service,
+};
 
 /// Collects every page of one of the server's paginated listings, from the
 /// first one on: `list_page` lists the page a token points at (`None` for
@@ -77,9 +82,11 @@ impl<S: Storage> Service for ScriptsClient<S> {
         all_pages(|page_token| self.grpc.list_public_scripts(page_token)).await
     }
 
-    async fn install_script(&self, request: InstallScriptRequest) -> Result<()> {
+    async fn install_script(&self, request: InstallScriptRequest) -> Result<Uuid> {
         let InstallScriptRequest {
+            installation_id,
             script_id,
+            label,
             parameters,
         } = request;
         let script = self
@@ -100,13 +107,42 @@ impl<S: Storage> Service for ScriptsClient<S> {
             .into());
         }
 
-        let content = serde_json::to_vec(&InstalledScript { script, parameters })
-            .with_context(|| format!("failed to serialize installed script {script_id}"))?;
+        let label = match label.trim() {
+            "" => default_label(&script, &parameters),
+            label => {
+                check_label(label)?;
+                label.to_string()
+            }
+        };
+        let installation_id = installation_id.unwrap_or_else(Uuid::now_v7);
+
+        let content = serde_json::to_vec(&InstalledScript {
+            installation_id,
+            label,
+            script,
+            parameters,
+        })
+        .with_context(|| format!("failed to serialize installation {installation_id}"))?;
 
         self.changelog
-            .send(EventType::InstallScript, script_id, Some(&content), None)
+            .send(
+                EventType::InstallScript,
+                installation_id,
+                Some(&content),
+                None,
+            )
             .await
-            .with_context(|| format!("failed to publish installation of script {script_id}"))
+            .with_context(|| {
+                format!("failed to publish installation {installation_id} of script {script_id}")
+            })?;
+        Ok(installation_id)
+    }
+
+    async fn uninstall_script(&self, installation_id: Uuid) -> Result<()> {
+        self.changelog
+            .send(EventType::UninstallScript, installation_id, None, None)
+            .await
+            .with_context(|| format!("failed to publish uninstallation {installation_id}"))
     }
 
     async fn list_installed_scripts(&self) -> Result<Vec<InstalledScript>> {
@@ -116,17 +152,67 @@ impl<S: Storage> Service for ScriptsClient<S> {
             .context("failed to list installed scripts")
     }
 
-    async fn fetch_installed_script(&self, script_id: Uuid) -> Result<InstalledScript> {
-        let installed = self
-            .storage
-            .list_installed_scripts()
+    async fn fetch_installed_script(&self, installation_id: Uuid) -> Result<InstalledScript> {
+        self.storage
+            .find_installed_script(installation_id)
             .await
-            .with_context(|| format!("failed to look up installation of script {script_id}"))?;
-        installed
-            .into_iter()
-            .find(|installed| installed.script().id() == script_id)
-            .ok_or_else(|| ErrorKind::ScriptNotInstalled(script_id).into())
+            .with_context(|| format!("failed to look up installation {installation_id}"))?
+            .ok_or_else(|| ErrorKind::ScriptNotInstalled(installation_id).into())
     }
+}
+
+/// Refuses a (trimmed, non-blank) installation label over
+/// [`MAX_INSTALLATION_LABEL_CHARS`] or holding a control character.
+fn check_label(label: &str) -> Result<()> {
+    let chars = label.chars().count();
+    if chars > MAX_INSTALLATION_LABEL_CHARS {
+        return Err(ErrorKind::InvalidInstallationLabel(format!(
+            "{chars} characters, over {MAX_INSTALLATION_LABEL_CHARS}"
+        ))
+        .into());
+    }
+    if label.chars().any(char::is_control) {
+        return Err(ErrorKind::InvalidInstallationLabel(
+            "contains a control character".to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The label an installation installed with a blank one gets: the first
+/// non-blank value, by parameter name, of `script`'s non-secret text
+/// parameters (on most scrapers the username, telling the user's accounts
+/// on the site apart), else the script's name. Whitespace is collapsed and
+/// control characters dropped, then it's cut to
+/// [`MAX_INSTALLATION_LABEL_CHARS`], so it always passes [`check_label`].
+fn default_label(script: &Script, parameters: &HashMap<String, Value>) -> String {
+    let mut names: Vec<&String> = script
+        .parameters
+        .iter()
+        .filter(|(_, parameter)| {
+            !parameter.secret && parameter.parameter_type == ScriptParameterType::String
+        })
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    let value = names
+        .into_iter()
+        .filter_map(|name| parameters.get(name)?.as_str())
+        .map(clean_label)
+        .find(|value| !value.is_empty());
+    let label = value.unwrap_or_else(|| clean_label(&script.name));
+    let label: String = label.chars().take(MAX_INSTALLATION_LABEL_CHARS).collect();
+    label.trim_end().to_string()
+}
+
+/// `text` with its control characters dropped and its whitespace runs
+/// collapsed to single spaces, trimmed.
+fn clean_label(text: &str) -> String {
+    text.split(|c: char| c.is_whitespace() || c.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -219,8 +305,20 @@ mod tests {
         mock_grpc
     }
 
+    /// The installation `changelog` recorded as the one event it was sent,
+    /// an `InstallScript` for `installation_id` without metadata.
+    fn sent_installation(changelog: &RecordingChangelog, installation_id: Uuid) -> InstalledScript {
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        let (event_type, id, content, metadata) = &sent[0];
+        assert_eq!(*event_type, EventType::InstallScript);
+        assert_eq!(*id, installation_id);
+        assert_eq!(*metadata, None);
+        serde_json::from_slice(content.as_deref().unwrap()).unwrap()
+    }
+
     #[tokio::test]
-    async fn install_script_publishes_the_script_and_its_parameters_as_json() {
+    async fn install_script_publishes_the_installation_as_json() {
         let script = FakeScript::new()
             .with_parameter("username", required_parameter())
             .build();
@@ -232,24 +330,244 @@ mod tests {
             changelog.clone(),
         );
 
-        client
+        let installation_id = client
             .install_script(InstallScriptRequest {
+                installation_id: None,
                 script_id: script.id(),
+                label: "  Compte joint ".to_string(),
                 parameters: parameters.clone(),
             })
             .await
             .unwrap();
 
-        let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        let (event_type, id, content, metadata) = &sent[0];
-        assert_eq!(*event_type, EventType::InstallScript);
-        assert_eq!(*id, script.id());
-        assert_eq!(*metadata, None);
-        let installed: InstalledScript =
-            serde_json::from_slice(content.as_deref().unwrap()).unwrap();
+        let installed = sent_installation(&changelog, installation_id);
+        assert_eq!(installed.installation_id(), installation_id);
+        assert_eq!(installed.label(), "Compte joint");
         assert_eq!(installed.script(), &script);
         assert_eq!(installed.parameters(), &parameters);
+    }
+
+    #[tokio::test]
+    async fn install_script_gives_each_new_installation_its_own_id() {
+        let script = FakeScript::new().build();
+        let mut mock_grpc = MockFydeClient::new();
+        let served = script.clone();
+        mock_grpc
+            .expect_fetch_script()
+            .times(2)
+            .returning(move |_| Ok(served.clone()));
+        let client = ScriptsClient::new(mock_grpc, MockStorage::new(), unused_changelog());
+        let request = InstallScriptRequest {
+            installation_id: None,
+            script_id: script.id(),
+            label: String::new(),
+            parameters: HashMap::new(),
+        };
+
+        let first = client.install_script(request.clone()).await.unwrap();
+        let second = client.install_script(request).await.unwrap();
+
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn install_script_replaces_the_given_installation() {
+        let script = FakeScript::new().build();
+        let existing = Uuid::now_v7();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = ScriptsClient::new(
+            grpc_fetching(script.clone()),
+            MockStorage::new(),
+            changelog.clone(),
+        );
+
+        let installation_id = client
+            .install_script(InstallScriptRequest {
+                installation_id: Some(existing),
+                script_id: script.id(),
+                label: "Marie".to_string(),
+                parameters: HashMap::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(installation_id, existing);
+        assert_eq!(
+            sent_installation(&changelog, existing).installation_id(),
+            existing
+        );
+    }
+
+    /// Installs a script with `parameters` declared as `declared`, under a
+    /// blank label, and returns the label it got.
+    async fn default_label_of(
+        declared: Vec<(&str, ScriptParameter)>,
+        parameters: HashMap<String, Value>,
+    ) -> String {
+        let mut script = FakeScript::new().with_name("Ameli");
+        for (name, parameter) in declared {
+            script = script.with_parameter(name, parameter);
+        }
+        let script = script.build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = ScriptsClient::new(
+            grpc_fetching(script.clone()),
+            MockStorage::new(),
+            changelog.clone(),
+        );
+
+        let installation_id = client
+            .install_script(InstallScriptRequest {
+                installation_id: None,
+                script_id: script.id(),
+                label: " \t".to_string(),
+                parameters,
+            })
+            .await
+            .unwrap();
+
+        sent_installation(&changelog, installation_id)
+            .label()
+            .to_string()
+    }
+
+    fn secret_parameter() -> ScriptParameter {
+        ScriptParameter {
+            secret: true,
+            ..required_parameter()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blank_label_defaults_to_the_first_non_secret_text_parameter() {
+        let label = default_label_of(
+            vec![
+                ("password", secret_parameter()),
+                ("username", required_parameter()),
+                ("zone", required_parameter()),
+            ],
+            HashMap::from([
+                ("password".to_string(), json!("hunter2")),
+                ("username".to_string(), json!("  marie\n dupont ")),
+                ("zone".to_string(), json!("nord")),
+            ]),
+        )
+        .await;
+
+        assert_eq!(label, "marie dupont");
+    }
+
+    #[tokio::test]
+    async fn a_blank_label_skips_blank_and_non_text_values() {
+        let label = default_label_of(
+            vec![
+                ("a_blank", required_parameter()),
+                (
+                    "b_number",
+                    ScriptParameter {
+                        parameter_type: ScriptParameterType::Number,
+                        ..required_parameter()
+                    },
+                ),
+                ("c_username", required_parameter()),
+            ],
+            HashMap::from([
+                ("a_blank".to_string(), json!("   ")),
+                ("b_number".to_string(), json!(42)),
+                ("c_username".to_string(), json!("marie")),
+            ]),
+        )
+        .await;
+
+        assert_eq!(label, "marie");
+    }
+
+    #[tokio::test]
+    async fn a_blank_label_falls_back_to_the_script_name() {
+        let label = default_label_of(
+            vec![("password", secret_parameter())],
+            HashMap::from([("password".to_string(), json!("hunter2"))]),
+        )
+        .await;
+
+        assert_eq!(label, "Ameli");
+    }
+
+    #[tokio::test]
+    async fn a_default_label_is_cut_to_the_maximum_length() {
+        let label = default_label_of(
+            vec![("username", required_parameter())],
+            HashMap::from([("username".to_string(), json!("é".repeat(100)))]),
+        )
+        .await;
+
+        assert_eq!(label, "é".repeat(MAX_INSTALLATION_LABEL_CHARS));
+    }
+
+    #[tokio::test]
+    async fn install_script_rejects_an_invalid_label_without_publishing() {
+        for label in [
+            "x".repeat(MAX_INSTALLATION_LABEL_CHARS + 1),
+            "Marie\u{7}".to_string(),
+        ] {
+            let script = FakeScript::new().build();
+            let changelog = Arc::new(RecordingChangelog::default());
+            let client = ScriptsClient::new(
+                grpc_fetching(script.clone()),
+                MockStorage::new(),
+                changelog.clone(),
+            );
+
+            let err = client
+                .install_script(InstallScriptRequest {
+                    installation_id: None,
+                    script_id: script.id(),
+                    label,
+                    parameters: HashMap::new(),
+                })
+                .await
+                .unwrap_err();
+
+            assert_eq!(err.code(), crate::ErrorCode::InvalidInstallationLabel);
+            assert!(changelog.sent.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_label_of_exactly_the_maximum_length_is_accepted() {
+        let script = FakeScript::new().build();
+        let client = ScriptsClient::new(
+            grpc_fetching(script.clone()),
+            MockStorage::new(),
+            unused_changelog(),
+        );
+
+        client
+            .install_script(InstallScriptRequest {
+                installation_id: None,
+                script_id: script.id(),
+                label: "é".repeat(MAX_INSTALLATION_LABEL_CHARS),
+                parameters: HashMap::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn uninstall_script_publishes_an_uninstall_event_for_the_installation() {
+        let installation_id = Uuid::now_v7();
+        let changelog = Arc::new(RecordingChangelog::default());
+        // No storage or gRPC expectations: uninstalling only publishes.
+        let client =
+            ScriptsClient::new(MockFydeClient::new(), MockStorage::new(), changelog.clone());
+
+        client.uninstall_script(installation_id).await.unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(
+            *sent,
+            vec![(EventType::UninstallScript, installation_id, None, None)]
+        );
     }
 
     #[tokio::test]
@@ -266,7 +584,9 @@ mod tests {
 
         let err = client
             .install_script(InstallScriptRequest {
+                installation_id: None,
                 script_id: script.id(),
+                label: String::new(),
                 parameters: HashMap::new(),
             })
             .await
@@ -299,7 +619,9 @@ mod tests {
 
         client
             .install_script(InstallScriptRequest {
+                installation_id: None,
                 script_id: script.id(),
+                label: String::new(),
                 parameters: HashMap::new(),
             })
             .await
@@ -321,7 +643,9 @@ mod tests {
 
         let err = client
             .install_script(InstallScriptRequest {
+                installation_id: None,
                 script_id: id,
+                label: String::new(),
                 parameters: HashMap::new(),
             })
             .await
@@ -350,15 +674,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_installed_script_returns_the_matching_installation() {
+    async fn fetch_installed_script_returns_the_installation() {
         let wanted = FakeInstalledScript::new().build();
-        let id = wanted.script().id();
-        let installed = vec![FakeInstalledScript::new().build(), wanted.clone()];
+        let id = wanted.installation_id();
+        let returned = wanted.clone();
         let mut storage = MockStorage::new();
         storage
-            .expect_list_installed_scripts()
+            .expect_find_installed_script()
+            .withf(move |requested| *requested == id)
             .times(1)
-            .returning(move || Ok(installed.clone()));
+            .returning(move |_| Ok(Some(returned.clone())));
 
         let client = ScriptsClient::new(MockFydeClient::new(), storage, unused_changelog());
 
@@ -369,9 +694,9 @@ mod tests {
     async fn fetch_installed_script_fails_when_it_hasnt_synced_here() {
         let mut storage = MockStorage::new();
         storage
-            .expect_list_installed_scripts()
+            .expect_find_installed_script()
             .times(1)
-            .returning(|| Ok(vec![FakeInstalledScript::new().build()]));
+            .returning(|_| Ok(None));
 
         let client = ScriptsClient::new(MockFydeClient::new(), storage, unused_changelog());
 
