@@ -154,8 +154,10 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   `get` is the only call that loads a document's content, for when it's actually shown.
   `search_facets` counts each field with its own filter lifted so UIs only offer reachable
   choices. A document's place is `Metadata::folder_id` (`None` = the root, À classer; a
-  folder deleted meanwhile counts as the root too): `upload` takes only the source and an
-  optional name (the classifier guesses the type, the document lands at the root),
+  folder deleted meanwhile counts as the root too): `upload` takes the source, an
+  optional name and an optional `folder_id` (the classifier guesses the type, and the folder
+  unless one is given: then it's typed only, classifying against no folders, and a folder not
+  synced here is `FolderNotFound` before embedding),
   `move_document`/`update_metadata` refuse a folder not synced here (`FolderNotFound`).
   `SearchFilters::folder` is `FolderFilter::Unfiled` or `Within(id)` (subfolders included,
   a recursive CTE over `folders`); `SearchFacets::folders` counts each folder with everything
@@ -323,7 +325,12 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   `UninstallScript`; installations are read from the local `installed_scripts` table (keyed
   by installation id). Enabling/disabling (and the plan's `max_scripts` quota) stays per
   script on the server, which never sees installations: callers enable on install and
-  disable once a script's last installation is gone.
+  disable once a script's last installation is gone. An installation also carries an
+  optional `folder_id` (`None` = classify each document): `install_script` refuses one not
+  synced here (`FolderNotFound`), and `run_installed` hands it to `fyde.save_document`, so
+  every document the run saves is filed there (a script can't override it). Once that
+  folder is deleted, the run fails on its first document with `FolderNotFound`: the app
+  re-installs to pick another.
 - **icons** — read-through cache over the server's `icons.v1.IconsService`: `fetch_icon(id)`
   serves the local `icons` table, else fetches and caches (icons never change, so never
   revalidated).

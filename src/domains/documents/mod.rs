@@ -75,7 +75,10 @@ pub trait Service: Send + Sync {
     /// from its text, on device: the folder is the one whose description it
     /// reads like (see the `folders` domain). Each is `None` when the
     /// classifier isn't sure (the document then lands at the root, À
-    /// classer), and both when the embedding model isn't available.
+    /// classer), and both when the embedding model isn't available. A
+    /// `request.folder_id` files it there instead, never guessing one (its
+    /// type still is): [`crate::ErrorCode::FolderNotFound`] for a folder not
+    /// synced here.
     ///
     /// The file type is determined from the source's name's extension;
     /// only `.pdf` is currently accepted, anything else is rejected with

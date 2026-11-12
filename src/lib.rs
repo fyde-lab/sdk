@@ -199,6 +199,7 @@ impl Client {
             sessions.clone(),
             sqlite.pool().clone(),
             changelog.clone(),
+            folders.clone(),
         );
         let usage = domains::usage::init(channel.clone(), sessions.clone());
         let attributes = domains::documents::attributes::init(channel.clone(), sessions.clone());

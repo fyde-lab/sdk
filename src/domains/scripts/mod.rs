@@ -29,6 +29,7 @@ pub use models::{
 
 use crate::Result;
 use crate::domains::changelog::Service as ChangelogService;
+use crate::domains::folders::Service as FoldersService;
 use crate::domains::sessions::SessionsClient;
 
 /// Reads scripts from the fyde server's scripts service (see
@@ -70,14 +71,18 @@ pub trait Service: Send + Sync {
     async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>>;
 
     /// Installs the script `request.script_id` for the authenticated user,
-    /// to be run with `request.parameters`: as a new installation if
-    /// `request.installation_id` is `None` (a user can install the same
-    /// script several times, once per account on its site), else replacing
-    /// that installation. Fetches the script (see [`Self::fetch_script`]),
-    /// then serializes it together with the installation's id, label and
-    /// parameters as an [`InstalledScript`] JSON document and publishes it,
-    /// encrypted, as an `InstallScript` changelog event whose subject is the
-    /// installation id, which it returns. Fails with
+    /// to be run with `request.parameters`, filing the documents it
+    /// downloads in `request.folder_id` (`None`: wherever each one's text
+    /// says it belongs): as a new installation if `request.installation_id`
+    /// is `None` (a user can install the same script several times, once per
+    /// account on its site), else replacing that installation, which is how
+    /// its parameters, label or folder change. Fetches the script (see
+    /// [`Self::fetch_script`]), then serializes it together with the
+    /// installation's id, label, parameters and folder as an
+    /// [`InstalledScript`] JSON document and publishes it, encrypted, as an
+    /// `InstallScript` changelog event whose subject is the installation id,
+    /// which it returns. Fails with [`crate::ErrorCode::FolderNotFound`] for
+    /// a folder not synced here, with
     /// [`crate::ErrorCode::MissingScriptParameter`] if a parameter the script
     /// marks `required` has no value, and with
     /// [`crate::ErrorCode::InvalidInstallationLabel`] if the trimmed label
@@ -115,7 +120,8 @@ pub trait Service: Send + Sync {
 
 /// Initializes the scripts service: talks to the fyde server's scripts
 /// service over the shared `channel` connection, authenticating every call
-/// via `sessions`, publishes script installations through `changelog`, and
+/// via `sessions`, publishes script installations through `changelog`
+/// (checking the folder they file documents in against `folders`), and
 /// reads installed scripts back from the local SQLite database (`pool`)
 /// the changelog materializes them into.
 pub(crate) fn init(
@@ -123,10 +129,12 @@ pub(crate) fn init(
     sessions: Arc<SessionsClient>,
     pool: SqlitePool,
     changelog: Arc<dyn ChangelogService>,
+    folders: Arc<dyn FoldersService>,
 ) -> Arc<dyn Service> {
     Arc::new(service::ScriptsClient::new(
         grpc_client::GrpcClient::new(channel, sessions),
         SqliteStorage::new(pool),
         changelog,
+        folders,
     ))
 }

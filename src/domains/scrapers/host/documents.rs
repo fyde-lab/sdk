@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use mlua::{Function, Lua, Table, Value};
 use tokio::runtime::Handle;
+use uuid::Uuid;
 
 use crate::ErrorCode;
 
@@ -18,14 +19,16 @@ use crate::domains::documents::{Service as DocumentsService, UploadRequest};
 /// not the uploaded document's real identity (that's the id `upload`
 /// returns) but it is its original name. The optional `fields` table lets a
 /// script propose the name to show instead (`name`). Everything else (its
-/// type, its folder) is derived from the document: any other key is
-/// ignored. A document whose content is already saved locally is silently
+/// type, and its folder unless `folder_id` is set: the one the user picked
+/// when installing the script) is derived from the document: any other key
+/// is ignored. A document whose content is already saved locally is silently
 /// skipped, not an error, so re-running a scraper doesn't fail on what it
 /// already fetched.
 pub(super) fn save_document_fn(
     lua: &Lua,
     documents: Arc<dyn DocumentsService>,
     scraper_name: &str,
+    folder_id: Option<Uuid>,
     runtime: Handle,
     stop: StopSignal,
 ) -> mlua::Result<Function> {
@@ -45,6 +48,7 @@ pub(super) fn save_document_fn(
 
             let leaf = name.rsplit(['/', '\\']).next().unwrap_or(&name);
             let mut request = UploadRequest::from_raw(sanitize_path_segment(leaf), bytes.to_vec());
+            request.folder_id = folder_id;
             if let Some(fields) = fields {
                 apply_upload_fields(&mut request, &fields)?;
             }
@@ -154,6 +158,7 @@ mod tests {
             &lua,
             Arc::new(documents),
             "didaxis",
+            None,
             runtime.handle().clone(),
             StopSignal::new(),
         )
@@ -161,6 +166,35 @@ mod tests {
         lua.globals().set("save_document", f).unwrap();
 
         lua.load(r#"save_document("payslip/january.pdf", "the pdf content")"#)
+            .exec()
+            .unwrap();
+    }
+
+    #[test]
+    fn save_document_files_the_document_in_the_installation_folder() {
+        let folder_id = Uuid::now_v7();
+        let mut documents = MockDocumentsService::new();
+        documents
+            .expect_upload()
+            .withf(move |request| request.folder_id == Some(folder_id))
+            .times(1)
+            .returning(|_| Ok(Uuid::now_v7()));
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let lua = Lua::new();
+        let f = save_document_fn(
+            &lua,
+            Arc::new(documents),
+            "didaxis",
+            Some(folder_id),
+            runtime.handle().clone(),
+            StopSignal::new(),
+        )
+        .unwrap();
+        lua.globals().set("save_document", f).unwrap();
+
+        // A script has no say in it.
+        lua.load(r#"save_document("january.pdf", "the pdf content", { folder_id = "x" })"#)
             .exec()
             .unwrap();
     }
@@ -187,6 +221,7 @@ mod tests {
             &lua,
             Arc::new(documents),
             "didaxis",
+            None,
             runtime.handle().clone(),
             StopSignal::new(),
         )
@@ -220,6 +255,7 @@ mod tests {
             &lua,
             Arc::new(documents),
             "didaxis",
+            None,
             runtime.handle().clone(),
             StopSignal::new(),
         )
@@ -244,6 +280,7 @@ mod tests {
             &lua,
             Arc::new(documents),
             "didaxis",
+            None,
             runtime.handle().clone(),
             StopSignal::new(),
         )
@@ -267,6 +304,7 @@ mod tests {
             &lua,
             Arc::new(documents),
             "didaxis",
+            None,
             runtime.handle().clone(),
             StopSignal::new(),
         )
@@ -291,6 +329,7 @@ mod tests {
             &lua,
             Arc::new(documents),
             "didaxis",
+            None,
             runtime.handle().clone(),
             stop,
         )
@@ -316,6 +355,7 @@ mod tests {
             &lua,
             Arc::new(documents),
             "didaxis",
+            None,
             runtime.handle().clone(),
             stop,
         )

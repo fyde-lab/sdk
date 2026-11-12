@@ -404,7 +404,13 @@ impl Service for Classifier {
                 ErrorKind::InvalidModel("the embedding model returned no vector".to_string())
             })?;
         let types = self.type_descriptions().await?;
-        let folders = self.folder_vectors(folders).await?;
+        // Typing only (an upload whose folder is already chosen): the
+        // folder texts cached for the next filing stay as they are.
+        let folders = if folders.is_empty() {
+            Vec::new()
+        } else {
+            self.folder_vectors(folders).await?
+        };
 
         Ok(classify(&document, &types, &folders))
     }
@@ -882,6 +888,22 @@ mod tests {
             let classification = classifier.classify("Facture EDF", &folders).await.unwrap();
             assert_eq!(classification.folder_id, Some(folders[1].id));
         }
+    }
+
+    #[tokio::test]
+    async fn classifier_typing_only_keeps_the_folder_texts_cached() {
+        let (folders, all) = folders_and_texts();
+        let document = along(all.len(), &[(all.len() - 1, 0.9)]);
+        // Every description once, across all three classifications.
+        let embedder = embedder_along_axes(all.clone(), document, 3, all.len());
+        let classifier = classifier(embedder, &Arc::default());
+
+        classifier.classify("Facture EDF", &folders).await.unwrap();
+        let typed_only = classifier.classify("Facture EDF", &[]).await.unwrap();
+        let classification = classifier.classify("Facture EDF", &folders).await.unwrap();
+
+        assert_eq!(typed_only.folder_id, None);
+        assert_eq!(classification.folder_id, Some(folders[1].id));
     }
 
     #[tokio::test]
