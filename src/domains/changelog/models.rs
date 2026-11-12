@@ -15,12 +15,15 @@ pub enum EventType {
     /// A document was deleted (see `documents::Service::delete`). Carries
     /// only the document's id as `subject_id`.
     Deleted,
-    /// A script was installed for the account (see
-    /// `scripts::Service::install_script`). The event's `subject_id` is the
-    /// installed script's id, and its `content` the JSON-serialized
-    /// `scripts::InstalledScript` (no `metadata`).
-    #[serde(alias = "ScriptInstalled")]
+    /// A script was installed for the account, or one of its installations
+    /// replaced (see `scripts::Service::install_script`). The event's
+    /// `subject_id` is the installation's id, and its `content` the
+    /// JSON-serialized `scripts::InstalledScript` (no `metadata`).
     InstallScript,
+    /// An installation was removed (see
+    /// `scripts::Service::uninstall_script`). Carries only the
+    /// installation's id as `subject_id`.
+    UninstallScript,
     /// A folder was created or changed (see `folders::Service`). The
     /// event's `subject_id` is the folder's id, and its `content` the
     /// JSON-serialized `folders::Folder`.
@@ -34,7 +37,7 @@ pub enum EventType {
 /// A single recorded write, decrypted from the server's changelog.
 /// `subject_id` is the id of whatever the write is about, which depends on
 /// [`EventType`]: a document for `SaveDocument`/`UpdateMetadata`/`Deleted`, a
-/// script for `InstallScript`, a folder for `SaveFolder`/`DeleteFolder`. Inlines a document's fields rather than
+/// script installation for `InstallScript`/`UninstallScript`, a folder for `SaveFolder`/`DeleteFolder`. Inlines a document's fields rather than
 /// wrapping a [`crate::domains::documents::Document`], since not every
 /// event type carries all of them: `content` is `None` for a metadata-only
 /// update, and both `content` and `metadata` are `None` for a deletion
@@ -162,15 +165,10 @@ mod tests {
     #[test]
     fn event_type_deserializes_its_former_variant_names() {
         let created = rmp_serde::to_vec("Created").unwrap();
-        let script_installed = rmp_serde::to_vec("ScriptInstalled").unwrap();
 
         assert_eq!(
             rmp_serde::from_slice::<EventType>(&created).unwrap(),
             EventType::SaveDocument
-        );
-        assert_eq!(
-            rmp_serde::from_slice::<EventType>(&script_installed).unwrap(),
-            EventType::InstallScript
         );
     }
 

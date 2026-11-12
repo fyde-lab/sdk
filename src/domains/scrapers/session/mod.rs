@@ -3,8 +3,6 @@ mod storage;
 mod storage_file;
 mod storage_sqlite;
 
-#[cfg(test)]
-pub(crate) use storage::MockStorage;
 pub(crate) use storage::Storage;
 pub(crate) use storage_sqlite::SqliteStorage;
 

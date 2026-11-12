@@ -270,8 +270,12 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "Le navigateur intégré de l'extension a rencontré un problème.",
         ),
         ErrorCode::ScriptNotInstalled => (
-            "This add-on isn't installed on this device yet.",
-            "Cette extension n'est pas encore installée sur cet appareil.",
+            "This account isn't set up on this device yet.",
+            "Ce compte n'est pas encore configuré sur cet appareil.",
+        ),
+        ErrorCode::InvalidInstallationLabel => (
+            "An account name must be at most 60 characters long.",
+            "Le nom d'un compte doit faire au plus 60 caractères.",
         ),
         ErrorCode::ScraperCredentialsRejected => (
             "The site refused the username or password.",

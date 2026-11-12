@@ -25,8 +25,8 @@ pub use domains::scrapers::{
     ProgressStep, Service as ScrapersService,
 };
 pub use domains::scripts::{
-    InstallScriptRequest, InstalledScript, Script, ScriptMetadata, ScriptParameter,
-    ScriptParameterType, ScriptType, Service as ScriptsService,
+    InstallScriptRequest, InstalledScript, MAX_INSTALLATION_LABEL_CHARS, Script, ScriptMetadata,
+    ScriptParameter, ScriptParameterType, ScriptType, Service as ScriptsService,
 };
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;
@@ -100,7 +100,7 @@ pub struct ClientConfig {
     /// [`ProgressStep`]s, never free text: word one for the user with
     /// [`ProgressStep::user_message`]. Scrapers can run in parallel, so it
     /// also gets the name the run was started under (`ScrapersService::run`'s
-    /// `name`, or the script id for `run_installed`), which tells concurrent
+    /// `name`, or the installation id for `run_installed`), which tells concurrent
     /// runs' events apart. `None` if the caller doesn't need to observe
     /// scraper progress.
     pub on_scraper_progress: Option<OnScraperProgress>,

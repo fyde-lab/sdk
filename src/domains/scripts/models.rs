@@ -258,35 +258,59 @@ impl From<Script> for ScriptMetadata {
     }
 }
 
-/// What [`super::Service::install_script`] takes: the id of the script to
-/// install, plus the values to run it with, keyed by the same machine names
-/// as [`Script::parameters`] (e.g. `{"username": "alice"}`).
+/// The most characters an installation's label (see
+/// [`InstalledScript::label`]) may hold, once trimmed.
+pub const MAX_INSTALLATION_LABEL_CHARS: usize = 60;
+
+/// What [`super::Service::install_script`] takes: which installation to
+/// write, the script to install, a label telling it apart from the user's
+/// other installations of the same script, and the values to run it with,
+/// keyed by the same machine names as [`Script::parameters`] (e.g.
+/// `{"username": "alice"}`).
 /// Its `Debug` output names the parameters but never shows their values,
-/// which include the user's credentials for the script's site.
+/// which include the user's credentials for the script's site, nor the
+/// label, often the user's username there.
 #[derive(Clone, PartialEq)]
 pub struct InstallScriptRequest {
+    /// `None` installs the script anew, as one more installation beside any
+    /// the user already has (one per account on the script's site);
+    /// `Some(id)` replaces installation `id` (new credentials, a new script
+    /// version), keeping its scraper session unless the version changes.
+    pub installation_id: Option<Uuid>,
     pub script_id: Uuid,
+    /// Shown to tell this installation apart from the user's others of the
+    /// same script (e.g. "Marie"). Trimmed; a blank one defaults to the
+    /// first non-blank non-secret text parameter, by parameter name, or
+    /// else the script's name (see `service::default_label`).
+    pub label: String,
     pub parameters: HashMap<String, Value>,
 }
 
 impl std::fmt::Debug for InstallScriptRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InstallScriptRequest")
+            .field("installation_id", &self.installation_id)
             .field("script_id", &self.script_id)
+            .field("label", &"[redacted]")
             .field("parameters", &RedactedValues(&self.parameters))
             .finish()
     }
 }
 
-/// A script installed for the authenticated user, as persisted locally once
-/// its `InstallScript` changelog event has been consumed (see
-/// [`super::Service::list_installed_scripts`]): the full script, plus the
-/// parameter values it was installed with, so it can be run without asking
-/// for them again. Also the exact JSON payload carried, encrypted, by that
-/// changelog event. Its `Debug` output never shows the parameters' values
-/// (see [`InstallScriptRequest`]).
+/// One installation of a script for the authenticated user, as persisted
+/// locally once its `InstallScript` changelog event has been consumed (see
+/// [`super::Service::list_installed_scripts`]): its own id, its label, the
+/// full script, plus the parameter values it was installed with, so it can
+/// be run without asking for them again. A user can install the same
+/// script several times, once per account on its site: each installation
+/// has its own id, under which its scraper session and cookies are kept.
+/// Also the exact JSON payload carried, encrypted, by that changelog event.
+/// Its `Debug` output never shows the label or the parameters' values (see
+/// [`InstallScriptRequest`]).
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstalledScript {
+    pub(super) installation_id: Uuid,
+    pub(super) label: String,
     pub(super) script: Script,
     pub(super) parameters: HashMap<String, Value>,
 }
@@ -294,6 +318,8 @@ pub struct InstalledScript {
 impl std::fmt::Debug for InstalledScript {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InstalledScript")
+            .field("installation_id", &self.installation_id)
+            .field("label", &"[redacted]")
             .field("script", &self.script)
             .field("parameters", &RedactedValues(&self.parameters))
             .finish()
@@ -315,6 +341,19 @@ impl std::fmt::Debug for RedactedValues<'_> {
 }
 
 impl InstalledScript {
+    /// This installation's id: what [`super::Service::fetch_installed_script`],
+    /// [`super::Service::uninstall_script`] and a reinstall take, and the
+    /// name its runs, scraper session and cookies are kept under.
+    pub fn installation_id(&self) -> Uuid {
+        self.installation_id
+    }
+
+    /// Tells this installation apart from the user's others of the same
+    /// script (e.g. "Marie"). Never blank.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
     pub fn script(&self) -> &Script {
         &self.script
     }
@@ -363,6 +402,11 @@ impl FakeScript {
 
     pub fn with_id(mut self, id: Uuid) -> Self {
         self.script.id = id;
+        self
+    }
+
+    pub fn with_name(mut self, name: &str) -> Self {
+        self.script.name = name.to_string();
         self
     }
 
@@ -418,6 +462,8 @@ impl FakeInstalledScript {
     pub(crate) fn new() -> Self {
         Self {
             installed: InstalledScript {
+                installation_id: Uuid::now_v7(),
+                label: crate::tools::testing::random_word().to_string(),
                 script: FakeScript::new().build(),
                 parameters: HashMap::from([(
                     "username".to_string(),
@@ -425,6 +471,16 @@ impl FakeInstalledScript {
                 )]),
             },
         }
+    }
+
+    pub(crate) fn with_installation_id(mut self, installation_id: Uuid) -> Self {
+        self.installed.installation_id = installation_id;
+        self
+    }
+
+    pub(crate) fn with_label(mut self, label: &str) -> Self {
+        self.installed.label = label.to_string();
+        self
     }
 
     pub(crate) fn with_script(mut self, script: Script) -> Self {
@@ -474,16 +530,19 @@ mod tests {
     }
 
     #[test]
-    fn debug_output_never_shows_parameter_values() {
+    fn debug_output_never_shows_the_label_or_parameter_values() {
         let parameters = HashMap::from([
             ("username".to_string(), Value::from("alice")),
             ("password".to_string(), Value::from("hunter2-secret")),
         ]);
         let installed = FakeInstalledScript::new()
+            .with_label("alice")
             .with_parameters(parameters.clone())
             .build();
         let request = InstallScriptRequest {
+            installation_id: None,
             script_id: Uuid::now_v7(),
+            label: "alice".to_string(),
             parameters,
         };
 

@@ -23,8 +23,8 @@ pub use models::FakeScript;
 #[cfg(test)]
 pub(crate) use models::{FakeInstalledScript, FakeScriptMetadata};
 pub use models::{
-    InstallScriptRequest, InstalledScript, Script, ScriptMetadata, ScriptParameter,
-    ScriptParameterType, ScriptType,
+    InstallScriptRequest, InstalledScript, MAX_INSTALLATION_LABEL_CHARS, Script, ScriptMetadata,
+    ScriptParameter, ScriptParameterType, ScriptType,
 };
 
 use crate::Result;
@@ -70,29 +70,47 @@ pub trait Service: Send + Sync {
     async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>>;
 
     /// Installs the script `request.script_id` for the authenticated user,
-    /// to be run with `request.parameters`: fetches the script (see
-    /// [`Self::fetch_script`]), then serializes it together with those
+    /// to be run with `request.parameters`: as a new installation if
+    /// `request.installation_id` is `None` (a user can install the same
+    /// script several times, once per account on its site), else replacing
+    /// that installation. Fetches the script (see [`Self::fetch_script`]),
+    /// then serializes it together with the installation's id, label and
     /// parameters as an [`InstalledScript`] JSON document and publishes it,
-    /// encrypted, as a `InstallScript` changelog event. Fails with
+    /// encrypted, as an `InstallScript` changelog event whose subject is the
+    /// installation id, which it returns. Fails with
     /// [`crate::ErrorCode::MissingScriptParameter`] if a parameter the script
-    /// marks `required` has no value.
+    /// marks `required` has no value, and with
+    /// [`crate::ErrorCode::InvalidInstallationLabel`] if the trimmed label
+    /// is over [`MAX_INSTALLATION_LABEL_CHARS`] characters or holds a control character. A blank
+    /// label defaults to the first non-blank non-secret text parameter, by
+    /// parameter name (usually the username), else the script's name.
     ///
     /// Returns once the event is published, not once it's saved locally:
     /// like every other changelog event, it's only materialized into local
     /// storage (and so only shows up in [`Self::list_installed_scripts`])
     /// once the background sync job consumes it back — on every device
-    /// logged into the same account, not just this one.
-    async fn install_script(&self, request: InstallScriptRequest) -> Result<()>;
+    /// logged into the same account, not just this one. Doesn't enable the
+    /// script on the server: callers do, with [`Self::enable_script`].
+    async fn install_script(&self, request: InstallScriptRequest) -> Result<Uuid>;
 
-    /// Lists every script installed for the authenticated user that's been
+    /// Uninstalls installation `installation_id`: publishes an
+    /// `UninstallScript` changelog event. Consuming it deletes the
+    /// installation and every scraper state kept under it (session,
+    /// cookies, debug reports) on each device. No local check, so an
+    /// installation that hasn't synced here yet can be uninstalled. Doesn't
+    /// disable the script on the server: callers do, with
+    /// [`Self::disable_script`], once none of its installations remains.
+    async fn uninstall_script(&self, installation_id: Uuid) -> Result<()>;
+
+    /// Lists every installation for the authenticated user that's been
     /// synced to this device so far, oldest installation first. Never talks
     /// to the server: reads straight from local storage.
     async fn list_installed_scripts(&self) -> Result<Vec<InstalledScript>>;
 
-    /// The installation of `script_id` synced to this device — the script
-    /// plus the parameter values to run it with. Fails with
+    /// The installation `installation_id` synced to this device — the
+    /// script plus the parameter values to run it with. Fails with
     /// `ErrorCode::ScriptNotInstalled` if there's none (yet).
-    async fn fetch_installed_script(&self, script_id: Uuid) -> Result<InstalledScript>;
+    async fn fetch_installed_script(&self, installation_id: Uuid) -> Result<InstalledScript>;
 }
 
 /// Initializes the scripts service: talks to the fyde server's scripts
