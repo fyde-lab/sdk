@@ -107,6 +107,10 @@ pub(crate) trait Storage: Send + Sync {
         limit: usize,
     ) -> Result<Vec<(Uuid, f32)>>;
 
+    /// The vectors of the document `id`'s chunks embedded by `model`, in
+    /// chunk order: none if it has none from `model`, or doesn't exist.
+    async fn get_embedding_vectors(&self, id: Uuid, model: &str) -> Result<Vec<Vec<f32>>>;
+
     /// The metadata of every document among `ids` previously saved locally
     /// by [`Self::save_document`], in no particular order, skipping ids with
     /// no document. Never loads their content.

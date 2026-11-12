@@ -301,6 +301,25 @@ impl Storage for SqliteStorage {
         Ok(ranked)
     }
 
+    async fn get_embedding_vectors(&self, id: Uuid, model: &str) -> Result<Vec<Vec<f32>>> {
+        let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT vector FROM document_embeddings
+             WHERE document_id = ?1 AND model = ?2 ORDER BY chunk",
+        )
+        .bind(id.to_string())
+        .bind(model)
+        .fetch_all(&self.pool)
+        .await
+        .with_context(|| format!("failed to read document {id}'s embeddings"))?;
+
+        rows.iter()
+            .map(|column| {
+                vector_from_column(column)
+                    .with_context(|| format!("invalid embedding of document {id}"))
+            })
+            .collect()
+    }
+
     async fn get_metadatas(&self, ids: &[Uuid]) -> Result<Vec<Metadata>> {
         let rows = sqlx::query(
             "SELECT id, name, original_name, content_type, length(content) AS size, checksum, created_at, transcript, type, folder_id, attributes FROM documents
@@ -543,14 +562,20 @@ fn vector_to_column(vector: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-#[cfg(test)]
-fn vector_from_column(column: &[u8]) -> Vec<f32> {
-    column
-        .as_chunks::<4>()
-        .0
+/// A `vector` column (see [`vector_to_column`]) as the vector it holds.
+fn vector_from_column(column: &[u8]) -> Result<Vec<f32>> {
+    let (values, rest) = column.as_chunks::<4>();
+    if !rest.is_empty() {
+        return Err(ErrorKind::InvalidModel(format!(
+            "a {}-byte embedding isn't a vector of f32",
+            column.len()
+        ))
+        .into());
+    }
+    Ok(values
         .iter()
         .map(|bytes| f32::from_le_bytes(*bytes))
-        .collect()
+        .collect())
 }
 
 fn folder_from_column(column: Option<String>) -> Result<Option<Uuid>> {
@@ -779,7 +804,7 @@ pub(super) mod tests {
                 assert_eq!(chunk, i as i64, "chunks are numbered in order from 0");
                 let chunk = FakeChunkEmbedding::new()
                     .with_range(start as usize..end as usize)
-                    .with_vector(vector_from_column(&vector))
+                    .with_vector(vector_from_column(&vector).unwrap())
                     .build();
                 (model, chunk)
             })
@@ -1035,7 +1060,11 @@ pub(super) mod tests {
 
         let vector = FakeChunkEmbedding::new().build().vector;
         assert_eq!(vector_to_column(&vector).len(), 4 * vector.len());
-        assert_eq!(vector_from_column(&vector_to_column(&vector)), vector);
+        assert_eq!(
+            vector_from_column(&vector_to_column(&vector)).unwrap(),
+            vector
+        );
+        assert!(vector_from_column(&[0, 0, 0x80]).is_err());
     }
 
     #[tokio::test]
@@ -2149,6 +2178,44 @@ pub(super) mod tests {
             .unwrap_err();
 
         assert!(err.has_context());
+    }
+
+    #[tokio::test]
+    async fn get_embedding_vectors_returns_a_documents_vectors_from_the_model_in_chunk_order() {
+        let storage = setup().await;
+        let id = save_embedded(
+            &storage,
+            searchable("doc", 1),
+            MODEL,
+            &[&[1.0, 0.0], &[0.0, 1.0], &[0.5, 0.5]],
+        )
+        .await;
+        let other_model = save_embedded(
+            &storage,
+            searchable("other", 2),
+            "other.onnx",
+            &[&[1.0, 0.0]],
+        )
+        .await;
+
+        assert_eq!(
+            storage.get_embedding_vectors(id, MODEL).await.unwrap(),
+            [vec![1.0, 0.0], vec![0.0, 1.0], vec![0.5, 0.5]]
+        );
+        assert!(
+            storage
+                .get_embedding_vectors(other_model, MODEL)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .get_embedding_vectors(Uuid::new_v4(), MODEL)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

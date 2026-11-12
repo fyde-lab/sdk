@@ -489,6 +489,16 @@ impl SearchQuery {
     }
 }
 
+/// A document [`super::Service::similar`] found close in meaning to another.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimilarDocument {
+    pub metadata: Metadata,
+    /// How sure the SDK is that it's close in meaning, from 0.0 (barely
+    /// related) to 1.0 (identical text): rescaled over the range that means
+    /// something for the embedding model, so fit to show as a percentage.
+    pub confidence: f32,
+}
+
 /// Builds a [`Metadata`] filled with random-but-plausible data, overridable
 /// field by field, for use in tests.
 #[cfg(any(test, feature = "testing"))]
