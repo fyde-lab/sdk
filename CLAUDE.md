@@ -78,7 +78,14 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
 - On-device model files (`tools::models`) live in `ClientConfig::models_dir`, never the client
   directory, and only ever land there through `ModelStore::ensure` (size + SHA-256 checked, then
   renamed into place). Pin a new model to a fixed revision, never a branch. `Client::init`
-  never downloads.
+  itself never waits on a download: it only starts every model's (embedding and GLiNER) in
+  the background through `documents::ModelPreloader` (one task per model, files only).
+  `start_loading` loads them in memory the same way (downloading what's missing): called by
+  `users::create` and by the app on opening the sources page (`Client::start_loading_models`).
+  Neither starts again while its previous run is still going (aborting it would restart a
+  download); dropping the `Client` aborts both; a failure is logged at warn, the first use
+  trying again. Unit tests that `init` a
+  `Client` pass a regular file as `models_dir` so that download fails without the network.
 - Never write to the `documents_fts` FTS5 table directly (triggers maintain it). A new virtual
   table must support `'delete-all'` so `SqliteClient::wipe` can clear it.
 
@@ -121,7 +128,8 @@ held by the `Client` until dropped: a second client on the same directory fails 
 `ClientAlreadyRunning` (one instance at a time, so every domain may write local storage freely).
 Public accessors: `documents()`, `folders()`, `attributes()`, `users()`, `settings()`, `server_state()`,
 `scripts()`, `icons()`, `scrapers()`, `usage()`, `user_message(&err)`, `language()`, plus
-`save_new_session(token)`/`is_connected()` over the crate-private `sessions` domain.
+`save_new_session(token)`/`is_connected()` over the crate-private `sessions` domain, and
+`start_loading_models()`.
 `ClientConfig::models_dir` is where on-device models are downloaded (see `tools::models`): `init`
 doesn't touch it, but rejects one inside a disk client directory (`InvalidModelsDirectory`,
 1013; lexical comparison of absolute paths). `ClientConfig` carries the
@@ -228,7 +236,8 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     embedding succeeded (model at hand), against the folders synced here; a failure publishes
     untyped at the root. Never run on consumption.
   - `gliner.rs` — `SpanFinder` (`OnnxGliner`, GLiNER-X small; ported from `doc-ai-poc`'s
-    `gliner.rs`), a pure adapter not wired into any flow yet: `spans(text, labels, threshold,
+    `gliner.rs`), a pure adapter not wired into any flow yet (only the `ModelPreloader`
+  fetches and loads its model): `spans(text, labels, threshold,
     max_words)` returns every span (byte range, label index, sigmoid score) scoring at least
     `threshold`, best first, overlaps and window-boundary duplicates included. Keep the model's
     details as they are: `<<ENT>>` = 250100 / `<<SEP>>` = 250101 (not in `tokenizer.json`),

@@ -20,12 +20,13 @@ use super::attributes::Service as AttributesService;
 use super::chunk;
 use super::classification::Service as ClassificationService;
 use super::embedder::Embedder;
+use super::gliner::SpanFinder;
 use super::storage::{FacetField, Storage, UNFILED};
 use super::transcript;
 use super::{
     CachedEmbeddings, ChunkEmbedding, Document, DocumentEmbeddings, EmbeddingCache, EmbeddingKey,
-    FacetCount, Indexer, Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery, Service,
-    SimilarDocument, UploadRequest, UploadSource,
+    FacetCount, Indexer, Metadata, ModelPreloader, SearchFacets, SearchFilters, SearchOrder,
+    SearchQuery, Service, SimilarDocument, UploadRequest, UploadSource,
 };
 
 /// The only content type [`Service::upload`] currently accepts.
@@ -1185,6 +1186,119 @@ fn parse_content(content: &[u8], original_name: &str, checksum: String) -> Resul
     })
 }
 
+/// Background tasks over the on-device models, aborted when dropped (a
+/// cancelled download leaves no partial file behind).
+struct ModelTasks(Vec<tokio::task::AbortHandle>);
+
+impl ModelTasks {
+    fn running(&self) -> bool {
+        self.0.iter().any(|task| !task.is_finished())
+    }
+}
+
+impl Drop for ModelTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// The default [`ModelPreloader`], over the models an injected [`Embedder`]
+/// and [`SpanFinder`] run. Dropping it stops the tasks it started.
+pub(crate) struct ModelPreloaderClient {
+    /// The runtime it was created on, which runs its tasks: its methods
+    /// may be called from any thread, outside of any runtime (the app's
+    /// bindings call them from the UI thread).
+    runtime: tokio::runtime::Handle,
+    embedder: Arc<dyn Embedder>,
+    span_finder: Arc<dyn SpanFinder>,
+    downloads: Mutex<Option<ModelTasks>>,
+    loads: Mutex<Option<ModelTasks>>,
+}
+
+impl ModelPreloaderClient {
+    /// Must be called from within a Tokio runtime, which then runs its
+    /// tasks.
+    pub(crate) fn new(embedder: Arc<dyn Embedder>, span_finder: Arc<dyn SpanFinder>) -> Self {
+        Self {
+            runtime: tokio::runtime::Handle::current(),
+            embedder,
+            span_finder,
+            downloads: Mutex::new(None),
+            loads: Mutex::new(None),
+        }
+    }
+}
+
+/// Stores the tasks `start` starts in `slot`, unless the ones already there
+/// are still running: starting them again would wait on the same downloads
+/// at best, and restart them at worst (aborting the previous tasks).
+fn start_unless_running(slot: &Mutex<Option<ModelTasks>>, start: impl FnOnce() -> ModelTasks) {
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if slot.as_ref().is_some_and(ModelTasks::running) {
+        return;
+    }
+    *slot = Some(start());
+}
+
+/// Runs `job`, which does `action` to the `model` model, on its own task. A
+/// failure is only logged: the model's first use tries again.
+fn spawn_model_job(
+    runtime: &tokio::runtime::Handle,
+    action: &'static str,
+    model: &'static str,
+    job: impl std::future::Future<Output = Result<()>> + Send + 'static,
+) -> tokio::task::AbortHandle {
+    runtime
+        .spawn(
+            async move {
+                match job.await {
+                    Ok(()) => tracing::debug!("{action}: the {model} model is ready"),
+                    Err(err) => tracing::warn!(
+                        code = ?err.code(),
+                        "failed to {action} the {model} model in the background, \
+                         it will be tried again when needed: {err}"
+                    ),
+                }
+            }
+            .instrument(tracing::debug_span!("model_preload", action, model)),
+        )
+        .abort_handle()
+}
+
+impl ModelPreloader for ModelPreloaderClient {
+    fn start_download(&self) {
+        start_unless_running(&self.downloads, || {
+            let embedder = self.embedder.clone();
+            let span_finder = self.span_finder.clone();
+            ModelTasks(vec![
+                spawn_model_job(&self.runtime, "download", "embedding", async move {
+                    embedder.download().await
+                }),
+                spawn_model_job(&self.runtime, "download", "GLiNER", async move {
+                    span_finder.download().await
+                }),
+            ])
+        });
+    }
+
+    fn start_loading(&self) {
+        start_unless_running(&self.loads, || {
+            let embedder = self.embedder.clone();
+            let span_finder = self.span_finder.clone();
+            ModelTasks(vec![
+                spawn_model_job(&self.runtime, "load", "embedding", async move {
+                    embedder.load().await
+                }),
+                spawn_model_job(&self.runtime, "load", "GLiNER", async move {
+                    span_finder.load().await
+                }),
+            ])
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write as _;
@@ -1197,6 +1311,7 @@ mod tests {
         Classification, FakeClassification, MockService as MockClassificationService,
     };
     use super::super::embedder::MockEmbedder;
+    use super::super::gliner::MockSpanFinder;
     use super::super::models::{FakeCachedEmbeddings, FakeChunkEmbedding, FakeDocumentEmbeddings};
     use super::super::storage::MockStorage;
     use super::super::transcript::tests::build_pdf;
@@ -4191,5 +4306,131 @@ mod tests {
         assert_eq!(title("no extension"), "no extension");
         assert_eq!(title(".pdf"), ".pdf");
         assert_eq!(title(""), "");
+    }
+
+    /// Whether `slot`'s tasks are all done, waiting up to 5 s for them.
+    async fn finished(slot: &Mutex<Option<ModelTasks>>) -> bool {
+        for _ in 0..500 {
+            if !slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(ModelTasks::running)
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_download_downloads_both_models_in_parallel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        // Each download reports whether the other one started while it was
+        // still running: one after the other, neither would see it.
+        let started = Arc::new(AtomicUsize::new(0));
+        let (report, reports) = std::sync::mpsc::channel();
+        let download = move || {
+            let started = started.clone();
+            let report = Mutex::new(report.clone());
+            move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while started.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let saw_both = started.load(Ordering::SeqCst) == 2;
+                report.lock().unwrap().send(saw_both).unwrap();
+            }
+        };
+        let mut embedder = MockEmbedder::new();
+        let embedding = download();
+        embedder.expect_download().times(1).returning(move || {
+            embedding();
+            Ok(())
+        });
+        let mut span_finder = MockSpanFinder::new();
+        let gliner = download();
+        span_finder.expect_download().times(1).returning(move || {
+            gliner();
+            Err(ErrorKind::ModelNotDownloaded("gliner".to_string()).into())
+        });
+        let preloader = ModelPreloaderClient::new(Arc::new(embedder), Arc::new(span_finder));
+
+        preloader.start_download();
+
+        let saw_both = tokio::task::spawn_blocking(move || {
+            let timeout = Duration::from_secs(10);
+            [reports.recv_timeout(timeout), reports.recv_timeout(timeout)]
+        })
+        .await
+        .unwrap();
+        assert_eq!(saw_both, [Ok(true), Ok(true)]);
+    }
+
+    #[tokio::test]
+    async fn start_loading_loads_both_models() {
+        let mut embedder = MockEmbedder::new();
+        embedder.expect_load().times(1).returning(|| Ok(()));
+        let mut span_finder = MockSpanFinder::new();
+        span_finder
+            .expect_load()
+            .times(1)
+            .returning(|| Err(ErrorKind::ModelNotDownloaded("gliner".to_string()).into()));
+        let preloader = ModelPreloaderClient::new(Arc::new(embedder), Arc::new(span_finder));
+
+        preloader.start_loading();
+
+        assert!(finished(&preloader.loads).await);
+    }
+
+    #[tokio::test]
+    async fn start_loading_can_be_called_outside_of_the_runtime() {
+        let mut embedder = MockEmbedder::new();
+        embedder.expect_load().times(1).returning(|| Ok(()));
+        let mut span_finder = MockSpanFinder::new();
+        span_finder.expect_load().times(1).returning(|| Ok(()));
+        let preloader = Arc::new(ModelPreloaderClient::new(
+            Arc::new(embedder),
+            Arc::new(span_finder),
+        ));
+
+        // A plain thread, like the app's UI thread calling the bindings.
+        let calling = preloader.clone();
+        std::thread::spawn(move || calling.start_loading())
+            .join()
+            .unwrap();
+
+        assert!(finished(&preloader.loads).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_loading_does_nothing_while_a_load_is_under_way() {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let mut embedder = MockEmbedder::new();
+        // Once while held back by `released`, once more after it's done.
+        embedder.expect_load().times(2).returning(move || {
+            let _ = released
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5));
+            Ok(())
+        });
+        let mut span_finder = MockSpanFinder::new();
+        span_finder.expect_load().times(2).returning(|| Ok(()));
+        let preloader = ModelPreloaderClient::new(Arc::new(embedder), Arc::new(span_finder));
+
+        preloader.start_loading();
+        preloader.start_loading();
+        release.send(()).unwrap();
+        assert!(finished(&preloader.loads).await);
+        release.send(()).unwrap();
+        preloader.start_loading();
+
+        assert!(finished(&preloader.loads).await);
     }
 }
