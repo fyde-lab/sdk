@@ -7,8 +7,8 @@ use uuid::Uuid;
 use crate::{ErrorCode, ErrorContext as _, Result};
 
 use super::{
-    Document, Metadata, SearchFacets, SearchFilters, SearchQuery, Service, UploadRequest,
-    UploadSource,
+    Document, Metadata, SearchFacets, SearchFilters, SearchQuery, Service, SimilarDocument,
+    UploadRequest, UploadSource,
 };
 
 /// A [`Service`] implementation for standalone/dev use (see
@@ -106,6 +106,15 @@ impl Service for DevDocumentsClient {
 
     async fn search_facets(&self, _text: &str, _filters: &SearchFilters) -> Result<SearchFacets> {
         Ok(SearchFacets::default())
+    }
+
+    async fn similar(
+        &self,
+        _id: Uuid,
+        _min_confidence: f32,
+        _limit: i64,
+    ) -> Result<Vec<SimilarDocument>> {
+        Ok(Vec::new())
     }
 
     async fn update_metadata(&self, _metadata: Metadata) -> Result<()> {

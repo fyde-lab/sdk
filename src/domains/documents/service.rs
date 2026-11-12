@@ -25,7 +25,7 @@ use super::transcript;
 use super::{
     CachedEmbeddings, ChunkEmbedding, Document, DocumentEmbeddings, EmbeddingCache, EmbeddingKey,
     FacetCount, Indexer, Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery, Service,
-    UploadRequest, UploadSource,
+    SimilarDocument, UploadRequest, UploadSource,
 };
 
 /// The only content type [`Service::upload`] currently accepts.
@@ -56,6 +56,13 @@ const RRF_K: f64 = 60.0;
 /// French corpus: documents answering a query scored 0.85–0.91, while most
 /// off-topic queries' best matches stayed below 0.85.
 const SIMILARITY_FLOOR: f32 = 0.85;
+
+/// The cosine similarity between two documents at which
+/// [`Service::similar`]'s confidence is 0: multilingual-e5-small puts
+/// unrelated text around 0.8 (see [`SIMILARITY_FLOOR`]). Not tuned on pairs
+/// of documents yet: [`super::DEFAULT_SIMILAR_MIN_CONFIDENCE`] maps back to
+/// [`SIMILARITY_FLOOR`], the search's.
+const UNRELATED_SIMILARITY: f32 = 0.8;
 
 /// The default [`Service`] implementation: publishes new documents as
 /// encrypted changelog events via an injected [`ChangelogService`], and
@@ -577,6 +584,89 @@ impl<S: Storage> Service for DocumentsClient<S> {
         })
     }
 
+    async fn similar(
+        &self,
+        id: Uuid,
+        min_confidence: f32,
+        limit: i64,
+    ) -> Result<Vec<SimilarDocument>> {
+        // Also refuses NaN.
+        if !(0.0..=1.0).contains(&min_confidence) {
+            return Err(ErrorKind::InvalidSearchQuery(format!(
+                "min_confidence must be between 0 and 1, got {min_confidence}"
+            ))
+            .into());
+        }
+        if limit <= 0 {
+            return Err(ErrorKind::InvalidSearchQuery(format!(
+                "limit must be positive, got {limit}"
+            ))
+            .into());
+        }
+
+        self.storage
+            .get_metadata(id)
+            .await
+            .with_context(|| format!("failed to load document {id}'s metadata"))?
+            .ok_or(ErrorKind::DocumentNotFound(id))?;
+
+        let model = self.embedder.model();
+        let vectors = self
+            .storage
+            .get_embedding_vectors(id, &model)
+            .await
+            .with_context(|| format!("failed to load document {id}'s embeddings"))?;
+        // No text, or not indexed by this model yet: nothing to compare.
+        let Some(centroid) = mean(&vectors).with_context(|| format!("document {id}"))? else {
+            return Ok(Vec::new());
+        };
+
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        // One more, since the document itself is among them.
+        let found: Vec<(Uuid, f32)> = self
+            .storage
+            .rank_by_similarity(
+                &centroid,
+                &model,
+                &SearchFilters::default(),
+                limit.saturating_add(1),
+            )
+            .await
+            .with_context(|| format!("failed to rank local documents by similarity to {id}"))?
+            .into_iter()
+            .filter(|(other, _)| *other != id)
+            .map_while(|(other, similarity)| {
+                // Most similar first, so those left are all below it.
+                confidence(similarity)
+                    .filter(|confidence| *confidence >= min_confidence)
+                    .map(|confidence| (other, confidence))
+            })
+            .take(limit)
+            .collect();
+        if found.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<Uuid> = found.iter().map(|(id, _)| *id).collect();
+        let mut metadatas: HashMap<Uuid, Metadata> = self
+            .storage
+            .get_metadatas(&ids)
+            .await
+            .context("failed to load the metadata of the similar documents")?
+            .into_iter()
+            .map(|metadata| (metadata.id, metadata))
+            .collect();
+        Ok(found
+            .into_iter()
+            .filter_map(|(id, confidence)| {
+                metadatas.remove(&id).map(|metadata| SimilarDocument {
+                    metadata,
+                    confidence,
+                })
+            })
+            .collect())
+    }
+
     async fn update_metadata(&self, metadata: Metadata) -> Result<()> {
         let id = metadata.id;
         self.check_metadata(&metadata)
@@ -901,6 +991,40 @@ fn title(name: &str) -> &str {
         Some((stem, _)) if !stem.is_empty() => stem,
         _ => name,
     }
+}
+
+/// How sure [`Service::similar`] is that a document whose cosine
+/// `similarity` to another is this is close to it, from 0.0 at
+/// [`UNRELATED_SIMILARITY`] to 1.0 for identical text, or `None` below that
+/// (unrelated).
+fn confidence(similarity: f32) -> Option<f32> {
+    (similarity >= UNRELATED_SIMILARITY)
+        .then(|| ((similarity - UNRELATED_SIMILARITY) / (1.0 - UNRELATED_SIMILARITY)).min(1.0))
+}
+
+/// The mean of a document's chunk `vectors`, what [`Service::similar`]
+/// compares other documents to: pointing where its text as a whole does,
+/// whatever its chunks' count. `None` for no vectors.
+fn mean(vectors: &[Vec<f32>]) -> Result<Option<Vec<f32>>> {
+    let Some(first) = vectors.first() else {
+        return Ok(None);
+    };
+    let mut sum = vec![0.0_f32; first.len()];
+    for vector in vectors {
+        if vector.len() != sum.len() {
+            return Err(ErrorKind::InvalidModel(format!(
+                "chunk embeddings of {} and {} dimensions can't be averaged",
+                sum.len(),
+                vector.len()
+            ))
+            .into());
+        }
+        for (sum, value) in sum.iter_mut().zip(vector) {
+            *sum += value;
+        }
+    }
+    let count = vectors.len() as f32;
+    Ok(Some(sum.into_iter().map(|sum| sum / count).collect()))
 }
 
 /// Rejects a `created_from` later than `created_until`, a range no
@@ -2226,6 +2350,189 @@ mod tests {
 
     fn found_ids(found: Vec<Metadata>) -> Vec<Uuid> {
         found.into_iter().map(|metadata| metadata.id).collect()
+    }
+
+    /// An embedder only asked which model it runs, [`QUERY_MODEL`].
+    fn model_only_embedder() -> Arc<dyn Embedder> {
+        let mut embedder = MockEmbedder::new();
+        embedder
+            .expect_model()
+            .return_const(QUERY_MODEL.to_string());
+        Arc::new(embedder)
+    }
+
+    /// Expects the document `id` to be looked up, and found.
+    fn expect_source(storage: &mut MockStorage, id: Uuid) {
+        storage
+            .expect_get_metadata()
+            .withf(move |requested| *requested == id)
+            .times(1)
+            .returning(|id| Ok(Some(super::super::FakeMetadata::new().with_id(id).build())));
+    }
+
+    /// Expects the document `id`'s [`QUERY_MODEL`] embeddings to be read,
+    /// returning `vectors`.
+    fn expect_vectors(storage: &mut MockStorage, id: Uuid, vectors: Vec<Vec<f32>>) {
+        storage
+            .expect_get_embedding_vectors()
+            .withf(move |requested, model| *requested == id && model == QUERY_MODEL)
+            .times(1)
+            .returning(move |_, _| Ok(vectors.clone()));
+    }
+
+    #[tokio::test]
+    async fn similar_ranks_other_documents_by_similarity_to_the_documents_mean_vector() {
+        let source = Uuid::new_v4();
+        let [close, closer] = ids(2).try_into().unwrap();
+        let mut storage = MockStorage::new();
+        expect_source(&mut storage, source);
+        expect_vectors(&mut storage, source, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+        storage
+            .expect_rank_by_similarity()
+            .withf(|query, model, filters, limit| {
+                query == [0.5, 0.5]
+                    && model == QUERY_MODEL
+                    && *filters == SearchFilters::default()
+                    && *limit == 3
+            })
+            .times(1)
+            .returning(move |_, _, _, _| Ok(vec![(source, 1.0), (closer, 1.0), (close, 0.9)]));
+        expect_page(&mut storage, vec![closer, close]);
+
+        let similar = searching(storage, model_only_embedder())
+            .similar(source, 0.4, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            similar
+                .iter()
+                .map(|found| found.metadata.id)
+                .collect::<Vec<_>>(),
+            [closer, close]
+        );
+        assert_eq!(similar[0].confidence, 1.0);
+        assert!((similar[1].confidence - 0.5).abs() < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn similar_drops_documents_below_the_min_confidence_and_past_the_limit() {
+        let source = Uuid::new_v4();
+        let [first, second, below] = ids(3).try_into().unwrap();
+        let mut storage = MockStorage::new();
+        expect_source(&mut storage, source);
+        expect_vectors(&mut storage, source, vec![vec![1.0, 0.0]]);
+        storage
+            .expect_rank_by_similarity()
+            .times(1)
+            .returning(move |_, _, _, _| Ok(vec![(first, 0.95), (second, 0.9), (below, 0.85)]));
+        expect_page(&mut storage, vec![first]);
+
+        let similar = searching(storage, model_only_embedder())
+            .similar(source, 0.4, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            similar
+                .iter()
+                .map(|found| found.metadata.id)
+                .collect::<Vec<_>>(),
+            [first]
+        );
+    }
+
+    #[tokio::test]
+    async fn similar_finds_nothing_for_a_document_without_embeddings() {
+        let source = Uuid::new_v4();
+        let mut storage = MockStorage::new();
+        expect_source(&mut storage, source);
+        expect_vectors(&mut storage, source, Vec::new());
+
+        let similar = searching(storage, model_only_embedder())
+            .similar(source, 0.0, 10)
+            .await
+            .unwrap();
+
+        assert!(similar.is_empty());
+    }
+
+    #[tokio::test]
+    async fn similar_never_returns_unrelated_documents_nor_loads_their_metadata() {
+        let source = Uuid::new_v4();
+        let mut storage = MockStorage::new();
+        expect_source(&mut storage, source);
+        expect_vectors(&mut storage, source, vec![vec![1.0, 0.0]]);
+        storage
+            .expect_rank_by_similarity()
+            .times(1)
+            .returning(move |_, _, _, _| {
+                Ok(vec![
+                    (source, 1.0),
+                    (Uuid::new_v4(), UNRELATED_SIMILARITY - 0.001),
+                ])
+            });
+
+        let similar = searching(storage, model_only_embedder())
+            .similar(source, 0.0, 10)
+            .await
+            .unwrap();
+
+        assert!(similar.is_empty());
+    }
+
+    #[test]
+    fn confidence_rescales_similarities_above_unrelated_text_to_0_through_1() {
+        assert_eq!(confidence(UNRELATED_SIMILARITY - 0.001), None);
+        assert_eq!(confidence(UNRELATED_SIMILARITY), Some(0.0));
+        assert_eq!(confidence(1.0), Some(1.0));
+        assert_eq!(confidence(1.0001), Some(1.0));
+        let at_search_floor = confidence(SIMILARITY_FLOOR).unwrap();
+        assert!((at_search_floor - super::super::DEFAULT_SIMILAR_MIN_CONFIDENCE).abs() < 1e-5);
+    }
+
+    #[tokio::test]
+    async fn similar_fails_for_a_document_not_synced_here() {
+        let mut storage = MockStorage::new();
+        storage
+            .expect_get_metadata()
+            .times(1)
+            .returning(|_| Ok(None));
+
+        let err = searching(storage, model_only_embedder())
+            .similar(Uuid::new_v4(), 0.9, 10)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::DocumentNotFound);
+    }
+
+    #[tokio::test]
+    async fn similar_rejects_invalid_arguments_without_querying_storage() {
+        for (min_confidence, limit) in
+            [(1.01, 10), (-0.01, 10), (f32::NAN, 10), (0.5, 0), (0.5, -1)]
+        {
+            let err = searching(MockStorage::new(), model_only_embedder())
+                .similar(Uuid::new_v4(), min_confidence, limit)
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                err.code(),
+                crate::ErrorCode::InvalidSearchQuery,
+                "min_confidence {min_confidence}, limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn mean_averages_vectors_and_rejects_mismatched_dimensions() {
+        assert_eq!(mean(&[]).unwrap(), None);
+        assert_eq!(
+            mean(&[vec![1.0, 0.0], vec![0.0, 1.0], vec![2.0, 2.0]]).unwrap(),
+            Some(vec![1.0, 1.0])
+        );
+        assert!(mean(&[vec![1.0, 0.0], vec![1.0]]).is_err());
     }
 
     #[tokio::test]

@@ -203,6 +203,13 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     bm25 alone, never failing over the model. `search_facets` with non-blank text counts the
     same hybrid set (`count_documents_among`/`created_at_range_among`). `Newest`/`Oldest` and
     blank text stay bm25/filters only.
+  - Similar documents: `similar(id, min_confidence, limit)` reads the document's stored vectors
+    (`get_embedding_vectors`, current model only; none = no results, never embeds), averages
+    them, and ranks the rest with `rank_by_similarity` (unfiltered, itself dropped). The
+    cosine is rescaled to `SimilarDocument::confidence` 0..=1 from `UNRELATED_SIMILARITY`
+    (0.8, untuned on document pairs; below it a document is never returned) up to 1.0, so
+    callers never handle e5 numbers. `DEFAULT_SIMILAR_MIN_CONFIDENCE` (0.25) maps back to
+    `SIMILARITY_FLOOR` (a test checks): keep the two in sync if either moves.
   - `classification/` — zero-shot `DocumentType` and folder guess at upload (ported from
     `doc-ai-poc`'s `classify.rs`): the whitespace-collapsed transcript (first 16 KiB) embedded
     as one passage, against `query: `-embedded texts. Types: French descriptions per type

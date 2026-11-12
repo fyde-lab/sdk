@@ -31,7 +31,7 @@ pub(crate) use models::FakeSearchFacets;
 pub(crate) use models::{CachedEmbeddings, ChunkEmbedding, DocumentEmbeddings, EmbeddingKey};
 pub use models::{
     Document, DocumentType, FacetCount, FolderFilter, Metadata, SearchFacets, SearchFilters,
-    SearchOrder, SearchQuery, UploadRequest, UploadSource,
+    SearchOrder, SearchQuery, SimilarDocument, UploadRequest, UploadSource,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use models::{FakeDocument, FakeMetadata};
@@ -53,6 +53,11 @@ use uuid::Uuid;
 use crate::domains::changelog;
 use crate::tools::models::ModelStore;
 use crate::{ErrorCode, Result};
+
+/// The `min_confidence` to pass [`Service::similar`] without a reason to
+/// pick another: about as close as a search needs a document to be to match
+/// by meaning.
+pub const DEFAULT_SIMILAR_MIN_CONFIDENCE: f32 = 0.25;
 
 /// Uploads documents by publishing them as encrypted changelog events, and
 /// reads back documents materialized locally from consumed events (see
@@ -117,6 +122,25 @@ pub trait Service: Send + Sync {
     /// Fails with [`crate::ErrorCode::InvalidSearchQuery`] for a
     /// `created_from` later than `created_until`.
     async fn search_facets(&self, text: &str, filters: &SearchFilters) -> Result<SearchFacets>;
+
+    /// Lists the other documents cached locally whose text is close in
+    /// meaning to that of the document `id`, most similar first (ties by
+    /// id), at most `limit`, keeping only those whose
+    /// [`SimilarDocument::confidence`] is at least `min_confidence` (see
+    /// [`DEFAULT_SIMILAR_MIN_CONFIDENCE`]). Compares the embeddings indexing
+    /// stored, so never needs the model, nor talks to the server, nor loads
+    /// their content. A document with no text (or not indexed by the
+    /// current model yet) has no similar document.
+    ///
+    /// Fails with [`crate::ErrorCode::DocumentNotFound`] for a document not
+    /// synced here, and [`crate::ErrorCode::InvalidSearchQuery`] for a
+    /// `min_confidence` outside `0.0..=1.0` or a non-positive `limit`.
+    async fn similar(
+        &self,
+        id: Uuid,
+        min_confidence: f32,
+        limit: i64,
+    ) -> Result<Vec<SimilarDocument>>;
 
     /// Encrypts `metadata` as given and publishes it as an "update metadata"
     /// changelog event, replacing whatever metadata was previously

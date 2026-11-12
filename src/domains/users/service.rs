@@ -823,6 +823,15 @@ mod tests {
             unimplemented!()
         }
 
+        async fn similar(
+            &self,
+            _id: uuid::Uuid,
+            _min_confidence: f32,
+            _limit: i64,
+        ) -> Result<Vec<crate::domains::documents::SimilarDocument>> {
+            unimplemented!()
+        }
+
         async fn update_metadata(
             &self,
             _metadata: crate::domains::documents::Metadata,
