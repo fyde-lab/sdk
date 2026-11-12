@@ -39,11 +39,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Eau",
-                    "Factures d'eau : consommation en m³, abonnement eau potable et assainissement, relevé du compteur d'eau",
+                    "Facture d'eau : distribution d'eau potable, assainissement collectif, relevé du compteur d'eau, consommation en m³, prix du mètre cube, redevances de l'agence de l'eau",
                 ),
                 en: (
                     "Water",
-                    "Water bills: consumption in m³, drinking water and sewerage subscription, water meter readings",
+                    "Water bills: drinking water supply, sewerage, water meter readings, consumption in m³, price per cubic metre, water agency charges",
                 ),
                 appearance: None,
                 children: &[],
@@ -51,11 +51,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Assurance habitation",
-                    "Assurance habitation multirisque : attestation d'assurance du logement, avis d'échéance, cotisation annuelle",
+                    "Assurance habitation multirisque : attestation d'assurance du logement, conditions particulières, avis d'échéance, garanties dégâts des eaux, incendie, vol, responsabilité civile, locataire ou propriétaire",
                 ),
                 en: (
                     "Home insurance",
-                    "Home insurance: certificate of insurance for the home, renewal notices, annual premium",
+                    "Home insurance: certificate of home insurance, policy schedule, renewal notices, water damage, fire, theft and liability cover, for tenants or owners",
                 ),
                 appearance: None,
                 children: &[],
@@ -63,11 +63,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Services à domicile",
-                    "Services à domicile : ménage, repassage, jardinage, entretien de la maison, petit bricolage",
+                    "Ménage, repassage et jardinage à domicile : facture de services à la personne, heures d'intervention",
                 ),
                 en: (
                     "Home services",
-                    "Home services: cleaning, ironing, gardening, house maintenance, small repairs",
+                    "Cleaning, ironing and gardening at home: home services invoices, hours worked",
                 ),
                 appearance: None,
                 children: &[],
@@ -75,11 +75,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Loyer et charges",
-                    "Quittances de loyer, bail de location, charges locatives, charges de copropriété, appels de fonds du syndic",
+                    "Location du logement : quittance de loyer, bail, avis d'échéance du loyer, provision pour charges locatives, dépôt de garantie, état des lieux ; charges de copropriété et appels de fonds du syndic",
                 ),
                 en: (
                     "Rent and charges",
-                    "Rent receipts, lease, service charges, co-ownership charges, calls for funds from the building manager",
+                    "Renting a home: rent receipts, lease, rent due notices, service charge provisions, deposit, check-in inventory; co-ownership charges and calls for funds from the building manager",
                 ),
                 appearance: None,
                 children: &[],
@@ -87,11 +87,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Achat et vente",
-                    "Achat ou vente d'un bien immobilier : compromis de vente, acte de vente, diagnostics, agence immobilière, notaire",
+                    "Transaction immobilière : compromis de vente, acte de vente notarié, diagnostics DPE et amiante, agence immobilière",
                 ),
                 en: (
                     "Buying and selling",
-                    "Buying or selling a property: preliminary sale agreement, deed of sale, surveys, estate agent, notary",
+                    "Property transaction: preliminary sale agreement, notarial deed of sale, energy performance and asbestos surveys, estate agent",
                 ),
                 appearance: None,
                 children: &[],
@@ -99,11 +99,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Travaux",
-                    "Travaux dans le logement : devis ou facture d'artisan, rénovation, plomberie, électricité, installation de chauffage",
+                    "Travaux dans le logement : devis ou facture d'un artisan, pose et installation, rénovation, plomberie, électricité, chauffage, poêle ou cheminée, menuiserie, main-d'œuvre et fournitures",
                 ),
                 en: (
                     "Works",
-                    "Works in the home: tradesperson's quotes or invoices, renovation, plumbing, electrics, heating installation",
+                    "Works in the home: tradesperson's quote or invoice, fitting and installation, renovation, plumbing, electrics, heating, stove or fireplace, joinery, labour and supplies",
                 ),
                 appearance: None,
                 children: &[],
@@ -121,11 +121,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Mobile",
-                    "Factures de forfait mobile : téléphone portable, appels, SMS, données internet mobile en Go",
+                    "Forfait mobile : facture de la ligne de téléphone portable, appels, SMS, Go de data",
                 ),
                 en: (
                     "Mobile",
-                    "Mobile plan bills: mobile phone, calls, texts, mobile data in GB",
+                    "Mobile plan: mobile phone line bill, calls, texts, GB of data",
                 ),
                 appearance: None,
                 children: &[],
@@ -133,11 +133,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Internet",
-                    "Factures de box internet : abonnement fibre ou ADSL, téléphone fixe et télévision",
+                    "Facture d'abonnement internet à la maison : box fibre optique ou ADSL, ligne fixe en 09, téléphone fixe, décodeur TV, location de la box, débit internet",
                 ),
                 en: (
                     "Internet",
-                    "Internet box bills: fibre or ADSL subscription, landline and TV",
+                    "Home internet subscription bills: fibre or ADSL box, landline, home phone, TV set-top box, box rental, internet speed",
                 ),
                 appearance: None,
                 children: &[],
@@ -155,11 +155,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Banque",
-                    "Relevés de compte bancaire : solde, opérations, virements, prélèvements, paiements par carte ; RIB, convention de compte, frais bancaires",
+                    "Relevé de compte courant : opérations, carte, virements, prélèvements, solde",
                 ),
                 en: (
                     "Banking",
-                    "Bank statements: balance, transactions, transfers, direct debits, card payments; bank details, account agreement, bank fees",
+                    "Current account statement: transactions, card, transfers, direct debits, balance",
                 ),
                 appearance: None,
                 children: &[],
@@ -179,11 +179,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Placements",
-                    "Placements financiers : assurance vie, PEA, compte-titres, SCPI, relevé de portefeuille, valorisation",
+                    "Assurance vie, PEA, actions et SCPI : relevé de portefeuille, valorisation, unités de compte",
                 ),
                 en: (
                     "Investments",
-                    "Investments: life insurance, share savings plan, securities account, real estate funds, portfolio statements, valuation",
+                    "Life insurance, share savings plan, shares and real estate funds: portfolio statement, valuation, units",
                 ),
                 appearance: None,
                 children: &[],
@@ -191,11 +191,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Crédits",
-                    "Prêt immobilier ou crédit à la consommation : offre de prêt, tableau d'amortissement, échéances, taux, capital restant dû",
+                    "Crédit immobilier ou à la consommation : offre de prêt, tableau d'amortissement, mensualités, taux d'intérêt, TAEG, capital restant dû, assurance emprunteur, remboursement anticipé",
                 ),
                 en: (
                     "Loans",
-                    "Mortgage or consumer credit: loan offer, repayment schedule, instalments, rate, outstanding principal",
+                    "Mortgage or consumer credit: loan offer, repayment schedule, monthly instalments, interest rate, APR, outstanding principal, borrower insurance, early repayment",
                 ),
                 appearance: None,
                 children: &[],
@@ -203,11 +203,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Jeux d'argent",
-                    "Jeux d'argent : paris sportifs, poker, loterie, casino en ligne, relevé des gains",
+                    "Jeux d'argent : paris sportifs, poker, loterie, casino en ligne, compte joueur, mises, gains et retraits",
                 ),
                 en: (
                     "Gambling",
-                    "Gambling: sports betting, poker, lottery, online casino, winnings statements",
+                    "Gambling: sports betting, poker, lottery, online casino, player account, stakes, winnings and withdrawals",
                 ),
                 appearance: None,
                 children: &[],
@@ -225,11 +225,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Impôt sur le revenu",
-                    "Avis d'impôt sur le revenu, déclaration des revenus et accusé de réception, avis de situation déclarative, prélèvement à la source",
+                    "Avis d'impôt sur le revenu, déclaration des revenus, revenu fiscal de référence",
                 ),
                 en: (
                     "Income tax",
-                    "Income tax notices, tax returns and acknowledgements, filing status notices, tax withheld at source",
+                    "Income tax notices, tax returns, reference taxable income",
                 ),
                 appearance: None,
                 children: &[],
@@ -237,11 +237,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Attestations fiscales",
-                    "Imprimé fiscal unique (IFU), attestations fiscales annuelles à reporter sur la déclaration, attestations de services à la personne ouvrant droit à crédit d'impôt",
+                    "Attestation fiscale annuelle à reporter sur la déclaration de revenus : imprimé fiscal unique (IFU), attestation pour le crédit d'impôt services à la personne ou frais de garde, montants déductibles",
                 ),
                 en: (
                     "Tax certificates",
-                    "Annual tax forms and certificates to report on the tax return, certificates for home services giving a tax credit",
+                    "Annual tax certificate to report on the tax return: single tax form, certificate for the home services or childcare tax credit, deductible amounts",
                 ),
                 appearance: None,
                 children: &[],
@@ -249,11 +249,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Taxe foncière",
-                    "Avis de taxe foncière : propriétés bâties ou non bâties, base d'imposition, taux communal, taxe d'enlèvement des ordures ménagères",
+                    "Avis de taxes foncières : propriétés bâties, taxe foncière communale et intercommunale, taxe d'enlèvement des ordures ménagères, montant à payer par le propriétaire",
                 ),
                 en: (
                     "Property tax",
-                    "Property tax notices: built or unbuilt property, tax base, local rate, household waste collection tax",
+                    "Property tax notices: built property, local and intercommunal property tax, household waste collection tax, amount payable by the owner",
                 ),
                 appearance: None,
                 children: &[],
@@ -261,11 +261,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Taxe d'habitation",
-                    "Avis de taxe d'habitation : résidence secondaire, valeur locative, taux voté par la commune, avis de dégrèvement",
+                    "Avis de taxe d'habitation : résidence secondaire, valeur locative brute, taux voté par la commune, majoration, contribution à l'audiovisuel public, dégrèvement",
                 ),
                 en: (
                     "Housing tax",
-                    "Housing tax notices: second home, rental value, local rate, relief notices",
+                    "Housing tax notices: second home, gross rental value, rate voted by the town, surcharge, public broadcasting fee, relief",
                 ),
                 appearance: None,
                 children: &[],
@@ -283,11 +283,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Assurance maladie",
-                    "Assurance maladie (CPAM, ameli) : relevés de remboursement de soins, attestation de droits, carte Vitale",
+                    "Assurance maladie, CPAM, ameli : relevé de remboursements de soins par la Sécurité sociale, base de remboursement, participation forfaitaire, attestation de droits, carte Vitale, indemnités journalières",
                 ),
                 en: (
                     "Health insurance",
-                    "National health insurance: statements of reimbursed care, certificate of entitlement, health card",
+                    "National health insurance: statements of care reimbursed by social security, reimbursement base, flat-rate contribution, certificate of entitlement, health card, daily sickness benefits",
                 ),
                 appearance: None,
                 children: &[],
@@ -295,11 +295,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Mutuelle",
-                    "Mutuelle santé complémentaire : décomptes de la mutuelle, part complémentaire remboursée, cotisation, garanties du contrat",
+                    "Mutuelle santé complémentaire : décompte de remboursement de la part complémentaire, tiers payant, carte de mutuelle, adhérent et bénéficiaires, garanties optique, dentaire et hospitalisation",
                 ),
                 en: (
                     "Complementary health",
-                    "Complementary health insurance: statements, top-up reimbursements, premiums, cover",
+                    "Complementary health insurance: statements of the top-up reimbursement, third-party payment, insurance card, member and beneficiaries, optical, dental and hospital cover",
                 ),
                 appearance: None,
                 children: &[],
@@ -307,11 +307,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Soins",
-                    "Soins médicaux : ordonnances, comptes rendus médicaux, factures de médecin, dentiste, pharmacie, hôpital, analyses",
+                    "Soins médicaux : ordonnance, consultation chez le médecin, dentiste, kinésithérapeute, pharmacie, hôpital, clinique, analyses de laboratoire, compte rendu médical, patient",
                 ),
                 en: (
                     "Care",
-                    "Medical care: prescriptions, medical reports, bills from doctors, dentists, pharmacies, hospitals, lab tests",
+                    "Medical care: prescriptions, doctor's appointments, dentist, physiotherapist, pharmacy, hospital, clinic, lab tests, medical reports, patient",
                 ),
                 appearance: None,
                 children: &[],
@@ -319,11 +319,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Prévoyance",
-                    "Contrat de prévoyance : garantie décès, invalidité, incapacité de travail, capital versé aux bénéficiaires",
+                    "Prévoyance : garantie décès, invalidité et incapacité de travail, rente, capital versé aux bénéficiaires, contrat de prévoyance individuelle ou collective",
                 ),
                 en: (
                     "Death and disability cover",
-                    "Death and disability cover: death, disability and incapacity benefits, lump sum paid to beneficiaries",
+                    "Death and disability cover: death, disability and incapacity benefits, annuity, lump sum paid to beneficiaries, individual or group cover",
                 ),
                 appearance: None,
                 children: &[],
@@ -341,11 +341,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Bulletins de paie",
-                    "Bulletins de salaire : salaire brut, cotisations sociales, net à payer, net imposable, employeur",
+                    "Fiche de paie du salarié : salaire brut, cotisations, net à payer avant impôt, net imposable",
                 ),
                 en: (
                     "Payslips",
-                    "Payslips: gross salary, social contributions, net pay, taxable pay, employer",
+                    "Employee payslip: gross salary, contributions, net pay before tax, taxable pay",
                 ),
                 appearance: None,
                 children: &[],
@@ -353,11 +353,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Contrats et attestations",
-                    "Contrats de travail, attestations employeur, certificats de travail, soldes de tout compte",
+                    "Emploi salarié : contrat de travail à durée indéterminée ou déterminée, période d'essai, avenant, attestation employeur, certificat de travail, reçu pour solde de tout compte, rupture du contrat",
                 ),
                 en: (
                     "Employment",
-                    "Employment contracts, employer certificates, certificates of employment, final settlements",
+                    "Employment: permanent or fixed-term employment contract, probation period, amendment, employer certificate, certificate of employment, final settlement receipt, termination",
                 ),
                 appearance: None,
                 children: &[],
@@ -365,11 +365,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Particulier employeur",
-                    "Particulier employeur : CESU, Pajemploi, salaire d'un employé à domicile ou d'une assistante maternelle",
+                    "Particulier employeur : bulletin de salaire établi par Pajemploi ou le Cesu pour l'assistante maternelle ou l'employé à domicile, heures et jours d'accueil, indemnités d'entretien",
                 ),
                 en: (
                     "Household employer",
-                    "Household employer: pay slips and declarations for a home employee or childminder",
+                    "Household employer: payslips issued through Pajemploi or Cesu for a childminder or home employee, hours and days of care, maintenance allowances",
                 ),
                 appearance: None,
                 children: &[],
@@ -377,11 +377,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Indépendant",
-                    "Activité indépendante ou portage salarial : auto-entrepreneur, URSSAF, facturation de missions, chiffre d'affaires, comptes rendus d'activité",
+                    "Activité de freelance ou portage salarial : facture d'une mission de prestation au client, compte rendu d'activité (CRA) avec les jours travaillés, contrat de prestation, auto-entrepreneur, chiffre d'affaires, Urssaf",
                 ),
                 en: (
                     "Freelance",
-                    "Self-employment or umbrella company: social contributions, invoicing missions, turnover, activity reports",
+                    "Freelance or umbrella company work: invoices for a service mission to the client, activity reports with days worked, service contracts, sole trader, turnover, social contributions",
                 ),
                 appearance: None,
                 children: &[],
@@ -401,11 +401,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Retraite",
-                    "Retraite : pension de base ou complémentaire, relevé de carrière, trimestres validés, caisse de retraite",
+                    "Retraite : relevé de carrière, trimestres validés, estimation indicative globale, pension de retraite de base ou complémentaire (Agirc-Arrco), caisse de retraite, retraité",
                 ),
                 en: (
                     "Retirement",
-                    "Retirement: basic or supplementary pension, career statement, pension fund",
+                    "Retirement: career statement, validated quarters, overall pension estimate, basic or supplementary pension, pension fund, retiree",
                 ),
                 appearance: None,
                 children: &[],
@@ -423,11 +423,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Prestations",
-                    "Prestations familiales de la CAF : allocations familiales, aide au logement, prime d'activité, congé parental",
+                    "CAF, Caisse d'allocations familiales : attestation de paiement, allocations familiales, aide personnalisée au logement (APL), prime d'activité, PAJE, quotient familial, allocataire",
                 ),
                 en: (
                     "Benefits",
-                    "Family benefits: child benefit, housing benefit, in-work bonus, parental leave",
+                    "Family allowance fund: payment certificates, child benefit, housing benefit, in-work bonus, early childhood benefits, family quotient, claimant",
                 ),
                 appearance: None,
                 children: &[],
@@ -435,11 +435,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Garde d'enfants",
-                    "Garde d'enfant : crèche, halte-garderie, assistante maternelle, centre de loisirs, frais de garde",
+                    "Garde d'enfant : crèche, micro-crèche, halte-garderie, contrat d'accueil, tarif horaire, frais de garde, centre de loisirs, projet pédagogique pour les tout-petits",
                 ),
                 en: (
                     "Childcare",
-                    "Childcare: nursery, day care, childminder, holiday club, childcare fees",
+                    "Childcare: nursery, micro-nursery, day care, care agreement, hourly rate, childcare fees, holiday club, educational project for toddlers",
                 ),
                 appearance: None,
                 children: &[],
@@ -491,11 +491,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Successions et donations",
-                    "Succession ou donation : notaire, héritiers, acte de donation, déclaration de succession, partage",
+                    "Succession ou donation : notaire, défunt, héritiers, acte de notoriété, déclaration de succession, donation, partage, legs, assurance vie au décès",
                 ),
                 en: (
                     "Inheritance and gifts",
-                    "Inheritance or gift: notary, heirs, deed of gift, estate declaration, division of the estate",
+                    "Inheritance or gift: notary, deceased, heirs, affidavit of inheritance, estate declaration, gift, division, bequest, life insurance on death",
                 ),
                 appearance: None,
                 children: &[],
@@ -515,11 +515,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Justice",
-                    "Procédure judiciaire : tribunal, jugement, avocat, commissaire de justice, assignation, convocation à une audience",
+                    "Procédure judiciaire : tribunal, jugement, avocat, commissaire de justice, huissier, assignation, convocation à une audience, plainte, litige",
                 ),
                 en: (
                     "Justice",
-                    "Legal proceedings: court, judgment, lawyer, bailiff, summons, hearing notice",
+                    "Legal proceedings: court, judgment, lawyer, bailiff, writ of summons, hearing notice, complaint, dispute",
                 ),
                 appearance: None,
                 children: &[],
@@ -537,11 +537,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Train",
-                    "Billets de train : trajet, gare de départ et d'arrivée, voiture, place",
+                    "Billets de train : SNCF, TGV, TER, trajet aller ou retour, gare de départ et d'arrivée, voiture et place, carte de réduction, e-billet",
                 ),
                 en: (
                     "Train",
-                    "Train tickets: journey, departure and arrival stations, coach, seat",
+                    "Train tickets: rail operator, high-speed or regional train, single or return journey, departure and arrival stations, coach and seat, railcard, e-ticket",
                 ),
                 appearance: None,
                 children: &[],
@@ -549,9 +549,12 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Avion",
-                    "Billets d'avion, cartes d'embarquement, réservations de vol",
+                    "Billets d'avion : réservation de vol, compagnie aérienne, aéroport de départ et d'arrivée, numéro de vol, carte d'embarquement, bagages",
                 ),
-                en: ("Flights", "Plane tickets, boarding passes, flight bookings"),
+                en: (
+                    "Flights",
+                    "Plane tickets: flight booking, airline, departure and arrival airports, flight number, boarding pass, luggage",
+                ),
                 appearance: None,
                 children: &[],
             },
@@ -570,11 +573,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Courses et partage",
-                    "Courses de VTC ou de taxi, trottinettes ou vélos en libre-service, autopartage",
+                    "Courses de VTC ou de taxi, trottinette ou vélo en libre-service, autopartage, covoiturage : reçu de course, trajet, chauffeur",
                 ),
                 en: (
                     "Rides",
-                    "Ride-hailing or taxi rides, shared scooters or bikes, car sharing",
+                    "Ride-hailing or taxi rides, shared scooters or bikes, car sharing, carpooling: ride receipts, journey, driver",
                 ),
                 appearance: None,
                 children: &[],
@@ -582,11 +585,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Voyages",
-                    "Voyages : réservations d'hôtel, locations de vacances, séjours, agence de voyage",
+                    "Voyages et vacances : réservation d'hôtel, location de vacances, séjour, gîte, camping, office de tourisme, agence de voyage, dates d'arrivée et de départ",
                 ),
                 en: (
                     "Travel",
-                    "Travel: hotel bookings, holiday rentals, stays, travel agency",
+                    "Travel and holidays: hotel bookings, holiday rentals, stays, cottages, campsites, tourist office, travel agency, arrival and departure dates",
                 ),
                 appearance: None,
                 children: &[],
@@ -594,11 +597,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Véhicule",
-                    "Véhicule : carte grise, achat d'une voiture, entretien, révision, contrôle technique",
+                    "Véhicule : certificat d'immatriculation (carte grise), ANTS, achat ou vente d'une voiture, entretien, révision, garage, contrôle technique, cession",
                 ),
                 en: (
                     "Vehicle",
-                    "Vehicle: registration certificate, buying a car, servicing, roadworthiness test",
+                    "Vehicle: registration certificate, buying or selling a car, servicing, garage, roadworthiness test, transfer of ownership",
                 ),
                 appearance: None,
                 children: &[],
@@ -606,11 +609,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Assurance auto",
-                    "Assurance automobile ou deux-roues : attestation d'assurance, carte verte, avis d'échéance, bonus-malus",
+                    "Assurance de la voiture : contrat auto, carte verte, bonus-malus, véhicule assuré",
                 ),
                 en: (
                     "Vehicle insurance",
-                    "Car or motorbike insurance: certificate of insurance, renewal notices, no-claims bonus",
+                    "Car insurance: motor policy, green card, no-claims bonus, insured vehicle",
                 ),
                 appearance: None,
                 children: &[],
@@ -628,11 +631,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Vétérinaire",
-                    "Vétérinaire : consultations, vaccins, soins pour chien ou chat, factures de la clinique",
+                    "Vétérinaire : facture de la clinique vétérinaire, consultation, vaccin, vermifuge, stérilisation, soins pour un chien ou un chat",
                 ),
                 en: (
                     "Vet",
-                    "Vet: consultations, vaccinations, care for dogs or cats, clinic bills",
+                    "Vet: veterinary clinic bills, consultations, vaccinations, deworming, neutering, care for a dog or cat",
                 ),
                 appearance: None,
                 children: &[],
@@ -652,11 +655,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Assurance animaux",
-                    "Assurance santé pour chien ou chat : cotisation, remboursement des frais vétérinaires",
+                    "Assurance pour chien ou chat : contrat d'assurance santé animale, remboursement des frais vétérinaires, identification de l'animal, cotisation",
                 ),
                 en: (
                     "Pet insurance",
-                    "Health insurance for dogs or cats: premium, reimbursed vet fees",
+                    "Insurance for dogs or cats: pet health insurance policy, reimbursed vet fees, pet identification, premium",
                 ),
                 appearance: None,
                 children: &[],
@@ -664,9 +667,12 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Fournitures",
-                    "Animalerie : nourriture, croquettes, litière, accessoires pour animaux",
+                    "Achats pour chien ou chat : croquettes, nourriture pour animaux, friandises, litière, jouets, laisse, animalerie",
                 ),
-                en: ("Pet supplies", "Pet shop: food, litter, accessories"),
+                en: (
+                    "Pet supplies",
+                    "Purchases for dogs or cats: kibble, pet food, treats, litter, toys, leads, pet shop",
+                ),
                 appearance: None,
                 children: &[],
             },
@@ -695,11 +701,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Courses",
-                    "Courses alimentaires : tickets de caisse de supermarché, drive, épicerie",
+                    "Courses alimentaires : ticket de caisse de supermarché, drive, épicerie, produits alimentaires",
                 ),
                 en: (
                     "Groceries",
-                    "Groceries: supermarket receipts, click and collect, corner shop",
+                    "Groceries: supermarket receipts, click and collect, corner shop, food products",
                 ),
                 appearance: None,
                 children: &[],
@@ -707,11 +713,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Repas livrés",
-                    "Livraison de repas : commandes à un restaurant livrées à domicile",
+                    "Livraison de repas : commande à un restaurant livrée à domicile, plats, frais de livraison, livreur",
                 ),
                 en: (
                     "Food delivery",
-                    "Food delivery: restaurant orders delivered home",
+                    "Food delivery: restaurant orders delivered home, dishes, delivery fees, courier",
                 ),
                 appearance: None,
                 children: &[],
@@ -719,11 +725,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Électronique",
-                    "Achats d'appareils électroniques : ordinateur, smartphone, tablette, télévision, garantie",
+                    "Achat d'appareils électroniques et accessoires : ordinateur, smartphone, tablette, télévision, coque, câble, pièce détachée, numéro de série, garantie",
                 ),
                 en: (
                     "Electronics",
-                    "Electronics: computer, smartphone, tablet, TV, warranty",
+                    "Electronic devices and accessories: computer, smartphone, tablet, TV, case, cable, spare part, serial number, warranty",
                 ),
                 appearance: None,
                 children: &[],
@@ -731,11 +737,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Maison",
-                    "Équipement de la maison : meubles, électroménager, literie, décoration",
+                    "Équipement de la maison : meubles, électroménager, literie, décoration, bricolage et jardinage",
                 ),
                 en: (
                     "Home equipment",
-                    "Home equipment: furniture, appliances, bedding, decoration",
+                    "Home equipment: furniture, appliances, bedding, decoration, DIY and gardening",
                 ),
                 appearance: None,
                 children: &[],
@@ -743,11 +749,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Vêtements",
-                    "Vêtements et chaussures : achats en magasin ou en ligne, retours",
+                    "Vêtements et chaussures : achat en magasin ou en ligne, taille, retour ou échange",
                 ),
                 en: (
                     "Clothing",
-                    "Clothes and shoes: in-store or online purchases, returns",
+                    "Clothes and shoes: in-store or online purchases, size, returns or exchanges",
                 ),
                 appearance: None,
                 children: &[],
@@ -755,11 +761,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Occasion",
-                    "Achat ou vente d'occasion entre particuliers : Vinted, Leboncoin, bordereau d'envoi",
+                    "Achat ou vente d'occasion entre particuliers : Vinted, Leboncoin, bordereau d'envoi, point relais, acheteur et vendeur",
                 ),
                 en: (
                     "Second-hand",
-                    "Second-hand buying or selling between individuals: marketplaces, shipping labels",
+                    "Second-hand buying or selling between individuals: Vinted, Leboncoin, shipping labels, pickup points, buyer and seller",
                 ),
                 appearance: None,
                 children: &[],
@@ -777,11 +783,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Sport",
-                    "Sport : licence, adhésion à un club, abonnement à une salle de sport, certificat médical",
+                    "Sport : licence sportive, adhésion à un club, abonnement à une salle de sport, cours, stage, forfait de ski, certificat médical de non contre-indication",
                 ),
                 en: (
                     "Sports",
-                    "Sports: licence, club membership, gym subscription, medical certificate",
+                    "Sports: sports licence, club membership, gym subscription, lessons, courses, ski pass, medical certificate of fitness",
                 ),
                 appearance: None,
                 children: &[],
@@ -801,11 +807,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Associations",
-                    "Adhésions à une association : cotisation annuelle, carte de membre",
+                    "Association loi 1901 : adhésion, cotisation de membre, assemblée générale, bureau, carte de membre",
                 ),
                 en: (
                     "Associations",
-                    "Association memberships: annual fee, membership card",
+                    "Non-profit associations: membership, member's fee, general meeting, board, membership card",
                 ),
                 appearance: None,
                 children: &[],
@@ -823,11 +829,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "École",
-                    "École, collège ou lycée : inscription, cantine, frais de scolarité, bulletins scolaires, périscolaire",
+                    "École, collège ou lycée : inscription scolaire, cantine, garderie périscolaire, assurance scolaire, frais de scolarité, bulletin scolaire, élève",
                 ),
                 en: (
                     "School",
-                    "School: enrolment, canteen, school fees, school reports, after-school care",
+                    "School: school enrolment, canteen, after-school care, school insurance, school fees, school reports, pupil",
                 ),
                 appearance: None,
                 children: &[],
@@ -835,11 +841,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Études supérieures",
-                    "Études supérieures : inscription à l'université ou en école, frais de scolarité, certificat de scolarité",
+                    "Université et grandes écoles : inscription, étudiant, diplôme",
                 ),
                 en: (
                     "Higher education",
-                    "Higher education: university or college enrolment, tuition fees, certificate of enrolment",
+                    "Universities and colleges: enrolment, student, degree",
                 ),
                 appearance: None,
                 children: &[],
@@ -847,11 +853,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Formation",
-                    "Formation professionnelle : CPF, organisme de formation, convention de formation, attestation de fin de formation",
+                    "Formation professionnelle : CPF, organisme de formation, programme, convention de formation, attestation de fin de formation, stagiaire",
                 ),
                 en: (
                     "Training",
-                    "Professional training: training provider, training agreement, certificate of completion",
+                    "Professional training: training account, training provider, programme, training agreement, certificate of completion, trainee",
                 ),
                 appearance: None,
                 children: &[],
@@ -869,11 +875,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Médias",
-                    "Abonnements média : streaming vidéo ou musique, plateformes de séries et de films",
+                    "Abonnements de streaming vidéo ou musique : séries, films, musique, plateforme, abonnement mensuel",
                 ),
                 en: (
                     "Media",
-                    "Media subscriptions: video or music streaming, series and film platforms",
+                    "Video or music streaming subscriptions: series, films, music, platform, monthly subscription",
                 ),
                 appearance: None,
                 children: &[],
@@ -881,11 +887,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Logiciels et cloud",
-                    "Abonnements logiciel ou cloud : hébergement web, serveur, nom de domaine, stockage en ligne, licences",
+                    "Facture ou reçu d'abonnement en ligne (invoice, receipt) : logiciel, application, moteur de recherche, assistant IA, hébergement, cloud, nom de domaine, plan mensuel",
                 ),
                 en: (
                     "Software and cloud",
-                    "Software or cloud subscriptions: web hosting, servers, domain names, online storage, licences",
+                    "Online subscription invoice or receipt: software, app, search engine, AI assistant, hosting, cloud, domain name, monthly plan",
                 ),
                 appearance: None,
                 children: &[],
@@ -893,11 +899,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
             ProposedFolder {
                 fr: (
                     "Presse",
-                    "Abonnements presse : journal, magazine, quotidien en ligne",
+                    "Abonnements presse : journal, magazine, quotidien en ligne, numéros",
                 ),
                 en: (
                     "Press",
-                    "Press subscriptions: newspapers, magazines, online news",
+                    "Press subscriptions: newspapers, magazines, online news, issues",
                 ),
                 appearance: None,
                 children: &[],
@@ -907,11 +913,11 @@ pub(super) const PROPOSED_LAYOUT: &[ProposedFolder] = &[
     ProposedFolder {
         fr: (
             "Dons",
-            "Reçus fiscaux de dons à une association ou une fondation, ouvrant droit à réduction d'impôt",
+            "Reçu fiscal de don à une association ou une fondation : reçu au titre des dons, donateur, réduction d'impôt, articles 200 et 238 bis du code général des impôts",
         ),
         en: (
             "Donations",
-            "Tax receipts for donations to a charity or foundation, giving a tax reduction",
+            "Tax receipt for a donation to a charity or foundation: donation receipt, donor, tax reduction, articles 200 and 238 bis of the French tax code",
         ),
         appearance: Some(FolderAppearance {
             color: FolderColor::Moss,
