@@ -207,12 +207,16 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     `doc-ai-poc`'s `classify.rs`): the whitespace-collapsed transcript (first 16 KiB) embedded
     as one passage, against `query: `-embedded texts. Types: French descriptions per type
     (`TYPES`: business data, kept there; a type scores its best description), flat argmax
-    (`Other` has no description) needing `TYPE_MARGIN` over the runner-up. Folders: each
+    (`Other` has no description) needing `TYPE_MARGIN` (0.01) over the runner-up. Folders: each
     described folder's `"{name} : {description}"` (a folder without a description is never
-    picked), the best one needing `FOLDER_MARGIN` over the runner-up and at least
-    `FOLDER_FLOOR` (0.85, the search floor: not yet tuned on real folders; the `#[ignore]`d
-    real-model test files synthetic documents in the French proposed layout). Type descriptions
-    are embedded lazily, once per process and model (`DESCRIPTIONS`); folder texts are cached
+    picked), the best one needing `FOLDER_MARGIN` (0.01) over the runner-up and at least
+    `FOLDER_FLOOR` (0.83). Both margins, the floor and the proposed layout's French
+    descriptions were tuned on a private corpus of ~1,200 real French documents labelled with
+    their proposed-layout folder (kept outside every repo); descriptions say how such documents
+    read, generically, never naming one household's issuers. Cross-language (English layout,
+    French documents) scores run ~0.04 lower, so few such documents clear the floor. The
+    `#[ignore]`d real-model test files synthetic documents in the French proposed layout.
+    Type descriptions are embedded lazily, once per process and model (`DESCRIPTIONS`); folder texts are cached
     per model, keeping only the latest classification's. `upload` classifies only after its
     embedding succeeded (model at hand), against the folders synced here; a failure publishes
     untyped at the root. Never run on consumption.

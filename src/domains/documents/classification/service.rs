@@ -260,17 +260,24 @@ pub(super) const TYPES: &[TypeLabel] = &[
 ];
 
 /// How much the best type must score above every other type to be kept.
-const TYPE_MARGIN: f32 = 0.005;
+/// Tuned on a corpus of ~1,200 real French documents: 0.01 types 91% of
+/// those it types correctly (85% at 0.005), leaving the rest untyped.
+const TYPE_MARGIN: f32 = 0.01;
 
 /// How much the best folder must score above every other described folder
-/// for a document to be filed in it: the margin categories were tuned with.
-const FOLDER_MARGIN: f32 = 0.005;
+/// for a document to be filed in it. Tuned on the same corpus filed in the
+/// French proposed layout: e5 scores every folder within a few hundredths
+/// of the next, so a smaller margin files many more documents in the wrong
+/// folder. At 0.01, 78% of the documents filed are filed right, and about
+/// half of them all stay at the root.
+const FOLDER_MARGIN: f32 = 0.01;
 
-/// The similarity to its description below which a folder isn't a match,
-/// even as the only one described: the floor searches use, where e5 put
-/// unrelated text around 0.8 and matching text at 0.85–0.91 (see
-/// `SIMILARITY_FLOOR`). Not yet tuned on real folders.
-const FOLDER_FLOOR: f32 = 0.85;
+/// The similarity to its text below which a folder isn't a match, even as
+/// the only one described. On that corpus, a document scores its own folder
+/// at least 0.83 five times out of six, and only one in seven other
+/// documents reaches it; with many described folders, [`FOLDER_MARGIN`] is
+/// what decides.
+const FOLDER_FLOOR: f32 = 0.83;
 
 /// How much of a transcript is embedded, in bytes of whitespace-collapsed
 /// text: the model only reads its first 512 tokens anyway, well within it,
