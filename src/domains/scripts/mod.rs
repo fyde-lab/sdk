@@ -82,8 +82,8 @@ pub trait Service: Send + Sync {
     /// marks `required` has no value, and with
     /// [`crate::ErrorCode::InvalidInstallationLabel`] if the trimmed label
     /// is over [`MAX_INSTALLATION_LABEL_CHARS`] characters or holds a control character. A blank
-    /// label defaults to the first non-blank non-secret text parameter, by
-    /// parameter name (usually the username), else the script's name.
+    /// label defaults to the first non-blank non-secret text parameter,
+    /// `username` first then the others by name, else the script's name.
     ///
     /// Returns once the event is published, not once it's saved locally:
     /// like every other changelog event, it's only materialized into local
