@@ -280,8 +280,9 @@ pub struct InstallScriptRequest {
     pub script_id: Uuid,
     /// Shown to tell this installation apart from the user's others of the
     /// same script (e.g. "Marie"). Trimmed; a blank one defaults to the
-    /// first non-blank non-secret text parameter, by parameter name, or
-    /// else the script's name (see `service::default_label`).
+    /// first non-blank non-secret text parameter, `username` first then
+    /// the others by name, or else the script's name (see
+    /// `service::default_label`).
     pub label: String,
     pub parameters: HashMap<String, Value>,
 }

@@ -161,6 +161,10 @@ impl<S: Storage> Service for ScriptsClient<S> {
     }
 }
 
+/// The parameter a blank label defaults to first (see [`default_label`]):
+/// the name most scrapers give their login.
+const USERNAME_PARAMETER: &str = "username";
+
 /// Refuses a (trimmed, non-blank) installation label over
 /// [`MAX_INSTALLATION_LABEL_CHARS`] or holding a control character.
 fn check_label(label: &str) -> Result<()> {
@@ -181,9 +185,9 @@ fn check_label(label: &str) -> Result<()> {
 }
 
 /// The label an installation installed with a blank one gets: the first
-/// non-blank value, by parameter name, of `script`'s non-secret text
-/// parameters (on most scrapers the username, telling the user's accounts
-/// on the site apart), else the script's name. Whitespace is collapsed and
+/// non-blank value of `script`'s non-secret text parameters, `username`
+/// first (most scrapers', telling the user's accounts on the site apart),
+/// then the others by name, else the script's name. Whitespace is collapsed and
 /// control characters dropped, then it's cut to
 /// [`MAX_INSTALLATION_LABEL_CHARS`], so it always passes [`check_label`].
 fn default_label(script: &Script, parameters: &HashMap<String, Value>) -> String {
@@ -195,7 +199,7 @@ fn default_label(script: &Script, parameters: &HashMap<String, Value>) -> String
         })
         .map(|(name, _)| name)
         .collect();
-    names.sort();
+    names.sort_by_key(|name| (name.as_str() != USERNAME_PARAMETER, name.as_str()));
     let value = names
         .into_iter()
         .filter_map(|name| parameters.get(name)?.as_str())
@@ -439,22 +443,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_blank_label_defaults_to_the_first_non_secret_text_parameter() {
+    async fn a_blank_label_defaults_to_the_username_first() {
         let label = default_label_of(
             vec![
+                ("login_url", required_parameter()),
                 ("password", secret_parameter()),
                 ("username", required_parameter()),
-                ("zone", required_parameter()),
             ],
             HashMap::from([
+                ("login_url".to_string(), json!("https://acme.example.com")),
                 ("password".to_string(), json!("hunter2")),
                 ("username".to_string(), json!("  marie\n dupont ")),
-                ("zone".to_string(), json!("nord")),
             ]),
         )
         .await;
 
         assert_eq!(label, "marie dupont");
+    }
+
+    #[tokio::test]
+    async fn a_blank_label_defaults_to_the_first_other_non_secret_text_parameter_by_name() {
+        let label = default_label_of(
+            vec![
+                ("password", secret_parameter()),
+                ("identifiant", required_parameter()),
+                ("zone", required_parameter()),
+            ],
+            HashMap::from([
+                ("password".to_string(), json!("hunter2")),
+                ("identifiant".to_string(), json!("2840775112048")),
+                ("zone".to_string(), json!("nord")),
+            ]),
+        )
+        .await;
+
+        assert_eq!(label, "2840775112048");
     }
 
     #[tokio::test]
