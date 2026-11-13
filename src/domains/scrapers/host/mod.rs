@@ -154,8 +154,8 @@ pub(super) struct HostConfig {
     /// soon as it's set (see [`StopSignal`]).
     pub(super) stop: StopSignal,
     pub(super) options: RunOptions,
-    /// The folder `fyde.save_document` files every document in, `None` to
-    /// let each one be classified (see [`DocumentsService::upload`]).
+    /// The folder `fyde.save_document` files every document within, `None`
+    /// to let each one go anywhere (see [`DocumentsService::upload`]).
     pub(super) folder_id: Option<Uuid>,
 }
 

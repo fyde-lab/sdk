@@ -135,7 +135,7 @@ pub trait Service: Send + Sync {
     /// name its session/cookies/reports are kept under, so each of the
     /// user's accounts on a site has its own, and runs of different
     /// installations of the same script go in parallel. Every document it
-    /// saves is filed in the installation's folder (see
+    /// saves is filed within the installation's folder, if it has one (see
     /// `InstalledScript::folder_id`). The browser stays hidden and no HTTP
     /// bodies are dumped.
     async fn run_installed(&self, installed: &InstalledScript) -> Result<()>;

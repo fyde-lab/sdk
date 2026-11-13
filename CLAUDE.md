@@ -155,9 +155,13 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   `search_facets` counts each field with its own filter lifted so UIs only offer reachable
   choices. A document's place is `Metadata::folder_id` (`None` = the root, À classer; a
   folder deleted meanwhile counts as the root too): `upload` takes the source, an
-  optional name and an optional `folder_id` (the classifier guesses the type, and the folder
+  optional name, an optional `folder_id` (the classifier guesses the type, and the folder
   unless one is given: then it's typed only, compared with no filed document, and a folder not
-  synced here is `FolderNotFound` before embedding),
+  synced here is `FolderNotFound` before embedding) and an optional `within_folder_id` (a
+  source's folder: compared only with the documents in it and every folder below it, it lands
+  in the winner, else in that folder itself, even without the model or when classifying fails;
+  never outside it nor at the root; one not synced here falls back to filing across the whole
+  vault, never failing; `folder_id` wins when both are set),
   `move_document`/`update_metadata` refuse a folder not synced here (`FolderNotFound`).
   `SearchFilters::folder` is `FolderFilter::Unfiled` or `Within(id)` (subfolders included,
   a recursive CTE over `folders`); `SearchFacets::folders` counts each folder with everything
@@ -331,11 +335,11 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   by installation id). Enabling/disabling (and the plan's `max_scripts` quota) stays per
   script on the server, which never sees installations: callers enable on install and
   disable once a script's last installation is gone. An installation also carries an
-  optional `folder_id` (`None` = classify each document): `install_script` refuses one not
-  synced here (`FolderNotFound`), and `run_installed` hands it to `fyde.save_document`, so
-  every document the run saves is filed there (a script can't override it). Once that
-  folder is deleted, the run fails on its first document with `FolderNotFound`: the app
-  re-installs to pick another.
+  optional `folder_id` (`None` = file each document anywhere): `install_script` refuses one
+  not synced here (`FolderNotFound`), and `run_installed` hands it to `fyde.save_document` as
+  `UploadRequest::within_folder_id`, so every document the run saves is filed within that
+  folder (a script can't override it). Once that folder is deleted, runs file automatically
+  across the vault, as with `None`, without failing: the app re-installs to pick another.
 - **icons** — read-through cache over the server's `icons.v1.IconsService`: `fetch_icon(id)`
   serves the local `icons` table, else fetches and caches (icons never change, so never
   revalidated).

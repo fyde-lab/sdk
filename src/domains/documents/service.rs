@@ -117,6 +117,21 @@ impl Drop for CachedUntilPublished<'_> {
     }
 }
 
+/// Which folders an upload may be filed in, by what they hold (see
+/// [`DocumentsClient::classify_upload`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Filing {
+    /// Only the folder it was given ([`UploadRequest::folder_id`]): it's
+    /// typed only.
+    Given,
+    /// One of these: the folder it's filed within
+    /// ([`UploadRequest::within_folder_id`]) first, where it stays without
+    /// a better one, then every folder below it.
+    Within(Vec<Uuid>),
+    /// Any folder synced here, or the root without a clear one.
+    Anywhere,
+}
+
 impl<S: Storage> DocumentsClient<S> {
     /// Creates a documents client using `storage` to read cached documents,
     /// `changelog` to publish new ones and drive [`Service::start_sync`],
@@ -221,22 +236,45 @@ impl<S: Storage> DocumentsClient<S> {
         }
     }
 
-    /// Sets `metadata`'s type to what its text looks like, and, if
-    /// `file_it`, files it in the folder holding the documents closest to it
+    /// Which folders a document uploaded within `folder_id` may be filed in:
+    /// that folder and every folder below it, or any folder (see
+    /// [`Filing::Anywhere`]) if it isn't synced here (deleted since, say).
+    async fn filing_within(&self, folder_id: Uuid) -> Result<Filing> {
+        let folders = self.folders().await?;
+        if !folders.iter().any(|folder| folder.id == folder_id) {
+            tracing::info!(
+                "folder {folder_id} to file a document within isn't synced here, filing it automatically"
+            );
+            return Ok(Filing::Anywhere);
+        }
+        Ok(Filing::Within(subtree(&folders, folder_id)))
+    }
+
+    /// Sets `metadata`'s type to what its text looks like, and files it as
+    /// `filing` allows, in the folder holding the documents closest to it
     /// (see [`Self::filed_documents`]; each `None` where the classifier
-    /// can't tell), or leaves them as they are if that fails: the document
-    /// is then published untyped, at the root (or in the folder it was
-    /// given), rather than not at all. `embeddings` are the document's own.
+    /// can't tell, a document filed within a folder then staying in it), or
+    /// leaves them as they are if that fails: the document is then
+    /// published untyped, at the root (or in the folder it was given or is
+    /// filed within), rather than not at all. `embeddings` are the
+    /// document's own.
     async fn classify_upload(
         &self,
         metadata: &mut Metadata,
         embeddings: &DocumentEmbeddings,
-        file_it: bool,
+        filing: &Filing,
     ) {
-        let filed = if file_it {
-            self.filed_documents(embeddings).await
-        } else {
-            Ok(Vec::new())
+        let candidates = match filing {
+            Filing::Given => Ok(Vec::new()),
+            Filing::Within(folders) => Ok(folders.clone()),
+            Filing::Anywhere => self
+                .folders()
+                .await
+                .map(|folders| folders.iter().map(|folder| folder.id).collect()),
+        };
+        let filed = match candidates {
+            Ok(candidates) => self.filed_documents(embeddings, &candidates).await,
+            Err(err) => Err(err),
         };
         let classification = match filed {
             Ok(filed) => self.classifier.classify(&metadata.transcript, &filed).await,
@@ -245,8 +283,18 @@ impl<S: Storage> DocumentsClient<S> {
         match classification {
             Ok(classification) => {
                 metadata.r#type = classification.r#type;
-                if file_it {
-                    metadata.folder_id = classification.folder_id;
+                match filing {
+                    Filing::Given => {}
+                    // Never outside it, nor out of it to the root.
+                    Filing::Within(folders) => {
+                        if let Some(folder_id) = classification
+                            .folder_id
+                            .filter(|folder_id| folders.contains(folder_id))
+                        {
+                            metadata.folder_id = Some(folder_id);
+                        }
+                    }
+                    Filing::Anywhere => metadata.folder_id = classification.folder_id,
                 }
             }
             Err(err) => tracing::warn!(
@@ -257,20 +305,18 @@ impl<S: Storage> DocumentsClient<S> {
         }
     }
 
-    /// The documents filed directly in a folder synced here (never at the
-    /// root, À classer), each with its similarity to the new document whose
+    /// The documents filed directly in one of `folders` (never at the root,
+    /// À classer), each with its similarity to the new document whose
     /// chunks' `embeddings` are given: what it's filed by. Compares them as
     /// [`Service::similar`] does, the mean of the new document's chunks
     /// against each one's best chunk, from the vectors stored for search
     /// (by the same model): never embeds nor loads their content. None
-    /// without folders.
-    async fn filed_documents(&self, embeddings: &DocumentEmbeddings) -> Result<Vec<FiledDocument>> {
-        let folders: Vec<Uuid> = self
-            .folders()
-            .await?
-            .iter()
-            .map(|folder| folder.id)
-            .collect();
+    /// without `folders`.
+    async fn filed_documents(
+        &self,
+        embeddings: &DocumentEmbeddings,
+        folders: &[Uuid],
+    ) -> Result<Vec<FiledDocument>> {
         if folders.is_empty() {
             return Ok(Vec::new());
         }
@@ -286,7 +332,7 @@ impl<S: Storage> DocumentsClient<S> {
 
         let similarities = self
             .storage
-            .similarity_by_folder(&centroid, &embeddings.model, &folders)
+            .similarity_by_folder(&centroid, &embeddings.model, folders)
             .await
             .context("failed to compare the document with those already filed")?;
         Ok(similarities
@@ -499,6 +545,20 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .await
             .with_context(|| format!("invalid metadata for document {original_name:?}"))?;
 
+        let filing = match (request.folder_id, request.within_folder_id) {
+            (Some(_), _) => Filing::Given,
+            (None, Some(within)) => self
+                .filing_within(within)
+                .await
+                .with_context(|| format!("failed to file document {original_name:?}"))?,
+            (None, None) => Filing::Anywhere,
+        };
+        // Filed there unless classifying finds better below it, even
+        // without the model.
+        if let Filing::Within(folders) = &filing {
+            metadata.folder_id = folders.first().copied();
+        }
+
         let id = metadata.id;
 
         // Never part of the event: only handed over to this client's own
@@ -512,13 +572,9 @@ impl<S: Storage> Service for DocumentsClient<S> {
         // Only with the model at hand (the document's just been embedded),
         // so an upload never waits for its download twice.
         if let Some(embeddings) = &embeddings {
-            self.classify_upload(
-                &mut metadata,
-                &embeddings.embeddings,
-                request.folder_id.is_none(),
-            )
-            .instrument(tracing::debug_span!("classify_document"))
-            .await;
+            self.classify_upload(&mut metadata, &embeddings.embeddings, &filing)
+                .instrument(tracing::debug_span!("classify_document"))
+                .await;
         }
 
         let cached = embeddings.as_ref().map(|embeddings| {
@@ -1105,6 +1161,22 @@ fn check_created_range(filters: &SearchFilters) -> Result<()> {
     Ok(())
 }
 
+/// `root` and every folder below it among `folders`, at any depth, `root`
+/// first.
+fn subtree(folders: &[Folder], root: Uuid) -> Vec<Uuid> {
+    let mut found = vec![root];
+    let mut next = 0;
+    while let Some(&parent) = found.get(next) {
+        for folder in folders {
+            if folder.parent_id == Some(parent) && !found.contains(&folder.id) {
+                found.push(folder.id);
+            }
+        }
+        next += 1;
+    }
+    found
+}
+
 /// Folds the counts of documents directly in each folder (by id, or
 /// [`UNFILED`]) into [`SearchFacets::folders`] and
 /// [`SearchFacets::unfiled`]: each of `folders` with the documents in it or
@@ -1684,6 +1756,7 @@ mod tests {
             },
             name: Some("overridden.pdf".to_string()),
             folder_id: None,
+            within_folder_id: None,
         };
 
         client.upload(request).await.unwrap();
@@ -4064,6 +4137,276 @@ mod tests {
 
         let metadata = published_metadata(&changelog);
         assert_eq!((metadata.r#type, metadata.folder_id), (None, None));
+    }
+
+    /// A folder `chosen` with a subfolder holding another, beside an
+    /// `other` folder with a subfolder of its own: all five, `chosen`'s
+    /// below it in the order they're compared.
+    struct Tree {
+        chosen: Folder,
+        child: Folder,
+        grandchild: Folder,
+        other: Folder,
+        all: Vec<Folder>,
+    }
+
+    fn tree() -> Tree {
+        let chosen = FakeFolder::new().build();
+        let child = FakeFolder::new().with_parent(chosen.id).build();
+        let grandchild = FakeFolder::new().with_parent(child.id).build();
+        let other = FakeFolder::new().build();
+        let other_child = FakeFolder::new().with_parent(other.id).build();
+        let all = vec![
+            other.clone(),
+            grandchild.clone(),
+            chosen.clone(),
+            other_child,
+            child.clone(),
+        ];
+        Tree {
+            chosen,
+            child,
+            grandchild,
+            other,
+            all,
+        }
+    }
+
+    /// An upload of a document with text, filed within `folder_id`.
+    fn upload_within(folder_id: Uuid) -> UploadRequest {
+        let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
+        request.within_folder_id = Some(folder_id);
+        request
+    }
+
+    /// A classifier expected to classify once, given the documents
+    /// `similarities` lists, as `classification`.
+    fn classifier_given(
+        similarities: Vec<(Uuid, f32)>,
+        classification: Classification,
+    ) -> Arc<dyn ClassificationService> {
+        let mut classifier = MockClassificationService::new();
+        classifier
+            .expect_classify()
+            .withf(move |_, filed| {
+                let filed: Vec<(Uuid, f32)> = filed
+                    .iter()
+                    .map(|document| (document.folder_id, document.similarity))
+                    .collect();
+                filed == similarities
+            })
+            .times(1)
+            .returning(move |_, _| Ok(classification));
+        Arc::new(classifier)
+    }
+
+    #[tokio::test]
+    async fn upload_within_a_folder_files_it_by_that_folder_and_those_below_it_only() {
+        let tree = tree();
+        let similarities = vec![(tree.chosen.id, 0.86), (tree.grandchild.id, 0.95)];
+        let storage = storage_comparing_with(
+            vec![tree.chosen.id, tree.child.id, tree.grandchild.id],
+            similarities.clone(),
+        );
+        let classification = FakeClassification::new()
+            .with_folder(tree.grandchild.id)
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_filing_with(
+            storage,
+            embedder_embedding_as_halves(),
+            changelog.clone(),
+            classifier_given(similarities, classification),
+            tree.all.clone(),
+        );
+
+        client.upload(upload_within(tree.chosen.id)).await.unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(
+            (metadata.r#type, metadata.folder_id),
+            (classification.r#type, Some(tree.grandchild.id))
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_within_a_folder_files_it_there_when_no_folder_wins() {
+        let tree = tree();
+        let storage = storage_comparing_with(
+            vec![tree.chosen.id, tree.child.id, tree.grandchild.id],
+            Vec::new(),
+        );
+        let classification = FakeClassification::new().with_folder(None).build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_filing_with(
+            storage,
+            embedder_embedding_as_halves(),
+            changelog.clone(),
+            classifier_given(Vec::new(), classification),
+            tree.all.clone(),
+        );
+
+        client.upload(upload_within(tree.chosen.id)).await.unwrap();
+
+        assert_eq!(
+            published_metadata(&changelog).folder_id,
+            Some(tree.chosen.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_within_a_folder_never_files_it_outside_that_folder() {
+        let tree = tree();
+        let storage = storage_comparing_with(
+            vec![tree.chosen.id, tree.child.id, tree.grandchild.id],
+            Vec::new(),
+        );
+        let outside = FakeClassification::new().with_folder(tree.other.id).build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_filing_with(
+            storage,
+            embedder_embedding_as_halves(),
+            changelog.clone(),
+            classifier_given(Vec::new(), outside),
+            tree.all.clone(),
+        );
+
+        client.upload(upload_within(tree.chosen.id)).await.unwrap();
+
+        assert_eq!(
+            published_metadata(&changelog).folder_id,
+            Some(tree.chosen.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_within_a_folder_files_it_there_when_classifying_fails() {
+        let tree = tree();
+        let mut storage = storage_for_a_new_upload();
+        storage
+            .expect_similarity_by_folder()
+            .times(1)
+            .returning(|_, _, _| Err(ErrorKind::InvalidModel("bad vector".to_string()).into()));
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_filing_with(
+            storage,
+            embedder_embedding_as_halves(),
+            changelog.clone(),
+            unused_classifier(),
+            tree.all.clone(),
+        );
+
+        client.upload(upload_within(tree.chosen.id)).await.unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(
+            (metadata.r#type, metadata.folder_id),
+            (None, Some(tree.chosen.id))
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_within_a_folder_files_it_there_without_the_model() {
+        let tree = tree();
+        let changelog = Arc::new(RecordingChangelog::default());
+        // Strict: caching, classifying or comparing panics.
+        let client = DocumentsClient::new(
+            storage_for_a_new_upload(),
+            changelog.clone(),
+            None,
+            accepting_attributes(),
+            unused_indexer(),
+            embedder_without_model(),
+            unused_cache(),
+            unused_classifier(),
+            folders_listing(tree.all.clone()),
+        );
+
+        client.upload(upload_within(tree.chosen.id)).await.unwrap();
+
+        assert_eq!(
+            published_metadata(&changelog).folder_id,
+            Some(tree.chosen.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_within_a_folder_not_synced_here_files_it_anywhere() {
+        let tree = tree();
+        let ids: Vec<Uuid> = tree.all.iter().map(|folder| folder.id).collect();
+        let similarities = vec![(tree.other.id, 0.95)];
+        let storage = storage_comparing_with(ids, similarities.clone());
+        let classification = FakeClassification::new().with_folder(tree.other.id).build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_filing_with(
+            storage,
+            embedder_embedding_as_halves(),
+            changelog.clone(),
+            classifier_given(similarities, classification),
+            tree.all.clone(),
+        );
+
+        client.upload(upload_within(Uuid::now_v7())).await.unwrap();
+
+        assert_eq!(
+            published_metadata(&changelog).folder_id,
+            Some(tree.other.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_within_a_folder_not_synced_here_leaves_it_at_the_root_without_a_winner() {
+        let tree = tree();
+        let ids: Vec<Uuid> = tree.all.iter().map(|folder| folder.id).collect();
+        let storage = storage_comparing_with(ids, Vec::new());
+        let classification = FakeClassification::new().with_folder(None).build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_filing_with(
+            storage,
+            embedder_embedding_as_halves(),
+            changelog.clone(),
+            classifier_given(Vec::new(), classification),
+            tree.all.clone(),
+        );
+
+        client.upload(upload_within(Uuid::now_v7())).await.unwrap();
+
+        assert_eq!(published_metadata(&changelog).folder_id, None);
+    }
+
+    #[tokio::test]
+    async fn upload_in_a_given_folder_ignores_the_folder_to_file_it_within() {
+        let tree = tree();
+        let classification = FakeClassification::new()
+            .with_folder(tree.grandchild.id)
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        // Strict storage: comparing the document with others panics.
+        let client = client_classifying_with_folders(
+            changelog.clone(),
+            classifier_given(Vec::new(), classification),
+            tree.all.clone(),
+        );
+
+        let mut request = upload_within(tree.chosen.id);
+        request.folder_id = Some(tree.other.id);
+        client.upload(request).await.unwrap();
+
+        assert_eq!(
+            published_metadata(&changelog).folder_id,
+            Some(tree.other.id)
+        );
+    }
+
+    #[test]
+    fn subtree_lists_a_folder_then_every_folder_below_it() {
+        let tree = tree();
+
+        assert_eq!(
+            subtree(&tree.all, tree.chosen.id),
+            [tree.chosen.id, tree.child.id, tree.grandchild.id]
+        );
+        assert_eq!(subtree(&tree.all, tree.grandchild.id), [tree.grandchild.id]);
     }
 
     #[tokio::test]

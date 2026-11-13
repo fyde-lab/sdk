@@ -72,17 +72,19 @@ pub trait Service: Send + Sync {
 
     /// Installs the script `request.script_id` for the authenticated user,
     /// to be run with `request.parameters`, filing the documents it
-    /// downloads in `request.folder_id` (`None`: with the documents each
-    /// one is the closest to): as a new installation if `request.installation_id`
-    /// is `None` (a user can install the same script several times, once per
-    /// account on its site), else replacing that installation, which is how
-    /// its parameters, label or folder change. Fetches the script (see
+    /// downloads within `request.folder_id` (see
+    /// [`InstalledScript::folder_id`]): as a new installation if
+    /// `request.installation_id` is `None` (a user can install the same
+    /// script several times, once per account on its site), else replacing
+    /// that installation, which is how its parameters, label or folder
+    /// change. Fetches the script (see
     /// [`Self::fetch_script`]), then serializes it together with the
     /// installation's id, label, parameters and folder as an
     /// [`InstalledScript`] JSON document and publishes it, encrypted, as an
     /// `InstallScript` changelog event whose subject is the installation id,
     /// which it returns. Fails with [`crate::ErrorCode::FolderNotFound`] for
-    /// a folder not synced here, with
+    /// a folder not synced here (one deleted later only makes runs file
+    /// automatically), with
     /// [`crate::ErrorCode::MissingScriptParameter`] if a parameter the script
     /// marks `required` has no value, and with
     /// [`crate::ErrorCode::InvalidInstallationLabel`] if the trimmed label
