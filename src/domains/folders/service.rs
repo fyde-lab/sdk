@@ -6,10 +6,8 @@ use uuid::Uuid;
 
 use crate::domains::changelog::{EventType, Service as ChangelogService};
 use crate::domains::documents::Storage as DocumentStorage;
-use crate::error::Language;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
-use super::layout::{PROPOSED_LAYOUT, ProposedFolder};
 use super::storage::Storage;
 use super::{
     Applier, CreateFolderRequest, DeleteFolderEvent, Folder, FolderAppearance, FolderColor,
@@ -142,49 +140,6 @@ impl<S: Storage> Service for FoldersClient<S> {
             .send(EventType::DeleteFolder, id, Some(&content), None)
             .await
             .with_context(|| format!("failed to publish deletion of folder {id}"))
-    }
-
-    async fn create_proposed_layout(&self, language: &str) -> Result<Vec<Folder>> {
-        let language = Language::parse(language);
-        // Folders published so far count as taken too, so the layout can't
-        // clash with itself.
-        let mut folders = self.folders().await?;
-        let mut created = Vec::new();
-        let mut pending: Vec<(Option<Uuid>, &ProposedFolder)> = PROPOSED_LAYOUT
-            .iter()
-            .map(|proposed| (None, proposed))
-            .collect();
-        while !pending.is_empty() {
-            let mut next = Vec::new();
-            for (parent_id, proposed) in pending {
-                let (name, description) = match language {
-                    Language::French => proposed.fr,
-                    Language::English => proposed.en,
-                };
-                let existing = folders
-                    .iter()
-                    .find(|folder| folder.parent_id == parent_id && same_name(&folder.name, name));
-                let id = match existing {
-                    Some(existing) => existing.id,
-                    None => {
-                        let folder = Folder {
-                            id: Uuid::now_v7(),
-                            parent_id,
-                            name: name.to_string(),
-                            description: description.to_string(),
-                            appearance: proposed.appearance,
-                        };
-                        self.publish(&folder).await?;
-                        folders.push(folder.clone());
-                        created.push(folder.clone());
-                        folder.id
-                    }
-                };
-                next.extend(proposed.children.iter().map(|child| (Some(id), child)));
-            }
-            pending = next;
-        }
-        Ok(created)
     }
 }
 
@@ -918,64 +873,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[tokio::test]
-    async fn create_proposed_layout_publishes_every_folder_parents_first_in_the_language() {
-        let (client, changelog) = client(storage_with(Vec::new()));
-
-        let created = client.create_proposed_layout("fr-FR").await.unwrap();
-
-        let published: Vec<Folder> = changelog
-            .sent
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(event_type, _, content)| {
-                assert_eq!(*event_type, EventType::SaveFolder);
-                serde_json::from_slice(content.as_deref().unwrap()).unwrap()
-            })
-            .collect();
-        assert_eq!(published, created);
-        assert_eq!(created.len(), proposed_folders().len());
-        let logement = created
-            .iter()
-            .find(|folder| folder.name == "Logement")
-            .unwrap();
-        assert_eq!(logement.parent_id, None);
-        let energie = created
-            .iter()
-            .find(|folder| folder.name == "Énergie")
-            .unwrap();
-        assert_eq!(energie.parent_id, Some(logement.id));
-        let position = |id: Uuid| created.iter().position(|folder| folder.id == id).unwrap();
-        assert!(position(logement.id) < position(energie.id));
-    }
-
-    #[tokio::test]
-    async fn create_proposed_layout_names_folders_in_english_for_any_other_language() {
-        let (client, _) = client(storage_with(Vec::new()));
-
-        let created = client.create_proposed_layout("de").await.unwrap();
-
-        assert!(created.iter().any(|folder| folder.name == "Housing"));
-        assert!(!created.iter().any(|folder| folder.name == "Logement"));
-    }
-
-    #[tokio::test]
-    async fn create_proposed_layout_reuses_a_folder_already_named_like_one_it_proposes() {
-        let existing = FakeFolder::new().with_name("logement").build();
-        let (client, _) = client(storage_with(vec![existing.clone()]));
-
-        let created = client.create_proposed_layout("fr").await.unwrap();
-
-        assert!(!created.iter().any(|folder| folder.name == "Logement"));
-        let energie = created
-            .iter()
-            .find(|folder| folder.name == "Énergie")
-            .unwrap();
-        assert_eq!(energie.parent_id, Some(existing.id));
-        assert_eq!(created.len(), proposed_folders().len() - 1);
     }
 
     #[tokio::test]

@@ -274,11 +274,12 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   puts the folder at the top level (default appearance if it has none), a sibling name clash
   gets a `" (2)"` suffix; deleting keeps the children (moved up, taking the top-level
   appearance when they land at the root) or removes every descendant.
-  `create_proposed_layout(language)` publishes `layout.rs`'s `PROPOSED_LAYOUT` (16 top-level
-  folders with appearance, one subfolder per kind of paper, French or English names and
-  descriptions; top-level folders with subfolders have no description, so the classifier files
-  into the subfolders), reusing a same-named folder already there. Keep its texts within the
-  folder rules (tests check).
+  New vaults start with no folder: the SDK proposes no layout. `layout.rs` (`#[cfg(test)]`)
+  keeps `PROPOSED_LAYOUT`, a sample vault (16 top-level folders with appearance, one subfolder
+  per kind of paper, French and English names and descriptions; top-level folders with
+  subfolders have no description, so the classifier files into the subfolders) as test data
+  only, via `proposed_layout_folders(language)`. Keep its texts within the folder rules (tests
+  check).
 - **users** — OPAQUE (RFC 9807, `opaque-ke`); the password never leaves the SDK.
   `FydeCipherSuite` (ristretto255 + 3DH/SHA-512 + Argon2id 64 MiB/3 iters/4 lanes) must match
   `../server`'s. `crypto.rs`'s `OpaqueClient` trait exists so service tests skip real KSF cost. Its `finish_*`

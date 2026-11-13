@@ -1,7 +1,7 @@
 use super::{FolderAppearance, FolderColor, FolderIcon};
 
-/// A folder of the proposed layout (see `Service::create_proposed_layout`),
-/// named and described in French and English (`(name, description)`).
+/// A folder of [`PROPOSED_LAYOUT`], named and described in French and
+/// English (`(name, description)`).
 pub(super) struct ProposedFolder {
     pub(super) fr: (&'static str, &'static str),
     pub(super) en: (&'static str, &'static str),
@@ -10,8 +10,9 @@ pub(super) struct ProposedFolder {
     pub(super) children: &'static [ProposedFolder],
 }
 
-/// The folders a new vault can start with: one per part of life, with a
-/// subfolder per kind of paper. Each subfolder (and a top-level folder
+/// A realistic vault's folders, for tests: one per part of life, with a
+/// subfolder per kind of paper (the classifier's real-model test files
+/// synthetic documents in it). Each subfolder (and a top-level folder
 /// without any) is described the way its documents read, which is what new
 /// documents are filed by; a top-level folder holding subfolders has no
 /// description, so documents go to its subfolders rather than to it.

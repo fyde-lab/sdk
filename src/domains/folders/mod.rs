@@ -1,3 +1,4 @@
+#[cfg(test)]
 mod layout;
 mod models;
 mod service;
@@ -62,16 +63,6 @@ pub trait Service: Send + Sync {
     /// Deletes a folder, keeping what it holds (moved up to its parent) or
     /// deleting it too (see [`FolderContents`]).
     async fn delete(&self, id: Uuid, contents: FolderContents) -> Result<()>;
-
-    /// Publishes the proposed layout: a folder per part of life (Logement,
-    /// Argent, Travail...) with a coloured icon, and a subfolder per kind of
-    /// paper, each described the way its documents read so new documents
-    /// are filed there. Named and described in `language` (a code or locale
-    /// like `"fr"` or `"fr-FR"`: French, anything else English). A folder
-    /// whose name is already taken where it would go is skipped, its
-    /// subfolders created in the existing one. Returns the folders created,
-    /// parents first.
-    async fn create_proposed_layout(&self, language: &str) -> Result<Vec<Folder>>;
 }
 
 /// Materializes consumed folder events into local storage, for the
@@ -128,9 +119,8 @@ pub(crate) fn folders_listing(folders: Vec<Folder>) -> Arc<dyn Service> {
     Arc::new(service)
 }
 
-/// The proposed layout in `language` (see
-/// [`Service::create_proposed_layout`]) as folders with fresh ids, for
-/// tests filing documents in it.
+/// `layout.rs`'s sample layout in `language` as folders with fresh ids,
+/// for tests filing documents in it.
 #[cfg(test)]
 pub(crate) fn proposed_layout_folders(language: &str) -> Vec<Folder> {
     fn add(
