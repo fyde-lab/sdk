@@ -266,9 +266,9 @@ impl Service for ScrapersClient {
 }
 
 impl ScrapersClient {
-    /// [`Service::run`], filing every document the script saves in
-    /// `folder_id` (`None`: with the documents each one is the closest to,
-    /// see [`DocumentsService::upload`]).
+    /// [`Service::run`], filing every document the script saves within
+    /// `folder_id` (`None`: anywhere, with the documents each one is the
+    /// closest to; see [`DocumentsService::upload`]).
     async fn run_filing_in(
         &self,
         name: &str,
@@ -788,7 +788,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_installed_files_every_saved_document_in_the_installation_folder() {
+    async fn run_installed_files_every_saved_document_within_the_installation_folder() {
         let script = FakeScript::new()
             .with_script(
                 r#"
@@ -816,7 +816,7 @@ mod tests {
         let mut documents = MockDocumentsService::new();
         documents
             .expect_upload()
-            .withf(move |request| request.folder_id == Some(folder_id))
+            .withf(move |request| request.within_folder_id == Some(folder_id))
             .times(2)
             .returning(|_| Ok(Uuid::now_v7()));
 

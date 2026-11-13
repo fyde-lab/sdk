@@ -285,9 +285,8 @@ pub struct InstallScriptRequest {
     /// `service::default_label`).
     pub label: String,
     pub parameters: HashMap<String, Value>,
-    /// The folder every document the script downloads is filed in. `None`
-    /// files each one with the documents it's the closest to (see
-    /// [`crate::DocumentsService::upload`]).
+    /// The folder every document the script downloads is filed within (see
+    /// [`InstalledScript::folder_id`]). `None` files each one anywhere.
     pub folder_id: Option<Uuid>,
 }
 
@@ -372,11 +371,15 @@ impl InstalledScript {
         &self.parameters
     }
 
-    /// The folder every document [`Self::script`] downloads is filed in, or
-    /// `None` to file each one with the documents it's the closest to. Running the
-    /// script fails with [`crate::ErrorCode::FolderNotFound`] on its first
-    /// document once this folder is deleted: install it again to pick
-    /// another.
+    /// The folder every document [`Self::script`] downloads is filed within:
+    /// in whichever of this folder and the folders below it holds the
+    /// documents closest to it, else in this folder itself, never outside
+    /// it nor at the root, À classer (see
+    /// [`crate::UploadRequest::within_folder_id`]). `None` files each one
+    /// anywhere in the vault, with the documents it's the closest to (see
+    /// [`crate::DocumentsService::upload`]). Once this folder is deleted (or
+    /// on a device it hasn't synced to), runs file their documents as with
+    /// `None`, without failing: install again to pick another folder.
     pub fn folder_id(&self) -> Option<Uuid> {
         self.folder_id
     }

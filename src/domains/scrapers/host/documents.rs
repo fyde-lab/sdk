@@ -19,11 +19,12 @@ use crate::domains::documents::{Service as DocumentsService, UploadRequest};
 /// not the uploaded document's real identity (that's the id `upload`
 /// returns) but it is its original name. The optional `fields` table lets a
 /// script propose the name to show instead (`name`). Everything else (its
-/// type, and its folder unless `folder_id` is set: the one the user picked
-/// when installing the script) is derived from the document: any other key
-/// is ignored. A document whose content is already saved locally is silently
-/// skipped, not an error, so re-running a scraper doesn't fail on what it
-/// already fetched.
+/// type and folder) is derived from the document, within `folder_id` if
+/// it's set (the one the user picked when installing the script: see
+/// [`UploadRequest::within_folder_id`]): any other key is ignored. A
+/// document whose content is already saved locally is silently skipped, not
+/// an error, so re-running a scraper doesn't fail on what it already
+/// fetched.
 pub(super) fn save_document_fn(
     lua: &Lua,
     documents: Arc<dyn DocumentsService>,
@@ -48,7 +49,7 @@ pub(super) fn save_document_fn(
 
             let leaf = name.rsplit(['/', '\\']).next().unwrap_or(&name);
             let mut request = UploadRequest::from_raw(sanitize_path_segment(leaf), bytes.to_vec());
-            request.folder_id = folder_id;
+            request.within_folder_id = folder_id;
             if let Some(fields) = fields {
                 apply_upload_fields(&mut request, &fields)?;
             }
@@ -171,12 +172,14 @@ mod tests {
     }
 
     #[test]
-    fn save_document_files_the_document_in_the_installation_folder() {
+    fn save_document_files_the_document_within_the_installation_folder() {
         let folder_id = Uuid::now_v7();
         let mut documents = MockDocumentsService::new();
         documents
             .expect_upload()
-            .withf(move |request| request.folder_id == Some(folder_id))
+            .withf(move |request| {
+                request.within_folder_id == Some(folder_id) && request.folder_id.is_none()
+            })
             .times(1)
             .returning(|_| Ok(Uuid::now_v7()));
 

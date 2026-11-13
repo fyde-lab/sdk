@@ -87,7 +87,12 @@ pub trait Service: Send + Sync {
     /// yet), and both when the embedding model isn't available. A
     /// `request.folder_id` files it there instead, never guessing one (its
     /// type still is): [`crate::ErrorCode::FolderNotFound`] for a folder not
-    /// synced here.
+    /// synced here. A `request.within_folder_id` (a source's folder) only
+    /// guesses among that folder and every folder below it, at any depth,
+    /// filing it in that folder itself when none wins (or without the
+    /// model): never outside it, nor at the root. One not synced here
+    /// (deleted since, say) doesn't fail the upload: it's guessed across
+    /// the whole vault, as without it.
     ///
     /// The file type is determined from the source's name's extension;
     /// only `.pdf` is currently accepted, anything else is rejected with
