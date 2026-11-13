@@ -356,8 +356,8 @@ pub enum UploadSource {
 pub struct UploadRequest {
     pub source: UploadSource,
     pub name: Option<String>,
-    /// The folder to file the document in. `None` guesses one from its
-    /// text (see [`super::Service::upload`]).
+    /// The folder to file the document in. `None` guesses one from the
+    /// documents already filed (see [`super::Service::upload`]).
     pub folder_id: Option<Uuid>,
 }
 

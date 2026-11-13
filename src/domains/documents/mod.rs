@@ -72,10 +72,19 @@ pub trait Service: Send + Sync {
     /// generated id. Its original name is the source's file name, its name
     /// `request.name` or, without one, that file name without its
     /// extension; it has no attribute, and its type and folder are guessed
-    /// from its text, on device: the folder is the one whose description it
-    /// reads like (see the `folders` domain). Each is `None` when the
-    /// classifier isn't sure (the document then lands at the root, À
-    /// classer), and both when the embedding model isn't available. A
+    /// on device. The type from its text. The folder from the documents
+    /// already filed, by content only (never by folder names): the one whose
+    /// documents directly in it are the closest to this one, compared as
+    /// [`Self::similar`] does, from the embeddings stored for search (so
+    /// without loading any document). A folder scores the mean similarity
+    /// of its three documents closest to the new one (of all of them if it
+    /// holds fewer), and wins only if no other folder comes within 0.01 of
+    /// it and it reaches what [`Self::similar`] keeps at
+    /// [`DEFAULT_SIMILAR_MIN_CONFIDENCE`]. So a folder holding no document,
+    /// and the documents at the root, never draw one. Each is `None` when
+    /// the classifier isn't sure (the document then lands at the root, À
+    /// classer, as every upload does into a vault with no filed document
+    /// yet), and both when the embedding model isn't available. A
     /// `request.folder_id` files it there instead, never guessing one (its
     /// type still is): [`crate::ErrorCode::FolderNotFound`] for a folder not
     /// synced here.

@@ -72,8 +72,8 @@ pub trait Service: Send + Sync {
 
     /// Installs the script `request.script_id` for the authenticated user,
     /// to be run with `request.parameters`, filing the documents it
-    /// downloads in `request.folder_id` (`None`: wherever each one's text
-    /// says it belongs): as a new installation if `request.installation_id`
+    /// downloads in `request.folder_id` (`None`: with the documents each
+    /// one is the closest to): as a new installation if `request.installation_id`
     /// is `None` (a user can install the same script several times, once per
     /// account on its site), else replacing that installation, which is how
     /// its parameters, label or folder change. Fetches the script (see

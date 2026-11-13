@@ -301,6 +301,51 @@ impl Storage for SqliteStorage {
         Ok(ranked)
     }
 
+    async fn similarity_by_folder(
+        &self,
+        query: &[f32],
+        model: &str,
+        folders: &[Uuid],
+    ) -> Result<Vec<(Uuid, f32)>> {
+        let query_norm = norm(query);
+        // Streamed, like `rank_by_similarity`.
+        let mut rows = sqlx::query(
+            "SELECT e.document_id AS id, d.folder_id, e.vector
+             FROM document_embeddings e JOIN documents d ON d.id = e.document_id
+             WHERE e.model = ?1 AND d.folder_id IN (SELECT value FROM json_each(?2))",
+        )
+        .bind(model)
+        .bind(ids_to_json(folders)?)
+        .fetch(&self.pool);
+
+        let mut best = HashMap::<String, (String, f32)>::new();
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .context("failed to read the embeddings of filed documents")?
+        {
+            let id: String = row.get("id");
+            let folder_id: String = row.get("folder_id");
+            let vector: &[u8] = row.get("vector");
+            let Some(similarity) = cosine(query, query_norm, vector)
+                .with_context(|| format!("invalid embedding of document {id}"))?
+            else {
+                continue;
+            };
+            best.entry(id)
+                .and_modify(|(_, best)| *best = best.max(similarity))
+                .or_insert((folder_id, similarity));
+        }
+
+        best.into_values()
+            .map(|(folder_id, similarity)| {
+                let folder_id = Uuid::parse_str(&folder_id)
+                    .with_context(|| format!("invalid folder id in local database: {folder_id}"))?;
+                Ok((folder_id, similarity))
+            })
+            .collect()
+    }
+
     async fn get_embedding_vectors(&self, id: Uuid, model: &str) -> Result<Vec<Vec<f32>>> {
         let rows: Vec<Vec<u8>> = sqlx::query_scalar(
             "SELECT vector FROM document_embeddings
@@ -758,14 +803,12 @@ pub(super) mod tests {
             (HEALTH, None),
             (BANKING, Some(HEALTH)),
         ] {
-            sqlx::query(
-                "INSERT INTO folders (id, parent_id, name, description) VALUES (?1, ?2, ?1, '')",
-            )
-            .bind(id.to_string())
-            .bind(parent.map(|parent: Uuid| parent.to_string()))
-            .execute(&pool)
-            .await
-            .unwrap();
+            sqlx::query("INSERT INTO folders (id, parent_id, name) VALUES (?1, ?2, ?1)")
+                .bind(id.to_string())
+                .bind(parent.map(|parent: Uuid| parent.to_string()))
+                .execute(&pool)
+                .await
+                .unwrap();
         }
 
         SqliteStorage::new(pool)
@@ -2178,6 +2221,111 @@ pub(super) mod tests {
             .unwrap_err();
 
         assert!(err.has_context());
+    }
+
+    /// [`Storage::similarity_by_folder`]'s entries, sorted.
+    async fn by_folder(
+        storage: &SqliteStorage,
+        query: &[f32],
+        folders: &[Uuid],
+    ) -> Vec<(Uuid, f32)> {
+        let mut found = storage
+            .similarity_by_folder(query, MODEL, folders)
+            .await
+            .unwrap();
+        found.sort_by(|(a_id, a), (b_id, b)| a_id.cmp(b_id).then(a.total_cmp(b)));
+        found
+    }
+
+    #[tokio::test]
+    async fn similarity_by_folder_scores_each_document_by_its_best_chunk_with_its_folder() {
+        let storage = setup().await;
+        save_embedded(
+            &storage,
+            searchable("good-chunk", 1).with_folder(HOUSING),
+            MODEL,
+            &[&[0.0, 1.0], &[1.0, 0.0]],
+        )
+        .await;
+        // Unnormalized: its cosine is 0.6 whatever its length.
+        save_embedded(
+            &storage,
+            searchable("fair", 2).with_folder(HOUSING),
+            MODEL,
+            &[&[6.0, 8.0]],
+        )
+        .await;
+        save_embedded(
+            &storage,
+            searchable("opposite", 3).with_folder(MONEY),
+            MODEL,
+            &[&[-1.0, 0.0]],
+        )
+        .await;
+
+        let found = by_folder(&storage, &[2.0, 0.0], &[HOUSING, MONEY]).await;
+
+        assert_eq!(found.len(), 3, "{found:?}");
+        let mut housing: Vec<f32> = found
+            .iter()
+            .filter(|(folder, _)| *folder == HOUSING)
+            .map(|(_, similarity)| *similarity)
+            .collect();
+        housing.sort_by(f32::total_cmp);
+        assert!((housing[0] - 0.6).abs() < 1e-6, "{found:?}");
+        assert!((housing[1] - 1.0).abs() < 1e-6, "{found:?}");
+        assert!(found.contains(&(MONEY, -1.0)), "{found:?}");
+    }
+
+    #[tokio::test]
+    async fn similarity_by_folder_keeps_only_documents_directly_in_the_folders_given() {
+        let storage = setup().await;
+        let embedded = |metadata| save_embedded(&storage, metadata, MODEL, &[&[1.0, 0.0]]);
+        embedded(searchable("in", 1).with_folder(HEALTH)).await;
+        // At the root (À classer), in a subfolder or another folder, or
+        // in a folder gone.
+        embedded(searchable("root", 2)).await;
+        embedded(searchable("subfolder", 3).with_folder(BANKING)).await;
+        embedded(searchable("other", 4).with_folder(MONEY)).await;
+        embedded(searchable("gone", 5).with_folder(Uuid::now_v7())).await;
+
+        let found = by_folder(&storage, &[1.0, 0.0], &[HEALTH]).await;
+
+        assert_eq!(found, [(HEALTH, 1.0)]);
+        assert!(by_folder(&storage, &[1.0, 0.0], &[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn similarity_by_folder_skips_documents_without_embeddings_from_the_model() {
+        let storage = setup().await;
+        let in_housing = |name: &str| searchable(name, 1).with_folder(HOUSING);
+        save_embedded(&storage, in_housing("e5"), MODEL, &[&[1.0, 0.0]]).await;
+        save_embedded(&storage, in_housing("other"), "other.onnx", &[&[1.0, 0.0]]).await;
+        save_embedded(&storage, in_housing("no-chunks"), MODEL, &[]).await;
+        save_embedded(&storage, in_housing("zero"), MODEL, &[&[0.0, 0.0]]).await;
+
+        let found = by_folder(&storage, &[1.0, 0.0], &[HOUSING]).await;
+
+        assert_eq!(found, [(HOUSING, 1.0)]);
+    }
+
+    #[tokio::test]
+    async fn similarity_by_folder_fails_on_an_embedding_of_another_length() {
+        let storage = setup().await;
+        save_embedded(
+            &storage,
+            searchable("doc", 1).with_folder(HOUSING),
+            MODEL,
+            &[&[1.0, 0.0, 0.0]],
+        )
+        .await;
+
+        let err = storage
+            .similarity_by_folder(&[1.0, 0.0], MODEL, &[HOUSING])
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::ModelLoadFailed);
     }
 
     #[tokio::test]

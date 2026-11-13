@@ -286,7 +286,7 @@ pub struct InstallScriptRequest {
     pub label: String,
     pub parameters: HashMap<String, Value>,
     /// The folder every document the script downloads is filed in. `None`
-    /// files each one where its text says it belongs (see
+    /// files each one with the documents it's the closest to (see
     /// [`crate::DocumentsService::upload`]).
     pub folder_id: Option<Uuid>,
 }
@@ -373,7 +373,7 @@ impl InstalledScript {
     }
 
     /// The folder every document [`Self::script`] downloads is filed in, or
-    /// `None` to file each one where its text says it belongs. Running the
+    /// `None` to file each one with the documents it's the closest to. Running the
     /// script fails with [`crate::ErrorCode::FolderNotFound`] on its first
     /// document once this folder is deleted: install it again to pick
     /// another.

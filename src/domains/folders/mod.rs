@@ -18,7 +18,7 @@ pub(crate) use models::DeleteFolderEvent;
 pub use models::FakeFolder;
 pub use models::{
     CreateFolderRequest, Folder, FolderAppearance, FolderColor, FolderContents, FolderIcon,
-    MAX_FOLDER_DESCRIPTION_CHARS, MAX_FOLDER_NAME_CHARS, UpdateFolderRequest,
+    MAX_FOLDER_NAME_CHARS, UpdateFolderRequest,
 };
 
 use crate::Result;
@@ -29,6 +29,8 @@ use crate::domains::changelog::Service as ChangelogService;
 /// device so far, then published as an encrypted changelog event
 /// (`SaveFolder`, `DeleteFolder`): like documents, it only shows up in
 /// [`Service::list`] once the sync job consumes it back, on every device.
+/// New documents are filed in them by what each already holds (see
+/// [`crate::domains::documents::Service::upload`]), never by their names.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Service: Send + Sync {
@@ -39,16 +41,13 @@ pub trait Service: Send + Sync {
     /// Publishes a new folder and returns it. Its name is trimmed and must
     /// be 1 to [`MAX_FOLDER_NAME_CHARS`] characters, without control
     /// characters ([`crate::ErrorCode::InvalidFolderName`]), and free among
-    /// its siblings, case-insensitively ([`crate::ErrorCode::FolderNameTaken`]);
-    /// its description at most [`MAX_FOLDER_DESCRIPTION_CHARS`]
-    /// ([`crate::ErrorCode::InvalidFolderDescription`]). A top-level folder
-    /// needs an appearance, a subfolder can't have one
+    /// its siblings, case-insensitively ([`crate::ErrorCode::FolderNameTaken`]).
+    /// A top-level folder needs an appearance, a subfolder can't have one
     /// ([`crate::ErrorCode::InvalidFolderAppearance`]); the parent must
     /// exist ([`crate::ErrorCode::FolderNotFound`]).
     async fn create(&self, request: CreateFolderRequest) -> Result<Folder>;
 
-    /// Renames, re-describes or recolours a folder, with
-    /// [`Self::create`]'s rules.
+    /// Renames or recolours a folder, with [`Self::create`]'s rules.
     async fn update(&self, request: UpdateFolderRequest) -> Result<()>;
 
     /// Moves a folder, with everything it holds, under `parent_id` (`None`
@@ -130,13 +129,12 @@ pub(crate) fn proposed_layout_folders(language: &str) -> Vec<Folder> {
         into: &mut Vec<Folder>,
     ) {
         for folder in proposed {
-            let (name, description) = if french { folder.fr } else { folder.en };
+            let name = if french { folder.fr } else { folder.en };
             let id = Uuid::now_v7();
             into.push(Folder {
                 id,
                 parent_id,
                 name: name.to_string(),
-                description: description.to_string(),
                 appearance: folder.appearance,
             });
             add(folder.children, Some(id), french, into);

@@ -107,6 +107,17 @@ pub(crate) trait Storage: Send + Sync {
         limit: usize,
     ) -> Result<Vec<(Uuid, f32)>>;
 
+    /// One entry per document directly in one of `folders` that has
+    /// embeddings from `model`: its folder, with its best chunk's cosine
+    /// similarity to `query`, in no particular order. Never loads their
+    /// content.
+    async fn similarity_by_folder(
+        &self,
+        query: &[f32],
+        model: &str,
+        folders: &[Uuid],
+    ) -> Result<Vec<(Uuid, f32)>>;
+
     /// The vectors of the document `id`'s chunks embedded by `model`, in
     /// chunk order: none if it has none from `model`, or doesn't exist.
     async fn get_embedding_vectors(&self, id: Uuid, model: &str) -> Result<Vec<Vec<f32>>>;

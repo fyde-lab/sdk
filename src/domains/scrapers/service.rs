@@ -267,8 +267,8 @@ impl Service for ScrapersClient {
 
 impl ScrapersClient {
     /// [`Service::run`], filing every document the script saves in
-    /// `folder_id` (`None`: wherever each one's text says it belongs, see
-    /// [`DocumentsService::upload`]).
+    /// `folder_id` (`None`: with the documents each one is the closest to,
+    /// see [`DocumentsService::upload`]).
     async fn run_filing_in(
         &self,
         name: &str,

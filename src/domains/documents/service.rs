@@ -18,7 +18,7 @@ use crate::domains::folders::{Folder, Service as FoldersService};
 
 use super::attributes::Service as AttributesService;
 use super::chunk;
-use super::classification::Service as ClassificationService;
+use super::classification::{FiledDocument, Service as ClassificationService};
 use super::embedder::Embedder;
 use super::gliner::SpanFinder;
 use super::storage::{FacetField, Storage, UNFILED};
@@ -56,7 +56,7 @@ const RRF_K: f64 = 60.0;
 /// into roughly 0.7–0.9, so even unrelated text scores high. Tuned on a real
 /// French corpus: documents answering a query scored 0.85–0.91, while most
 /// off-topic queries' best matches stayed below 0.85.
-const SIMILARITY_FLOOR: f32 = 0.85;
+pub(super) const SIMILARITY_FLOOR: f32 = 0.85;
 
 /// The cosine similarity between two documents at which
 /// [`Service::similar`]'s confidence is 0: multilingual-e5-small puts
@@ -222,22 +222,24 @@ impl<S: Storage> DocumentsClient<S> {
     }
 
     /// Sets `metadata`'s type to what its text looks like, and, if
-    /// `file_it`, files it in the folder whose description it reads like
-    /// (each `None` where the classifier can't tell), or leaves them as they
-    /// are if that fails: the document is then published untyped, at the
-    /// root (or in the folder it was given), rather than not at all.
-    async fn classify_upload(&self, metadata: &mut Metadata, file_it: bool) {
-        let folders = if file_it {
-            self.folders().await
+    /// `file_it`, files it in the folder holding the documents closest to it
+    /// (see [`Self::filed_documents`]; each `None` where the classifier
+    /// can't tell), or leaves them as they are if that fails: the document
+    /// is then published untyped, at the root (or in the folder it was
+    /// given), rather than not at all. `embeddings` are the document's own.
+    async fn classify_upload(
+        &self,
+        metadata: &mut Metadata,
+        embeddings: &DocumentEmbeddings,
+        file_it: bool,
+    ) {
+        let filed = if file_it {
+            self.filed_documents(embeddings).await
         } else {
             Ok(Vec::new())
         };
-        let classification = match folders {
-            Ok(folders) => {
-                self.classifier
-                    .classify(&metadata.transcript, &folders)
-                    .await
-            }
+        let classification = match filed {
+            Ok(filed) => self.classifier.classify(&metadata.transcript, &filed).await,
             Err(err) => Err(err),
         };
         match classification {
@@ -253,6 +255,47 @@ impl<S: Storage> DocumentsClient<S> {
                 metadata.id
             ),
         }
+    }
+
+    /// The documents filed directly in a folder synced here (never at the
+    /// root, À classer), each with its similarity to the new document whose
+    /// chunks' `embeddings` are given: what it's filed by. Compares them as
+    /// [`Service::similar`] does, the mean of the new document's chunks
+    /// against each one's best chunk, from the vectors stored for search
+    /// (by the same model): never embeds nor loads their content. None
+    /// without folders.
+    async fn filed_documents(&self, embeddings: &DocumentEmbeddings) -> Result<Vec<FiledDocument>> {
+        let folders: Vec<Uuid> = self
+            .folders()
+            .await?
+            .iter()
+            .map(|folder| folder.id)
+            .collect();
+        if folders.is_empty() {
+            return Ok(Vec::new());
+        }
+        let vectors = embeddings
+            .chunks
+            .iter()
+            .map(|chunk| chunk.vector.as_slice());
+        let Some(centroid) =
+            mean(vectors).context("failed to average the uploaded document's chunk embeddings")?
+        else {
+            return Ok(Vec::new());
+        };
+
+        let similarities = self
+            .storage
+            .similarity_by_folder(&centroid, &embeddings.model, &folders)
+            .await
+            .context("failed to compare the document with those already filed")?;
+        Ok(similarities
+            .into_iter()
+            .map(|(folder_id, similarity)| FiledDocument {
+                folder_id,
+                similarity,
+            })
+            .collect())
     }
 
     /// Embeds a search's `text`, or `None` if that fails (the model isn't
@@ -468,10 +511,14 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
         // Only with the model at hand (the document's just been embedded),
         // so an upload never waits for its download twice.
-        if embeddings.is_some() {
-            self.classify_upload(&mut metadata, request.folder_id.is_none())
-                .instrument(tracing::debug_span!("classify_document"))
-                .await;
+        if let Some(embeddings) = &embeddings {
+            self.classify_upload(
+                &mut metadata,
+                &embeddings.embeddings,
+                request.folder_id.is_none(),
+            )
+            .instrument(tracing::debug_span!("classify_document"))
+            .await;
         }
 
         let cached = embeddings.as_ref().map(|embeddings| {
@@ -628,7 +675,9 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .await
             .with_context(|| format!("failed to load document {id}'s embeddings"))?;
         // No text, or not indexed by this model yet: nothing to compare.
-        let Some(centroid) = mean(&vectors).with_context(|| format!("document {id}"))? else {
+        let Some(centroid) =
+            mean(vectors.iter().map(Vec::as_slice)).with_context(|| format!("document {id}"))?
+        else {
             return Ok(Vec::new());
         };
 
@@ -1014,14 +1063,18 @@ fn confidence(similarity: f32) -> Option<f32> {
 }
 
 /// The mean of a document's chunk `vectors`, what [`Service::similar`]
-/// compares other documents to: pointing where its text as a whole does,
-/// whatever its chunks' count. `None` for no vectors.
-fn mean(vectors: &[Vec<f32>]) -> Result<Option<Vec<f32>>> {
-    let Some(first) = vectors.first() else {
+/// compares other documents to (and uploads are filed by): pointing where
+/// its text as a whole does, whatever its chunks' count. `None` for no
+/// vectors.
+fn mean<'a>(vectors: impl IntoIterator<Item = &'a [f32]>) -> Result<Option<Vec<f32>>> {
+    let mut vectors = vectors.into_iter().peekable();
+    let Some(first) = vectors.peek() else {
         return Ok(None);
     };
     let mut sum = vec![0.0_f32; first.len()];
+    let mut count = 0_usize;
     for vector in vectors {
+        count += 1;
         if vector.len() != sum.len() {
             return Err(ErrorKind::InvalidModel(format!(
                 "chunk embeddings of {} and {} dimensions can't be averaged",
@@ -1034,7 +1087,7 @@ fn mean(vectors: &[Vec<f32>]) -> Result<Option<Vec<f32>>> {
             *sum += value;
         }
     }
-    let count = vectors.len() as f32;
+    let count = count as f32;
     Ok(Some(sum.into_iter().map(|sum| sum / count).collect()))
 }
 
@@ -2588,12 +2641,12 @@ mod tests {
 
     #[test]
     fn mean_averages_vectors_and_rejects_mismatched_dimensions() {
-        assert_eq!(mean(&[]).unwrap(), None);
+        assert_eq!(mean([]).unwrap(), None);
         assert_eq!(
-            mean(&[vec![1.0, 0.0], vec![0.0, 1.0], vec![2.0, 2.0]]).unwrap(),
+            mean([[1.0, 0.0].as_slice(), &[0.0, 1.0], &[2.0, 2.0]]).unwrap(),
             Some(vec![1.0, 1.0])
         );
-        assert!(mean(&[vec![1.0, 0.0], vec![1.0]]).is_err());
+        assert!(mean([[1.0, 0.0].as_slice(), &[1.0]]).is_err());
     }
 
     #[tokio::test]
@@ -3845,10 +3898,29 @@ mod tests {
         folders: Vec<Folder>,
     ) -> DocumentsClient<MockStorage> {
         let (embedder, _) = embedder_embedding_once();
+        client_filing_with(
+            storage_for_a_new_upload(),
+            embedder,
+            changelog,
+            classifier,
+            folders,
+        )
+    }
+
+    /// A client uploading through `changelog` with `storage`, embedding with
+    /// `embedder` and caching once, classifying with `classifier`, with
+    /// `folders` synced.
+    fn client_filing_with(
+        storage: MockStorage,
+        embedder: MockEmbedder,
+        changelog: Arc<RecordingChangelog>,
+        classifier: Arc<dyn ClassificationService>,
+        folders: Vec<Folder>,
+    ) -> DocumentsClient<MockStorage> {
         let mut cache = MockEmbeddingCache::new();
         cache.expect_put().times(1).return_const(());
         DocumentsClient::new(
-            storage_for_a_new_upload(),
+            storage,
             changelog,
             None,
             accepting_attributes(),
@@ -3869,24 +3941,57 @@ mod tests {
         metadata.clone()
     }
 
+    /// An embedder for `"e5.onnx"` embedding every passage as
+    /// `vector(0.5)`, so a document's chunks average to it too.
+    fn embedder_embedding_as_halves() -> MockEmbedder {
+        let mut embedder = idle_embedder("e5.onnx");
+        embedder
+            .expect_embed_passages()
+            .times(1)
+            .returning(|passages| Ok(passages.iter().map(|_| vector(0.5)).collect()));
+        embedder
+    }
+
+    /// [`storage_for_a_new_upload`], also expecting the upload to be
+    /// compared once with the documents in `folders` (its chunks' mean,
+    /// `vector(0.5)`), finding `similarities`.
+    fn storage_comparing_with(folders: Vec<Uuid>, similarities: Vec<(Uuid, f32)>) -> MockStorage {
+        let mut storage = storage_for_a_new_upload();
+        storage
+            .expect_similarity_by_folder()
+            .withf(move |query, model, given| {
+                query == vector(0.5).as_slice() && model == "e5.onnx" && given == folders.as_slice()
+            })
+            .times(1)
+            .returning(move |_, _, _| Ok(similarities.clone()));
+        storage
+    }
+
     #[tokio::test]
-    async fn upload_publishes_the_document_typed_and_filed_from_its_transcript() {
-        let folder = FakeFolder::new().build();
-        let classification = FakeClassification::new().with_folder(folder.id).build();
+    async fn upload_publishes_the_document_typed_and_filed_by_the_documents_already_filed() {
+        let (energy, payslips) = (FakeFolder::new().build(), FakeFolder::new().build());
+        let similarities = vec![(energy.id, 0.86), (payslips.id, 0.95), (payslips.id, 0.93)];
+        let storage = storage_comparing_with(vec![energy.id, payslips.id], similarities.clone());
+        let classification = FakeClassification::new().with_folder(payslips.id).build();
         let mut classifier = MockClassificationService::new();
-        let expected_folders = vec![folder.clone()];
         classifier
             .expect_classify()
-            .withf(move |text, folders| {
-                text.contains("Montant : 42 €") && folders == expected_folders.as_slice()
+            .withf(move |text, filed| {
+                let filed: Vec<(Uuid, f32)> = filed
+                    .iter()
+                    .map(|document| (document.folder_id, document.similarity))
+                    .collect();
+                text.contains("Montant : 42 €") && filed == similarities
             })
             .times(1)
             .returning(move |_, _| Ok(classification));
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = client_classifying_with_folders(
+        let client = client_filing_with(
+            storage,
+            embedder_embedding_as_halves(),
             changelog.clone(),
             Arc::new(classifier),
-            vec![folder.clone()],
+            vec![energy, payslips.clone()],
         );
 
         client
@@ -3900,8 +4005,65 @@ mod tests {
         let metadata = published_metadata(&changelog);
         assert_eq!(
             (metadata.r#type, metadata.folder_id),
-            (classification.r#type, Some(folder.id))
+            (classification.r#type, Some(payslips.id))
         );
+    }
+
+    #[tokio::test]
+    async fn upload_without_folders_types_the_document_comparing_it_with_nothing() {
+        let classification = FakeClassification::new().with_folder(None).build();
+        let mut classifier = MockClassificationService::new();
+        classifier
+            .expect_classify()
+            .withf(|_, filed| filed.is_empty())
+            .times(1)
+            .returning(move |_, _| Ok(classification));
+        let changelog = Arc::new(RecordingChangelog::default());
+        // Strict storage: comparing the document with others panics.
+        let client = client_classifying_with(changelog.clone(), Arc::new(classifier));
+
+        client
+            .upload(UploadRequest::from_raw(
+                "a.pdf",
+                build_pdf("Montant : 42 €"),
+            ))
+            .await
+            .unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!(
+            (metadata.r#type, metadata.folder_id),
+            (classification.r#type, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_publishes_the_document_unclassified_when_it_can_t_be_compared() {
+        let folder = FakeFolder::new().build();
+        let mut storage = storage_for_a_new_upload();
+        storage
+            .expect_similarity_by_folder()
+            .times(1)
+            .returning(|_, _, _| Err(ErrorKind::InvalidModel("bad vector".to_string()).into()));
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_filing_with(
+            storage,
+            embedder_embedding_as_halves(),
+            changelog.clone(),
+            unused_classifier(),
+            vec![folder],
+        );
+
+        client
+            .upload(UploadRequest::from_raw(
+                "a.pdf",
+                build_pdf("Montant : 42 €"),
+            ))
+            .await
+            .unwrap();
+
+        let metadata = published_metadata(&changelog);
+        assert_eq!((metadata.r#type, metadata.folder_id), (None, None));
     }
 
     #[tokio::test]
@@ -3912,7 +4074,7 @@ mod tests {
         let mut classifier = MockClassificationService::new();
         classifier
             .expect_classify()
-            .withf(|_, folders| folders.is_empty())
+            .withf(|_, filed| filed.is_empty())
             .times(1)
             .returning(move |_, _| Ok(classification));
         let changelog = Arc::new(RecordingChangelog::default());

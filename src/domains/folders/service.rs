@@ -11,8 +11,7 @@ use crate::{ErrorContext as _, ErrorKind, Result};
 use super::storage::Storage;
 use super::{
     Applier, CreateFolderRequest, DeleteFolderEvent, Folder, FolderAppearance, FolderColor,
-    FolderContents, FolderIcon, MAX_FOLDER_DESCRIPTION_CHARS, MAX_FOLDER_NAME_CHARS, Service,
-    UpdateFolderRequest,
+    FolderContents, FolderIcon, MAX_FOLDER_NAME_CHARS, Service, UpdateFolderRequest,
 };
 
 /// The appearance a folder gets when it ends up at the top level without
@@ -66,7 +65,6 @@ impl<S: Storage> Service for FoldersClient<S> {
 
     async fn create(&self, request: CreateFolderRequest) -> Result<Folder> {
         let name = valid_name(&request.name)?;
-        let description = valid_description(&request.description)?;
         let folders = self.folders().await?;
         if let Some(parent_id) = request.parent_id {
             find(&folders, parent_id)?;
@@ -78,7 +76,6 @@ impl<S: Storage> Service for FoldersClient<S> {
             id: Uuid::now_v7(),
             parent_id: request.parent_id,
             name,
-            description,
             appearance: request.appearance,
         };
         self.publish(&folder).await?;
@@ -93,9 +90,6 @@ impl<S: Storage> Service for FoldersClient<S> {
             let name = valid_name(name)?;
             check_name_free(&folders, folder.parent_id, &name, Some(folder.id))?;
             folder.name = name;
-        }
-        if let Some(description) = &request.description {
-            folder.description = valid_description(description)?;
         }
         if let Some(appearance) = request.appearance {
             check_appearance(folder.parent_id, Some(appearance))?;
@@ -273,20 +267,6 @@ fn valid_name(name: &str) -> Result<String> {
         .into());
     }
     Ok(name.to_string())
-}
-
-/// `description` trimmed, if it's at most [`MAX_FOLDER_DESCRIPTION_CHARS`]
-/// characters.
-fn valid_description(description: &str) -> Result<String> {
-    let description = description.trim();
-    let length = description.chars().count();
-    if length > MAX_FOLDER_DESCRIPTION_CHARS {
-        return Err(ErrorKind::InvalidFolderDescription(format!(
-            "a folder description must be at most {MAX_FOLDER_DESCRIPTION_CHARS} characters, got {length}"
-        ))
-        .into());
-    }
-    Ok(description.to_string())
 }
 
 /// A top-level folder needs an appearance; a subfolder takes its top-level
@@ -478,7 +458,6 @@ mod tests {
         CreateFolderRequest {
             parent_id: None,
             name: name.to_string(),
-            description: "Bulletins de salaire".to_string(),
             appearance: Some(APPEARANCE),
         }
     }
@@ -500,7 +479,6 @@ mod tests {
         let created = client
             .create(CreateFolderRequest {
                 name: "  Travail ".to_string(),
-                description: " Bulletins de salaire ".to_string(),
                 ..top_level_request("")
             })
             .await
@@ -509,7 +487,6 @@ mod tests {
         let published = published_folder(&changelog);
         assert_eq!(published, created);
         assert_eq!(published.name, "Travail");
-        assert_eq!(published.description, "Bulletins de salaire");
         assert_eq!(published.parent_id, None);
         assert_eq!(published.appearance, Some(APPEARANCE));
     }
@@ -523,7 +500,6 @@ mod tests {
             .create(CreateFolderRequest {
                 parent_id: Some(parent.id),
                 name: "Bulletins de paie".to_string(),
-                description: String::new(),
                 appearance: None,
             })
             .await
@@ -551,21 +527,6 @@ mod tests {
             .create(top_level_request(&"é".repeat(MAX_FOLDER_NAME_CHARS)))
             .await
             .unwrap();
-    }
-
-    #[tokio::test]
-    async fn create_rejects_a_too_long_description() {
-        let (client, _) = client(storage_with(Vec::new()));
-
-        let err = client
-            .create(CreateFolderRequest {
-                description: "a".repeat(MAX_FOLDER_DESCRIPTION_CHARS + 1),
-                ..top_level_request("Travail")
-            })
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.code(), ErrorCode::InvalidFolderDescription);
     }
 
     #[tokio::test]
@@ -601,7 +562,6 @@ mod tests {
             .create(CreateFolderRequest {
                 parent_id: Some(Uuid::now_v7()),
                 name: "Eau".to_string(),
-                description: String::new(),
                 appearance: None,
             })
             .await
@@ -642,7 +602,7 @@ mod tests {
         client
             .update(UpdateFolderRequest {
                 id: folder.id,
-                description: Some("Contrats de travail".to_string()),
+                name: Some("Emploi".to_string()),
                 ..UpdateFolderRequest::default()
             })
             .await
@@ -652,7 +612,7 @@ mod tests {
         assert_eq!(
             published,
             Folder {
-                description: "Contrats de travail".to_string(),
+                name: "Emploi".to_string(),
                 ..folder
             }
         );
@@ -818,9 +778,8 @@ mod tests {
     #[test]
     fn the_proposed_layout_passes_the_rules_a_user_s_folders_do() {
         for proposed in proposed_folders() {
-            for (name, description) in [proposed.fr, proposed.en] {
+            for name in [proposed.fr, proposed.en] {
                 assert_eq!(valid_name(name).unwrap(), name);
-                assert_eq!(valid_description(description).unwrap(), description);
             }
         }
         for top in PROPOSED_LAYOUT {
@@ -830,7 +789,7 @@ mod tests {
                 assert!(
                     child.children.is_empty(),
                     "{}: two levels at most",
-                    child.fr.0
+                    child.fr
                 );
             }
         }
@@ -839,7 +798,7 @@ mod tests {
     #[test]
     fn the_proposed_layout_has_no_sibling_names_clashing() {
         let check = |folders: &[ProposedFolder]| {
-            for pick in [|f: &ProposedFolder| f.fr.0, |f: &ProposedFolder| f.en.0] {
+            for pick in [|f: &ProposedFolder| f.fr, |f: &ProposedFolder| f.en] {
                 let names: HashSet<String> = folders
                     .iter()
                     .map(|folder| pick(folder).to_lowercase())
@@ -850,28 +809,6 @@ mod tests {
         check(PROPOSED_LAYOUT);
         for top in PROPOSED_LAYOUT {
             check(top.children);
-        }
-    }
-
-    #[test]
-    fn the_proposed_layout_describes_what_documents_are_filed_by_only() {
-        for top in PROPOSED_LAYOUT {
-            // A top-level folder with subfolders is left undescribed, so
-            // documents land in its subfolders rather than in it.
-            assert_eq!(
-                top.children.is_empty(),
-                !top.fr.1.is_empty(),
-                "{}",
-                top.fr.0
-            );
-            assert_eq!(top.fr.1.is_empty(), top.en.1.is_empty(), "{}", top.fr.0);
-            for child in top.children {
-                assert!(
-                    !child.fr.1.is_empty() && !child.en.1.is_empty(),
-                    "{}",
-                    child.fr.0
-                );
-            }
         }
     }
 

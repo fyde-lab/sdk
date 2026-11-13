@@ -16,8 +16,7 @@ pub use domains::documents::{
 };
 pub use domains::folders::{
     CreateFolderRequest, Folder, FolderAppearance, FolderColor, FolderContents, FolderIcon,
-    MAX_FOLDER_DESCRIPTION_CHARS, MAX_FOLDER_NAME_CHARS, Service as FoldersService,
-    UpdateFolderRequest,
+    MAX_FOLDER_NAME_CHARS, Service as FoldersService, UpdateFolderRequest,
 };
 pub use domains::icons::{Icon, Service as IconsService};
 pub use domains::scrapers::{

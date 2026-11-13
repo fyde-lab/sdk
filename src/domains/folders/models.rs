@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// A folder of the vault: it holds documents, subfolders, or both. Folders
-/// are the user's own (created, renamed, described, moved and deleted
-/// through [`super::Service`]), synced across devices as encrypted
-/// changelog events, so the server never sees their names or descriptions.
+/// are the user's own (created, renamed, moved and deleted through
+/// [`super::Service`]), synced across devices as encrypted changelog
+/// events, so the server never sees their names. New documents are filed
+/// by what the folders already hold (see
+/// [`crate::domains::documents::Service::upload`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Folder {
     pub id: Uuid,
@@ -13,11 +15,6 @@ pub struct Folder {
     /// 1 to [`MAX_FOLDER_NAME_CHARS`] characters, unique among its siblings
     /// (case-insensitively).
     pub name: String,
-    /// What belongs in this folder, in the user's words: what the
-    /// classifier files new documents by. Empty when the user wrote none,
-    /// in which case nothing is filed here automatically. At most
-    /// [`MAX_FOLDER_DESCRIPTION_CHARS`] characters.
-    pub description: String,
     /// Set on top-level folders only: a subfolder shows its top-level
     /// folder's.
     pub appearance: Option<FolderAppearance>,
@@ -25,9 +22,6 @@ pub struct Folder {
 
 /// The longest folder name, in characters.
 pub const MAX_FOLDER_NAME_CHARS: usize = 60;
-
-/// The longest folder description, in characters.
-pub const MAX_FOLDER_DESCRIPTION_CHARS: usize = 300;
 
 /// The colour and icon a top-level folder is shown with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -90,7 +84,6 @@ pub struct CreateFolderRequest {
     /// `None` to create a top-level folder.
     pub parent_id: Option<Uuid>,
     pub name: String,
-    pub description: String,
     /// Required for a top-level folder, refused for a subfolder.
     pub appearance: Option<FolderAppearance>,
 }
@@ -101,7 +94,6 @@ pub struct CreateFolderRequest {
 pub struct UpdateFolderRequest {
     pub id: Uuid,
     pub name: Option<String>,
-    pub description: Option<String>,
     /// Only for a top-level folder.
     pub appearance: Option<FolderAppearance>,
 }
@@ -148,7 +140,6 @@ impl FakeFolder {
                     crate::tools::testing::random_word(),
                     crate::tools::testing::random_hex(4)
                 ),
-                description: crate::tools::testing::random_word().to_string(),
                 appearance: Some(FolderAppearance {
                     color: FolderColor::Sand,
                     icon: FolderIcon::Home,
@@ -174,11 +165,6 @@ impl FakeFolder {
         self
     }
 
-    pub fn with_description(mut self, description: &str) -> Self {
-        self.folder.description = description.to_string();
-        self
-    }
-
     pub fn with_appearance(mut self, appearance: Option<FolderAppearance>) -> Self {
         self.folder.appearance = appearance;
         self
@@ -186,5 +172,33 @@ impl FakeFolder {
 
     pub fn build(self) -> Folder {
         self.folder
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_saved_with_a_description_still_deserializes() {
+        // How `SaveFolder` events carried a folder while folders had a
+        // description: those events stay in the changelog.
+        let id = Uuid::now_v7();
+        let parent_id = Uuid::now_v7();
+        let json = format!(
+            r#"{{"id":"{id}","parent_id":"{parent_id}","name":"Énergie","description":"Factures d'électricité","appearance":null}}"#
+        );
+
+        let folder: Folder = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            folder,
+            Folder {
+                id,
+                parent_id: Some(parent_id),
+                name: "Énergie".to_string(),
+                appearance: None,
+            }
+        );
     }
 }
