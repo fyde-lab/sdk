@@ -4,12 +4,23 @@ use super::super::DocumentType;
 
 /// What [`super::Service::classify`] guessed about a document. A field is
 /// `None` when no choice clearly beat the others (or, for the folder, none
-/// is close enough to the document, or none is described).
+/// holds documents close enough to it, or none holds any).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Classification {
     pub(crate) r#type: Option<DocumentType>,
-    /// The described folder the document reads like.
+    /// The folder whose documents the document is the closest to.
     pub(crate) folder_id: Option<Uuid>,
+}
+
+/// A document already filed directly in a folder, as
+/// [`super::Service::classify`] files a new one by.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FiledDocument {
+    pub(crate) folder_id: Uuid,
+    /// Its cosine similarity to the new document: its best chunk's to the
+    /// mean of the new document's chunks, as
+    /// [`super::super::Service::similar`] compares documents.
+    pub(crate) similarity: f32,
 }
 
 /// Builds a [`Classification`] filled with random-but-plausible data,

@@ -25,7 +25,7 @@ impl SqliteStorage {
 #[async_trait]
 impl Storage for SqliteStorage {
     async fn list_folders(&self) -> Result<Vec<Folder>> {
-        let rows = sqlx::query("SELECT id, parent_id, name, description, color, icon FROM folders")
+        let rows = sqlx::query("SELECT id, parent_id, name, color, icon FROM folders")
             .fetch_all(&self.pool)
             .await
             .context("failed to list folders from local database")?;
@@ -49,19 +49,17 @@ impl Storage for SqliteStorage {
                 None => (None, None),
             };
             sqlx::query(
-                "INSERT INTO folders (id, parent_id, name, description, color, icon)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO folders (id, parent_id, name, color, icon)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(id) DO UPDATE SET
                      parent_id = excluded.parent_id,
                      name = excluded.name,
-                     description = excluded.description,
                      color = excluded.color,
                      icon = excluded.icon",
             )
             .bind(folder.id.to_string())
             .bind(folder.parent_id.map(|id| id.to_string()))
             .bind(&folder.name)
-            .bind(&folder.description)
             .bind(color)
             .bind(icon)
             .execute(&mut *tx)
@@ -119,7 +117,6 @@ fn folder_from_row(row: &SqliteRow) -> Result<Folder> {
             })
             .transpose()?,
         name: row.get("name"),
-        description: row.get("description"),
         appearance,
     })
 }
@@ -183,7 +180,6 @@ mod tests {
         let renamed = FakeFolder::new()
             .with_id(folder.id)
             .with_name("Renamed")
-            .with_description("Other")
             .build();
 
         storage

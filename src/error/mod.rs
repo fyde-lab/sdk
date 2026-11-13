@@ -168,8 +168,7 @@ macro_rules! for_each_error_code {
             FolderNotFound = 4017,
             /// A folder can't move into itself or one of its subfolders.
             InvalidFolderMove = 4018,
-            /// A folder's description is too long.
-            InvalidFolderDescription = 4019,
+            // 4019 (InvalidFolderDescription) is retired: never reuse it.
             /// A top-level folder lacks its colour and icon, or a subfolder
             /// was given one (it shows its top-level folder's).
             InvalidFolderAppearance = 4020,
@@ -336,8 +335,6 @@ pub(crate) enum ErrorKind {
     DocumentNotFound(uuid::Uuid),
     #[error("invalid folder move: {0}")]
     InvalidFolderMove(String),
-    #[error("invalid folder description: {0}")]
-    InvalidFolderDescription(String),
     #[error("invalid folder appearance: {0}")]
     InvalidFolderAppearance(String),
     #[error("invalid script type: {0:?}")]
@@ -435,7 +432,6 @@ impl ErrorKind {
             ErrorKind::FolderNameTaken(_) => ErrorCode::FolderNameTaken,
             ErrorKind::FolderNotFound(_) => ErrorCode::FolderNotFound,
             ErrorKind::InvalidFolderMove(_) => ErrorCode::InvalidFolderMove,
-            ErrorKind::InvalidFolderDescription(_) => ErrorCode::InvalidFolderDescription,
             ErrorKind::InvalidFolderAppearance(_) => ErrorCode::InvalidFolderAppearance,
             ErrorKind::InvalidAttribute(_) => ErrorCode::InvalidAttribute,
             ErrorKind::DocumentTooLarge { .. } => ErrorCode::DocumentTooLarge,

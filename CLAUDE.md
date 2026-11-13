@@ -156,7 +156,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   choices. A document's place is `Metadata::folder_id` (`None` = the root, À classer; a
   folder deleted meanwhile counts as the root too): `upload` takes the source, an
   optional name and an optional `folder_id` (the classifier guesses the type, and the folder
-  unless one is given: then it's typed only, classifying against no folders, and a folder not
+  unless one is given: then it's typed only, compared with no filed document, and a folder not
   synced here is `FolderNotFound` before embedding),
   `move_document`/`update_metadata` refuse a folder not synced here (`FolderNotFound`).
   `SearchFilters::folder` is `FolderFilter::Unfiled` or `Within(id)` (subfolders included,
@@ -216,23 +216,27 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     (0.8, untuned on document pairs; below it a document is never returned) up to 1.0, so
     callers never handle e5 numbers. `DEFAULT_SIMILAR_MIN_CONFIDENCE` (0.25) maps back to
     `SIMILARITY_FLOOR` (a test checks): keep the two in sync if either moves.
-  - `classification/` — zero-shot `DocumentType` and folder guess at upload (ported from
-    `doc-ai-poc`'s `classify.rs`): the whitespace-collapsed transcript (first 16 KiB) embedded
-    as one passage, against `query: `-embedded texts. Types: French descriptions per type
-    (`TYPES`: business data, kept there; a type scores its best description), flat argmax
-    (`Other` has no description) needing `TYPE_MARGIN` (0.01) over the runner-up. Folders: each
-    described folder's `"{name} : {description}"` (a folder without a description is never
-    picked), the best one needing `FOLDER_MARGIN` (0.01) over the runner-up and at least
-    `FOLDER_FLOOR` (0.83). Both margins, the floor and the proposed layout's French
-    descriptions were tuned on a private corpus of ~1,200 real French documents labelled with
-    their proposed-layout folder (kept outside every repo); descriptions say how such documents
-    read, generically, never naming one household's issuers. Cross-language (English layout,
-    French documents) scores run ~0.04 lower, so few such documents clear the floor. The
-    `#[ignore]`d real-model test files synthetic documents in the French proposed layout.
-    Type descriptions are embedded lazily, once per process and model (`DESCRIPTIONS`); folder texts are cached
-    per model, keeping only the latest classification's. `upload` classifies only after its
-    embedding succeeded (model at hand), against the folders synced here; a failure publishes
-    untyped at the root. Never run on consumption.
+  - `classification/` — `DocumentType` and folder guess at upload. Types are zero-shot (ported
+    from `doc-ai-poc`'s `classify.rs`): the whitespace-collapsed transcript (first 16 KiB)
+    embedded as one passage, against `query: `-embedded French descriptions per type (`TYPES`:
+    business data, kept there; a type scores its best description), flat argmax (`Other` has
+    no description) needing `TYPE_MARGIN` (0.01, tuned on a private corpus of ~1,200 real
+    French documents kept outside every repo) over the runner-up. Folders are guessed by
+    content only, never by name: `upload` compares the new document (the mean of its upload
+    embeddings' chunks) with every document directly in a folder synced here as `similar`
+    does (each one's best stored chunk, current model only: `Storage::similarity_by_folder`,
+    vectors only, streamed) and hands the classifier these `FiledDocument`s. A folder scores
+    the mean of its `FOLDER_NEIGHBOURS` (3) closest documents (all of them if fewer), so one
+    misfiled document doesn't draw everything like it; the best needs `FOLDER_MARGIN` (0.01,
+    untuned on document pairs) over the runner-up and at least `FOLDER_FLOOR`
+    (= `SIMILARITY_FLOOR`, what `similar` keeps at `DEFAULT_SIMILAR_MIN_CONFIDENCE`), else the
+    document stays at the root. Root documents and empty folders never draw one; a vault with
+    nothing filed yet files everything at the root. The `#[ignore]`d real-model tests type
+    synthetic documents, and file a second batch by a first one filed in the French proposed
+    layout (unrelated texts scored 0.78–0.83 there, the right folder 0.90–0.99). Type
+    descriptions are embedded lazily, once per process and model (`DESCRIPTIONS`). `upload`
+    classifies only after its embedding succeeded (model at hand, vectors to compare); a
+    failure publishes untyped at the root. Never run on consumption.
   - `gliner.rs` — `SpanFinder` (`OnnxGliner`, GLiNER-X small; ported from `doc-ai-poc`'s
     `gliner.rs`), a pure adapter not wired into any flow yet (only `Client::init`'s
     `start_model_loading` fetches and loads its model): `spans(text, labels, threshold,
@@ -263,11 +267,11 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   fails the pass (retried) rather than letting the cursor pass an unindexed document. An
   event failing `POISON_PILL_PASSES` (5) passes in a row is logged at error level on each
   further failure; it's never skipped (ask before adding any skip mechanism).
-- **folders** — the vault's folders (`Folder`: parent, name, description, and a colour + icon
-  on top-level folders only). No gRPC transport: `Service` validates each change against the
-  folders synced so far (name trimmed, 1–60 chars, no control chars, unique among siblings
-  case-insensitively; description ≤ 300 chars; appearance required at the top level and refused
-  below; no move into itself or a descendant) and publishes a `SaveFolder` (the whole folder,
+- **folders** — the vault's folders (`Folder`: parent, name, and a colour + icon on top-level
+  folders only; no description: documents are filed by what folders hold). No gRPC transport:
+  `Service` validates each change against the folders synced so far (name trimmed, 1–60
+  chars, no control chars, unique among siblings case-insensitively; appearance required at
+  the top level and refused below; no move into itself or a descendant) and publishes a `SaveFolder` (the whole folder,
   JSON) or `DeleteFolder` (`FolderContents::Keep`/`Delete`, JSON) event; `list` reads the local
   `folders` table. The changelog consumer applies them through `Applier` (`FolderApplier`),
   which resolves concurrent edits identically on every device: a missing parent or a cycle
@@ -276,10 +280,10 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   appearance when they land at the root) or removes every descendant.
   New vaults start with no folder: the SDK proposes no layout. `layout.rs` (`#[cfg(test)]`)
   keeps `PROPOSED_LAYOUT`, a sample vault (16 top-level folders with appearance, one subfolder
-  per kind of paper, French and English names and descriptions; top-level folders with
-  subfolders have no description, so the classifier files into the subfolders) as test data
-  only, via `proposed_layout_folders(language)`. Keep its texts within the folder rules (tests
-  check).
+  per kind of paper, French and English names) as test data only, via
+  `proposed_layout_folders(language)`. Keep its names within the folder rules (tests check).
+  `SaveFolder` events published while folders had a `description` still decode (serde ignores
+  the field: never add `deny_unknown_fields` to `Folder`).
 - **users** — OPAQUE (RFC 9807, `opaque-ke`); the password never leaves the SDK.
   `FydeCipherSuite` (ristretto255 + 3DH/SHA-512 + Argon2id 64 MiB/3 iters/4 lanes) must match
   `../server`'s. `crypto.rs`'s `OpaqueClient` trait exists so service tests skip real KSF cost. Its `finish_*`

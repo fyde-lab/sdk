@@ -233,10 +233,6 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "A folder can't be moved into itself or one of its subfolders.",
             "Un dossier ne peut pas être déplacé dans lui-même ni dans l'un de ses sous-dossiers.",
         ),
-        ErrorCode::InvalidFolderDescription => (
-            "A folder description must be 300 characters at most.",
-            "La description d'un dossier doit faire 300 caractères au plus.",
-        ),
         ErrorCode::InvalidFolderAppearance => (
             "Only a top-level folder has its own colour and icon.",
             "Seul un dossier principal a sa propre couleur et sa propre icône.",

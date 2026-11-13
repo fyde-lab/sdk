@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use super::super::DocumentType;
 use super::super::embedder::Embedder;
-use super::{Classification, Service};
-use crate::domains::folders::Folder;
+use super::super::service::SIMILARITY_FLOOR;
+use super::{Classification, FiledDocument, Service};
 use crate::{ErrorContext as _, ErrorKind, Result};
 
 /// A [`DocumentType`], described the way such documents read: e5 matches
@@ -264,31 +264,29 @@ pub(super) const TYPES: &[TypeLabel] = &[
 /// those it types correctly (85% at 0.005), leaving the rest untyped.
 const TYPE_MARGIN: f32 = 0.01;
 
-/// How much the best folder must score above every other described folder
-/// for a document to be filed in it. Tuned on the same corpus filed in the
-/// French proposed layout: e5 scores every folder within a few hundredths
-/// of the next, so a smaller margin files many more documents in the wrong
-/// folder. At 0.01, 78% of the documents filed are filed right, and about
-/// half of them all stay at the root.
+/// How many of a folder's documents closest to a new one its score
+/// averages (see [`folder_scores`]): enough that one document filed there
+/// by mistake doesn't draw every document like it, few enough that a
+/// folder holding many kinds of papers still matches each of them.
+const FOLDER_NEIGHBOURS: usize = 3;
+
+/// How much the best folder must score above every other folder holding
+/// documents for a new one to be filed in it, else it stays at the root (À
+/// classer). Kept from when folders were matched on their descriptions, not
+/// retuned on documents compared with documents yet.
 const FOLDER_MARGIN: f32 = 0.01;
 
-/// The similarity to its text below which a folder isn't a match, even as
-/// the only one described. On that corpus, a document scores its own folder
-/// at least 0.83 five times out of six, and only one in seven other
-/// documents reaches it; with many described folders, [`FOLDER_MARGIN`] is
-/// what decides.
-const FOLDER_FLOOR: f32 = 0.83;
+/// The score below which a folder isn't a match, even as the only one
+/// holding documents: the search's [`SIMILARITY_FLOOR`], which is also what
+/// [`crate::DEFAULT_SIMILAR_MIN_CONFIDENCE`] keeps, so a document is only
+/// filed with documents [`super::super::Service::similar`] would list as
+/// similar to it.
+const FOLDER_FLOOR: f32 = SIMILARITY_FLOOR;
 
 /// How much of a transcript is embedded, in bytes of whitespace-collapsed
 /// text: the model only reads its first 512 tokens anyway, well within it,
 /// so a huge transcript isn't tokenized whole for nothing.
 const MAX_TEXT_BYTES: usize = 16 * 1024;
-
-/// A folder's id with the embedding of its text (see [`folder_text`]).
-pub(super) type FolderVector = (Uuid, Arc<Vec<f32>>);
-
-/// Embedded texts by model, then text.
-type EmbeddedTexts = HashMap<String, HashMap<String, Arc<Vec<f32>>>>;
 
 /// The embedding of every description in [`TYPES`], in their order.
 pub(super) struct Embedded {
@@ -296,20 +294,16 @@ pub(super) struct Embedded {
 }
 
 /// [`Embedded`] type descriptions per model (see [`Embedder::model`]), each
-/// computed on the first classification needing it, and the folder texts
-/// embedded so far (see [`folder_text`]) per model.
+/// computed on the first classification needing it.
 #[derive(Default)]
 pub(super) struct DescriptionVectors {
     /// Held while embedding, so concurrent first classifications embed the
     /// descriptions once.
     by_model: tokio::sync::Mutex<HashMap<String, Arc<Embedded>>>,
-    /// By model, then text. Only the folders of the latest classification
-    /// are kept, so renamed or deleted ones don't pile up.
-    folders: tokio::sync::Mutex<EmbeddedTexts>,
 }
 
 /// The default [`Service`]: embeds a document's text with an injected
-/// [`Embedder`], and the descriptions into an injected
+/// [`Embedder`], and the type descriptions into an injected
 /// [`DescriptionVectors`], then [`classify`]s.
 pub(super) struct Classifier {
     embedder: Arc<dyn Embedder>,
@@ -349,33 +343,6 @@ impl Classifier {
         Ok(embedded)
     }
 
-    /// Each described folder of `folders` with its text's embedding,
-    /// reusing what earlier classifications embedded with the same model.
-    async fn folder_vectors(&self, folders: &[Folder]) -> Result<Vec<FolderVector>> {
-        let model = self.embedder.model();
-        let mut cache = self.descriptions.folders.lock().await;
-        let previous = cache.remove(&model).unwrap_or_default();
-        let mut current = HashMap::new();
-        let mut vectors = Vec::new();
-        for folder in folders {
-            let Some(text) = folder_text(folder) else {
-                continue;
-            };
-            let vector = match previous.get(&text).or_else(|| current.get(&text)) {
-                Some(vector) => Arc::clone(vector),
-                None => Arc::new(
-                    self.embed_query(&text)
-                        .await
-                        .with_context(|| format!("failed to embed folder {}", folder.id))?,
-                ),
-            };
-            current.insert(text, vector.clone());
-            vectors.push((folder.id, vector));
-        }
-        cache.insert(model, current);
-        Ok(vectors)
-    }
-
     async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         self.embedder
             .embed_query(text.to_string())
@@ -386,10 +353,13 @@ impl Classifier {
 
 #[async_trait]
 impl Service for Classifier {
-    async fn classify(&self, text: &str, folders: &[Folder]) -> Result<Classification> {
+    async fn classify(&self, text: &str, filed: &[FiledDocument]) -> Result<Classification> {
         let text = classified_text(text);
         if text.is_empty() {
-            return Ok(Classification::default());
+            return Ok(Classification {
+                r#type: None,
+                folder_id: file(filed),
+            });
         }
 
         // First: it loads the model, which embedding the descriptions as
@@ -404,26 +374,12 @@ impl Service for Classifier {
                 ErrorKind::InvalidModel("the embedding model returned no vector".to_string())
             })?;
         let types = self.type_descriptions().await?;
-        // Typing only (an upload whose folder is already chosen): the
-        // folder texts cached for the next filing stay as they are.
-        let folders = if folders.is_empty() {
-            Vec::new()
-        } else {
-            self.folder_vectors(folders).await?
-        };
 
-        Ok(classify(&document, &types, &folders))
+        Ok(classify(&document, &types, filed))
     }
 }
 
-/// What a folder is matched on: its name and description, or `None` for a
-/// folder without a description, which nothing is filed in by itself.
-fn folder_text(folder: &Folder) -> Option<String> {
-    let description = folder.description.trim();
-    (!description.is_empty()).then(|| format!("{} : {description}", folder.name.trim()))
-}
-
-/// The part of `transcript` a document is classified from: its first
+/// The part of `transcript` a document is typed from: its first
 /// [`MAX_TEXT_BYTES`] of text, whitespace collapsed (the model's
 /// tokenizer splits on whitespace anyway), cut on a character boundary.
 /// Empty for a blank transcript.
@@ -448,13 +404,12 @@ fn classified_text(transcript: &str) -> String {
 }
 
 /// Classifies the `document` vector: the clearly best type against the
-/// embedded type descriptions, and the clearly best of the described
-/// `folders` (each with its text's embedding) if it scores at least
-/// [`FOLDER_FLOOR`] (see [`decide`]).
+/// embedded type descriptions, and the folder the `filed` documents point
+/// to (see [`file()`]).
 pub(super) fn classify(
     document: &[f32],
     types: &Embedded,
-    folders: &[FolderVector],
+    filed: &[FiledDocument],
 ) -> Classification {
     let r#type = decide(
         TYPES
@@ -464,17 +419,46 @@ pub(super) fn classify(
         TYPE_MARGIN,
     );
 
-    let scores: Vec<(Uuid, f32)> = folders
-        .iter()
-        .map(|(id, vector)| (*id, similarity(document, vector)))
-        .collect();
-    let folder_id = decide(scores.iter().copied(), FOLDER_MARGIN).filter(|chosen| {
+    Classification {
+        r#type,
+        folder_id: file(filed),
+    }
+}
+
+/// The folder a new document belongs in, given how similar the documents
+/// already `filed` are to it: the best-scoring folder (see
+/// [`folder_scores`]) if it beats every other by [`FOLDER_MARGIN`] and
+/// scores at least [`FOLDER_FLOOR`]. `None` without any filed document.
+pub(super) fn file(filed: &[FiledDocument]) -> Option<Uuid> {
+    let scores = folder_scores(filed);
+    decide(scores.iter().copied(), FOLDER_MARGIN).filter(|chosen| {
         scores
             .iter()
             .any(|(id, score)| id == chosen && *score >= FOLDER_FLOOR)
-    });
+    })
+}
 
-    Classification { r#type, folder_id }
+/// Each folder holding one of `filed` with its score: the mean similarity
+/// to the new document of its [`FOLDER_NEIGHBOURS`] documents closest to
+/// it (of all of them, when it holds fewer).
+fn folder_scores(filed: &[FiledDocument]) -> Vec<(Uuid, f32)> {
+    let mut by_folder: HashMap<Uuid, Vec<f32>> = HashMap::new();
+    for document in filed {
+        by_folder
+            .entry(document.folder_id)
+            .or_default()
+            .push(document.similarity);
+    }
+
+    by_folder
+        .into_iter()
+        .map(|(folder_id, mut similarities)| {
+            similarities.sort_by(|a, b| b.total_cmp(a));
+            similarities.truncate(FOLDER_NEIGHBOURS);
+            let mean = similarities.iter().sum::<f32>() / similarities.len() as f32;
+            (folder_id, mean)
+        })
+        .collect()
 }
 
 /// The cosine similarity of `document` and `description` (both
@@ -522,7 +506,6 @@ mod tests {
     use super::super::super::embedder::MockEmbedder;
     use super::*;
     use crate::ErrorCode;
-    use crate::domains::folders::FakeFolder;
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     enum Choice {
@@ -682,22 +665,6 @@ mod tests {
         }
     }
 
-    /// `count` folders, each embedded along its own axis past the type
-    /// descriptions'.
-    fn folder_axes(count: usize) -> (Vec<FolderVector>, usize) {
-        let first = texts(&[]).len();
-        let dimensions = first + count;
-        let folders = (0..count)
-            .map(|index| {
-                (
-                    Uuid::now_v7(),
-                    Arc::new(along(dimensions, &[(first + index, 1.0)])),
-                )
-            })
-            .collect();
-        (folders, dimensions)
-    }
-
     #[test]
     fn classify_picks_the_clearly_best_type() {
         let dimensions = texts(&[]).len();
@@ -726,60 +693,97 @@ mod tests {
     }
 
     #[test]
-    fn classify_files_in_the_folder_clearly_closest_to_the_document() {
-        let (folders, dimensions) = folder_axes(2);
-        let first = texts(&[]).len();
-        let document = along(dimensions, &[(first, 0.9), (first + 1, 0.88)]);
+    fn classify_files_by_the_filed_documents() {
+        let dimensions = texts(&[]).len();
+        let document = along(dimensions, &[(type_axis(DocumentType::Payslip), 1.0)]);
+        let folder_id = Uuid::now_v7();
 
-        let classification = classify(&document, &embedded_types(dimensions), &folders);
-
-        assert_eq!(classification.folder_id, Some(folders[0].0));
-    }
-
-    #[test]
-    fn classify_files_nowhere_when_two_folders_are_within_the_margin() {
-        let (folders, dimensions) = folder_axes(2);
-        let first = texts(&[]).len();
-        let document = along(
-            dimensions,
-            &[(first, 0.9), (first + 1, 0.9 - FOLDER_MARGIN * 0.5)],
+        let classification = classify(
+            &document,
+            &embedded_types(dimensions),
+            &filed(folder_id, &[0.95]),
         );
-
-        let classification = classify(&document, &embedded_types(dimensions), &folders);
-
-        assert_eq!(classification.folder_id, None);
-    }
-
-    #[test]
-    fn classify_files_in_a_lone_folder_only_from_the_floor() {
-        let (folders, dimensions) = folder_axes(1);
-        let first = texts(&[]).len();
-        let filed = |score: f32| {
-            classify(
-                &along(dimensions, &[(first, score)]),
-                &embedded_types(dimensions),
-                &folders,
-            )
-            .folder_id
-        };
-
-        assert_eq!(filed(FOLDER_FLOOR + 0.01), Some(folders[0].0));
-        assert_eq!(filed(FOLDER_FLOOR - 0.01), None);
-    }
-
-    #[test]
-    fn folder_text_is_the_name_and_description_and_none_without_a_description() {
-        let described = FakeFolder::new()
-            .with_name("Voiture")
-            .with_description(" Carte grise, assurance ")
-            .build();
-        let undescribed = FakeFolder::new().with_description("  ").build();
 
         assert_eq!(
-            folder_text(&described).as_deref(),
-            Some("Voiture : Carte grise, assurance")
+            classification,
+            Classification {
+                r#type: Some(DocumentType::Payslip),
+                folder_id: Some(folder_id),
+            }
         );
-        assert_eq!(folder_text(&undescribed), None);
+    }
+
+    /// A document filed in `folder_id` for each of `similarities`.
+    fn filed(folder_id: Uuid, similarities: &[f32]) -> Vec<FiledDocument> {
+        similarities
+            .iter()
+            .map(|similarity| FiledDocument {
+                folder_id,
+                similarity: *similarity,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn file_picks_the_folder_whose_documents_are_the_closest() {
+        let (energy, payslips) = (Uuid::now_v7(), Uuid::now_v7());
+        let documents = [filed(energy, &[0.88, 0.87]), filed(payslips, &[0.96, 0.95])].concat();
+
+        assert_eq!(file(&documents), Some(payslips));
+    }
+
+    #[test]
+    fn file_gives_none_without_filed_documents() {
+        assert_eq!(file(&[]), None);
+    }
+
+    #[test]
+    fn file_gives_none_when_two_folders_are_within_the_margin() {
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let documents = [filed(a, &[0.92]), filed(b, &[0.92 - FOLDER_MARGIN * 0.5])].concat();
+
+        assert_eq!(file(&documents), None);
+    }
+
+    #[test]
+    fn file_keeps_a_folder_beating_the_runner_up_by_the_margin() {
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        let documents = [filed(a, &[0.92]), filed(b, &[0.92 - FOLDER_MARGIN * 2.0])].concat();
+
+        assert_eq!(file(&documents), Some(a));
+    }
+
+    #[test]
+    fn file_files_in_a_lone_folder_only_from_the_floor() {
+        let folder_id = Uuid::now_v7();
+
+        assert_eq!(
+            file(&filed(folder_id, &[FOLDER_FLOOR + 0.01])),
+            Some(folder_id)
+        );
+        assert_eq!(file(&filed(folder_id, &[FOLDER_FLOOR - 0.01])), None);
+    }
+
+    #[test]
+    fn file_scores_a_folder_by_its_closest_documents_on_average() {
+        // One document like the new one, filed among unrelated ones, draws
+        // it less than a folder of documents all like it.
+        let (stray, regular) = (Uuid::now_v7(), Uuid::now_v7());
+        let documents = [
+            filed(stray, &[0.97, 0.81, 0.8, 0.8]),
+            filed(regular, &[0.94, 0.93, 0.93, 0.5]),
+        ]
+        .concat();
+
+        assert_eq!(file(&documents), Some(regular));
+    }
+
+    #[test]
+    fn file_scores_a_folder_holding_few_documents_by_those_it_holds() {
+        let (new, full) = (Uuid::now_v7(), Uuid::now_v7());
+        let documents = [filed(new, &[0.95]), filed(full, &[0.9, 0.9, 0.9, 0.9])].concat();
+
+        assert_eq!(file(&documents), Some(new));
     }
 
     /// An embedder embedding each of `all` texts (see [`texts`]) along its
@@ -814,35 +818,10 @@ mod tests {
         Classifier::new(Arc::new(embedder), descriptions.clone())
     }
 
-    /// Two described folders and one without a description, and every
-    /// text the classifier embeds for them.
-    fn folders_and_texts() -> (Vec<Folder>, Vec<String>) {
-        let folders = vec![
-            FakeFolder::new()
-                .with_name("Bulletins de paie")
-                .with_description("salaire net à payer")
-                .build(),
-            FakeFolder::new()
-                .with_name("Énergie")
-                .with_description("facture d'électricité")
-                .build(),
-            FakeFolder::new().with_description("").build(),
-        ];
-        let all = texts(&[
-            "Bulletins de paie : salaire net à payer".to_string(),
-            "Énergie : facture d'électricité".to_string(),
-        ]);
-        (folders, all)
-    }
-
     #[tokio::test]
-    async fn classifier_types_and_files_the_document_s_text() {
-        let (folders, all) = folders_and_texts();
-        let payslips = all.len() - 2;
-        let document = along(
-            all.len(),
-            &[(type_axis(DocumentType::Payslip), 1.0), (payslips, 0.9)],
-        );
+    async fn classifier_types_the_document_s_text_and_files_it_by_the_filed_documents() {
+        let all = texts(&[]);
+        let document = along(all.len(), &[(type_axis(DocumentType::Payslip), 1.0)]);
         let mut embedder = embedder_along_axes(all.clone(), Vec::new(), 0, all.len());
         embedder
             .expect_embed_passages()
@@ -850,9 +829,11 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(vec![document.clone()]));
         let classifier = classifier(embedder, &Arc::default());
+        let (energy, payslips) = (Uuid::now_v7(), Uuid::now_v7());
+        let documents = [filed(energy, &[0.86]), filed(payslips, &[0.95, 0.94])].concat();
 
         let classification = classifier
-            .classify("Bulletin de paie\n  net à payer", &folders)
+            .classify("Bulletin de paie\n  net à payer", &documents)
             .await
             .unwrap();
 
@@ -860,73 +841,48 @@ mod tests {
             classification,
             Classification {
                 r#type: Some(DocumentType::Payslip),
-                folder_id: Some(folders[0].id),
+                folder_id: Some(payslips),
             }
         );
     }
 
     #[tokio::test]
-    async fn classifier_leaves_a_blank_text_unclassified_without_embedding() {
+    async fn classifier_files_a_blank_text_without_embedding_it() {
         let classifier = classifier(MockEmbedder::new(), &Arc::default());
+        let folder_id = Uuid::now_v7();
 
         let classification = classifier
-            .classify(" \n ", &[FakeFolder::new().build()])
+            .classify(" \n ", &filed(folder_id, &[0.95]))
             .await
             .unwrap();
 
-        assert_eq!(classification, Classification::default());
+        assert_eq!(
+            classification,
+            Classification {
+                r#type: None,
+                folder_id: Some(folder_id),
+            }
+        );
     }
 
     #[tokio::test]
     async fn classifier_embeds_each_description_once_across_classifications() {
-        let (folders, all) = folders_and_texts();
-        let document = along(all.len(), &[(all.len() - 1, 0.9)]);
+        let all = texts(&[]);
+        let document = along(all.len(), &[(type_axis(DocumentType::Invoice), 1.0)]);
         let embedder = embedder_along_axes(all.clone(), document, 2, all.len());
         let classifier = classifier(embedder, &Arc::default());
 
         for _ in 0..2 {
-            let classification = classifier.classify("Facture EDF", &folders).await.unwrap();
-            assert_eq!(classification.folder_id, Some(folders[1].id));
+            let classification = classifier.classify("Facture EDF", &[]).await.unwrap();
+            assert_eq!(classification.r#type, Some(DocumentType::Invoice));
         }
-    }
-
-    #[tokio::test]
-    async fn classifier_typing_only_keeps_the_folder_texts_cached() {
-        let (folders, all) = folders_and_texts();
-        let document = along(all.len(), &[(all.len() - 1, 0.9)]);
-        // Every description once, across all three classifications.
-        let embedder = embedder_along_axes(all.clone(), document, 3, all.len());
-        let classifier = classifier(embedder, &Arc::default());
-
-        classifier.classify("Facture EDF", &folders).await.unwrap();
-        let typed_only = classifier.classify("Facture EDF", &[]).await.unwrap();
-        let classification = classifier.classify("Facture EDF", &folders).await.unwrap();
-
-        assert_eq!(typed_only.folder_id, None);
-        assert_eq!(classification.folder_id, Some(folders[1].id));
-    }
-
-    #[tokio::test]
-    async fn classifier_embeds_a_folder_again_once_its_description_changed() {
-        let (mut folders, mut all) = folders_and_texts();
-        all.push("Énergie : gaz".to_string());
-        let document = along(all.len(), &[(all.len() - 1, 0.9)]);
-        // Every description once, the changed one included.
-        let embedder = embedder_along_axes(all.clone(), document, 2, all.len());
-        let classifier = classifier(embedder, &Arc::default());
-
-        classifier.classify("Facture", &folders).await.unwrap();
-        folders[1].description = "gaz".to_string();
-        let classification = classifier.classify("Facture", &folders).await.unwrap();
-
-        assert_eq!(classification.folder_id, Some(folders[1].id));
     }
 
     #[tokio::test]
     async fn classifiers_sharing_descriptions_embed_them_once_per_model() {
         let shared = Arc::<DescriptionVectors>::default();
-        let (folders, all) = folders_and_texts();
-        let document = along(all.len(), &[(all.len() - 1, 0.9)]);
+        let all = texts(&[]);
+        let document = along(all.len(), &[(type_axis(DocumentType::Invoice), 1.0)]);
         let first = classifier(
             embedder_along_axes(all.clone(), document.clone(), 1, all.len()),
             &shared,
@@ -940,7 +896,7 @@ mod tests {
             embedder
                 .expect_model()
                 .return_const("other.onnx".to_string());
-            let document = along(all.len(), &[(all.len() - 1, 0.9)]);
+            let document = document.clone();
             embedder
                 .expect_embed_passages()
                 .times(1)
@@ -958,8 +914,8 @@ mod tests {
         };
 
         for classifier in [first, same_model, other_model] {
-            let classification = classifier.classify("Facture EDF", &folders).await.unwrap();
-            assert_eq!(classification.folder_id, Some(folders[1].id));
+            let classification = classifier.classify("Facture EDF", &[]).await.unwrap();
+            assert_eq!(classification.r#type, Some(DocumentType::Invoice));
         }
     }
 
@@ -1031,8 +987,9 @@ mod tests {
         assert_eq!(classification.r#type, Some(DocumentType::Invoice));
     }
 
-    /// A synthetic document, the proposed layout's French folder it should
-    /// be filed in, and its type (`None`: not checked, no type fitting it).
+    /// A synthetic document, the proposed layout's French folder it's filed
+    /// in (or should be), and its type (`None`: not checked, no type fitting
+    /// it).
     struct Case {
         text: &'static str,
         folder: &'static str,
@@ -1176,40 +1133,223 @@ mod tests {
         ),
     ];
 
-    /// Downloads multilingual-e5-small (see `FYDE_TEST_MODELS_DIR`) and
-    /// checks it files every one of [`CASES`] in the French proposed layout
-    /// as expected.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "downloads a 135 MB model from Hugging Face"]
-    async fn multilingual_e5_files_synthetic_documents_in_the_proposed_layout() {
-        let temp = tempfile::tempdir().unwrap();
+    /// More made-up documents, each of a kind one of [`CASES`] is, filed in
+    /// the same folder: half from the same issuer, half from another one.
+    const NEW_CASES: &[Case] = &[
+        case(
+            "Électricité de France — Facture n° 30012398765 du 14/05/2025. Période du 12/03/2025 au 11/05/2025. \
+             Relevé du compteur Linky : index 45698 kWh. Consommation : 488 kWh. Abonnement option base 9 kVA : 31,46 €. \
+             Consommation : 123,05 €. Taxes et contributions : 18,72 €. Montant total TTC : 173,23 €, prélevé le 28/05/2025.",
+            "Énergie",
+            None,
+        ),
+        case(
+            "ENGIE — Votre facture de gaz naturel du 03/02/2025. Point de comptage et d'estimation n° GI012345. \
+             Index relevé : 18 452 m³, soit 1 874 kWh consommés du 01/12/2024 au 31/01/2025. Abonnement : 24,10 €. \
+             Consommation de gaz : 168,40 €. Taxe intérieure sur la consommation de gaz naturel : 30,92 €. Total TTC à payer : 223,42 €.",
+            "Énergie",
+            None,
+        ),
+        case(
+            "Quittance de loyer — mois d'avril 2025. Je soussigné Jean Martin, propriétaire du logement situé \
+             12 rue des Lilas, 69003 Lyon, déclare avoir reçu de Madame Claire Durand, locataire, la somme de \
+             850,00 € au titre du paiement du loyer (780,00 €) et des charges (70,00 €) pour la période du 01/04/2025 \
+             au 30/04/2025, et lui en donne quittance.",
+            "Loyer et charges",
+            None,
+        ),
+        case(
+            "Bouygues Telecom — Facture du 08/03/2025. Ligne mobile 07 98 76 54 32, forfait Sensation 100 Go : 24,99 €. \
+             Appels et SMS illimités, 100 Go d'internet mobile en France, 15 Go depuis l'Europe. Hors forfait : 1,20 € \
+             (appel vers un numéro surtaxé). Montant total TTC : 26,19 €, prélevé le 18/03/2025.",
+            "Mobile",
+            None,
+        ),
+        case(
+            "Banque Populaire — Relevé de compte courant n° 12345678901 du 01/03/2025 au 31/03/2025. \
+             Solde créditeur au 01/03/2025 : 3 153,22 €. 04/03 CB MONOPRIX 38,70. 05/03 VIR SEPA SALAIRE \
+             MARS +2 310,00. 10/03 PRLV SEPA FREE MOBILE 19,99. 22/03 CB FNAC 129,00. 27/03 RETRAIT DAB 40,00. \
+             Total des opérations : débit 227,69, crédit 2 310,00. Nouveau solde créditeur au 31/03/2025 : 5 235,53 €.",
+            "Banque",
+            None,
+        ),
+        case(
+            "Direction générale des Finances publiques — Avis d'impôt 2024 sur les revenus de l'année 2023. \
+             Impôt sur le revenu. Nombre de parts : 2,5. Revenu fiscal de référence : 49 870 €. Revenu brut global : \
+             55 410 €. Impôt sur le revenu net : 3 104 €. Retenue à la source prélevée en 2023 : 3 180 €. \
+             Montant restitué : 76 €, versé sur votre compte bancaire.",
+            "Impôt sur le revenu",
+            None,
+        ),
+        case(
+            "Direction générale des Finances publiques — Avis d'impôt 2024 Taxes foncières. Propriétés bâties. \
+             Commune de Villeurbanne. Adresse du bien : 12 rue des Lilas. Base d'imposition : 2 080 €. \
+             Taux communal 44,05 %, taxe d'enlèvement des ordures ménagères 8,10 %. Montant de votre impôt : \
+             1 085 €. Date limite de paiement : 15/10/2024.",
+            "Taxe foncière",
+            None,
+        ),
+        case(
+            "L'Assurance Maladie — Relevé de vos remboursements de soins. Assurée : Claire Durand. \
+             Date des soins 12/03/2025, consultation chez un médecin spécialiste, base de remboursement 50,00 €, \
+             taux 70 %, montant remboursé 33,00 €, participation forfaitaire 2,00 €. Total versé sur votre compte le 17/03/2025 : 33,00 €.",
+            "Assurance maladie",
+            None,
+        ),
+        case(
+            "Bulletin de paie — Période du 01/03/2025 au 31/03/2025. Employeur : Société Exemple SAS, SIRET \
+             123 456 789 00012. Salarié : Claire Durand, ingénieure, coefficient 130. Salaire de base 3 200,00 €. \
+             Prime exceptionnelle 300,00 €. Total des cotisations salariales : 790,15 €. Net à payer avant impôt \
+             sur le revenu : 2 709,85 €. Impôt sur le revenu prélevé à la source : 135,49 €. Net payé : 2 574,36 €.",
+            "Bulletins de paie",
+            None,
+        ),
+        case(
+            "Caisse d'allocations familiales du Rhône — Attestation de paiement. Allocataire : Claire Durand. \
+             Nous vous avons versé en avril 2025 : allocations familiales 141,99 €, aide personnalisée au logement \
+             112,00 €. Cette attestation peut servir de justificatif auprès des organismes qui vous la demandent.",
+            "Prestations",
+            None,
+        ),
+        case(
+            "SNCF Connect — Votre e-billet. Aller simple le 02/06/2025. Départ Lyon Part-Dieu 17h04, arrivée \
+             Marseille Saint-Charles 18h45. TGV INOUI n° 6177, voiture 5, place 82, 2nde classe. Passager : \
+             Claire Durand. Prix payé : 35,00 €. Référence de dossier : AZERTY.",
+            "Train",
+            None,
+        ),
+        case(
+            "Cdiscount — Facture de votre commande n° 2503151234ABC du 15/03/2025. Article : aspirateur sans fil \
+             25,2 V, quantité 1, 149,99 € TTC. Frais de livraison : 4,99 €. Adresse de livraison : Claire Durand, \
+             12 rue des Lilas, Lyon. Total HT 129,15 €, TVA 20 % 25,83 €, total TTC 154,98 €. Réglé par carte bancaire.",
+            "En ligne",
+            None,
+        ),
+        case(
+            "OVHcloud — Facture FR12398765 du 01/04/2025. Désignation : serveur privé virtuel VPS Starter, \
+             1 vCore, 2 Go, avril 2025, 4,20 € HT. Sauvegarde automatique, 1,00 € HT. Total HT 5,20 €, \
+             TVA 20 % 1,04 €, total TTC 6,24 €.",
+            "Logiciels et cloud",
+            None,
+        ),
+        case(
+            "Reçu fiscal — Fondation Abbé Pierre pour le logement des défavorisés, reconnue d'utilité publique. \
+             Reçu au titre des dons, article 200 du code général des impôts. Donatrice : Claire Durand, Lyon. \
+             Montant du don : 80,00 €, versé le 05/11/2024 par prélèvement. Vous bénéficiez d'une réduction d'impôt de 75 %.",
+            "Dons",
+            None,
+        ),
+    ];
+
+    /// Made-up documents of kinds no folder holds.
+    const UNRELATED: &[&str] = &[
+        "Recette du gâteau au chocolat : faire fondre 200 g de chocolat noir avec 150 g de beurre. Ajouter \
+         150 g de sucre, 4 œufs puis 50 g de farine. Verser dans un moule beurré et cuire 25 minutes à 180 °C.",
+        "Carnet de vaccination du chien Rex, berger australien né le 03/05/2021, puce électronique \
+         250269812345678. Vaccin CHPPiL et rage le 12/06/2024, rappel prévu le 12/06/2025. Vermifuge le 01/09/2024. \
+         Clinique vétérinaire des Lilas, Dr Morel.",
+    ];
+
+    /// The first characters of `text`, to tell which document a line is about.
+    fn beginning(text: &str) -> String {
+        text.chars().take(60).collect()
+    }
+
+    /// multilingual-e5-small (see `FYDE_TEST_MODELS_DIR`), downloaded to
+    /// `temp` unless that's set.
+    fn multilingual_e5(temp: &tempfile::TempDir) -> Arc<dyn Embedder> {
         let dir = std::env::var_os("FYDE_TEST_MODELS_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| temp.path().to_path_buf());
-        let embedder = super::super::super::init_embedder(Arc::new(
-            crate::tools::models::ModelStore::new(dir),
-        ));
-        let classifier = Classifier::new(embedder, Arc::default());
+        super::super::super::init_embedder(Arc::new(crate::tools::models::ModelStore::new(dir)))
+    }
+
+    /// Downloads multilingual-e5-small (see `FYDE_TEST_MODELS_DIR`) and
+    /// checks it types every one of [`CASES`] as expected.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "downloads a 135 MB model from Hugging Face"]
+    async fn multilingual_e5_types_synthetic_documents() {
+        let temp = tempfile::tempdir().unwrap();
+        let classifier = Classifier::new(multilingual_e5(&temp), Arc::default());
+
+        let mut wrong = Vec::new();
+        for case in CASES {
+            let classification = classifier.classify(case.text, &[]).await.unwrap();
+            let r#type = case.r#type.or(classification.r#type);
+            println!("{:?} <- {}", classification.r#type, beginning(case.text));
+            if classification.r#type != r#type {
+                wrong.push(format!(
+                    "{:?} instead of {type:?} <- {}",
+                    classification.r#type,
+                    beginning(case.text)
+                ));
+            }
+        }
+
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Downloads multilingual-e5-small (see `FYDE_TEST_MODELS_DIR`), files
+    /// each of [`CASES`] in its folder of the French proposed layout, then
+    /// checks every one of [`NEW_CASES`] is filed with the documents like it,
+    /// and every one of [`UNRELATED`] nowhere.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "downloads a 135 MB model from Hugging Face"]
+    async fn multilingual_e5_files_new_documents_with_the_documents_like_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let embedder = multilingual_e5(&temp);
         let folders = crate::domains::folders::proposed_layout_folders("fr");
+        let id_of = |name: &str| {
+            folders
+                .iter()
+                .find(|folder| folder.name == name)
+                .unwrap_or_else(|| panic!("no folder {name:?}"))
+                .id
+        };
         let name_of = |id: Option<Uuid>| {
             id.and_then(|id| folders.iter().find(|folder| folder.id == id))
                 .map(|folder| folder.name.as_str())
         };
+        let embed = async |text: &str| {
+            embedder
+                .embed_passages(vec![text.to_string()])
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+        };
+        let mut vault = Vec::new();
+        for case in CASES {
+            vault.push((id_of(case.folder), embed(case.text).await));
+        }
+        let filed = |document: &[f32]| -> Vec<FiledDocument> {
+            vault
+                .iter()
+                .map(|(folder_id, vector)| FiledDocument {
+                    folder_id: *folder_id,
+                    similarity: similarity(document, vector),
+                })
+                .collect()
+        };
 
         let mut wrong = Vec::new();
-        for case in CASES {
-            let classification = classifier.classify(case.text, &folders).await.unwrap();
-            let filed = name_of(classification.folder_id);
-            let r#type = case.r#type.or(classification.r#type);
-            println!(
-                "{filed:?} {:?} <- {}",
-                classification.r#type,
-                &case.text[..60]
-            );
-            if filed != Some(case.folder) || classification.r#type != r#type {
+        let expected = NEW_CASES
+            .iter()
+            .map(|case| (case.text, Some(case.folder)))
+            .chain(UNRELATED.iter().map(|text| (*text, None)));
+        for (text, folder) in expected {
+            let filed = filed(&embed(text).await);
+            let mut scores: Vec<(Option<&str>, f32)> = folder_scores(&filed)
+                .into_iter()
+                .map(|(id, score)| (name_of(Some(id)), score))
+                .collect();
+            scores.sort_by(|(_, a), (_, b)| b.total_cmp(a));
+            let chosen = name_of(file(&filed));
+            println!("{chosen:?} {:?} <- {}", &scores[..2], beginning(text));
+            if chosen != folder {
                 wrong.push(format!(
-                    "{filed:?} {:?} instead of {:?} {type:?}",
-                    classification.r#type, case.folder
+                    "{chosen:?} instead of {folder:?} <- {}",
+                    beginning(text)
                 ));
             }
         }
