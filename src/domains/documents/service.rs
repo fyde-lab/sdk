@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,7 +18,7 @@ use crate::domains::folders::{Folder, Service as FoldersService};
 
 use super::attributes::Service as AttributesService;
 use super::chunk;
-use super::classification::{FiledDocument, Service as ClassificationService};
+use super::classification::{Classification, FiledDocument, Service as ClassificationService};
 use super::embedder::Embedder;
 use super::gliner::SpanFinder;
 use super::storage::{FacetField, Storage, UNFILED};
@@ -257,31 +257,17 @@ impl<S: Storage> DocumentsClient<S> {
     /// leaves them as they are if that fails: the document is then
     /// published untyped, at the root (or in the folder it was given or is
     /// filed within), rather than not at all. `embeddings` are the
-    /// document's own.
+    /// document's own: their chunks' mean is what it's typed and filed by,
+    /// so classifying never runs the model on the document again.
     async fn classify_upload(
         &self,
         metadata: &mut Metadata,
         embeddings: &DocumentEmbeddings,
         filing: &Filing,
     ) {
-        let candidates = match filing {
-            Filing::Given => Ok(Vec::new()),
-            Filing::Within(folders) => Ok(folders.clone()),
-            Filing::Anywhere => self
-                .folders()
-                .await
-                .map(|folders| folders.iter().map(|folder| folder.id).collect()),
-        };
-        let filed = match candidates {
-            Ok(candidates) => self.filed_documents(embeddings, &candidates).await,
-            Err(err) => Err(err),
-        };
-        let classification = match filed {
-            Ok(filed) => self.classifier.classify(&metadata.transcript, &filed).await,
-            Err(err) => Err(err),
-        };
-        match classification {
-            Ok(classification) => {
+        match self.classification(embeddings, filing).await {
+            Ok(None) => {}
+            Ok(Some(classification)) => {
                 metadata.r#type = classification.r#type;
                 match filing {
                     Filing::Given => {}
@@ -305,21 +291,14 @@ impl<S: Storage> DocumentsClient<S> {
         }
     }
 
-    /// The documents filed directly in one of `folders` (never at the root,
-    /// À classer), each with its similarity to the new document whose
-    /// chunks' `embeddings` are given: what it's filed by. Compares them as
-    /// [`Service::similar`] does, the mean of the new document's chunks
-    /// against each one's best chunk, from the vectors stored for search
-    /// (by the same model): never embeds nor loads their content. None
-    /// without `folders`.
-    async fn filed_documents(
+    /// What [`Self::classify_upload`] sets: the classifier's verdict on the
+    /// mean of the document's chunk `embeddings`, given the documents
+    /// already filed where `filing` allows. `None` without any chunk.
+    async fn classification(
         &self,
         embeddings: &DocumentEmbeddings,
-        folders: &[Uuid],
-    ) -> Result<Vec<FiledDocument>> {
-        if folders.is_empty() {
-            return Ok(Vec::new());
-        }
+        filing: &Filing,
+    ) -> Result<Option<Classification>> {
         let vectors = embeddings
             .chunks
             .iter()
@@ -327,12 +306,51 @@ impl<S: Storage> DocumentsClient<S> {
         let Some(centroid) =
             mean(vectors).context("failed to average the uploaded document's chunk embeddings")?
         else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
+
+        let filed = match filing {
+            Filing::Given => Vec::new(),
+            Filing::Within(folders) => {
+                self.filed_documents(&centroid, &embeddings.model, folders)
+                    .await?
+            }
+            Filing::Anywhere => {
+                let folders: Vec<Uuid> = self
+                    .folders()
+                    .await?
+                    .iter()
+                    .map(|folder| folder.id)
+                    .collect();
+                self.filed_documents(&centroid, &embeddings.model, &folders)
+                    .await?
+            }
+        };
+        self.classifier
+            .classify(&centroid, &embeddings.model, &filed)
+            .await
+            .map(Some)
+    }
+
+    /// The documents filed directly in one of `folders` (never at the root,
+    /// À classer), each with its similarity to the new document whose
+    /// chunks' mean (embedded by `model`) is `centroid`: what it's filed by.
+    /// Compares them as [`Service::similar`] does, against each one's best
+    /// chunk, from the vectors stored for search (by the same model): never
+    /// embeds nor loads their content. None without `folders`.
+    async fn filed_documents(
+        &self,
+        centroid: &[f32],
+        model: &str,
+        folders: &[Uuid],
+    ) -> Result<Vec<FiledDocument>> {
+        if folders.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let similarities = self
             .storage
-            .similarity_by_folder(&centroid, &embeddings.model, folders)
+            .similarity_by_folder(centroid, model, folders)
             .await
             .context("failed to compare the document with those already filed")?;
         Ok(similarities
@@ -1164,12 +1182,22 @@ fn check_created_range(filters: &SearchFilters) -> Result<()> {
 /// `root` and every folder below it among `folders`, at any depth, `root`
 /// first.
 fn subtree(folders: &[Folder], root: Uuid) -> Vec<Uuid> {
+    let mut children: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for folder in folders {
+        if let Some(parent_id) = folder.parent_id {
+            children.entry(parent_id).or_default().push(folder.id);
+        }
+    }
+
     let mut found = vec![root];
+    let mut seen = HashSet::from([root]);
     let mut next = 0;
     while let Some(&parent) = found.get(next) {
-        for folder in folders {
-            if folder.parent_id == Some(parent) && !found.contains(&folder.id) {
-                found.push(folder.id);
+        for &child in children.get(&parent).into_iter().flatten() {
+            // Guards against a cycle, which the folders' applier never
+            // leaves but storage can't rule out.
+            if seen.insert(child) {
+                found.push(child);
             }
         }
         next += 1;
@@ -1429,7 +1457,7 @@ mod tests {
         classifier
             .expect_classify()
             .times(times)
-            .returning(move |_, _| Ok(classification));
+            .returning(move |_, _, _| Ok(classification));
         Arc::new(classifier)
     }
 
@@ -4049,15 +4077,15 @@ mod tests {
         let mut classifier = MockClassificationService::new();
         classifier
             .expect_classify()
-            .withf(move |text, filed| {
+            .withf(move |document, model, filed| {
                 let filed: Vec<(Uuid, f32)> = filed
                     .iter()
                     .map(|document| (document.folder_id, document.similarity))
                     .collect();
-                text.contains("Montant : 42 €") && filed == similarities
+                document == vector(0.5).as_slice() && model == "e5.onnx" && filed == similarities
             })
             .times(1)
-            .returning(move |_, _| Ok(classification));
+            .returning(move |_, _, _| Ok(classification));
         let changelog = Arc::new(RecordingChangelog::default());
         let client = client_filing_with(
             storage,
@@ -4088,9 +4116,9 @@ mod tests {
         let mut classifier = MockClassificationService::new();
         classifier
             .expect_classify()
-            .withf(|_, filed| filed.is_empty())
+            .withf(|_, _, filed| filed.is_empty())
             .times(1)
-            .returning(move |_, _| Ok(classification));
+            .returning(move |_, _, _| Ok(classification));
         let changelog = Arc::new(RecordingChangelog::default());
         // Strict storage: comparing the document with others panics.
         let client = client_classifying_with(changelog.clone(), Arc::new(classifier));
@@ -4188,7 +4216,7 @@ mod tests {
         let mut classifier = MockClassificationService::new();
         classifier
             .expect_classify()
-            .withf(move |_, filed| {
+            .withf(move |_, _, filed| {
                 let filed: Vec<(Uuid, f32)> = filed
                     .iter()
                     .map(|document| (document.folder_id, document.similarity))
@@ -4196,7 +4224,7 @@ mod tests {
                 filed == similarities
             })
             .times(1)
-            .returning(move |_, _| Ok(classification));
+            .returning(move |_, _, _| Ok(classification));
         Arc::new(classifier)
     }
 
@@ -4417,9 +4445,9 @@ mod tests {
         let mut classifier = MockClassificationService::new();
         classifier
             .expect_classify()
-            .withf(|_, filed| filed.is_empty())
+            .withf(|_, _, filed| filed.is_empty())
             .times(1)
-            .returning(move |_, _| Ok(classification));
+            .returning(move |_, _, _| Ok(classification));
         let changelog = Arc::new(RecordingChangelog::default());
         let client = client_classifying_with_folders(
             changelog.clone(),
@@ -4445,7 +4473,7 @@ mod tests {
         classifier
             .expect_classify()
             .times(1)
-            .returning(|_, _| Err(ErrorKind::ModelNotDownloaded("e5".to_string()).into()));
+            .returning(|_, _, _| Err(ErrorKind::ModelNotDownloaded("e5".to_string()).into()));
         let changelog = Arc::new(RecordingChangelog::default());
         let client = client_classifying_with_folders(
             changelog.clone(),
@@ -4516,7 +4544,7 @@ mod tests {
         classifier
             .expect_classify()
             .times(1)
-            .returning(|_, _| Err(ErrorKind::ModelNotDownloaded("e5".to_string()).into()));
+            .returning(|_, _, _| Err(ErrorKind::ModelNotDownloaded("e5".to_string()).into()));
         let changelog = Arc::new(RecordingChangelog::default());
         let client = client_classifying_with(changelog.clone(), Arc::new(classifier));
 
