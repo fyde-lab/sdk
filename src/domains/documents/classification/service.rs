@@ -262,6 +262,9 @@ pub(super) const TYPES: &[TypeLabel] = &[
 /// How much the best type must score above every other type to be kept.
 /// Tuned on a corpus of ~1,200 real French documents: 0.01 types 91% of
 /// those it types correctly (85% at 0.005), leaving the rest untyped.
+/// That was with each document embedded as one passage of its first 16 KiB
+/// of text, not as the mean of its chunks it's typed by now: to re-check on
+/// that corpus.
 const TYPE_MARGIN: f32 = 0.01;
 
 /// How many of a folder's documents closest to a new one its score
@@ -283,11 +286,6 @@ const FOLDER_MARGIN: f32 = 0.01;
 /// similar to it.
 const FOLDER_FLOOR: f32 = SIMILARITY_FLOOR;
 
-/// How much of a transcript is embedded, in bytes of whitespace-collapsed
-/// text: the model only reads its first 512 tokens anyway, well within it,
-/// so a huge transcript isn't tokenized whole for nothing.
-const MAX_TEXT_BYTES: usize = 16 * 1024;
-
 /// The embedding of every description in [`TYPES`], in their order.
 pub(super) struct Embedded {
     pub(super) types: Vec<Vec<Vec<f32>>>,
@@ -302,9 +300,9 @@ pub(super) struct DescriptionVectors {
     by_model: tokio::sync::Mutex<HashMap<String, Arc<Embedded>>>,
 }
 
-/// The default [`Service`]: embeds a document's text with an injected
-/// [`Embedder`], and the type descriptions into an injected
-/// [`DescriptionVectors`], then [`classify`]s.
+/// The default [`Service`]: embeds the type descriptions with an injected
+/// [`Embedder`] into an injected [`DescriptionVectors`], then
+/// [`classify`]s the document's own embedding.
 pub(super) struct Classifier {
     embedder: Arc<dyn Embedder>,
     descriptions: Arc<DescriptionVectors>,
@@ -353,54 +351,36 @@ impl Classifier {
 
 #[async_trait]
 impl Service for Classifier {
-    async fn classify(&self, text: &str, filed: &[FiledDocument]) -> Result<Classification> {
-        let text = classified_text(text);
-        if text.is_empty() {
-            return Ok(Classification {
-                r#type: None,
-                folder_id: file(filed),
-            });
+    async fn classify(
+        &self,
+        document: &[f32],
+        model: &str,
+        filed: &[FiledDocument],
+    ) -> Result<Classification> {
+        // The descriptions are embedded by the embedder's model: a document
+        // embedded by another can't be compared with them.
+        let descriptions_model = self.embedder.model();
+        if model != descriptions_model {
+            return Err(ErrorKind::InvalidModel(format!(
+                "a document embedded by {model} can't be typed against descriptions embedded by {descriptions_model}"
+            ))
+            .into());
         }
-
-        // First: it loads the model, which embedding the descriptions as
-        // queries won't do.
-        let document = self
-            .embedder
-            .embed_passages(vec![text])
-            .await
-            .context("failed to embed the document's text")?
-            .pop()
-            .ok_or_else(|| {
-                ErrorKind::InvalidModel("the embedding model returned no vector".to_string())
-            })?;
         let types = self.type_descriptions().await?;
 
-        Ok(classify(&document, &types, filed))
+        Ok(classify(&normalized(document), &types, filed))
     }
 }
 
-/// The part of `transcript` a document is typed from: its first
-/// [`MAX_TEXT_BYTES`] of text, whitespace collapsed (the model's
-/// tokenizer splits on whitespace anyway), cut on a character boundary.
-/// Empty for a blank transcript.
-fn classified_text(transcript: &str) -> String {
-    let mut text = String::new();
-    for word in transcript.split_whitespace() {
-        if text.len() >= MAX_TEXT_BYTES {
-            break;
-        }
-        if !text.is_empty() {
-            text.push(' ');
-        }
-        text.push_str(word);
+/// `vector` scaled to unit length, as the type descriptions are, so its
+/// dot product with them is their cosine similarity (a mean of unit
+/// vectors is shorter than them). A zero vector stays zero.
+fn normalized(vector: &[f32]) -> Vec<f32> {
+    let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm == 0.0 {
+        return vector.to_vec();
     }
-
-    let mut end = text.len().min(MAX_TEXT_BYTES);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text
+    vector.iter().map(|value| value / norm).collect()
 }
 
 /// Classifies the `document` vector: the clearly best type against the
@@ -583,37 +563,13 @@ mod tests {
     }
 
     #[test]
-    fn classified_text_collapses_whitespace() {
-        assert_eq!(
-            classified_text("  Facture\n\n n°12\t TTC  "),
-            "Facture n°12 TTC"
-        );
+    fn normalized_scales_a_vector_to_unit_length() {
+        assert_eq!(normalized(&[3.0, 4.0]), [0.6, 0.8]);
     }
 
     #[test]
-    fn classified_text_of_a_blank_transcript_is_empty() {
-        assert_eq!(classified_text(" \n\t "), "");
-    }
-
-    #[test]
-    fn classified_text_is_capped_on_a_character_boundary() {
-        // 3-byte characters: the cap falls inside one.
-        assert_ne!(MAX_TEXT_BYTES % 3, 0);
-        let transcript = format!("{} {}", "€".repeat(MAX_TEXT_BYTES), "suite");
-
-        let text = classified_text(&transcript);
-
-        assert_eq!(text, "€".repeat(MAX_TEXT_BYTES / 3));
-    }
-
-    #[test]
-    fn classified_text_stops_adding_words_past_the_cap() {
-        let transcript = "mot ".repeat(MAX_TEXT_BYTES);
-
-        let text = classified_text(&transcript);
-
-        assert_eq!(text.len(), MAX_TEXT_BYTES);
-        assert!(text.starts_with("mot mot"));
+    fn normalized_leaves_a_zero_vector_at_zero() {
+        assert_eq!(normalized(&[0.0, 0.0]), [0.0, 0.0]);
     }
 
     /// Every type description, in [`TYPES`] order, then `extra` texts:
@@ -786,23 +742,11 @@ mod tests {
         assert_eq!(file(&documents), Some(new));
     }
 
-    /// An embedder embedding each of `all` texts (see [`texts`]) along its
-    /// own axis, and documents as `document`, expecting `passages` document
-    /// embeddings and `queries` text ones.
-    fn embedder_along_axes(
-        all: Vec<String>,
-        document: Vec<f32>,
-        passages: usize,
-        queries: usize,
-    ) -> MockEmbedder {
+    /// An embedder of `model` embedding each of `all` texts (see [`texts`])
+    /// along its own axis, expecting `queries` of them.
+    fn embedder_along_axes(model: &str, all: Vec<String>, queries: usize) -> MockEmbedder {
         let mut embedder = MockEmbedder::new();
-        embedder.expect_model().return_const("e5.onnx".to_string());
-        if passages > 0 {
-            embedder
-                .expect_embed_passages()
-                .times(passages)
-                .returning(move |_| Ok(vec![document.clone()]));
-        }
+        embedder.expect_model().return_const(model.to_string());
         let dimensions = all.len();
         embedder
             .expect_embed_query()
@@ -819,21 +763,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn classifier_types_the_document_s_text_and_files_it_by_the_filed_documents() {
+    async fn classifier_types_the_document_s_embedding_and_files_it_by_the_filed_documents() {
         let all = texts(&[]);
-        let document = along(all.len(), &[(type_axis(DocumentType::Payslip), 1.0)]);
-        let mut embedder = embedder_along_axes(all.clone(), Vec::new(), 0, all.len());
-        embedder
-            .expect_embed_passages()
-            .withf(|passages| passages == &["Bulletin de paie net à payer".to_string()])
-            .times(1)
-            .returning(move |_| Ok(vec![document.clone()]));
-        let classifier = classifier(embedder, &Arc::default());
+        // A mean of chunks, shorter than a unit vector: normalized, it's
+        // the payslip description itself.
+        let document = along(all.len(), &[(type_axis(DocumentType::Payslip), 0.5)]);
+        let classifier = classifier(
+            embedder_along_axes("e5.onnx", all.clone(), all.len()),
+            &Arc::default(),
+        );
         let (energy, payslips) = (Uuid::now_v7(), Uuid::now_v7());
         let documents = [filed(energy, &[0.86]), filed(payslips, &[0.95, 0.94])].concat();
 
         let classification = classifier
-            .classify("Bulletin de paie\n  net à payer", &documents)
+            .classify(&document, "e5.onnx", &documents)
             .await
             .unwrap();
 
@@ -847,33 +790,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn classifier_files_a_blank_text_without_embedding_it() {
-        let classifier = classifier(MockEmbedder::new(), &Arc::default());
-        let folder_id = Uuid::now_v7();
+    async fn classifier_refuses_a_document_embedded_by_another_model() {
+        let mut embedder = MockEmbedder::new();
+        embedder.expect_model().return_const("e5.onnx".to_string());
+        let classifier = classifier(embedder, &Arc::default());
 
-        let classification = classifier
-            .classify(" \n ", &filed(folder_id, &[0.95]))
+        let err = classifier
+            .classify(&[1.0], "other.onnx", &[])
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(
-            classification,
-            Classification {
-                r#type: None,
-                folder_id: Some(folder_id),
-            }
-        );
+        assert_eq!(err.code(), ErrorCode::ModelLoadFailed);
     }
 
     #[tokio::test]
     async fn classifier_embeds_each_description_once_across_classifications() {
         let all = texts(&[]);
         let document = along(all.len(), &[(type_axis(DocumentType::Invoice), 1.0)]);
-        let embedder = embedder_along_axes(all.clone(), document, 2, all.len());
-        let classifier = classifier(embedder, &Arc::default());
+        let classifier = classifier(
+            embedder_along_axes("e5.onnx", all.clone(), all.len()),
+            &Arc::default(),
+        );
 
         for _ in 0..2 {
-            let classification = classifier.classify("Facture EDF", &[]).await.unwrap();
+            let classification = classifier
+                .classify(&document, "e5.onnx", &[])
+                .await
+                .unwrap();
             assert_eq!(classification.r#type, Some(DocumentType::Invoice));
         }
     }
@@ -883,73 +826,31 @@ mod tests {
         let shared = Arc::<DescriptionVectors>::default();
         let all = texts(&[]);
         let document = along(all.len(), &[(type_axis(DocumentType::Invoice), 1.0)]);
-        let first = classifier(
-            embedder_along_axes(all.clone(), document.clone(), 1, all.len()),
-            &shared,
-        );
-        let same_model = classifier(
-            embedder_along_axes(all.clone(), document.clone(), 1, 0),
-            &shared,
-        );
-        let other_model = {
-            let mut embedder = MockEmbedder::new();
-            embedder
-                .expect_model()
-                .return_const("other.onnx".to_string());
-            let document = document.clone();
-            embedder
-                .expect_embed_passages()
-                .times(1)
-                .returning(move |_| Ok(vec![document.clone()]));
-            let dimensions = all.len();
-            let texts = all.clone();
-            embedder
-                .expect_embed_query()
-                .times(all.len())
-                .returning(move |query| {
-                    let axis = texts.iter().position(|text| *text == query).unwrap();
-                    Ok(along(dimensions, &[(axis, 1.0)]))
-                });
-            classifier(embedder, &shared)
-        };
+        let classifiers = [
+            (
+                "e5.onnx",
+                classifier(
+                    embedder_along_axes("e5.onnx", all.clone(), all.len()),
+                    &shared,
+                ),
+            ),
+            (
+                "e5.onnx",
+                classifier(embedder_along_axes("e5.onnx", all.clone(), 0), &shared),
+            ),
+            (
+                "other.onnx",
+                classifier(
+                    embedder_along_axes("other.onnx", all.clone(), all.len()),
+                    &shared,
+                ),
+            ),
+        ];
 
-        for classifier in [first, same_model, other_model] {
-            let classification = classifier.classify("Facture EDF", &[]).await.unwrap();
+        for (model, classifier) in classifiers {
+            let classification = classifier.classify(&document, model, &[]).await.unwrap();
             assert_eq!(classification.r#type, Some(DocumentType::Invoice));
         }
-    }
-
-    #[tokio::test]
-    async fn classifier_fails_when_the_document_can_t_be_embedded() {
-        let mut embedder = MockEmbedder::new();
-        embedder
-            .expect_embed_passages()
-            .times(1)
-            .returning(|_| Err(ErrorKind::ModelDownloadStatus(503).into()));
-        let classifier = classifier(embedder, &Arc::default());
-
-        let err = classifier.classify("Facture", &[]).await.unwrap_err();
-
-        assert_eq!(err.code(), ErrorCode::ModelDownloadFailed);
-        assert!(
-            err.to_string()
-                .contains("failed to embed the document's text"),
-            "{err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn classifier_fails_when_the_model_returns_no_vector() {
-        let mut embedder = MockEmbedder::new();
-        embedder
-            .expect_embed_passages()
-            .times(1)
-            .returning(|_| Ok(Vec::new()));
-        let classifier = classifier(embedder, &Arc::default());
-
-        let err = classifier.classify("Facture", &[]).await.unwrap_err();
-
-        assert_eq!(err.code(), ErrorCode::ModelLoadFailed);
     }
 
     #[tokio::test]
@@ -959,10 +860,6 @@ mod tests {
         let document = along(dimensions, &[(type_axis(DocumentType::Invoice), 1.0)]);
         let mut embedder = MockEmbedder::new();
         embedder.expect_model().return_const("e5.onnx".to_string());
-        embedder
-            .expect_embed_passages()
-            .times(2)
-            .returning(move |_| Ok(vec![document.clone()]));
         let queries = AtomicUsize::new(0);
         embedder
             .expect_embed_query()
@@ -976,13 +873,19 @@ mod tests {
             });
         let classifier = classifier(embedder, &Arc::default());
 
-        let err = classifier.classify("Facture", &[]).await.unwrap_err();
+        let err = classifier
+            .classify(&document, "e5.onnx", &[])
+            .await
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("failed to embed the document type descriptions"),
             "{err}"
         );
-        let classification = classifier.classify("Facture", &[]).await.unwrap();
+        let classification = classifier
+            .classify(&document, "e5.onnx", &[])
+            .await
+            .unwrap();
 
         assert_eq!(classification.r#type, Some(DocumentType::Invoice));
     }
@@ -1270,11 +1173,22 @@ mod tests {
     #[ignore = "downloads a 135 MB model from Hugging Face"]
     async fn multilingual_e5_types_synthetic_documents() {
         let temp = tempfile::tempdir().unwrap();
-        let classifier = Classifier::new(multilingual_e5(&temp), Arc::default());
+        let embedder = multilingual_e5(&temp);
+        let classifier = Classifier::new(embedder.clone(), Arc::default());
 
         let mut wrong = Vec::new();
         for case in CASES {
-            let classification = classifier.classify(case.text, &[]).await.unwrap();
+            // Embedded as one passage, as an upload holding one chunk is.
+            let document = embedder
+                .embed_passages(vec![case.text.to_string()])
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            let classification = classifier
+                .classify(&document, &embedder.model(), &[])
+                .await
+                .unwrap();
             let r#type = case.r#type.or(classification.r#type);
             println!("{:?} <- {}", classification.r#type, beginning(case.text));
             if classification.r#type != r#type {

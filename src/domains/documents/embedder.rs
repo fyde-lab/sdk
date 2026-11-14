@@ -753,13 +753,13 @@ mod tests {
         let changelog = Arc::new(CapturingChangelog::default());
         let mut attributes = MockAttributesService::new();
         attributes.expect_check().returning(|_| Ok(()));
-        // Mocked: the classifier embeds the document's text too, which
-        // `passages_calls` mustn't count.
+        // Mocked: the real one embeds its type descriptions, which have
+        // nothing to do with the document's embeddings.
         let mut classifier = MockClassifier::new();
         classifier
             .expect_classify()
             .times(1)
-            .returning(|_, _| Ok(Classification::default()));
+            .returning(|_, _, _| Ok(Classification::default()));
         let client = DocumentsClient::new(
             SqliteStorage::new(pool.clone()),
             changelog.clone(),

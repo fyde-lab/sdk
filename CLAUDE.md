@@ -221,11 +221,13 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     callers never handle e5 numbers. `DEFAULT_SIMILAR_MIN_CONFIDENCE` (0.25) maps back to
     `SIMILARITY_FLOOR` (a test checks): keep the two in sync if either moves.
   - `classification/` — `DocumentType` and folder guess at upload. Types are zero-shot (ported
-    from `doc-ai-poc`'s `classify.rs`): the whitespace-collapsed transcript (first 16 KiB)
-    embedded as one passage, against `query: `-embedded French descriptions per type (`TYPES`:
-    business data, kept there; a type scores its best description), flat argmax (`Other` has
-    no description) needing `TYPE_MARGIN` (0.01, tuned on a private corpus of ~1,200 real
-    French documents kept outside every repo) over the runner-up. Folders are guessed by
+    from `doc-ai-poc`'s `classify.rs`): the mean of the document's upload chunk embeddings
+    (normalized; the classifier never runs the model on the document itself), against
+    `query: `-embedded French descriptions per type (`TYPES`: business data, kept there; a
+    type scores its best description), flat argmax (`Other` has no description) needing
+    `TYPE_MARGIN` (0.01, tuned on a private corpus of ~1,200 real French documents kept outside
+    every repo, back when the first 16 KiB of text was embedded as one passage: to re-check)
+    over the runner-up. Folders are guessed by
     content only, never by name: `upload` compares the new document (the mean of its upload
     embeddings' chunks) with every document directly in a folder synced here as `similar`
     does (each one's best stored chunk, current model only: `Storage::similarity_by_folder`,
