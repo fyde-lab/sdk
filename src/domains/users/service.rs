@@ -865,6 +865,10 @@ mod tests {
         fn indexing_model_error(&self) -> Option<crate::ErrorCode> {
             unimplemented!()
         }
+
+        fn sync_progress(&self) -> crate::SyncProgress {
+            unimplemented!()
+        }
     }
 
     /// A [`MockOpaqueClient`] wired up for a successful `create()` call:

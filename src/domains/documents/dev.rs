@@ -8,7 +8,7 @@ use crate::{ErrorCode, ErrorContext as _, Result};
 
 use super::{
     Document, Metadata, SearchFacets, SearchFilters, SearchQuery, Service, SimilarDocument,
-    UploadRequest, UploadSource,
+    SyncProgress, UploadRequest, UploadSource,
 };
 
 /// A [`Service`] implementation for standalone/dev use (see
@@ -134,6 +134,10 @@ impl Service for DevDocumentsClient {
     }
 
     fn stop_sync(&self) {}
+
+    fn sync_progress(&self) -> SyncProgress {
+        SyncProgress::default()
+    }
 
     fn indexing_model_error(&self) -> Option<ErrorCode> {
         None

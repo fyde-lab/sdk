@@ -303,6 +303,10 @@ mod tests {
         fn stop_consume_job(&self) {
             unimplemented!("not used by the scripts service")
         }
+
+        fn sync_progress(&self) -> crate::domains::changelog::SyncProgress {
+            unimplemented!("not used by the scripts service")
+        }
     }
 
     /// A changelog for tests that never publish anything: any recorded

@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::{ErrorCode, ErrorContext as _, ErrorKind, Result};
 
 use crate::domains::changelog::{
-    ChangelogEvent, EventType, MAX_EVENT_BYTES, Service as ChangelogService,
+    ChangelogEvent, EventType, MAX_EVENT_BYTES, Service as ChangelogService, SyncProgress,
 };
 use crate::domains::folders::{Folder, Service as FoldersService};
 
@@ -851,6 +851,10 @@ impl<S: Storage> Service for DocumentsClient<S> {
         self.changelog.stop_consume_job();
     }
 
+    fn sync_progress(&self) -> SyncProgress {
+        self.changelog.sync_progress()
+    }
+
     fn indexing_model_error(&self) -> Option<ErrorCode> {
         self.indexer.model_error()
     }
@@ -1537,6 +1541,8 @@ mod tests {
         /// When set, `send` records the event, notifies it, then never
         /// returns.
         hang_send: Option<Arc<tokio::sync::Notify>>,
+        /// What `sync_progress` returns.
+        progress: SyncProgress,
     }
 
     #[async_trait]
@@ -1588,6 +1594,10 @@ mod tests {
         fn stop_consume_job(&self) {
             self.stopped
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn sync_progress(&self) -> SyncProgress {
+            self.progress
         }
     }
 
@@ -3129,6 +3139,20 @@ mod tests {
         client.stop_sync();
 
         assert!(changelog.stopped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn sync_progress_is_the_changelog_services() {
+        let progress = SyncProgress {
+            consumed: 3,
+            total: Some(5),
+        };
+        let client = publishing_client(Arc::new(RecordingChangelog {
+            progress,
+            ..Default::default()
+        }));
+
+        assert_eq!(client.sync_progress(), progress);
     }
 
     /// A documents client over `changelog` alone, for tests of calls that
