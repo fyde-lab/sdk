@@ -34,6 +34,33 @@ pub enum EventType {
     DeleteFolder,
 }
 
+/// How far the running sync job has got through the changelog since it
+/// started (at login, or at `Client::init` with a session already open):
+/// what a new device shows while it replays the account's history.
+/// Counts changelog events, not documents: the server can't tell a
+/// document's event from a folder's or a script installation's, and a
+/// document can have several.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SyncProgress {
+    /// Events the job has gone through so far, applied or skipped as
+    /// replays of one already applied.
+    pub consumed: u64,
+    /// How many events the job has to go through to catch up: those
+    /// consumed before its latest pass plus those the server counted after
+    /// that pass's cursor. `None` until the server has counted (or if it
+    /// can't). Never below `consumed`: an event recorded after the count
+    /// raises it.
+    pub total: Option<u64>,
+}
+
+impl SyncProgress {
+    /// Whether the job has gone through every event the server counted:
+    /// whatever arrives from then on is the live tail.
+    pub fn is_caught_up(&self) -> bool {
+        self.total.is_some_and(|total| self.consumed >= total)
+    }
+}
+
 /// A single recorded write, decrypted from the server's changelog.
 /// `subject_id` is the id of whatever the write is about, which depends on
 /// [`EventType`]: a document for `SaveDocument`/`UpdateMetadata`/`Deleted`, a

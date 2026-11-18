@@ -273,6 +273,14 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   fails the pass (retried) rather than letting the cursor pass an unindexed document. An
   event failing `POISON_PILL_PASSES` (5) passes in a row is logged at error level on each
   further failure; it's never skipped (ask before adding any skip mechanism).
+  `sync_progress` (`SyncProgress`, public through `documents::Service::sync_progress`) is how far
+  the running job has got, for a device just logged into to show its history arriving:
+  `consumed` counts every event gone through since the job started (applied or skipped as a
+  replay), `total` is `consumed` plus the server's `CountSince` from each pass's cursor (asked
+  after the reachability wait, before opening the stream), raised to `consumed` when a live
+  event outruns it. A failed count (an older server) is logged and leaves `total` as it was,
+  `None` on the first pass; it never fails the pass. Reset by `start_consume_job`. Counts events,
+  not documents: the server can't tell them apart.
 - **folders** — the vault's folders (`Folder`: parent, name, and a colour + icon on top-level
   folders only; no description: documents are filed by what folders hold). No gRPC transport:
   `Service` validates each change against the folders synced so far (name trimmed, 1–60

@@ -7,7 +7,7 @@ mod storage_settings;
 
 #[cfg(any(test, feature = "testing"))]
 pub use models::FakeChangelogEvent;
-pub use models::{ChangelogEvent, EventType};
+pub use models::{ChangelogEvent, EventType, SyncProgress};
 
 /// The largest encrypted event [`Service::send`] publishes, in bytes. The
 /// server decodes requests with tonic's default 4 MiB message limit, so a
@@ -106,6 +106,12 @@ pub(crate) trait Service: Send + Sync {
     /// awaiting the next event on an otherwise idle stream, rather than
     /// only being checked between passes.
     fn stop_consume_job(&self);
+
+    /// How far the job [`Self::start_consume_job`] started last has got
+    /// (see [`SyncProgress`]): reset when a job starts, its total counted by
+    /// the server at the start of each pass. A count that fails is logged
+    /// and leaves the total as it was, never failing the pass.
+    fn sync_progress(&self) -> SyncProgress;
 }
 
 /// Initializes the changelog service: connects to the fyde server over the

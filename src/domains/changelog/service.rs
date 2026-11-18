@@ -17,7 +17,7 @@ use crate::{Error, ErrorContext as _, ErrorKind, Result};
 use super::Service;
 use super::crypto;
 use super::grpc_client::{ChangelogEvent as ProtoChangelogEvent, FydeClient};
-use super::models::{ChangelogEvent, EventType};
+use super::models::{ChangelogEvent, EventType, SyncProgress};
 use super::storage::CursorStorage;
 
 impl ChangelogEvent {
@@ -138,6 +138,8 @@ pub(super) struct ChangelogClient<
     /// The event the last passes failed on (by its id as the server sent
     /// it), and how many passes in a row did.
     failure_streak: Mutex<Option<(String, u32)>>,
+    /// See [`Service::sync_progress`].
+    progress: Mutex<SyncProgress>,
 }
 
 impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStorage>
@@ -180,6 +182,39 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
             secrets,
             stop: watch::Sender::new(false),
             failure_streak: Mutex::new(None),
+            progress: Mutex::new(SyncProgress::default()),
+        }
+    }
+
+    fn progress(&self) -> std::sync::MutexGuard<'_, SyncProgress> {
+        self.progress.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Asks the server how many events follow `since`, setting the job's
+    /// total to those plus the ones it already consumed. A failure (an
+    /// older server without `CountSince`, say) is only logged: the total is
+    /// for display, and the pass goes on without it.
+    async fn count_remaining(&self, since: Option<Uuid>) {
+        match self.grpc.count_since(since).await {
+            Ok(remaining) => {
+                let mut progress = self.progress();
+                progress.total = Some(progress.consumed + remaining);
+            }
+            Err(err) => tracing::warn!(
+                "failed to count the changelog events left to consume, \
+                 sync progress has no total: {err:?}"
+            ),
+        }
+    }
+
+    /// Counts one more event gone through by the job, raising the total if
+    /// it was recorded after the server counted.
+    fn event_consumed(&self) {
+        let mut progress = self.progress();
+        progress.consumed += 1;
+        let consumed = progress.consumed;
+        if let Some(total) = progress.total.as_mut() {
+            *total = (*total).max(consumed);
         }
     }
 
@@ -426,6 +461,8 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
             tokio::time::sleep(SERVER_REACHABILITY_POLL_INTERVAL).await;
         }
 
+        self.count_remaining(since).await;
+
         let mut stream = self
             .grpc
             .consume_since(since)
@@ -475,6 +512,7 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
                     .await
                     .with_context(|| format!("failed to persist changelog cursor {}", event.id))?;
                 self.event_applied();
+                self.event_consumed();
                 offset = Some(event.id);
                 continue;
             }
@@ -513,6 +551,7 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
                 .with_context(|| format!("failed to persist changelog cursor {}", event.id))?;
 
             offset = Some(event.id);
+            self.event_consumed();
             callback(event);
         }
 
@@ -611,6 +650,7 @@ impl<
         // and would otherwise still read as `true` here, making this job
         // return immediately without ever streaming.
         self.stop.send_replace(false);
+        *self.progress() = SyncProgress::default();
 
         tokio::spawn(async move { self.run_consume_loop(&mut *callback).await });
 
@@ -625,6 +665,10 @@ impl<
         // updates the value unconditionally, so a task that starts
         // afterwards still sees it immediately via `subscribe`.
         self.stop.send_replace(true);
+    }
+
+    fn sync_progress(&self) -> SyncProgress {
+        *self.progress()
     }
 }
 
@@ -665,6 +709,14 @@ mod tests {
     };
     use crate::domains::secrets::MockService as MockSecretsService;
     use crate::domains::server_state::MockService as MockServerState;
+
+    /// A [`MockFydeClient`] whose server counts nothing left to consume, for
+    /// tests where sync progress isn't under test.
+    fn counting_grpc() -> MockFydeClient {
+        let mut mock = MockFydeClient::new();
+        mock.expect_count_since().returning(|_| Ok(0));
+        mock
+    }
 
     /// A [`ServerStateService`] mock reporting the server as always
     /// reachable, for tests where reachability isn't under test.
@@ -729,7 +781,7 @@ mod tests {
         let document_id = Uuid::now_v7();
         let event_id = Uuid::now_v7();
 
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc
             .expect_consume_since()
             .withf(|id| id.is_none())
@@ -798,7 +850,7 @@ mod tests {
         let proto = proto_event(event_id, document_id);
         let expected: [u8; 32] = Sha256::digest(&proto.encrypted_content).into();
 
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc
             .expect_consume_since()
             .returning(move |_| Ok(futures::stream::iter(vec![Ok(proto.clone())]).boxed()));
@@ -867,7 +919,7 @@ mod tests {
             previous_id: String::new(),
         };
 
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc
             .expect_consume_since()
             .times(2)
@@ -969,7 +1021,7 @@ mod tests {
         let document_id = Uuid::now_v7();
         let event_id = Uuid::now_v7();
 
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc.expect_consume_since().returning(move |_| {
             Ok(futures::stream::iter(vec![Ok(proto_event(event_id, document_id))]).boxed())
         });
@@ -1020,7 +1072,7 @@ mod tests {
         let event_id = Uuid::now_v7();
         let existing = Uuid::now_v7();
 
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc.expect_consume_since().returning(move |_| {
             Ok(futures::stream::iter(vec![Ok(proto_event(event_id, document_id))]).boxed())
         });
@@ -1089,7 +1141,7 @@ mod tests {
         let document_id = Uuid::now_v7();
         let event_id = Uuid::now_v7();
 
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc.expect_consume_since().returning(move |_| {
             Ok(futures::stream::iter(vec![Ok(proto_event(event_id, document_id))]).boxed())
         });
@@ -1192,7 +1244,7 @@ mod tests {
 
     /// A gRPC mock streaming the single `event`.
     fn grpc_streaming(event: ProtoChangelogEvent) -> MockFydeClient {
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc
             .expect_consume_since()
             .returning(move |_| Ok(futures::stream::iter(vec![Ok(event.clone())]).boxed()));
@@ -1449,7 +1501,7 @@ mod tests {
         cursor_storage: MockCursorStorage,
         folders: MockApplier,
     ) -> ChangelogClient<MockStorage, MockScriptStorage, MockStateStorage, MockCursorStorage> {
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc
             .expect_consume_since()
             .return_once(move |_| Ok(futures::stream::iter(vec![Ok(event)]).boxed()));
@@ -1578,7 +1630,7 @@ mod tests {
         let document_id = Uuid::now_v7();
         let event_id = Uuid::now_v7();
 
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc.expect_consume_since().returning(move |_| {
             Ok(futures::stream::iter(vec![Ok(proto_event_with_type(
                 event_id,
@@ -1645,7 +1697,7 @@ mod tests {
     async fn consume_does_not_advance_past_a_deletion_it_failed_to_apply() {
         let event_id = Uuid::now_v7();
 
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc.expect_consume_since().returning(move |_| {
             Ok(futures::stream::iter(vec![Ok(proto_event_with_type(
                 event_id,
@@ -1690,7 +1742,7 @@ mod tests {
         let document_id = Uuid::now_v7();
         let event_id = Uuid::now_v7();
 
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc.expect_consume_since().returning(move |_| {
             Ok(futures::stream::iter(vec![Ok(proto_event_with_type(
                 event_id,
@@ -1755,7 +1807,7 @@ mod tests {
         ))
         .unwrap();
 
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc.expect_consume_since().returning(move |_| {
             Ok(futures::stream::iter(vec![Ok(ProtoChangelogEvent {
                 id: event_id.to_string(),
@@ -1804,7 +1856,7 @@ mod tests {
         let cursor = Uuid::now_v7();
         let event_id = Uuid::now_v7();
 
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc
             .expect_consume_since()
             .withf(move |id| *id == Some(cursor))
@@ -1861,7 +1913,15 @@ mod tests {
     fn client_streaming(
         events: Vec<ProtoChangelogEvent>,
     ) -> ChangelogClient<MockStorage, MockScriptStorage, MockStateStorage, MockCursorStorage> {
-        let mut mock_grpc = MockFydeClient::new();
+        client_streaming_from(counting_grpc(), events)
+    }
+
+    /// [`client_streaming`] over `mock_grpc`, which must answer
+    /// `count_since` itself.
+    fn client_streaming_from(
+        mut mock_grpc: MockFydeClient,
+        events: Vec<ProtoChangelogEvent>,
+    ) -> ChangelogClient<MockStorage, MockScriptStorage, MockStateStorage, MockCursorStorage> {
         mock_grpc.expect_consume_since().returning(move |_| {
             Ok(futures::stream::iter(events.clone().into_iter().map(Ok)).boxed())
         });
@@ -1892,6 +1952,117 @@ mod tests {
             reachable_server_state(),
             fake_secrets(),
         )
+    }
+
+    /// Two chained events, as [`client_streaming`] streams them.
+    fn two_chained_events() -> Vec<ProtoChangelogEvent> {
+        let (first_id, second_id) = (Uuid::now_v7(), Uuid::now_v7());
+        vec![
+            proto_event(first_id, Uuid::now_v7()),
+            ProtoChangelogEvent {
+                previous_id: first_id.to_string(),
+                ..proto_event(second_id, Uuid::now_v7())
+            },
+        ]
+    }
+
+    /// A [`MockFydeClient`] whose server counts `count` events from the
+    /// beginning of the changelog.
+    fn grpc_counting(count: u64) -> MockFydeClient {
+        let mut mock = MockFydeClient::new();
+        mock.expect_count_since()
+            .withf(|id| id.is_none())
+            .returning(move |_| Ok(count));
+        mock
+    }
+
+    #[tokio::test]
+    async fn sync_progress_counts_consumed_events_against_the_servers_count() {
+        let client = client_streaming_from(grpc_counting(3), two_chained_events());
+
+        client.consume_once(&mut |_| {}).await.unwrap();
+
+        let progress = client.sync_progress();
+        assert_eq!(
+            progress,
+            SyncProgress {
+                consumed: 2,
+                total: Some(3)
+            }
+        );
+        assert!(!progress.is_caught_up());
+    }
+
+    #[tokio::test]
+    async fn sync_progress_raises_the_total_for_events_recorded_after_the_count() {
+        let client = client_streaming_from(grpc_counting(1), two_chained_events());
+
+        client.consume_once(&mut |_| {}).await.unwrap();
+
+        let progress = client.sync_progress();
+        assert_eq!(
+            progress,
+            SyncProgress {
+                consumed: 2,
+                total: Some(2)
+            }
+        );
+        assert!(progress.is_caught_up());
+    }
+
+    #[tokio::test]
+    async fn sync_progress_is_caught_up_at_once_when_nothing_is_left_to_consume() {
+        let client = client_streaming_from(grpc_counting(0), Vec::new());
+
+        client.consume_once(&mut |_| {}).await.unwrap();
+
+        assert!(client.sync_progress().is_caught_up());
+    }
+
+    #[tokio::test]
+    async fn sync_progress_adds_a_later_passs_count_to_what_was_consumed() {
+        let mut mock_grpc = MockFydeClient::new();
+        let mut counts = vec![2, 1].into_iter();
+        mock_grpc
+            .expect_count_since()
+            .returning(move |_| Ok(counts.next().unwrap()));
+        let client = client_streaming_from(mock_grpc, two_chained_events());
+
+        client.consume_once(&mut |_| {}).await.unwrap();
+        client.consume_once(&mut |_| {}).await.unwrap();
+
+        // 2 consumed, then 1 more counted: 3, until the second pass's two
+        // events raise it.
+        assert_eq!(
+            client.sync_progress(),
+            SyncProgress {
+                consumed: 4,
+                total: Some(4)
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_progress_has_no_total_but_consumes_when_the_server_cannot_count() {
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc.expect_count_since().returning(|_| {
+            Err(ErrorKind::InvalidResponse("CountSince is not implemented".into()).into())
+        });
+        let client = client_streaming_from(mock_grpc, two_chained_events());
+
+        let mut consumed = 0;
+        client.consume_once(&mut |_| consumed += 1).await.unwrap();
+
+        assert_eq!(consumed, 2);
+        let progress = client.sync_progress();
+        assert_eq!(
+            progress,
+            SyncProgress {
+                consumed: 2,
+                total: None
+            }
+        );
+        assert!(!progress.is_caught_up());
     }
 
     #[tokio::test]
@@ -1958,7 +2129,7 @@ mod tests {
 
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_in_mock = attempts.clone();
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc.expect_consume_since().returning(move |_| {
             if attempts_in_mock.fetch_add(1, Ordering::SeqCst) == 0 {
                 Err(ErrorKind::InvalidChangelogEvent("boom".to_string()).into())
@@ -2016,7 +2187,7 @@ mod tests {
 
         let attempts = Arc::new(AtomicU32::new(0));
         let attempts_in_mock = attempts.clone();
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc.expect_consume_since().returning(move |_| {
             attempts_in_mock.fetch_add(1, Ordering::SeqCst);
             Ok(futures::stream::empty().boxed())
@@ -2066,7 +2237,7 @@ mod tests {
     fn always_failing_client(
         attempts: Arc<std::sync::atomic::AtomicU32>,
     ) -> ChangelogClient<MockStorage, MockScriptStorage, MockStateStorage, MockCursorStorage> {
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc.expect_consume_since().returning(move |_| {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(ErrorKind::InvalidChangelogEvent("boom".to_string()).into())
@@ -2154,7 +2325,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_consume_job_interrupts_a_loop_parked_on_an_idle_stream() {
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc
             .expect_consume_since()
             .returning(|_| Ok(futures::stream::pending().boxed()));
@@ -2199,7 +2370,7 @@ mod tests {
         // No `expect_consume_since()`: the mock panics if it's called,
         // which is how this test proves the loop never opens a stream when
         // it's already been stopped.
-        let mock_grpc = MockFydeClient::new();
+        let mock_grpc = counting_grpc();
         let document_storage = MockStorage::new();
         let cursor_storage = MockCursorStorage::new();
 
@@ -2230,7 +2401,7 @@ mod tests {
         // The stream never yields anything and never closes, so if
         // `start_consume_job` awaited the loop inline instead of spawning
         // it onto its own task, this test would time out.
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc
             .expect_consume_since()
             .returning(|_| Ok(futures::stream::pending().boxed()));
@@ -2272,7 +2443,7 @@ mod tests {
         let document_id = Uuid::now_v7();
         let metadata = FakeMetadata::new().build();
 
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         let expected_metadata = metadata.clone();
         mock_grpc
             .expect_record_event()
@@ -2316,7 +2487,7 @@ mod tests {
         // No `expect_record_event()`: the mock panics if it reaches the
         // transport layer.
         let client = ChangelogClient::new(
-            MockFydeClient::new(),
+            counting_grpc(),
             MockStorage::new(),
             idle_indexer(),
             MockScriptStorage::new(),
@@ -2347,7 +2518,7 @@ mod tests {
         events: Vec<ProtoChangelogEvent>,
         indexer: MockIndexer,
     ) -> ChangelogClient<MockStorage, MockScriptStorage, MockStateStorage, MockCursorStorage> {
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc.expect_consume_since().returning(move |_| {
             Ok(futures::stream::iter(events.clone().into_iter().map(Ok)).boxed())
         });
@@ -2404,7 +2575,7 @@ mod tests {
             .in_sequence(&mut sequence)
             .returning(|_| Ok(()));
 
-        let mut mock_grpc = MockFydeClient::new();
+        let mut mock_grpc = counting_grpc();
         mock_grpc.expect_consume_since().returning(move |_| {
             Ok(futures::stream::iter(vec![Ok(first.clone()), Ok(second.clone())]).boxed())
         });

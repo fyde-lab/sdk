@@ -17,7 +17,7 @@ pub(crate) mod transcript;
 
 #[cfg(any(test, feature = "testing"))]
 pub use crate::domains::changelog::FakeChangelogEvent;
-pub use crate::domains::changelog::{ChangelogEvent, EventType};
+pub use crate::domains::changelog::{ChangelogEvent, EventType, SyncProgress};
 pub use attributes::{
     Attribute, AttributeDefinition, AttributeType, Service as AttributesService,
     SetAttributeRequest,
@@ -221,6 +221,14 @@ pub trait Service: Send + Sync {
     /// `stop_consume_job` — see [`Self::start_sync`]'s own doc comment for
     /// why that's the only way to reach it.
     fn stop_sync(&self);
+
+    /// How far the job [`Self::start_sync`] started has got through the
+    /// changelog (see [`SyncProgress`]): a device just logged into replays
+    /// the account's whole history, and a UI can poll this to show how
+    /// much of it has arrived. Counted afresh by every job, so it starts
+    /// from nothing again at each login. Delegates to the
+    /// [`crate::domains::changelog`] service, like [`Self::start_sync`].
+    fn sync_progress(&self) -> SyncProgress;
 
     /// Why documents can't be indexed right now, if they can't: the model
     /// indexing needs couldn't be fetched or loaded (e.g.

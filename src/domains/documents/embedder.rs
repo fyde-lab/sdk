@@ -565,6 +565,10 @@ mod tests {
         }
 
         fn stop_consume_job(&self) {}
+
+        fn sync_progress(&self) -> crate::domains::changelog::SyncProgress {
+            crate::domains::changelog::SyncProgress::default()
+        }
     }
 
     /// Indexes a synthetic tax notice and two distractors with the real
@@ -719,6 +723,10 @@ mod tests {
         }
 
         fn stop_consume_job(&self) {}
+
+        fn sync_progress(&self) -> crate::domains::changelog::SyncProgress {
+            crate::domains::changelog::SyncProgress::default()
+        }
     }
 
     async fn migrated_memory_pool() -> sqlx::SqlitePool {

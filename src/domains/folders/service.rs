@@ -424,6 +424,10 @@ mod tests {
         }
 
         fn stop_consume_job(&self) {}
+
+        fn sync_progress(&self) -> crate::domains::changelog::SyncProgress {
+            crate::domains::changelog::SyncProgress::default()
+        }
     }
 
     fn storage_with(folders: Vec<Folder>) -> MockStorage {

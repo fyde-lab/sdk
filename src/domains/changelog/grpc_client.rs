@@ -19,7 +19,7 @@ mod proto {
 pub(super) use proto::ConsumeSinceResponse as ChangelogEvent;
 
 use proto::changelog_service_client::ChangelogServiceClient as ChangelogClient;
-use proto::{ConsumeSinceRequest, RecordEventRequest};
+use proto::{ConsumeSinceRequest, CountSinceRequest, RecordEventRequest};
 
 /// A stream of raw changelog events as received from the server, opened by
 /// [`FydeClient::consume_since`].
@@ -41,6 +41,11 @@ pub(super) trait FydeClient: Send + Sync {
     /// oldest first: replays persisted history, then continues with the
     /// live tail. `None` means "from the beginning of the changelog".
     async fn consume_since(&self, id: Option<Uuid>) -> Result<EventStream>;
+
+    /// Counts the entries with an id strictly greater than `id`: how many
+    /// [`Self::consume_since`] from the same `id` would replay, as of now.
+    /// `None` means "from the beginning of the changelog".
+    async fn count_since(&self, id: Option<Uuid>) -> Result<u64>;
 }
 
 /// The production [`FydeClient`] implementation, backed by a tonic
@@ -114,6 +119,22 @@ impl FydeClient for GrpcClient {
             .await
             .with_context(|| format!("failed to consume changelog events since id {id:?}"))?;
         Ok(Box::pin(response.into_inner()))
+    }
+
+    async fn count_since(&self, id: Option<Uuid>) -> Result<u64> {
+        let request = self
+            .sessions
+            .authenticated_request(CountSinceRequest {
+                id: id.map(|id| id.to_string()).unwrap_or_default(),
+            })
+            .await?;
+
+        let response = self
+            .sessions
+            .check_response(self.client().count_since(request).await)
+            .await
+            .with_context(|| format!("failed to count changelog events since id {id:?}"))?;
+        Ok(response.into_inner().count)
     }
 }
 
