@@ -22,7 +22,7 @@ use super::classification::{Classification, FiledDocument, Service as Classifica
 use super::embedder::Embedder;
 use super::gliner::SpanFinder;
 use super::storage::{FacetField, Storage, UNFILED};
-use super::transcript;
+use super::transcript::{self, Ocr, PAGE_SEPARATOR};
 use super::{
     CachedEmbeddings, ChunkEmbedding, Document, DocumentEmbeddings, EmbeddingCache, EmbeddingKey,
     FacetCount, Indexer, Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery, Service,
@@ -86,6 +86,8 @@ pub(super) struct DocumentsClient<S: Storage> {
     classifier: Arc<dyn ClassificationService>,
     /// The folders documents are filed in.
     folders: Arc<dyn FoldersService>,
+    /// What reads uploads' scanned pages.
+    ocr: Arc<dyn Ocr>,
     /// When embedding an upload last failed (see [`UPLOAD_EMBED_RETRY_AFTER`]).
     embed_failed_at: Mutex<Option<tokio::time::Instant>>,
 }
@@ -140,8 +142,9 @@ impl<S: Storage> DocumentsClient<S> {
     /// document before it's published, `indexer` as what that job caches
     /// documents through, `embedder` to embed uploads' and searches' text,
     /// `cache` to hand uploads' embeddings over to `indexer`, `classifier`
-    /// to classify uploads, and `folders` to check the folders documents are
-    /// moved to and count documents per folder.
+    /// to classify uploads, `folders` to check the folders documents are
+    /// moved to and count documents per folder, and `ocr` to read uploads'
+    /// scanned pages.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         storage: S,
@@ -153,6 +156,7 @@ impl<S: Storage> DocumentsClient<S> {
         cache: Arc<dyn EmbeddingCache>,
         classifier: Arc<dyn ClassificationService>,
         folders: Arc<dyn FoldersService>,
+        ocr: Arc<dyn Ocr>,
     ) -> Self {
         Self {
             storage,
@@ -164,12 +168,79 @@ impl<S: Storage> DocumentsClient<S> {
             cache,
             classifier,
             folders,
+            ocr,
             embed_failed_at: Mutex::new(None),
         }
     }
 }
 
 impl<S: Storage> DocumentsClient<S> {
+    /// The transcript of the PDF `content`: each page's text layer when it's
+    /// usable (see [`transcript::PageText::is_usable`]), else the page is
+    /// rendered and read by OCR, one at a time. OCR never fails an upload:
+    /// without its models, or for a page it fails to read or finds no text
+    /// on, the page keeps its text layer (logged at warn). The text layer
+    /// and rendering run on the blocking pool.
+    async fn transcribe(&self, content: &[u8]) -> Result<String> {
+        let content: Arc<[u8]> = Arc::from(content);
+        let pages = {
+            let content = content.clone();
+            tokio::task::spawn_blocking(move || transcript::text_layers(&content))
+                .await
+                .context("the text layer task failed")??
+        };
+        let scanned: Vec<usize> = (0..pages.len())
+            .filter(|&index| !pages[index].is_usable())
+            .collect();
+        let mut texts: Vec<String> = pages.into_iter().map(|page| page.text).collect();
+        if scanned.is_empty() {
+            return Ok(texts.join(PAGE_SEPARATOR));
+        }
+
+        if let Err(err) = self.ocr.load().await {
+            tracing::warn!(
+                code = ?err.code(),
+                pages = scanned.len(),
+                "keeping the text layer of scanned pages, OCR is unavailable: {err}"
+            );
+            return Ok(texts.join(PAGE_SEPARATOR));
+        }
+        for index in scanned {
+            match self
+                .read_page(&content, index)
+                .instrument(tracing::debug_span!("ocr_page", index))
+                .await
+            {
+                Ok(Some(text)) if !text.trim().is_empty() => texts[index] = text,
+                Ok(_) => {}
+                Err(err) => tracing::warn!(
+                    code = ?err.code(),
+                    index,
+                    "keeping the text layer of a scanned page OCR failed to read: {err}"
+                ),
+            }
+        }
+        Ok(texts.join(PAGE_SEPARATOR))
+    }
+
+    /// The OCR'd text of the 0-based page `index` of the PDF `content`,
+    /// `None` for a blank page.
+    async fn read_page(&self, content: &Arc<[u8]>, index: usize) -> Result<Option<String>> {
+        let content = content.clone();
+        let Some(image) =
+            tokio::task::spawn_blocking(move || transcript::render_page(&content, index))
+                .await
+                .context("the page rendering task failed")??
+        else {
+            return Ok(None);
+        };
+        self.ocr
+            .read(image)
+            .await
+            .with_context(|| format!("failed to read page {index}"))
+            .map(Some)
+    }
+
     /// The folders synced to this device.
     async fn folders(&self) -> Result<Vec<Folder>> {
         self.folders.list().await.context("failed to list folders")
@@ -549,8 +620,13 @@ impl<S: Storage> Service for DocumentsClient<S> {
             return Err(ErrorKind::DuplicateDocument(existing).into());
         }
 
-        let mut metadata = parse_content(&content, &original_name, checksum)
+        let transcript = self
+            .transcribe(&content)
+            .instrument(tracing::debug_span!("transcribe"))
+            .await
+            .context("failed to extract document transcript")
             .with_context(|| format!("failed to parse document {original_name:?}"))?;
+        let mut metadata = new_metadata(&content, &original_name, checksum, transcript);
         if let Some(name) = request.name {
             metadata.name = name;
         }
@@ -1315,11 +1391,16 @@ fn checksum(content: &[u8]) -> String {
 }
 
 /// Builds the [`Metadata`] of a freshly uploaded PDF `content`, originally
-/// named `original_name`, whose [`checksum`] is `checksum`: a new id, its
-/// name (the file name without extension), size and transcript. Its type,
-/// folder and attributes are left empty.
-#[tracing::instrument(level = "debug", skip(content, checksum), fields(size = content.len()))]
-fn parse_content(content: &[u8], original_name: &str, checksum: String) -> Result<Metadata> {
+/// named `original_name`, whose [`checksum`] is `checksum` and
+/// [`DocumentsClient::transcribe`]d text `transcript`: a new id, its name
+/// (the file name without extension), size and transcript. Its type, folder
+/// and attributes are left empty.
+fn new_metadata(
+    content: &[u8],
+    original_name: &str,
+    checksum: String,
+    transcript: String,
+) -> Metadata {
     let name = Path::new(original_name)
         .file_stem()
         .and_then(|name| name.to_str())
@@ -1331,10 +1412,7 @@ fn parse_content(content: &[u8], original_name: &str, checksum: String) -> Resul
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let transcript =
-        transcript::extract(content).context("failed to extract document transcript")?;
-
-    Ok(Metadata {
+    Metadata {
         id: Uuid::now_v7(),
         original_name: original_name.to_string(),
         name,
@@ -1346,7 +1424,7 @@ fn parse_content(content: &[u8], original_name: &str, checksum: String) -> Resul
         r#type: None,
         folder_id: None,
         attributes: BTreeMap::new(),
-    })
+    }
 }
 
 /// The background tasks [`start_model_loading`] starts, aborted when dropped
@@ -1361,17 +1439,19 @@ impl Drop for ModelLoading {
     }
 }
 
-/// Starts loading the models `embedder` and `span_finder` run (downloading
-/// them first if needed), each on its own task so they're fetched in
-/// parallel and their first use doesn't wait minutes for them. A failure is
-/// only logged: the model's first use tries again.
+/// Starts loading the models `embedder`, `span_finder` and `ocr` run
+/// (downloading them first if needed), each on its own task so they're
+/// fetched in parallel and their first use doesn't wait minutes for them. A
+/// failure is only logged: the model's first use tries again.
 pub(crate) fn start_model_loading(
     embedder: Arc<dyn Embedder>,
     span_finder: Arc<dyn SpanFinder>,
+    ocr: Arc<dyn Ocr>,
 ) -> ModelLoading {
     ModelLoading(vec![
         spawn_model_loading("embedding", async move { embedder.load().await }),
         spawn_model_loading("GLiNER", async move { span_finder.load().await }),
+        spawn_model_loading("OCR", async move { ocr.load().await }),
     ])
 }
 
@@ -1412,7 +1492,8 @@ mod tests {
     use super::super::gliner::MockSpanFinder;
     use super::super::models::{FakeCachedEmbeddings, FakeChunkEmbedding, FakeDocumentEmbeddings};
     use super::super::storage::MockStorage;
-    use super::super::transcript::tests::build_pdf;
+    use super::super::transcript::MockOcr;
+    use super::super::transcript::tests::{build_pdf, build_pdf_from, text_at};
     use super::super::{Attribute, DocumentType};
     use super::super::{FakeDocument, FakeMetadata, MockEmbeddingCache, MockIndexer};
     use super::*;
@@ -1443,6 +1524,15 @@ mod tests {
 
     /// A classifier whose every call panics: for tests that never classify
     /// an upload.
+    /// An [`Ocr`] whose models can't be loaded: an upload's scanned pages
+    /// keep their text layer, as on a device without them.
+    fn no_ocr() -> Arc<dyn Ocr> {
+        let mut ocr = MockOcr::new();
+        ocr.expect_load()
+            .returning(|| Err(ErrorKind::ModelNotDownloaded("ocr".to_string()).into()));
+        Arc::new(ocr)
+    }
+
     fn unused_classifier() -> Arc<dyn ClassificationService> {
         Arc::new(MockClassificationService::new())
     }
@@ -1503,6 +1593,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         let err = client
@@ -1633,6 +1724,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         let id = client
@@ -1690,6 +1782,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         let err = client
@@ -1718,6 +1811,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         let result = client.upload(UploadRequest::from_path(file.path())).await;
@@ -1740,6 +1834,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         let err = client
@@ -1775,6 +1870,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         let request = UploadRequest {
@@ -1810,6 +1906,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
         let metadata = super::super::FakeMetadata::new()
             .with_attributes([("price".to_string(), Attribute::Integer(1))])
@@ -1834,6 +1931,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
         let attributes = BTreeMap::from([("price".to_string(), Attribute::Float(32.3))]);
         let metadata = super::super::FakeMetadata::new()
@@ -1859,6 +1957,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             folders_listing(vec![FakeFolder::new().build()]),
+            no_ocr(),
         );
         let metadata = super::super::FakeMetadata::new()
             .with_folder(Uuid::now_v7())
@@ -1893,6 +1992,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             folders_listing(folders),
+            no_ocr(),
         )
     }
 
@@ -1987,6 +2087,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         let err = client
@@ -2036,6 +2137,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         assert_eq!(client.get(id).await.unwrap(), Some(document));
@@ -2066,6 +2168,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         let page = client.list(1, 2).await.unwrap();
@@ -2113,6 +2216,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         let documents = client
@@ -2148,6 +2252,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         client.search(SearchQuery::new(" - ", 0, 10)).await.unwrap();
@@ -2175,6 +2280,7 @@ mod tests {
                 unused_cache(),
                 unused_classifier(),
                 no_folders(),
+                no_ocr(),
             );
 
             let err = client.search(query.clone()).await.unwrap_err();
@@ -2282,6 +2388,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             folders_listing(vec![folder.clone()]),
+            no_ocr(),
         );
 
         let facets = client.search_facets(" facture ", &filters).await.unwrap();
@@ -2316,6 +2423,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         let err = client
@@ -2412,6 +2520,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         let err = client
@@ -2524,6 +2633,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         )
     }
 
@@ -3004,6 +3114,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             folders_listing(vec![folder.clone()]),
+            no_ocr(),
         )
         .search_facets(" impôts ", &filters)
         .await
@@ -3044,6 +3155,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         client.update_metadata(metadata).await.unwrap();
@@ -3081,6 +3193,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         client.start_sync().await.unwrap();
@@ -3106,6 +3219,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         client.start_sync().await.unwrap();
@@ -3124,6 +3238,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         client.stop_sync();
@@ -3144,6 +3259,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         )
     }
 
@@ -3549,6 +3665,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         assert_eq!(
@@ -3764,6 +3881,7 @@ mod tests {
             Arc::new(cache),
             classifier_returning(Classification::default(), 1),
             no_folders(),
+            no_ocr(),
         );
 
         let id = client
@@ -3810,6 +3928,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         let id = client
@@ -3839,6 +3958,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             no_folders(),
+            no_ocr(),
         );
 
         client
@@ -3874,6 +3994,7 @@ mod tests {
             Arc::new(cache),
             classifier_returning(Classification::default(), 1),
             no_folders(),
+            no_ocr(),
         );
 
         let err = client
@@ -3915,6 +4036,7 @@ mod tests {
             Arc::new(cache),
             classifier_returning(Classification::default(), 1),
             no_folders(),
+            no_ocr(),
         );
 
         let upload = client.upload(UploadRequest::from_raw(
@@ -3968,6 +4090,7 @@ mod tests {
             Arc::new(cache),
             classifier_returning(Classification::default(), 1),
             no_folders(),
+            no_ocr(),
         );
         let upload = |text| client.upload(UploadRequest::from_raw("a.pdf", build_pdf(text)));
 
@@ -4030,6 +4153,7 @@ mod tests {
             Arc::new(cache),
             classifier,
             folders_listing(folders),
+            no_ocr(),
         )
     }
 
@@ -4348,6 +4472,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             folders_listing(tree.all.clone()),
+            no_ocr(),
         );
 
         client.upload(upload_within(tree.chosen.id)).await.unwrap();
@@ -4503,6 +4628,7 @@ mod tests {
             unused_cache(),
             unused_classifier(),
             folders_listing(vec![FakeFolder::new().build()]),
+            no_ocr(),
         );
 
         let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
@@ -4578,6 +4704,7 @@ mod tests {
             Arc::new(cache),
             classifier_returning(Classification::default(), 1),
             no_folders(),
+            no_ocr(),
         );
         let id = client
             .upload(UploadRequest::from_raw("Facture mars.pdf", pdf))
@@ -4866,13 +4993,146 @@ mod tests {
         assert_eq!(title(""), "");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn start_model_loading_loads_both_models_in_parallel() {
+    #[tokio::test]
+    async fn transcribe_keeps_a_usable_text_layer_without_touching_ocr() {
+        // `MockOcr` panics on any call.
+        let client = transcribing_client(MockOcr::new());
+        let pdf = build_pdf_from(&[text_at(100, 700, 12, DIGITAL_PAGE)], 0);
+
+        let transcript = client.transcribe(&pdf).await.unwrap();
+
+        assert_eq!(transcript, DIGITAL_PAGE);
+    }
+
+    #[tokio::test]
+    async fn transcribe_reads_a_scanned_page_with_ocr() {
+        let mut ocr = MockOcr::new();
+        ocr.expect_load().times(1).returning(|| Ok(()));
+        ocr.expect_read()
+            .times(1)
+            .withf(|page| {
+                page.width > 0 && page.rgb.len() == (page.width * page.height * 3) as usize
+            })
+            .returning(|_| Ok("Facture lue par OCR".to_string()));
+        let client = transcribing_client(ocr);
+        // Too few letters to be the page's text: a page number over a scan.
+        let pdf = build_pdf_from(&[text_at(100, 700, 12, "Page 1")], 0);
+
+        let transcript = client.transcribe(&pdf).await.unwrap();
+
+        assert_eq!(transcript, "Facture lue par OCR");
+    }
+
+    #[tokio::test]
+    async fn transcribe_only_reads_the_scanned_pages() {
+        let mut ocr = MockOcr::new();
+        ocr.expect_load().times(1).returning(|| Ok(()));
+        ocr.expect_read()
+            .times(1)
+            .returning(|_| Ok("scanned".to_string()));
+        let client = transcribing_client(ocr);
+        let pdf = build_pdf_from(
+            &[
+                text_at(100, 700, 12, DIGITAL_PAGE),
+                text_at(100, 700, 12, "Page 2"),
+            ],
+            0,
+        );
+
+        let transcript = client.transcribe(&pdf).await.unwrap();
+
+        assert_eq!(transcript, format!("{DIGITAL_PAGE}{PAGE_SEPARATOR}scanned"));
+    }
+
+    #[tokio::test]
+    async fn transcribe_keeps_the_text_layer_when_ocr_is_unavailable() {
+        let client = transcribing_client_with(no_ocr());
+        let pdf = build_pdf_from(&[text_at(100, 700, 12, "Page 1")], 0);
+
+        let transcript = client.transcribe(&pdf).await.unwrap();
+
+        assert_eq!(transcript, "Page 1");
+    }
+
+    #[tokio::test]
+    async fn transcribe_keeps_the_text_layer_of_a_page_ocr_fails_on_or_finds_nothing_on() {
+        let mut ocr = MockOcr::new();
+        ocr.expect_load().times(1).returning(|| Ok(()));
+        let mut reads = 0;
+        ocr.expect_read().times(2).returning(move |_| {
+            reads += 1;
+            if reads == 1 {
+                Err(ErrorKind::ModelNotDownloaded("ocr".to_string()).into())
+            } else {
+                Ok("  \n ".to_string())
+            }
+        });
+        let client = transcribing_client(ocr);
+        let pdf = build_pdf_from(
+            &[
+                text_at(100, 700, 12, "Page 1"),
+                text_at(100, 700, 12, "Page 2"),
+            ],
+            0,
+        );
+
+        let transcript = client.transcribe(&pdf).await.unwrap();
+
+        assert_eq!(transcript, format!("Page 1{PAGE_SEPARATOR}Page 2"));
+    }
+
+    #[tokio::test]
+    async fn transcribe_skips_ocr_on_a_blank_page() {
+        let mut ocr = MockOcr::new();
+        ocr.expect_load().times(1).returning(|| Ok(()));
+        // No `read`: a blank page has nothing to read.
+        let client = transcribing_client(ocr);
+        let pdf = build_pdf_from(&[Vec::new()], 0);
+
+        let transcript = client.transcribe(&pdf).await.unwrap();
+
+        assert_eq!(transcript, "");
+    }
+
+    #[tokio::test]
+    async fn transcribe_fails_on_an_unreadable_pdf() {
+        let client = transcribing_client(MockOcr::new());
+
+        let err = client.transcribe(b"not a pdf").await.unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::UnreadablePdf);
+    }
+
+    /// A page whose text layer is its text.
+    const DIGITAL_PAGE: &str = "Facture du 06/08/2022, montant 42 euros";
+
+    /// A client only `transcribe` is called on, reading scans with `ocr`.
+    fn transcribing_client(ocr: MockOcr) -> DocumentsClient<MockStorage> {
+        transcribing_client_with(Arc::new(ocr))
+    }
+
+    fn transcribing_client_with(ocr: Arc<dyn Ocr>) -> DocumentsClient<MockStorage> {
+        DocumentsClient::new(
+            MockStorage::new(),
+            Arc::new(RecordingChangelog::default()),
+            None,
+            accepting_attributes(),
+            unused_indexer(),
+            unused_embedder(),
+            unused_cache(),
+            unused_classifier(),
+            no_folders(),
+            ocr,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn start_model_loading_loads_every_model_in_parallel() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::{Duration, Instant};
 
-        // Each load reports whether the other one started while it was
-        // still running: one after the other, neither would see it.
+        // Each load reports whether the others started while it was still
+        // running: one after the other, none would see them all.
         let started = Arc::new(AtomicUsize::new(0));
         let (report, reports) = std::sync::mpsc::channel();
         let load = move || {
@@ -4881,11 +5141,11 @@ mod tests {
             move || {
                 started.fetch_add(1, Ordering::SeqCst);
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while started.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                while started.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                let saw_both = started.load(Ordering::SeqCst) == 2;
-                report.lock().unwrap().send(saw_both).unwrap();
+                let saw_all = started.load(Ordering::SeqCst) == 3;
+                report.lock().unwrap().send(saw_all).unwrap();
             }
         };
         let mut embedder = MockEmbedder::new();
@@ -4901,14 +5161,22 @@ mod tests {
             Err(ErrorKind::ModelNotDownloaded("gliner".to_string()).into())
         });
 
-        let _loading = start_model_loading(Arc::new(embedder), Arc::new(span_finder));
+        let mut ocr = MockOcr::new();
+        let ocr_load = load();
+        ocr.expect_load().times(1).returning(move || {
+            ocr_load();
+            Ok(())
+        });
 
-        let saw_both = tokio::task::spawn_blocking(move || {
+        let _loading =
+            start_model_loading(Arc::new(embedder), Arc::new(span_finder), Arc::new(ocr));
+
+        let saw_all = tokio::task::spawn_blocking(move || {
             let timeout = Duration::from_secs(10);
-            [reports.recv_timeout(timeout), reports.recv_timeout(timeout)]
+            [(); 3].map(|()| reports.recv_timeout(timeout))
         })
         .await
         .unwrap();
-        assert_eq!(saw_both, [Ok(true), Ok(true)]);
+        assert_eq!(saw_all, [Ok(true), Ok(true), Ok(true)]);
     }
 }

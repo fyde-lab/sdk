@@ -25,7 +25,8 @@ RUSTFLAGS="--cfg tokio_unstable" cargo build --features tokio-console  # serve t
   library on the first build (network, then cached); `ORT_LIB_PATH` points it at a local build.
 - `FYDE_TEST_MODELS_DIR=/some/dir cargo test -- --ignored multilingual_e5` runs the real-model
   tests (`tools::onnx` and `documents::embedder`; downloads ~135 MB from Hugging Face; the directory keeps them for the next run).
-  `-- --ignored gliner_x_small` runs `documents::gliner`'s (~190 MB).
+  `-- --ignored gliner_x_small` runs `documents::gliner`'s (~190 MB), `-- --ignored pp_ocrv5`
+  `documents::transcript::ocr`'s (~13 MB).
 
 ## Non-negotiable rules
 
@@ -78,7 +79,7 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
 - On-device model files (`tools::models`) live in `ClientConfig::models_dir`, never the client
   directory, and only ever land there through `ModelStore::ensure` (size + SHA-256 checked, then
   renamed into place). Pin a new model to a fixed revision, never a branch. `Client::init`
-  itself never waits on a download: it starts loading every model (embedding and GLiNER) in
+  itself never waits on a download: it starts loading every model (embedding, GLiNER, OCR) in
   memory in the background, downloading it first if needed (`documents::start_model_loading`,
   one task per model so they're fetched in parallel; aborted when the `Client` drops; a failure
   is logged at warn, the first use trying again). Unit tests that `init` a
@@ -99,7 +100,8 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   real-model test is `#[ignore]`), `documents/embedder.rs` (pooling on hand-built outputs; the
   real-model ranking test is `#[ignore]`), `documents/gliner.rs` (splitting, windows, inputs and
   logit decoding are pure functions tested directly; the real-model test is `#[ignore]`),
-  `storage_sqlite.rs` files, `secrets/storage_keystore.rs` (keyring's in-memory mock),
+  `documents/transcript/` (real PDFs built with `lopdf`, layout rules on hand-placed glyphs;
+  the real OCR test is `#[ignore]`), `storage_sqlite.rs` files, `secrets/storage_keystore.rs` (keyring's in-memory mock),
   `changelog/storage_settings.rs`. `changelog::Service` can't be automocked (its
   `start_consume_job` takes a boxed `FnMut`), so use the hand-written `RecordingChangelog`-style
   fakes for it.
@@ -173,15 +175,27 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     (`AttributesService::list`/`set`/`check`). Checks (`check_values`, then defined types) run on
     upload and `update_metadata`. Promote anything that needs filtering/sorting to a real
     `Metadata` field instead of querying attributes JSON.
-  - `transcript/` — extracts a PDF's text into `Metadata::transcript` on upload: each page's
-    own text layer through `hayro` (pure Rust, standard fonts and CMaps embedded; invisible
-    text included), joined by `PAGE_SEPARATOR` (`chunk.rs` splits on it). `text_layer.rs` is the
-    adapter: a `hayro_interpret::Device` recording glyphs, then laid out like the page (reading
-    frames snapped to quarter turns, margin text after the body; lines anchored on their largest
-    glyph; chunks on a character grid of the median glyph width, right-aligned when their right
-    edge lines up with other lines'; vertical gaps as up to 2 blank lines). Glyphs without a
-    readable Unicode mapping are left out. A malformed or password-protected PDF is
-    `ErrorKind::Pdf` (`UnreadablePdf`, 4003); a `hayro` panic is caught into it too.
+  - `transcript/` — adapters extracting a PDF's text into `Metadata::transcript` on upload,
+    pages joined by `PAGE_SEPARATOR` (`chunk.rs` splits on it); `service.rs`'s `transcribe`
+    decides which page gets what. All PDF work runs on the blocking pool.
+    - `text_layer.rs`: each page's own text layer through `hayro` (pure Rust, standard fonts
+      and CMaps embedded; invisible text included), a `hayro_interpret::Device` recording
+      glyphs then laid out like the page (reading frames snapped to quarter turns, margin text
+      after the body; lines anchored on their largest glyph; chunks on a character grid of the
+      median letter width, right-aligned when their right edge lines up with other lines';
+      vertical gaps as up to 2 blank lines). Glyphs without a readable Unicode mapping are left
+      out and counted: `PageText::is_usable` needs 20+ letters/digits and under 5% unreadable.
+    - A page whose text layer isn't usable (a scan) is rendered (`render.rs`: `hayro` at 200 dpi,
+      longest side ≤ 2400 px, blank margins trimmed, `None` when blank) and read by `Ocr`
+      (`ocr.rs`, `OnnxOcr`: PP-OCRv5 mobile det + Latin rec through `oar-ocr`, on the SDK's
+      ONNX Runtime pin, detection at ≤ 1280 px, lines under 0.5 confidence dropped, the Latin
+      dictionary embedded from the rec model's `inference.yml`; its lines laid out with the
+      text layer's grid, `layout_boxes`). One page at a time, so a long scan never holds every
+      bitmap. OCR never fails an upload: models unavailable, a page it fails on or finds nothing
+      on keeps its text layer (logged at warn). Never run on consumption: the transcript travels
+      in the event.
+    - A malformed or password-protected PDF is `ErrorKind::Pdf` (`UnreadablePdf`, 4003); a
+      `hayro` panic is caught into it too.
   - Indexing: a document is never cached without its embeddings. The changelog consumer
     applies `SaveDocument`/`UpdateMetadata` through the `Indexer` trait (`DocumentIndexer` in
     `service.rs`), which embeds then writes document + embeddings in one transaction. Rules:
@@ -416,10 +430,11 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
 
 ### On-device models (`src/tools/models/`, `src/tools/onnx/`)
 
-Used by `documents::embedder` and `documents::gliner`. `tools::models` is the registry: each `Model`
-is one file (name, URL at a fixed Hugging Face revision, size, SHA-256); today
-`MULTILINGUAL_E5_SMALL` (MIT) and `GLINER_X_SMALL` (Apache-2.0, `knowledgator/gliner-x-small`),
-both int8 ONNX, each with its `_TOKENIZER`. `ModelStore::ensure` returns `<models_dir>/<sha256[..16]>-<name>`. A file
+Used by `documents::embedder`, `documents::gliner` and `documents::transcript::ocr`. `tools::models`
+is the registry: each `Model` is one file (name, URL at a fixed Hugging Face revision, size,
+SHA-256); today `MULTILINGUAL_E5_SMALL` (MIT) and `GLINER_X_SMALL` (Apache-2.0,
+`knowledgator/gliner-x-small`), both int8 ONNX, each with its `_TOKENIZER`, and
+`PP_OCRV5_MOBILE_DET` + `LATIN_PP_OCRV5_MOBILE_REC` (Apache-2.0, `PaddlePaddle`'s ONNX exports). `ModelStore::ensure` returns `<models_dir>/<sha256[..16]>-<name>`. A file
 already there is SHA-256-checked the first time the store sees it (replaced on mismatch), then
 trusted by size. Otherwise it's downloaded over `wreq` (client built on the first download;
 redirects followed) into a `.<file>.<uuid>.part` beside it, removed on any failure or
@@ -432,13 +447,14 @@ model `find` lacks), `ModelUnavailable` (1204, any other HTTP
 status: only an update helps), `ModelCorrupted` (1202, wrong size/hash), `ModelLoadFailed`
 (1203, `tools::onnx`, and `ErrorKind::InvalidModel` for a model whose inputs/outputs don't match).
 `tools::onnx` is a thin port of `doc-ai-poc`'s loaders: `session(path, threads)` (Level3
-optimizations) and `tokenizer(path)` (`tokenizers`, `onig` regexes).
+optimizations) and `tokenizer(path)` (`tokenizers`, `onig` regexes). `oar-ocr` builds its own
+sessions, so `OnnxOcr` calls `onnx::load_runtime` first (the load-dynamic targets' library load).
 
 ### ONNX Runtime
 
-`ort` is pinned to `=2.0.0-rc.13`, the exact version `oar-ocr` 0.10.2 uses, so a future OCR
-dependency shares the one runtime (add it with `default-features = false`: its defaults enable
-`ort`'s `download-binaries` + `tls-native`). No `api-*` feature, so any ONNX Runtime ≥ 1.17 loads.
+`ort` is pinned to `=2.0.0-rc.13`, the exact version `oar-ocr` 0.10.2 (pinned too) uses, so OCR
+shares the one runtime (`oar-ocr` is added with `default-features = false`: its defaults enable
+`ort`'s `download-binaries` + `tls-native`). Bump both together. No `api-*` feature, so any ONNX Runtime ≥ 1.17 loads.
 How it's linked depends on the target, chosen by the two target-specific `ort` entries in
 `Cargo.toml` and mirrored by `build.rs`'s `ort_links_statically` (`cfg(ort_load_dynamic)`): keep
 all three in sync.

@@ -22,11 +22,15 @@ console-subscriber = { version = "0.5.0", optional = true }
 # `decode_text`), the way `wreq::Response::text` would.
 encoding_rs = "0.8.41"
 futures = "0.3.34"
-# Reads a PDF's text layer (`documents/transcript`): pure Rust, with the 14
-# standard fonts and the predefined CMaps embedded (its default features), so
-# no pdfium/poppler library to ship per platform.
-hayro-interpret = "0.9.0"
+# Reads a PDF's text layer and renders its scanned pages for OCR
+# (`documents/transcript`): pure Rust, with the 14 standard fonts and the
+# predefined CMaps embedded (its default features), so no pdfium/poppler
+# library to ship per platform.
+hayro = "0.9.0"
 hkdf = "0.12.4"
+# The RGB pages `oar-ocr` reads (`documents/transcript/ocr.rs`): its own
+# version, no codec (pages come from `hayro`, never from a file).
+image = { version = "0.25.10", default-features = false }
 # The `secrets` domain (`domains/secrets`) keeps the account master key and
 # the session token in the OS's native credential store rather than in the
 # local SQLite database. `keyring-core` is the store-agnostic API; each
@@ -45,6 +49,10 @@ keyring-core = "1.0.0"
 # scrapers domain (`domains/scrapers`) to round-trip JSON through Lua tables.
 mlua = { version = "0.12.1", features = ["lua54", "vendored", "error-send", "serialize"] }
 opaque-ke = { version = "4.0.1", features = ["argon2"] }
+# PP-OCRv5 (text detection + recognition) on the scanned pages of uploads
+# (`documents/transcript/ocr.rs`). Pinned with `ort` below, which it shares;
+# no default features, which would download ONNX Runtime binaries of its own.
+oar-ocr = { version = "=0.10.2", default-features = false, features = ["simd"] }
 # ONNX Runtime, for the on-device models (`tools::onnx`). Pinned to the exact
 # release `oar-ocr` 0.10.2 depends on, so OCR shares this one runtime. How it's
 # linked depends on the target: see the two `ort` entries further down.
@@ -194,7 +202,7 @@ opt-level = 3
 
 [dev-dependencies]
 # Only used to hand-build minimal PDF fixtures for `documents/transcript.rs`
-# tests; extraction itself uses `hayro-interpret` (a regular dependency).
+# tests; extraction itself uses `hayro` (a regular dependency).
 lopdf = "0.39"
 # Only used to hand-build a `log` record for `tools::log` tests.
 log = "0.4.34"

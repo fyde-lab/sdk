@@ -17,20 +17,22 @@
 //!    columns, the others left-aligned. Vertical gaps become blank lines (at
 //!    most 2), which `chunk.rs` reads as paragraph breaks.
 //!
-//! Only an adapter: no decision about what to do with the text.
+//! [`layout_boxes`] lays OCR'd lines out with the same grid, so a scan keeps
+//! its layout too. Only an adapter: [`PageText::is_usable`] measures the text
+//! layer, deciding what to do with a page is up to the caller.
 
 use std::cmp::Ordering;
 use std::f64::consts::FRAC_PI_2;
 
-use hayro_interpret::font::{Glyph as PdfGlyph, GlyphRun};
-use hayro_interpret::hayro_cmap::BfString;
-use hayro_interpret::hayro_syntax::page::Page;
-use hayro_interpret::kurbo::{Affine, BezPath, Point, Rect};
-use hayro_interpret::util::TransformExt as _;
-use hayro_interpret::{
+use hayro::hayro_interpret::font::{Glyph as PdfGlyph, GlyphRun};
+use hayro::hayro_interpret::hayro_cmap::BfString;
+use hayro::hayro_interpret::kurbo::{Affine, BezPath, Point, Rect};
+use hayro::hayro_interpret::util::TransformExt as _;
+use hayro::hayro_interpret::{
     BlendMode, ClipPath, Context, Device, DrawMode, DrawProps, Image, ImageDrawProps,
     InterpreterCache, InterpreterSettings, SoftMask, interpret_page,
 };
+use hayro::hayro_syntax::page::Page;
 
 /// Glyph space is 1000 units per em in `hayro`, whatever the font.
 const UNITS_PER_EM: f64 = 1000.0;
@@ -58,9 +60,83 @@ const DUPLICATE_DISTANCE: f64 = 0.15;
 /// Most blank lines a vertical gap becomes.
 const MAX_BLANK_LINES: usize = 2;
 
+/// A text layer with fewer letters and digits than this has no real content
+/// (a page number over a scan).
+const MIN_USABLE_LETTERS: usize = 20;
+
+/// A text layer with at least one glyph in this many mapping to no readable
+/// character is garbage (a font without a Unicode mapping).
+const MAX_UNREADABLE_RATIO: usize = 20;
+
+/// A page's text layer, and how much of it could be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PageText {
+    pub(crate) text: String,
+    /// Letters and digits in [`Self::text`].
+    pub(crate) letters: usize,
+    /// Glyphs drawn, spaces aside, readable or not.
+    pub(crate) glyphs: usize,
+    /// Glyphs mapping to no readable character, left out of the text.
+    pub(crate) unreadable: usize,
+}
+
+impl PageText {
+    /// Whether the text layer is the page's text: it has real content
+    /// (at least [`MIN_USABLE_LETTERS`] letters or digits) and fewer than
+    /// one glyph in [`MAX_UNREADABLE_RATIO`] is unreadable. A scan, or a
+    /// page whose fonts map to nothing, isn't.
+    pub(crate) fn is_usable(&self) -> bool {
+        self.letters >= MIN_USABLE_LETTERS && self.unreadable * MAX_UNREADABLE_RATIO < self.glyphs
+    }
+}
+
 /// The text layer of `page`, laid out as described in this module's docs.
-pub(super) fn page_text(page: &Page<'_>) -> String {
-    let glyphs = collect_glyphs(page);
+pub(super) fn page_text(page: &Page<'_>) -> PageText {
+    let collector = collect_glyphs(page);
+    let text = frames_text(collector.glyphs);
+    PageText {
+        letters: text.chars().filter(|c| c.is_alphanumeric()).count(),
+        text,
+        glyphs: collector.drawn,
+        unreadable: collector.unreadable,
+    }
+}
+
+/// A line of text an OCR engine found on a page image, in pixels from its
+/// top-left corner.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TextBox {
+    pub(crate) text: String,
+    pub(crate) left: f64,
+    pub(crate) top: f64,
+    pub(crate) right: f64,
+    pub(crate) bottom: f64,
+}
+
+/// OCR'd lines laid out with the same grid as a text layer: each box is
+/// taken as one run of glyphs as tall as the box, its baseline at its
+/// bottom.
+pub(crate) fn layout_boxes(boxes: Vec<TextBox>) -> String {
+    let glyphs = boxes
+        .into_iter()
+        .filter_map(|text_box| {
+            let text = text_box.text.trim();
+            let size = text_box.bottom - text_box.top;
+            (!text.is_empty() && size > 0.0 && text_box.right > text_box.left).then(|| Glyph {
+                text: text.to_string(),
+                turn: 0,
+                x: text_box.left,
+                end: text_box.right,
+                baseline: text_box.bottom,
+                size,
+            })
+        })
+        .collect();
+    layout(glyphs)
+}
+
+/// `glyphs`' text, each reading frame laid out on its own.
+fn frames_text(glyphs: Vec<Glyph>) -> String {
     let mut frames: [Vec<Glyph>; 4] = Default::default();
     for glyph in glyphs {
         frames[usize::from(glyph.turn)].push(glyph);
@@ -102,7 +178,7 @@ impl Glyph {
 }
 
 /// Runs `page` through `hayro`'s interpreter, recording its glyphs.
-fn collect_glyphs(page: &Page<'_>) -> Vec<Glyph> {
+fn collect_glyphs(page: &Page<'_>) -> Collector {
     let (width, height) = page.render_dimensions();
     let cache = InterpreterCache::new();
     let mut context = Context::new(
@@ -115,20 +191,33 @@ fn collect_glyphs(page: &Page<'_>) -> Vec<Glyph> {
     );
     let mut collector = Collector::default();
     interpret_page(page, &mut context, &mut collector);
-    collector.glyphs
+    collector
 }
 
 #[derive(Default)]
 struct Collector {
     glyphs: Vec<Glyph>,
+    /// Glyphs drawn, spaces aside, readable or not.
+    drawn: usize,
+    /// Glyphs left out for mapping to no readable character.
+    unreadable: usize,
 }
 
 impl<'a> Device<'a> for Collector {
     fn draw_glyph_run(&mut self, run: &GlyphRun<'_, 'a>, props: DrawProps<'a>, _: &DrawMode) {
         for positioned in run.glyphs() {
-            let Some(text) = positioned.as_unicode().and_then(readable_text) else {
-                continue;
+            let text = match readable_text(positioned.as_unicode()) {
+                Readable::Text(text) => text,
+                Readable::Dropped => continue,
+                Readable::Unreadable => {
+                    self.drawn += 1;
+                    self.unreadable += 1;
+                    continue;
+                }
             };
+            if !text.chars().all(char::is_whitespace) {
+                self.drawn += 1;
+            }
             // Both in glyph space (`hayro` scales a Type 3 font's widths by
             // its font matrix).
             let advance = match &**positioned {
@@ -151,14 +240,25 @@ impl<'a> Device<'a> for Collector {
     fn pop_transparency_group(&mut self) {}
 }
 
-/// A glyph's text as it goes in the transcript, `None` for one that maps to
-/// no readable character (no Unicode mapping, a private-use code point, a
-/// replacement or control character): left out rather than printed as
-/// garbage. Ligatures are spelled out, soft hyphens dropped.
-fn readable_text(unicode: BfString) -> Option<String> {
+/// What a glyph's Unicode mapping gives the transcript.
+#[derive(Debug, PartialEq, Eq)]
+enum Readable {
+    Text(String),
+    /// Nothing, on purpose (a soft hyphen).
+    Dropped,
+    /// No readable character: no Unicode mapping, a private-use code point,
+    /// a replacement or control character. Left out rather than printed as
+    /// garbage.
+    Unreadable,
+}
+
+/// A glyph's text as it goes in the transcript. Ligatures are spelled out,
+/// soft hyphens dropped.
+fn readable_text(unicode: Option<BfString>) -> Readable {
     let raw = match unicode {
-        BfString::Char(c) => c.to_string(),
-        BfString::String(s) => s,
+        Some(BfString::Char(c)) => c.to_string(),
+        Some(BfString::String(s)) => s,
+        None => return Readable::Unreadable,
     };
     let mut text = String::with_capacity(raw.len());
     for c in raw.chars() {
@@ -171,12 +271,16 @@ fn readable_text(unicode: BfString) -> Option<String> {
             '\u{FB04}' => text.push_str("ffl"),
             '\u{FB05}' | '\u{FB06}' => text.push_str("st"),
             c if c.is_whitespace() => text.push(' '),
-            '\u{FFFD}' | '\u{E000}'..='\u{F8FF}' => return None,
-            c if c.is_control() => return None,
+            '\u{FFFD}' | '\u{E000}'..='\u{F8FF}' => return Readable::Unreadable,
+            c if c.is_control() => return Readable::Unreadable,
             c => text.push(c),
         }
     }
-    (!text.is_empty()).then_some(text)
+    if text.is_empty() {
+        Readable::Dropped
+    } else {
+        Readable::Text(text)
+    }
 }
 
 /// Places a glyph drawn with `transform` (glyph space to page space) and
@@ -374,12 +478,13 @@ fn chunks(line: &Line) -> Vec<Chunk> {
 
 /// The grid's column width: the median width of the frame's letters and
 /// digits (punctuation is narrower, and a form's dot leaders would make the
-/// grid far too wide), half their median size if none has a width.
+/// grid far too wide), half their median size if none has a width. An OCR'd
+/// line counts as one glyph, its width shared by its characters.
 fn column_width(glyphs: &[Glyph]) -> f64 {
     let letters = || {
         glyphs
             .iter()
-            .filter(|glyph| glyph.text.chars().all(char::is_alphanumeric))
+            .filter(|glyph| glyph.text.chars().any(char::is_alphanumeric))
     };
     let width = median(
         letters()
@@ -452,16 +557,71 @@ mod tests {
 
     #[test]
     fn readable_text_spells_out_ligatures_and_drops_unreadable_glyphs() {
-        assert_eq!(readable_text(BfString::Char('\u{FB01}')), Some("fi".into()));
-        assert_eq!(readable_text(BfString::Char('\u{00A0}')), Some(" ".into()));
-        assert_eq!(readable_text(BfString::Char('\u{00AD}')), None);
-        assert_eq!(readable_text(BfString::Char('\u{FFFD}')), None);
-        assert_eq!(readable_text(BfString::Char('\u{E001}')), None);
-        assert_eq!(readable_text(BfString::Char('\u{0007}')), None);
+        let text = |c: char| readable_text(Some(BfString::Char(c)));
+
+        assert_eq!(text('\u{FB01}'), Readable::Text("fi".into()));
+        assert_eq!(text('\u{00A0}'), Readable::Text(" ".into()));
+        assert_eq!(text('\u{00AD}'), Readable::Dropped);
+        assert_eq!(text('\u{FFFD}'), Readable::Unreadable);
+        assert_eq!(text('\u{E001}'), Readable::Unreadable);
+        assert_eq!(text('\u{0007}'), Readable::Unreadable);
+        assert_eq!(readable_text(None), Readable::Unreadable);
         assert_eq!(
-            readable_text(BfString::String("é".into())),
-            Some("é".into())
+            readable_text(Some(BfString::String("é".into()))),
+            Readable::Text("é".into())
         );
+    }
+
+    fn page_text_of(text: &str, unreadable: usize) -> PageText {
+        PageText {
+            text: text.to_string(),
+            letters: text.chars().filter(|c| c.is_alphanumeric()).count(),
+            glyphs: text.chars().filter(|c| !c.is_whitespace()).count() + unreadable,
+            unreadable,
+        }
+    }
+
+    #[test]
+    fn a_text_layer_is_usable_with_enough_readable_letters() {
+        assert!(page_text_of("Facture du 06/08/2022, montant 42 euros", 0).is_usable());
+        // A page number over a scan.
+        assert!(!page_text_of("Page 1 / 2", 0).is_usable());
+        // Mostly glyphs without a Unicode mapping.
+        assert!(!page_text_of("Facture du 06/08/2022, montant 42 euros", 20).is_usable());
+        assert!(page_text_of("Facture du 06/08/2022, montant 42 euros", 1).is_usable());
+    }
+
+    fn text_box(text: &str, left: f64, top: f64, right: f64, bottom: f64) -> TextBox {
+        TextBox {
+            text: text.to_string(),
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn layout_boxes_lays_ocr_lines_out_like_a_text_layer() {
+        let boxes = vec![
+            // Out of order, as detection may return them.
+            text_box("Total", 100.0, 150.0, 150.0, 170.0),
+            text_box("Facture n 42", 100.0, 100.0, 220.0, 120.0),
+            text_box("125,00", 400.0, 151.0, 460.0, 171.0),
+            text_box("  ", 300.0, 100.0, 310.0, 120.0),
+        ];
+
+        let text = layout_boxes(boxes);
+        let lines: Vec<&str> = text.lines().collect();
+
+        assert_eq!(lines.len(), 2, "{text:?}");
+        assert_eq!(lines[0], "Facture n 42");
+        assert!(lines[1].starts_with("Total  ") && lines[1].ends_with("125,00"));
+    }
+
+    #[test]
+    fn layout_boxes_of_nothing_is_empty() {
+        assert_eq!(layout_boxes(Vec::new()), "");
     }
 
     #[test]

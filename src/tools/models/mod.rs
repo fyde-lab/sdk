@@ -3,8 +3,9 @@
 //! downloads them into `ClientConfig::models_dir`.
 //!
 //! That directory is never the client's own one: logout deletes every file
-//! there, and models aren't user data. Nothing downloads on `Client::init`:
-//! only [`ModelStore::ensure`] does, when a model is first needed.
+//! there, and models aren't user data. Only [`ModelStore::ensure`]
+//! downloads, when a model is first needed (`Client::init` starts loading
+//! every model in the background).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -85,6 +86,30 @@ pub(crate) const GLINER_X_SMALL_TOKENIZER: Model = Model {
     url: gliner_x_small_url!("tokenizer.json"),
     size: 16_335_050,
     sha256: "619d3790cf59a0e50afdf04239db19093568fbd8d806963e35d54a8fb71d099c",
+};
+
+/// PP-OCRv5 mobile text detection (Apache-2.0): where the lines of text are
+/// on a page image (see `documents::transcript::ocr`).
+pub(crate) const PP_OCRV5_MOBILE_DET: Model = Model {
+    name: "pp-ocrv5-mobile-det.onnx",
+    url: concat!(
+        "https://huggingface.co/PaddlePaddle/PP-OCRv5_mobile_det_onnx/resolve/",
+        "e6f4fa85f00e168c862bc462aebca69eef9b3d3d/inference.onnx"
+    ),
+    size: 4_826_518,
+    sha256: "a431985659dc921974177a95adcfbb90fd9e51989a5e04d70d0b75f597b6e61d",
+};
+
+/// PP-OCRv5 mobile Latin text recognition (Apache-2.0): the text of each
+/// line [`PP_OCRV5_MOBILE_DET`] finds. Its dictionary is embedded in the SDK.
+pub(crate) const LATIN_PP_OCRV5_MOBILE_REC: Model = Model {
+    name: "latin-pp-ocrv5-mobile-rec.onnx",
+    url: concat!(
+        "https://huggingface.co/PaddlePaddle/latin_PP-OCRv5_mobile_rec_onnx/resolve/",
+        "89d3a50e2c27e2e7cceeab0e944c25c807d5db4f/inference.onnx"
+    ),
+    size: 8_042_023,
+    sha256: "7888113072263cb471b93f66dd5e2ad70548dc526fa1ace760d0d973dd121498",
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1131,6 +1156,8 @@ mod tests {
             MULTILINGUAL_E5_SMALL_TOKENIZER,
             GLINER_X_SMALL,
             GLINER_X_SMALL_TOKENIZER,
+            PP_OCRV5_MOBILE_DET,
+            LATIN_PP_OCRV5_MOBILE_REC,
         ];
 
         for model in registry {

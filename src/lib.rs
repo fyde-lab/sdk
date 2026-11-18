@@ -160,10 +160,12 @@ impl Client {
         let channel = lazy_channel(config.url)?;
         let models = Arc::new(tools::models::ModelStore::new(config.models_dir));
         let embedder = domains::documents::init_embedder(models.clone());
+        let ocr = domains::documents::init_ocr(models.clone());
         // Downloaded and loaded as soon as the app starts, so their first
-        // use (an upload or sync for the embedding model) doesn't wait for
-        // them.
-        let model_loading = domains::documents::start_model_loading(models, embedder.clone());
+        // use (an upload or sync for the embedding model, a scanned upload
+        // for OCR) doesn't wait for them.
+        let model_loading =
+            domains::documents::start_model_loading(models, embedder.clone(), ocr.clone());
         // Shared by uploads (which fill it), the sync job (which empties
         // it) and logout (which clears it).
         let embedding_cache = domains::documents::init_embedding_cache();
@@ -210,6 +212,7 @@ impl Client {
             embedder,
             embedding_cache.clone(),
             folders.clone(),
+            ocr,
             config.on_document_change,
         );
         let users = domains::users::init(
