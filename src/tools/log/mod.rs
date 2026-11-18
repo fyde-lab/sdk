@@ -138,7 +138,7 @@ mod tests {
         let lines = forwarded(|| {
             let record = log::Record::builder()
                 .level(log::Level::Warn)
-                .target("pdf_oxide::object")
+                .target("some_crate::object")
                 .file(Some("object.rs"))
                 .line(Some(291))
                 .args(format_args!("treating as empty stream"))
@@ -150,7 +150,7 @@ mod tests {
             lines,
             vec![(
                 LogLevel::Warn,
-                "pdf_oxide::object: treating as empty stream".to_string()
+                "some_crate::object: treating as empty stream".to_string()
             )]
         );
     }

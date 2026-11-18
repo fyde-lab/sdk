@@ -368,8 +368,7 @@ impl Client {
 /// Routes the SDK's `tracing` output to the terminal and, when set, to
 /// `on_log`. The SDK's own targets log at `log_level`, while dependencies
 /// (bridged from the `log` crate as well as native `tracing` ones) are capped
-/// at WARN so their internals don't drown the SDK's logs, and `pdf_oxide` at
-/// ERROR since it warns about every slightly malformed PDF it extracts.
+/// at WARN so their internals don't drown the SDK's logs.
 /// Every span also logs its busy/idle time to the terminal when it closes, to
 /// show where time goes (e.g. `upload`'s PDF parsing, at DEBUG).
 /// With the `tokio-console` feature, also serves the runtime's tasks to
@@ -392,8 +391,7 @@ fn install_tracing(
     let filter = Targets::new()
         .with_default(level.min(LevelFilter::WARN))
         .with_target("fyde_sdk", level)
-        .with_target("fyde::scrapers", level)
-        .with_target("pdf_oxide", level.min(LevelFilter::ERROR));
+        .with_target("fyde::scrapers", level);
     let callback_layer = on_log.map(|callback| CallbackLayer { callback });
     let logs = tracing_subscriber::fmt::layer()
         .with_span_events(FmtSpan::CLOSE)

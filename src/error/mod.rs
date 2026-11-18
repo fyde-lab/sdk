@@ -294,8 +294,9 @@ pub(crate) enum ErrorKind {
     Xdg(#[from] xdg::BaseDirectoriesError),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("pdf error: {0}")]
-    Pdf(#[from] pdf_oxide::Error),
+    /// Why a PDF couldn't be read (`documents::transcript`).
+    #[error("unreadable pdf: {0}")]
+    Pdf(&'static str),
     #[error("lua error: {0}")]
     Lua(#[from] mlua::Error),
     #[error("unsupported document extension {0:?}: only .pdf is supported")]
@@ -639,7 +640,6 @@ impl_from_source!(
     sqlx::migrate::MigrateError,
     xdg::BaseDirectoriesError,
     serde_json::Error,
-    pdf_oxide::Error,
     mlua::Error,
     keyring_core::Error,
     rmp_serde::encode::Error,

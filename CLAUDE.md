@@ -173,7 +173,15 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     (`AttributesService::list`/`set`/`check`). Checks (`check_values`, then defined types) run on
     upload and `update_metadata`. Promote anything that needs filtering/sorting to a real
     `Metadata` field instead of querying attributes JSON.
-  - `transcript.rs` — extracts a PDF's text into `Metadata::transcript` on upload (and for `fyde.pdf`, whole or within a rectangle).
+  - `transcript/` — extracts a PDF's text into `Metadata::transcript` on upload: each page's
+    own text layer through `hayro` (pure Rust, standard fonts and CMaps embedded; invisible
+    text included), joined by `PAGE_SEPARATOR` (`chunk.rs` splits on it). `text_layer.rs` is the
+    adapter: a `hayro_interpret::Device` recording glyphs, then laid out like the page (reading
+    frames snapped to quarter turns, margin text after the body; lines anchored on their largest
+    glyph; chunks on a character grid of the median glyph width, right-aligned when their right
+    edge lines up with other lines'; vertical gaps as up to 2 blank lines). Glyphs without a
+    readable Unicode mapping are left out. A malformed or password-protected PDF is
+    `ErrorKind::Pdf` (`UnreadablePdf`, 4003); a `hayro` panic is caught into it too.
   - Indexing: a document is never cached without its embeddings. The changelog consumer
     applies `SaveDocument`/`UpdateMetadata` through the `Indexer` trait (`DocumentIndexer` in
     `service.rs`), which embeds then writes document + embeddings in one transaction. Rules:
@@ -350,7 +358,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   (gRPC health; never fails), **usage** (`get_usage`, plan limits + current usage; never cached).
 - **scrapers** — runs Lua scripts that log into third-party sites. Contract: the script
   returns `{ run = function(parameters) ... }` and only calls the `fyde` table built in
-  `host/` (`http`, `html`, `json`, `pdf`, `log`, `progress`, `input`, `save_document`, `session`,
+  `host/` (`http`, `html`, `json`, `log`, `progress`, `input`, `save_document`, `session`,
   `browser`, plus `helpers`: shared Lua helpers in `host/helpers.lua` that scripts alias instead
   of inlining — `../scripts` relies on their names and behaviour).
   - `mlua::Lua` is `!Send`: `run` builds the VM inside `spawn_blocking` and host functions use
@@ -368,8 +376,6 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     `update(current, total)` has no message. New steps need wording in every language in
     `ProgressStep::user_message`, plus a matching variant in the application's bindings
     (`../application/sdkBridge/rust`).
-  - `pdf.text(content)` / `pdf.text_in_rect(content, page, {x, y, width, height})` read a PDF's
-    text through `documents::transcript` (`page` from 1; points from the bottom-left corner).
   - `save_document` uploads via `documents::Service::upload`; `DuplicateDocument` is skipped.
     `helpers.save_pdf` records each URL it saved from in `fyde.session.saved_urls`
     (`helpers.already_saved`/`mark_saved`) and skips it on later runs without downloading,
