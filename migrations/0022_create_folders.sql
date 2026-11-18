@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS folders (
     id TEXT PRIMARY KEY,
     parent_id TEXT,
     name TEXT NOT NULL,
+    description TEXT NOT NULL,
     color TEXT,
     icon TEXT
 );
