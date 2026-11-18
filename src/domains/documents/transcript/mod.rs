@@ -1,27 +1,35 @@
 //! A PDF's text transcript, stored in its encrypted metadata so it can be
-//! searched and embedded without re-parsing the document. Each page's own
-//! text layer, laid out like the page ([`text_layer`]), pages separated by
-//! [`PAGE_SEPARATOR`].
+//! searched and embedded without re-parsing the document: each page's own
+//! text layer, laid out like the page ([`text_layer`]), or for a page without
+//! a usable one (a scan), its OCR'd text ([`render`], then [`ocr`]). Which a
+//! page gets is the documents service's call; pages are separated by
+//! [`PAGE_SEPARATOR`]. Only adapters.
 
+mod ocr;
+mod render;
 mod text_layer;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use hayro_interpret::hayro_syntax::{LoadPdfError, Pdf};
+use hayro::hayro_syntax::{LoadPdfError, Pdf};
+
+#[cfg(test)]
+pub(crate) use ocr::MockOcr;
+pub(crate) use ocr::{Ocr, OnnxOcr};
+pub(crate) use render::PageImage;
+pub(crate) use text_layer::PageText;
 
 use crate::{ErrorContext as _, ErrorKind, Result};
 
-/// What [`extract`] puts between two pages.
+/// What goes between two pages of a transcript.
 pub(super) const PAGE_SEPARATOR: &str = "\n\n---\n\n";
 
-/// The transcript of the PDF in `content`: every page's text layer, in
-/// order, joined by [`PAGE_SEPARATOR`]. A page without one (a scan) is
-/// empty.
+/// The text layer of every page of the PDF in `content`, in order.
 ///
 /// Callers are expected to have already verified `content` is a PDF (see
 /// [`super::service::PDF_CONTENT_TYPE`]) — this always attempts to parse it as one.
 #[tracing::instrument(level = "debug", skip_all, fields(size = content.len()))]
-pub(crate) fn extract(content: &[u8]) -> Result<String> {
+pub(crate) fn text_layers(content: &[u8]) -> Result<Vec<PageText>> {
     let pdf = tracing::debug_span!("parse_pdf")
         .in_scope(|| parse(content))
         .context("failed to parse PDF document")?;
@@ -30,15 +38,26 @@ pub(crate) fn extract(content: &[u8]) -> Result<String> {
             // `hayro` reads untrusted bytes: a bug of its must fail this
             // document's upload, not unwind through the caller.
             catch_unwind(AssertUnwindSafe(|| {
-                pdf.pages()
-                    .iter()
-                    .map(text_layer::page_text)
-                    .collect::<Vec<_>>()
-                    .join(PAGE_SEPARATOR)
+                pdf.pages().iter().map(text_layer::page_text).collect()
             }))
             .map_err(|_| ErrorKind::Pdf("reading its text layer panicked"))
         })
         .context("failed to extract text from PDF document")
+}
+
+/// The 0-based page `index` of the PDF in `content` rendered for OCR, its
+/// blank margins trimmed; `None` for a blank page.
+#[tracing::instrument(level = "debug", skip(content), fields(size = content.len()))]
+pub(crate) fn render_page(content: &[u8], index: usize) -> Result<Option<PageImage>> {
+    let pdf = parse(content).context("failed to parse PDF document")?;
+    let page = pdf
+        .pages()
+        .get(index)
+        .ok_or(ErrorKind::Pdf("it has no such page"))
+        .with_context(|| format!("failed to find page {index}"))?;
+    catch_unwind(AssertUnwindSafe(|| render::render_for_ocr(page)))
+        .map_err(|_| ErrorKind::Pdf("rendering it panicked"))
+        .with_context(|| format!("failed to render page {index}"))
 }
 
 /// Parses `content` (decrypting it if it's only protected by an owner
@@ -63,6 +82,15 @@ pub(crate) mod tests {
     use super::*;
     use crate::ErrorCode;
 
+    /// Every page's text layer, joined like a transcript.
+    fn extract(content: &[u8]) -> Result<String> {
+        Ok(text_layers(content)?
+            .into_iter()
+            .map(|page| page.text)
+            .collect::<Vec<_>>()
+            .join(PAGE_SEPARATOR))
+    }
+
     /// Builds a minimal, single-page PDF containing `text`, for use as
     /// fixture content in tests that need real (rather than hand-rolled)
     /// PDF bytes.
@@ -82,7 +110,7 @@ pub(crate) mod tests {
 
     /// The operations writing `text` at (`x`, `y`) (PDF points, from the
     /// bottom-left corner) in `size`-point Courier.
-    fn text_at(x: i64, y: i64, size: i64, text: &str) -> Vec<Operation> {
+    pub(crate) fn text_at(x: i64, y: i64, size: i64, text: &str) -> Vec<Operation> {
         vec![
             Operation::new("BT", vec![]),
             Operation::new("Tf", vec!["F1".into(), size.into()]),
@@ -94,7 +122,7 @@ pub(crate) mod tests {
 
     /// Builds an A4 PDF with one page per element of `pages`, each drawn by
     /// those operations (`F1` is Courier) and rotated by `rotate` degrees.
-    fn build_pdf_from(pages: &[Vec<Operation>], rotate: i64) -> Vec<u8> {
+    pub(crate) fn build_pdf_from(pages: &[Vec<Operation>], rotate: i64) -> Vec<u8> {
         let mut doc = lopdf::Document::with_version("1.5");
 
         let pages_id = doc.new_object_id();
@@ -243,5 +271,47 @@ pub(crate) mod tests {
         let transcript = extract(&build_pdf_from(&[Vec::new()], 0)).unwrap();
 
         assert_eq!(transcript, "");
+    }
+
+    #[test]
+    fn text_layers_tells_a_text_layer_with_real_content_from_a_bare_page() {
+        let mut operations = text_at(100, 700, 12, "Facture du 06/08/2022, montant 42 euros");
+        operations.extend(text_at(100, 680, 12, "Page 1"));
+        let pdf = build_pdf_from(&[operations, text_at(500, 30, 10, "Page 2")], 0);
+
+        let pages = text_layers(&pdf).unwrap();
+
+        assert_eq!(pages.len(), 2);
+        assert!(pages[0].is_usable(), "{:?}", pages[0]);
+        assert_eq!(pages[0].unreadable, 0);
+        assert!(!pages[1].is_usable(), "{:?}", pages[1]);
+        assert_eq!(pages[1].text, "Page 2");
+    }
+
+    #[test]
+    fn render_page_renders_the_inked_part_of_a_page() {
+        let pdf = build_pdf("Hello World!");
+
+        let image = render_page(&pdf, 0).unwrap().unwrap();
+
+        // 48pt Courier at 200 dpi, trimmed: far smaller than the A4 page.
+        assert!(image.width > 400 && image.width < 1653, "{image:?}");
+        assert!(image.height > 50 && image.height < 300, "{image:?}");
+        assert_eq!(image.rgb.len(), (image.width * image.height * 3) as usize);
+        assert!(image.rgb.iter().any(|&value| value < 100));
+    }
+
+    #[test]
+    fn render_page_of_a_blank_page_is_none() {
+        let pdf = build_pdf_from(&[Vec::new()], 0);
+
+        assert_eq!(render_page(&pdf, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn render_page_fails_for_a_page_the_pdf_does_not_have() {
+        let err = render_page(&build_pdf("Hello"), 1).unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::UnreadablePdf);
     }
 }

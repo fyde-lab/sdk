@@ -394,6 +394,9 @@ pub(crate) enum ErrorKind {
     InvalidModel(String),
     #[error("onnx runtime error: {0}")]
     Onnx(#[from] ort::Error),
+    /// `oar-ocr` failed to build its pipeline or to read a page.
+    #[error("ocr error: {0}")]
+    Ocr(#[source] oar_ocr::core::OCRError),
     /// Not an [`ort::Error`]: building one calls into the very runtime that
     /// failed to load.
     #[cfg(ort_load_dynamic)]
@@ -463,9 +466,10 @@ impl ErrorKind {
             ErrorKind::ModelDownloadStatus(_) => ErrorCode::ModelUnavailable,
             ErrorKind::ModelCorrupted(_) => ErrorCode::ModelCorrupted,
             ErrorKind::ModelNotDownloaded(_) => ErrorCode::ModelDownloadFailed,
-            ErrorKind::Onnx(_) | ErrorKind::Tokenizer(_) | ErrorKind::InvalidModel(_) => {
-                ErrorCode::ModelLoadFailed
-            }
+            ErrorKind::Onnx(_)
+            | ErrorKind::Ocr(_)
+            | ErrorKind::Tokenizer(_)
+            | ErrorKind::InvalidModel(_) => ErrorCode::ModelLoadFailed,
             #[cfg(ort_load_dynamic)]
             ErrorKind::OnnxRuntimeLoad(_) => ErrorCode::ModelLoadFailed,
         }

@@ -40,9 +40,10 @@ pub(crate) fn tokenizer(path: &Path) -> Result<Tokenizer> {
 }
 
 /// Loads the shared ONNX Runtime library, once: `ort` would otherwise load it
-/// lazily on its first call and panic if it's missing.
+/// lazily on its first call and panic if it's missing. [`session`] calls it;
+/// so must anything building its own sessions (`oar-ocr`'s), first.
 #[cfg(ort_load_dynamic)]
-fn load_runtime() -> Result<()> {
+pub(crate) fn load_runtime() -> Result<()> {
     let path = runtime_library_path(std::env::var_os("ORT_DYLIB_PATH"));
 
     // `false` when an earlier call already committed the environment.
@@ -55,7 +56,7 @@ fn load_runtime() -> Result<()> {
 }
 
 #[cfg(not(ort_load_dynamic))]
-fn load_runtime() -> Result<()> {
+pub(crate) fn load_runtime() -> Result<()> {
     Ok(())
 }
 
