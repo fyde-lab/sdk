@@ -306,18 +306,26 @@ pub(crate) fn init_embedder(models: Arc<ModelStore>) -> Arc<dyn embedder::Embedd
     Arc::new(embedder::OnnxEmbedder::new(models))
 }
 
+/// Initializes the OCR the documents [`Service`] reads uploads' scanned
+/// pages with, from the models `models` holds (fetched on its first use,
+/// unless [`start_model_loading`] already did).
+pub(crate) fn init_ocr(models: Arc<ModelStore>) -> Arc<dyn transcript::Ocr> {
+    Arc::new(transcript::OnnxOcr::new(models))
+}
+
 pub(crate) use service::ModelLoading;
 
 /// Starts downloading (if needed) and loading in memory, in the background,
-/// the models `embedder` (see [`init_embedder`]) and GLiNER (from `models`;
-/// not used by any flow yet) run, each on its own task so they're fetched
-/// in parallel. Dropping the returned [`ModelLoading`] stops whatever is
-/// still under way.
+/// the models `embedder` (see [`init_embedder`]), `ocr` (see [`init_ocr`])
+/// and GLiNER (from `models`; not used by any flow yet) run, each on its own
+/// task so they're fetched in parallel. Dropping the returned
+/// [`ModelLoading`] stops whatever is still under way.
 pub(crate) fn start_model_loading(
     models: Arc<ModelStore>,
     embedder: Arc<dyn embedder::Embedder>,
+    ocr: Arc<dyn transcript::Ocr>,
 ) -> ModelLoading {
-    service::start_model_loading(embedder, Arc::new(gliner::OnnxGliner::new(models)))
+    service::start_model_loading(embedder, Arc::new(gliner::OnnxGliner::new(models)), ocr)
 }
 
 /// Initializes the [`Indexer`] the changelog consumer caches documents
@@ -344,7 +352,8 @@ pub(crate) fn init_indexer(
 /// [`crate::ClientConfig`]) for every event [`Service::start_sync`]
 /// consumes. Uploads and searches embed their text with `embedder` (see
 /// [`init_embedder`]), uploads leaving theirs in `cache` for `indexer`, and
-/// are classified with it.
+/// are classified with it; their scanned pages are read with `ocr` (see
+/// [`init_ocr`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn init(
     pool: SqlitePool,
@@ -354,6 +363,7 @@ pub(crate) fn init(
     embedder: Arc<dyn embedder::Embedder>,
     cache: Arc<dyn EmbeddingCache>,
     folders: Arc<dyn crate::domains::folders::Service>,
+    ocr: Arc<dyn transcript::Ocr>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Arc<dyn Service> {
     let storage = storage_sqlite::SqliteStorage::new(pool);
@@ -368,6 +378,7 @@ pub(crate) fn init(
         cache,
         classification::init(embedder),
         folders,
+        ocr,
     ))
 }
 

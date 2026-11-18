@@ -306,6 +306,7 @@ mod tests {
     use super::super::embedding_cache::MemoryEmbeddingCache;
     use super::super::service::{DocumentIndexer, DocumentsClient};
     use super::super::storage_sqlite::tests::stored_embeddings;
+    use super::super::transcript::MockOcr;
     use super::super::transcript::tests::build_pdf_pages;
     use super::super::{
         ChangelogEvent, Document, EmbeddingCache as _, EventType, FakeDocument, FakeMetadata,
@@ -634,6 +635,7 @@ mod tests {
             Arc::new(MemoryEmbeddingCache::new(0)),
             Arc::new(MockClassifier::new()),
             no_folders(),
+            Arc::new(MockOcr::new()),
         );
         let text = "combien j'ai payé au fisc l'an dernier";
 
@@ -778,6 +780,8 @@ mod tests {
             cache.clone(),
             Arc::new(classifier),
             no_folders(),
+            // Every page has a text layer.
+            Arc::new(MockOcr::new()),
         );
         // Pages are never chunked together.
         let pdf = build_pdf_pages(&[
