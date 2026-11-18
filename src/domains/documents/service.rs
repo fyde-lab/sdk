@@ -22,11 +22,12 @@ use super::classification::{Classification, FiledDocument, Service as Classifica
 use super::embedder::Embedder;
 use super::gliner::SpanFinder;
 use super::storage::{FacetField, Storage, UNFILED};
+use super::thumbnail;
 use super::transcript::{self, Ocr, PAGE_SEPARATOR};
 use super::{
     CachedEmbeddings, ChunkEmbedding, Document, DocumentEmbeddings, EmbeddingCache, EmbeddingKey,
-    FacetCount, Indexer, Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery, Service,
-    SimilarDocument, UploadRequest, UploadSource,
+    FacetCount, Indexer, MAX_THUMBNAIL_SIDE, Metadata, SearchFacets, SearchFilters, SearchOrder,
+    SearchQuery, Service, SimilarDocument, Thumbnail, UploadRequest, UploadSource,
 };
 
 /// The only content type [`Service::upload`] currently accepts.
@@ -693,6 +694,33 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
     async fn get(&self, id: Uuid) -> Result<Option<Document>> {
         self.storage.get_document(id).await
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn thumbnail(
+        &self,
+        id: Uuid,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Option<Thumbnail>> {
+        let Some(document) = self
+            .storage
+            .get_document(id)
+            .await
+            .with_context(|| format!("failed to load document {id} to draw its thumbnail"))?
+        else {
+            return Ok(None);
+        };
+        let (width, height) = (
+            max_width.clamp(1, MAX_THUMBNAIL_SIDE),
+            max_height.clamp(1, MAX_THUMBNAIL_SIDE),
+        );
+
+        tokio::task::spawn_blocking(move || thumbnail::render(&document.content, width, height))
+            .await
+            .context("the thumbnail task failed")?
+            .with_context(|| format!("failed to draw the thumbnail of document {id}"))
+            .map(Some)
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -4991,6 +5019,79 @@ mod tests {
         assert_eq!(title("no extension"), "no extension");
         assert_eq!(title(".pdf"), ".pdf");
         assert_eq!(title(""), "");
+    }
+
+    /// A client only `thumbnail` is called on, `document` being the one
+    /// document its storage has.
+    fn thumbnailing_client(document: Option<Document>) -> DocumentsClient<MockStorage> {
+        let mut storage = MockStorage::new();
+        let expected = document.as_ref().map(|document| document.id);
+        storage
+            .expect_get_document()
+            .times(1)
+            .withf(move |id| expected.is_none_or(|expected| *id == expected))
+            .returning(move |_| Ok(document.clone()));
+        DocumentsClient::new(
+            storage,
+            Arc::new(RecordingChangelog::default()),
+            None,
+            accepting_attributes(),
+            unused_indexer(),
+            unused_embedder(),
+            unused_cache(),
+            unused_classifier(),
+            no_folders(),
+            Arc::new(MockOcr::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn thumbnail_draws_the_first_page_of_a_cached_document_as_a_png() {
+        let document = FakeDocument::new().with_content(build_pdf("Hello")).build();
+        let id = document.id;
+        let client = thumbnailing_client(Some(document));
+
+        let thumbnail = client.thumbnail(id, 120, 300).await.unwrap().unwrap();
+
+        // An A4 page, fitted by its width.
+        assert_eq!((thumbnail.width, thumbnail.height), (120, 170));
+        assert!(thumbnail.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[tokio::test]
+    async fn thumbnail_of_a_document_not_cached_is_none() {
+        let client = thumbnailing_client(None);
+
+        assert_eq!(
+            client.thumbnail(Uuid::now_v7(), 100, 100).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn thumbnail_clamps_the_box() {
+        let document = FakeDocument::new().with_content(build_pdf("Hello")).build();
+        let id = document.id;
+        let client = thumbnailing_client(Some(document));
+
+        let thumbnail = client.thumbnail(id, 0, u32::MAX).await.unwrap().unwrap();
+
+        // Fitted in 1 x MAX_THUMBNAIL_SIDE.
+        assert_eq!(thumbnail.width, 1);
+        assert!(thumbnail.height >= 1 && thumbnail.height <= MAX_THUMBNAIL_SIDE);
+    }
+
+    #[tokio::test]
+    async fn thumbnail_fails_as_an_unreadable_pdf_for_content_it_cannot_draw() {
+        let document = FakeDocument::new()
+            .with_content(b"not a pdf".to_vec())
+            .build();
+        let id = document.id;
+        let client = thumbnailing_client(Some(document));
+
+        let err = client.thumbnail(id, 100, 100).await.unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::UnreadablePdf);
     }
 
     #[tokio::test]

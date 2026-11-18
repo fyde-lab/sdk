@@ -13,6 +13,7 @@ mod models;
 mod service;
 mod storage;
 mod storage_sqlite;
+mod thumbnail;
 pub(crate) mod transcript;
 
 #[cfg(any(test, feature = "testing"))]
@@ -31,7 +32,7 @@ pub(crate) use models::FakeSearchFacets;
 pub(crate) use models::{CachedEmbeddings, ChunkEmbedding, DocumentEmbeddings, EmbeddingKey};
 pub use models::{
     Document, DocumentType, FacetCount, FolderFilter, Metadata, SearchFacets, SearchFilters,
-    SearchOrder, SearchQuery, SimilarDocument, UploadRequest, UploadSource,
+    SearchOrder, SearchQuery, SimilarDocument, Thumbnail, UploadRequest, UploadSource,
 };
 #[cfg(any(test, feature = "testing"))]
 pub use models::{FakeDocument, FakeMetadata};
@@ -58,6 +59,10 @@ use crate::{ErrorCode, Result};
 /// pick another: about as close as a search needs a document to be to match
 /// by meaning.
 pub const DEFAULT_SIMILAR_MIN_CONFIDENCE: f32 = 0.25;
+
+/// The largest side, in pixels, [`Service::thumbnail`] renders: a full A4
+/// page at about 175 dpi, 12 MiB of pixels at most while it's drawn.
+pub const MAX_THUMBNAIL_SIDE: u32 = 2048;
 
 /// Uploads documents by publishing them as encrypted changelog events, and
 /// reads back documents materialized locally from consumed events (see
@@ -105,6 +110,23 @@ pub trait Service: Send + Sync {
     /// and [`Self::search`] return metadata alone, so fetch it with this
     /// once the document is actually shown.
     async fn get(&self, id: Uuid) -> Result<Option<Document>>;
+
+    /// The first page of a document previously cached in local storage by
+    /// [`Self::start_sync`], as a PNG as large as fits within `max_width` x
+    /// `max_height` pixels, its aspect ratio kept, on a white background;
+    /// `None` if the document doesn't exist. Each side of the box is
+    /// clamped to `1..=`[`MAX_THUMBNAIL_SIDE`]. Rendered from the document's
+    /// content on every call, never stored (about 10 ms for a card-sized
+    /// one, rarely over 100): cache it in memory while it's shown.
+    ///
+    /// Fails with [`crate::ErrorCode::UnreadablePdf`] for a document whose
+    /// content can't be rendered.
+    async fn thumbnail(
+        &self,
+        id: Uuid,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Option<Thumbnail>>;
 
     /// Lists the metadata of documents previously cached in local storage,
     /// oldest first, one page at a time. Never loads their content (see
