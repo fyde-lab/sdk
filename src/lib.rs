@@ -11,8 +11,9 @@ use std::sync::Arc;
 pub use domains::documents::{
     Attribute, AttributeDefinition, AttributeType, AttributesService, ChangelogEvent,
     DEFAULT_SIMILAR_MIN_CONFIDENCE, Document, DocumentType, EventType, FacetCount, FolderFilter,
-    Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery, Service as DocumentsService,
-    SetAttributeRequest, SimilarDocument, SyncProgress, UploadRequest,
+    MAX_THUMBNAIL_SIDE, Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery,
+    Service as DocumentsService, SetAttributeRequest, SimilarDocument, SyncProgress, Thumbnail,
+    UploadRequest,
 };
 pub use domains::folders::{
     CreateFolderRequest, Folder, FolderAppearance, FolderColor, FolderContents, FolderIcon,

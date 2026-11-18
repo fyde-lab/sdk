@@ -800,6 +800,15 @@ mod tests {
             unimplemented!()
         }
 
+        async fn thumbnail(
+            &self,
+            _id: uuid::Uuid,
+            _max_width: u32,
+            _max_height: u32,
+        ) -> Result<Option<crate::domains::documents::Thumbnail>> {
+            unimplemented!()
+        }
+
         async fn list(
             &self,
             _offset: i64,

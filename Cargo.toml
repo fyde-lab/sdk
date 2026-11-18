@@ -28,9 +28,10 @@ futures = "0.3.34"
 # library to ship per platform.
 hayro = "0.9.0"
 hkdf = "0.12.4"
-# The RGB pages `oar-ocr` reads (`documents/transcript/ocr.rs`): its own
-# version, no codec (pages come from `hayro`, never from a file).
-image = { version = "0.25.10", default-features = false }
+# The RGB pages `oar-ocr` reads (`documents/transcript/ocr.rs`), at its own
+# version, and the PNG thumbnails are encoded with (`documents/thumbnail.rs`):
+# no other codec, pages come from `hayro`, never from a file.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 # The `secrets` domain (`domains/secrets`) keeps the account master key and
 # the session token in the OS's native credential store rather than in the
 # local SQLite database. `keyring-core` is the store-agnostic API; each

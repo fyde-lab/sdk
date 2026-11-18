@@ -62,7 +62,7 @@ pub(crate) fn render_page(content: &[u8], index: usize) -> Result<Option<PageIma
 
 /// Parses `content` (decrypting it if it's only protected by an owner
 /// password, as bank statements often are).
-fn parse(content: &[u8]) -> Result<Pdf> {
+pub(super) fn parse(content: &[u8]) -> Result<Pdf> {
     catch_unwind(|| Pdf::new(content.to_vec()))
         .map_err(|_| ErrorKind::Pdf("parsing it panicked"))?
         .map_err(|err| {
