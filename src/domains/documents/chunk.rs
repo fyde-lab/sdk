@@ -4,8 +4,7 @@
 
 use std::ops::Range;
 
-/// What [`super::transcript::extract`] puts between two pages.
-const PAGE_SEPARATOR: &str = "\n\n---\n\n";
+use super::transcript::PAGE_SEPARATOR;
 
 /// A chunk's size, in characters of whitespace-collapsed text: layout
 /// padding (grid-aligned text is mostly spaces) doesn't count.
