@@ -153,7 +153,11 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   no-op if it isn't cached. `get`/`list`/`search`/`search_facets` are local-only
   (`storage_sqlite.rs`, FTS5 `bm25` ranking over contentless `documents_fts`). `list`/`search`
   return `Metadata` only (their query never selects `content`; `size` is `length(content)`):
-  `get` is the only call that loads a document's content, for when it's actually shown.
+  `get` is the only call that loads a document's content, for when it's actually shown, besides
+  `thumbnail(id, max_width, max_height)`: the first page as a PNG fitting the box (each side
+  clamped to `1..=MAX_THUMBNAIL_SIDE`, 2048), rendered by `thumbnail.rs` (`hayro`, white
+  background, on the blocking pool) from the cached content on every call and never stored, so
+  logout has nothing more to wipe; `None` for a document not cached here.
   `search_facets` counts each field with its own filter lifted so UIs only offer reachable
   choices. A document's place is `Metadata::folder_id` (`None` = the root, À classer; a
   folder deleted meanwhile counts as the root too): `upload` takes the source, an

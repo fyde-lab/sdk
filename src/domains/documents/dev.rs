@@ -8,7 +8,7 @@ use crate::{ErrorCode, ErrorContext as _, Result};
 
 use super::{
     Document, Metadata, SearchFacets, SearchFilters, SearchQuery, Service, SimilarDocument,
-    SyncProgress, UploadRequest, UploadSource,
+    SyncProgress, Thumbnail, UploadRequest, UploadSource,
 };
 
 /// A [`Service`] implementation for standalone/dev use (see
@@ -93,6 +93,15 @@ impl Service for DevDocumentsClient {
     }
 
     async fn get(&self, _id: Uuid) -> Result<Option<Document>> {
+        Ok(None)
+    }
+
+    async fn thumbnail(
+        &self,
+        _id: Uuid,
+        _max_width: u32,
+        _max_height: u32,
+    ) -> Result<Option<Thumbnail>> {
         Ok(None)
     }
 

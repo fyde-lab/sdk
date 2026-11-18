@@ -394,6 +394,9 @@ pub(crate) enum ErrorKind {
     InvalidModel(String),
     #[error("onnx runtime error: {0}")]
     Onnx(#[from] ort::Error),
+    /// Encoding an image in memory failed (a thumbnail's PNG).
+    #[error("image encoding error: {0}")]
+    ImageEncoding(#[source] image::ImageError),
     /// `oar-ocr` failed to build its pipeline or to read a page.
     #[error("ocr error: {0}")]
     Ocr(#[source] oar_ocr::core::OCRError),
@@ -417,7 +420,7 @@ impl ErrorKind {
             ErrorKind::InvalidModelsDirectory { .. } => ErrorCode::InvalidModelsDirectory,
             ErrorKind::InvalidUuid(_) => ErrorCode::InvalidUuid,
             ErrorKind::InvalidInteger(_) => ErrorCode::InvalidInteger,
-            ErrorKind::Io(_) => ErrorCode::Io,
+            ErrorKind::Io(_) | ErrorKind::ImageEncoding(_) => ErrorCode::Io,
             ErrorKind::Database(_) => ErrorCode::Database,
             ErrorKind::Migrate(_) => ErrorCode::DatabaseMigration,
             ErrorKind::Xdg(_) => ErrorCode::DataDirectory,
