@@ -35,7 +35,7 @@ use super::stop::StopSignal;
 /// picked up, once the script's `run` function has returned.
 pub(super) struct Installed {
     cookie_jar: Arc<Jar>,
-    visited_origins: Arc<Mutex<HashSet<String>>>,
+    visited_urls: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Installed {
@@ -55,7 +55,7 @@ impl Installed {
             .from_value(LuaValue::Table(session_table))
             .context("converting fyde.session to JSON")?;
 
-        let cookies = export_cookies(&self.cookie_jar, &self.visited_origins);
+        let cookies = export_cookies(&self.cookie_jar, &self.visited_urls);
 
         Ok((session_data, cookies))
     }
@@ -204,7 +204,7 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
     } = config;
     let scraper_name = scraper_name.as_str();
     let cookie_jar = build_jar(&cookies);
-    let visited_origins = Arc::new(Mutex::new(HashSet::new()));
+    let visited_urls = Arc::new(Mutex::new(HashSet::new()));
     let allowed_domains = Arc::new(options.allowed_domains.clone());
 
     let fyde = lua.create_table().context("creating the `fyde` table")?;
@@ -216,7 +216,7 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
         http::table(
             lua,
             cookie_jar.clone(),
-            visited_origins.clone(),
+            visited_urls.clone(),
             recorder.clone(),
             runtime.clone(),
             stop.clone(),
@@ -288,7 +288,7 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
 
     Ok(Installed {
         cookie_jar,
-        visited_origins,
+        visited_urls,
     })
 }
 

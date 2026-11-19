@@ -28,24 +28,34 @@ pub(crate) fn build_jar(cookies: &[Cookie]) -> Arc<Jar> {
     Arc::new(jar)
 }
 
-/// Exports every unexpired cookie `jar` holds for each origin in
-/// `visited_origins` (see `track_origin` below), ready to be persisted via
+/// Exports every unexpired cookie `jar` holds for each URL in
+/// `visited_urls` (see `track_url` below), ready to be persisted via
 /// `cookies::Service::save`. `Jar::get_all` can't be used here: by design it
 /// drops the `Domain` of host-only cookies entirely (see its docs), which
 /// would make them unreplayable against the right host on the next run.
-/// Querying `matches()` per origin `fyde.http` actually visited instead means
+/// Querying `matches()` per URL `fyde.http` actually visited instead means
 /// a cookie's host is always known from the origin it was found under, even
-/// when the jar itself doesn't carry it on the cookie. Ported from
-/// `demo-rust-fyde`'s `host/session.rs::export_cookies`.
-pub(crate) fn export_cookies(jar: &Jar, visited_origins: &Mutex<HashSet<String>>) -> Vec<Cookie> {
-    let origins = match visited_origins.lock() {
-        Ok(origins) => origins.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
+/// when the jar itself doesn't carry it on the cookie. Querying the visited
+/// URLs' paths, not just their origins' `/`, is what keeps a cookie scoped to
+/// a narrower `Path` (e.g. Keycloak's `Path=/realms/<realm>/` SSO cookies):
+/// `matches()` path-matches like a browser, so it never returns one for `/`.
+/// A cookie matched under several URLs of the same origin is exported once.
+/// Ported from `demo-rust-fyde`'s `host/session.rs::export_cookies`.
+pub(crate) fn export_cookies(jar: &Jar, visited_urls: &Mutex<HashSet<String>>) -> Vec<Cookie> {
+    let mut urls: Vec<String> = match visited_urls.lock() {
+        Ok(urls) => urls.iter().cloned().collect(),
+        Err(poisoned) => poisoned.into_inner().iter().cloned().collect(),
     };
+    // Deterministic output regardless of the set's iteration order.
+    urls.sort();
 
+    let mut seen = HashSet::new();
     let mut cookies = Vec::new();
-    for origin in origins {
-        for cookie in jar.matches(origin.as_str()) {
+    for url in urls {
+        let Some(origin) = origin_of(&url) else {
+            continue;
+        };
+        for cookie in jar.matches(url.as_str()) {
             let mut set_cookie = format!("{}={}", cookie.name(), cookie.value());
             // Only set when the original cookie carried an explicit `Domain`
             // attribute (i.e. it isn't host-only) — reproduced here so
@@ -60,31 +70,57 @@ pub(crate) fn export_cookies(jar: &Jar, visited_origins: &Mutex<HashSet<String>>
             if cookie.secure() {
                 set_cookie.push_str("; Secure");
             }
-            cookies.push(Cookie {
-                origin: origin.clone(),
-                set_cookie,
-            });
+            if seen.insert((origin.clone(), set_cookie.clone())) {
+                cookies.push(Cookie {
+                    origin: origin.clone(),
+                    set_cookie,
+                });
+            }
         }
     }
     cookies
 }
 
-/// Records `url`'s origin (`scheme://host[:port]`) into the shared set
-/// [`export_cookies`] later uses to know which hosts to ask the cookie jar
-/// about when exporting cookies for the next run.
-fn track_origin(origins: &Mutex<HashSet<String>>, url: &str) {
-    if let Some(origin) = origin_of(url)
-        && let Ok(mut origins) = origins.lock()
+/// Records `url` (`scheme://host[:port]/path`, query and fragment dropped)
+/// into the shared set [`export_cookies`] later uses to know which hosts and
+/// paths to ask the cookie jar about when exporting cookies for the next run.
+fn track_url(urls: &Mutex<HashSet<String>>, url: &str) {
+    if let Some(scope) = scope_of(url)
+        && let Ok(mut urls) = urls.lock()
     {
-        origins.insert(origin);
+        urls.insert(scope);
     }
+}
+
+/// Tracks every URL `resp`'s redirect chain went through, and the one it
+/// landed on: a hop can set cookies (an OIDC bounce through an identity
+/// provider the script never requests itself), which would otherwise be
+/// lost with the run.
+fn track_redirects(urls: &Mutex<HashSet<String>>, resp: &wreq::Response) {
+    if let Some(history) = resp.extensions().get::<wreq::redirect::History>() {
+        for hop in history {
+            track_url(urls, &hop.uri.to_string());
+        }
+    }
+    track_url(urls, &resp.uri().to_string());
 }
 
 fn origin_of(url: &str) -> Option<String> {
     let scheme_end = url.find("://")?;
     let rest = &url[scheme_end + 3..];
-    let host_end = rest.find('/').unwrap_or(rest.len());
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     Some(format!("{}://{}", &url[..scheme_end], &rest[..host_end]))
+}
+
+/// `url`'s origin and path (`/` when it has none), without query or fragment.
+fn scope_of(url: &str) -> Option<String> {
+    let origin = origin_of(url)?;
+    let rest = &url[origin.len()..];
+    let path = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+    Some(format!(
+        "{origin}{}",
+        if path.is_empty() { "/" } else { path }
+    ))
 }
 
 fn to_header_map(headers: Option<Table>) -> LuaResult<HeaderMap> {
@@ -242,7 +278,7 @@ fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
 pub(super) fn table(
     lua: &Lua,
     jar: Arc<Jar>,
-    visited_origins: Arc<Mutex<HashSet<String>>>,
+    visited_urls: Arc<Mutex<HashSet<String>>>,
     recorder: Arc<Recorder>,
     runtime: Handle,
     stop: StopSignal,
@@ -252,7 +288,7 @@ pub(super) fn table(
     let host = Arc::new(HttpHost {
         client: build_client(options, jar.clone(), allowed_domains.clone())?,
         jar,
-        visited_origins,
+        visited_urls,
         recorder,
         runtime,
         stop,
@@ -343,6 +379,7 @@ pub(super) fn table(
 
             let status = resp.status().as_u16();
             record_redirects(&download.recorder, "DOWNLOAD", &resp);
+            track_redirects(&download.visited_urls, &resp);
             let content_type = resp
                 .headers()
                 .get(wreq::header::CONTENT_TYPE)
@@ -468,7 +505,7 @@ fn build_client(
 struct HttpHost {
     client: Client,
     jar: Arc<Jar>,
-    visited_origins: Arc<Mutex<HashSet<String>>>,
+    visited_urls: Arc<Mutex<HashSet<String>>>,
     recorder: Arc<Recorder>,
     runtime: Handle,
     stop: StopSignal,
@@ -478,11 +515,11 @@ struct HttpHost {
 
 impl HttpHost {
     /// The gate every method passes before touching the network: rejects
-    /// (and records) a `url` outside `allowed_domains`, then remembers its
-    /// origin for [`export_cookies`].
+    /// (and records) a `url` outside `allowed_domains`, then remembers it
+    /// for [`export_cookies`].
     fn admit(&self, action: &str, url: &str) -> LuaResult<()> {
         ensure_domain_allowed_or_record(&self.recorder, action, url, &self.allowed_domains)?;
-        track_origin(&self.visited_origins, url);
+        track_url(&self.visited_urls, url);
         Ok(())
     }
 
@@ -518,6 +555,7 @@ impl HttpHost {
         let resp = self.send(action, url, request)?;
         let status = resp.status().as_u16();
         record_redirects(&self.recorder, method, &resp);
+        track_redirects(&self.visited_urls, &resp);
         let out = response_to_table(lua, &self.runtime, &self.stop, resp)?;
 
         let mut entry = json!({
@@ -854,24 +892,86 @@ mod tests {
     }
 
     #[test]
-    fn export_cookies_only_exports_visited_origins() {
+    fn export_cookies_only_exports_visited_urls() {
         let cookies = vec![Cookie {
             origin: "https://example.com".to_string(),
             set_cookie: "session=abc; Path=/".to_string(),
         }];
         let jar = build_jar(&cookies);
-        let visited_origins = Mutex::new(HashSet::new());
+        let visited_urls = Mutex::new(HashSet::new());
 
-        assert_eq!(export_cookies(&jar, &visited_origins), Vec::new());
+        assert_eq!(export_cookies(&jar, &visited_urls), Vec::new());
 
-        visited_origins
+        visited_urls
             .lock()
             .unwrap()
             .insert("https://example.com".to_string());
-        let exported = export_cookies(&jar, &visited_origins);
+        let exported = export_cookies(&jar, &visited_urls);
 
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0].origin, "https://example.com");
         assert!(exported[0].set_cookie.starts_with("session=abc"));
+    }
+
+    #[test]
+    fn export_cookies_keeps_a_cookie_scoped_to_a_visited_path() {
+        let jar = Jar::default();
+        jar.add(
+            "KEYCLOAK_IDENTITY=abc; Path=/realms/societaire/; Secure",
+            "https://login.example.com/realms/societaire/login-actions/authenticate",
+        );
+        let visited_urls = Mutex::new(HashSet::new());
+
+        // Visiting only the origin's root never path-matches it.
+        track_url(&visited_urls, "https://login.example.com/");
+        assert_eq!(export_cookies(&jar, &visited_urls), Vec::new());
+
+        track_url(
+            &visited_urls,
+            "https://login.example.com/realms/societaire/login-actions/authenticate?session_code=x",
+        );
+        let exported = export_cookies(&jar, &visited_urls);
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].origin, "https://login.example.com");
+        assert!(exported[0].set_cookie.contains("Path=/realms/societaire"));
+
+        // ...and it replays into a fresh jar under the same scope.
+        let restored = build_jar(&exported);
+        let matched: Vec<_> = restored
+            .matches("https://login.example.com/realms/societaire/protocol/openid-connect/auth")
+            .collect();
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].value(), "abc");
+    }
+
+    #[test]
+    fn export_cookies_exports_a_cookie_matched_by_several_urls_once() {
+        let cookies = vec![Cookie {
+            origin: "https://example.com".to_string(),
+            set_cookie: "session=abc; Path=/".to_string(),
+        }];
+        let jar = build_jar(&cookies);
+        let visited_urls = Mutex::new(HashSet::new());
+        track_url(&visited_urls, "https://example.com/a");
+        track_url(&visited_urls, "https://example.com/b/c");
+
+        assert_eq!(export_cookies(&jar, &visited_urls).len(), 1);
+    }
+
+    #[test]
+    fn scope_of_keeps_the_path_and_drops_query_and_fragment() {
+        assert_eq!(
+            scope_of("https://example.com/a/b?c=1#d"),
+            Some("https://example.com/a/b".to_string())
+        );
+        assert_eq!(
+            scope_of("https://example.com"),
+            Some("https://example.com/".to_string())
+        );
+        assert_eq!(
+            scope_of("https://example.com?c=1"),
+            Some("https://example.com/".to_string())
+        );
+        assert_eq!(scope_of("not a url"), None);
     }
 }
