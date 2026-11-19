@@ -395,6 +395,10 @@ mod tests {
             std::future::pending().await
         }
 
+        async fn prepare_attribute_extraction(&self) -> crate::Result<()> {
+            unimplemented!()
+        }
+
         async fn get(
             &self,
             _id: Uuid,

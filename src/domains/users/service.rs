@@ -793,6 +793,10 @@ mod tests {
             unimplemented!()
         }
 
+        async fn prepare_attribute_extraction(&self) -> Result<()> {
+            unimplemented!()
+        }
+
         async fn get(
             &self,
             _id: uuid::Uuid,

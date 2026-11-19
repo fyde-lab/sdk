@@ -304,6 +304,7 @@ mod tests {
     use super::super::attributes::MockService as MockAttributesService;
     use super::super::classification::{Classification, MockService as MockClassifier};
     use super::super::embedding_cache::MemoryEmbeddingCache;
+    use super::super::gliner::MockSpanFinder;
     use super::super::service::{DocumentIndexer, DocumentsClient};
     use super::super::storage_sqlite::tests::stored_embeddings;
     use super::super::transcript::MockOcr;
@@ -636,6 +637,7 @@ mod tests {
             Arc::new(MockClassifier::new()),
             no_folders(),
             Arc::new(MockOcr::new()),
+            Arc::new(MockSpanFinder::new()),
         );
         let text = "combien j'ai payé au fisc l'an dernier";
 
@@ -782,6 +784,7 @@ mod tests {
             no_folders(),
             // Every page has a text layer.
             Arc::new(MockOcr::new()),
+            Arc::new(MockSpanFinder::new()),
         );
         // Pages are never chunked together.
         let pdf = build_pdf_pages(&[

@@ -2028,6 +2028,7 @@ mod tests {
             name: Some("overridden.pdf".to_string()),
             folder_id: None,
             within_folder_id: None,
+            extract_attributes: false,
         };
 
         client.upload(request).await.unwrap();
