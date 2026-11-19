@@ -10,6 +10,7 @@ mod service;
 #[cfg(test)]
 pub(crate) use models::FakeAttributeDefinition;
 pub use models::{Attribute, AttributeDefinition, AttributeType, SetAttributeRequest};
+pub(crate) use service::{MAX_ATTRIBUTES, check_values};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

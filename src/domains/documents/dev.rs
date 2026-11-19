@@ -92,6 +92,11 @@ impl Service for DevDocumentsClient {
         Ok(id)
     }
 
+    /// Nothing to load: dev uploads never extract attributes.
+    async fn prepare_attribute_extraction(&self) -> Result<()> {
+        Ok(())
+    }
+
     async fn get(&self, _id: Uuid) -> Result<Option<Document>> {
         Ok(None)
     }

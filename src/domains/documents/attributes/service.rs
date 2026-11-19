@@ -95,7 +95,7 @@ fn check_against_definitions(
 /// The most attributes a single document can carry: every one of them is
 /// re-encrypted into each of the document's changelog events, and cached on
 /// every device of the account.
-const MAX_ATTRIBUTES: usize = 64;
+pub(crate) const MAX_ATTRIBUTES: usize = 64;
 /// The longest an attribute name can be, in bytes.
 const MAX_ATTRIBUTE_NAME_LEN: usize = 64;
 /// The longest a string, or select option, attribute value can be, in bytes.

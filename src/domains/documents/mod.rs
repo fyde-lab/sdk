@@ -4,10 +4,7 @@ mod classification;
 mod dev;
 mod embedder;
 mod embedding_cache;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "not wired into any document flow yet")
-)]
+mod extraction;
 mod gliner;
 mod models;
 mod service;
@@ -102,7 +99,24 @@ pub trait Service: Send + Sync {
     /// The file type is determined from the source's name's extension;
     /// only `.pdf` is currently accepted, anything else is rejected with
     /// [`crate::ErrorCode::UnsupportedDocumentExtension`].
+    ///
+    /// A request that asks for it ([`UploadRequest::extract_attributes`]:
+    /// a scraper's) also gets attributes read from its transcript before
+    /// it's published: every attribute definition (see
+    /// [`AttributesService::list`]) of a type text can give (strings,
+    /// integers, floats, dates, amounts) is looked for by the GLiNER model,
+    /// fetched and loaded first if [`Self::prepare_attribute_extraction`]
+    /// hasn't already, and each one found becomes an attribute of the
+    /// document. Never fails the upload: without the model or the
+    /// definitions, it's published without attributes.
     async fn upload(&self, request: UploadRequest) -> Result<Uuid>;
+
+    /// Fetches (if needed) and loads the model [`Self::upload`] extracts
+    /// attributes with, unless that's already done, so the uploads asking
+    /// for it don't wait for it. A scraper run calls it as its script
+    /// starts, alongside it: nothing else loads that model. A failure is
+    /// retried by the next call, or the next upload extracting attributes.
+    async fn prepare_attribute_extraction(&self) -> Result<()>;
 
     /// Fetches a document previously cached in local storage by
     /// [`Self::start_sync`], content included, or `None` if it doesn't
@@ -335,19 +349,27 @@ pub(crate) fn init_ocr(models: Arc<ModelStore>) -> Arc<dyn transcript::Ocr> {
     Arc::new(transcript::OnnxOcr::new(models))
 }
 
+/// Initializes the GLiNER model the documents [`Service`] extracts uploads'
+/// attributes with, from the models `models` holds: fetched and loaded only
+/// by [`Service::prepare_attribute_extraction`] (a scraper run starting) or
+/// the first upload extracting attributes, never at startup.
+pub(crate) fn init_span_finder(models: Arc<ModelStore>) -> Arc<dyn gliner::SpanFinder> {
+    Arc::new(gliner::OnnxGliner::new(models))
+}
+
 pub(crate) use service::ModelLoading;
 
 /// Starts downloading (if needed) and loading in memory, in the background,
-/// the models `embedder` (see [`init_embedder`]), `ocr` (see [`init_ocr`])
-/// and GLiNER (from `models`; not used by any flow yet) run, each on its own
-/// task so they're fetched in parallel. Dropping the returned
+/// the models `embedder` (see [`init_embedder`]) and `ocr` (see
+/// [`init_ocr`]) run, each on its own task so they're fetched in parallel.
+/// Not GLiNER's: only a scraper run loads it (see
+/// [`Service::prepare_attribute_extraction`]). Dropping the returned
 /// [`ModelLoading`] stops whatever is still under way.
 pub(crate) fn start_model_loading(
-    models: Arc<ModelStore>,
     embedder: Arc<dyn embedder::Embedder>,
     ocr: Arc<dyn transcript::Ocr>,
 ) -> ModelLoading {
-    service::start_model_loading(embedder, Arc::new(gliner::OnnxGliner::new(models)), ocr)
+    service::start_model_loading(embedder, ocr)
 }
 
 /// Initializes the [`Indexer`] the changelog consumer caches documents
@@ -375,7 +397,8 @@ pub(crate) fn init_indexer(
 /// consumes. Uploads and searches embed their text with `embedder` (see
 /// [`init_embedder`]), uploads leaving theirs in `cache` for `indexer`, and
 /// are classified with it; their scanned pages are read with `ocr` (see
-/// [`init_ocr`]).
+/// [`init_ocr`]), and their attributes, when asked for, extracted with
+/// `span_finder` (see [`init_span_finder`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn init(
     pool: SqlitePool,
@@ -386,6 +409,7 @@ pub(crate) fn init(
     cache: Arc<dyn EmbeddingCache>,
     folders: Arc<dyn crate::domains::folders::Service>,
     ocr: Arc<dyn transcript::Ocr>,
+    span_finder: Arc<dyn gliner::SpanFinder>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Arc<dyn Service> {
     let storage = storage_sqlite::SqliteStorage::new(pool);
@@ -401,6 +425,7 @@ pub(crate) fn init(
         classification::init(embedder),
         folders,
         ocr,
+        span_finder,
     ))
 }
 

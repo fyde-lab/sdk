@@ -164,9 +164,10 @@ impl Client {
         let ocr = domains::documents::init_ocr(models.clone());
         // Downloaded and loaded as soon as the app starts, so their first
         // use (an upload or sync for the embedding model, a scanned upload
-        // for OCR) doesn't wait for them.
-        let model_loading =
-            domains::documents::start_model_loading(models, embedder.clone(), ocr.clone());
+        // for OCR) doesn't wait for them. Not GLiNER, which only scraper
+        // runs need: each one loads it as its script starts.
+        let span_finder = domains::documents::init_span_finder(models);
+        let model_loading = domains::documents::start_model_loading(embedder.clone(), ocr.clone());
         // Shared by uploads (which fill it), the sync job (which empties
         // it) and logout (which clears it).
         let embedding_cache = domains::documents::init_embedding_cache();
@@ -214,6 +215,7 @@ impl Client {
             embedding_cache.clone(),
             folders.clone(),
             ocr,
+            span_finder,
             config.on_document_change,
         );
         let users = domains::users::init(
