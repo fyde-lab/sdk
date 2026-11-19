@@ -1001,6 +1001,7 @@ mod tests {
                 indexer_storage,
                 Arc::new(embedder),
                 Arc::new(cache),
+                Arc::new(tokio::sync::Notify::new()),
             )),
             MockScriptStorage::new(),
             MockStateStorage::new(),

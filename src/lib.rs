@@ -11,9 +11,8 @@ use std::sync::Arc;
 pub use domains::documents::{
     Attribute, AttributeDefinition, AttributeType, AttributesService, ChangelogEvent,
     DEFAULT_SIMILAR_MIN_CONFIDENCE, Document, DocumentType, EventType, FacetCount, FolderFilter,
-    MAX_THUMBNAIL_SIDE, Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery,
-    Service as DocumentsService, SetAttributeRequest, SimilarDocument, SyncProgress, Thumbnail,
-    UploadRequest,
+    Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery, Service as DocumentsService,
+    SetAttributeRequest, SimilarDocument, SyncProgress, THUMBNAIL_SIDE, Thumbnail, UploadRequest,
 };
 pub use domains::folders::{
     CreateFolderRequest, Folder, FolderAppearance, FolderColor, FolderContents, FolderIcon,
@@ -151,6 +150,9 @@ pub struct Client {
     /// The on-device models' background loading started by `init`. Never
     /// read: it only exists so dropping the `Client` stops it.
     _model_loading: domains::documents::ModelLoading,
+    /// The documents' thumbnails' background drawing started by `init`.
+    /// Never read: it only exists so dropping the `Client` stops it.
+    _thumbnail_job: domains::documents::ThumbnailJob,
     /// The locked handle to [`instance_lock_path`] (see [`lock_instance`]),
     /// held for as long as this `Client` lives. Never read: it only exists
     /// so dropping the `Client` releases the lock.
@@ -192,10 +194,17 @@ impl Client {
         // Shared by uploads (which fill it), the sync job (which empties
         // it) and logout (which clears it).
         let embedding_cache = domains::documents::init_embedding_cache();
+        // Woken by the indexer each time the sync job caches a document.
+        // Started right away, so documents cached before thumbnails were
+        // stored (or while the job was stopped) get theirs too.
+        let thumbnail_wake = Arc::new(domains::documents::ThumbnailWake::new());
+        let thumbnail_job =
+            domains::documents::start_thumbnail_job(sqlite.pool().clone(), thumbnail_wake.clone());
         let indexer = domains::documents::init_indexer(
             sqlite.pool().clone(),
             embedder.clone(),
             embedding_cache.clone(),
+            thumbnail_wake,
         );
 
         let settings = domains::settings::init(sqlite.pool().clone());
@@ -283,6 +292,7 @@ impl Client {
             usage,
             users,
             _model_loading: model_loading,
+            _thumbnail_job: thumbnail_job,
             _instance_lock: instance_lock,
         })
     }

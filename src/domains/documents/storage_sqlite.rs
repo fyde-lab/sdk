@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{ErrorContext as _, ErrorKind, Result};
 
-use super::storage::{FacetField, Storage, UNFILED};
+use super::storage::{FacetField, Storage, StoredThumbnail, UNFILED};
 use super::{
     Attribute, Document, DocumentEmbeddings, DocumentType, FacetCount, FolderFilter, Metadata,
     SearchFilters, SearchOrder,
@@ -515,6 +515,49 @@ impl Storage for SqliteStorage {
 
         Ok(())
     }
+
+    async fn documents_without_thumbnail(&self, limit: i64) -> Result<Vec<Uuid>> {
+        // Through the partial `documents_without_thumbnail` index.
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM documents WHERE thumbnail IS NULL
+             ORDER BY created_at DESC, id LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list the documents with no thumbnail from local database")?;
+
+        ids.into_iter().map(id_from_column).collect()
+    }
+
+    async fn set_thumbnail(&self, id: Uuid, thumbnail: &[u8]) -> Result<()> {
+        sqlx::query("UPDATE documents SET thumbnail = ?1 WHERE id = ?2")
+            .bind(thumbnail)
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .with_context(|| {
+                format!("failed to save document {id}'s thumbnail to local database")
+            })?;
+
+        Ok(())
+    }
+
+    async fn get_thumbnail(&self, id: Uuid) -> Result<Option<StoredThumbnail>> {
+        let thumbnail: Option<Option<Vec<u8>>> =
+            sqlx::query_scalar("SELECT thumbnail FROM documents WHERE id = ?1")
+                .bind(id.to_string())
+                .fetch_optional(&self.pool)
+                .await
+                .with_context(|| {
+                    format!("failed to fetch document {id}'s thumbnail from local database")
+                })?;
+
+        Ok(thumbnail.map(|thumbnail| match thumbnail {
+            Some(png) => StoredThumbnail::Stored(png),
+            None => StoredThumbnail::Missing,
+        }))
+    }
 }
 
 /// Inserts `embeddings` as the embeddings of the document `id`, chunks
@@ -1004,6 +1047,167 @@ pub(super) mod tests {
         let storage = setup().await;
 
         assert_eq!(storage.get_metadata(Uuid::now_v7()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_saved_document_has_no_thumbnail_until_one_is_set() {
+        let storage = setup().await;
+        let document = FakeDocument::new().build();
+        storage
+            .save_document(&document, &embeddings())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.get_thumbnail(document.id).await.unwrap(),
+            Some(StoredThumbnail::Missing)
+        );
+
+        storage.set_thumbnail(document.id, b"png").await.unwrap();
+
+        assert_eq!(
+            storage.get_thumbnail(document.id).await.unwrap(),
+            Some(StoredThumbnail::Stored(b"png".to_vec()))
+        );
+    }
+
+    #[tokio::test]
+    async fn set_thumbnail_keeps_an_empty_one_apart_from_none() {
+        let storage = setup().await;
+        let document = FakeDocument::new().build();
+        storage
+            .save_document(&document, &embeddings())
+            .await
+            .unwrap();
+
+        storage.set_thumbnail(document.id, &[]).await.unwrap();
+
+        assert_eq!(
+            storage.get_thumbnail(document.id).await.unwrap(),
+            Some(StoredThumbnail::Stored(Vec::new()))
+        );
+        assert!(
+            storage
+                .documents_without_thumbnail(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_thumbnail_returns_none_when_missing() {
+        let storage = setup().await;
+
+        assert_eq!(storage.get_thumbnail(Uuid::now_v7()).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn set_thumbnail_does_nothing_for_a_missing_document() {
+        let storage = setup().await;
+        let id = Uuid::now_v7();
+
+        storage.set_thumbnail(id, b"png").await.unwrap();
+
+        assert_eq!(storage.get_thumbnail(id).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn documents_without_thumbnail_lists_them_newest_first_up_to_the_limit() {
+        let storage = setup().await;
+        let (oldest, middle, drawn, newest) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        save(&storage, searchable("oldest", 1).with_id(oldest)).await;
+        save(&storage, searchable("middle", 2).with_id(middle)).await;
+        save(&storage, searchable("drawn", 3).with_id(drawn)).await;
+        save(&storage, searchable("newest", 4).with_id(newest)).await;
+        storage.set_thumbnail(drawn, b"png").await.unwrap();
+
+        assert_eq!(
+            storage.documents_without_thumbnail(10).await.unwrap(),
+            vec![newest, middle, oldest]
+        );
+        assert_eq!(
+            storage.documents_without_thumbnail(2).await.unwrap(),
+            vec![newest, middle]
+        );
+    }
+
+    #[tokio::test]
+    async fn documents_without_thumbnail_uses_its_partial_index() {
+        let storage = setup().await;
+
+        // The same query as `documents_without_thumbnail`'s. `EXPLAIN QUERY
+        // PLAN`'s detail is its fourth column.
+        let details: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT id FROM documents WHERE thumbnail IS NULL
+             ORDER BY created_at DESC, id LIMIT 10",
+        )
+        .fetch_all(&storage.pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get::<String, _>(3))
+        .collect();
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("documents_without_thumbnail")),
+            "{details:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_a_thumbnail_keeps_the_document_searchable() {
+        let storage = setup().await;
+        let id = Uuid::now_v7();
+        save(&storage, searchable("quittance", 1).with_id(id)).await;
+
+        storage.set_thumbnail(id, b"png").await.unwrap();
+
+        assert_eq!(
+            search_names(
+                &storage,
+                &["quittance"],
+                &SearchFilters::default(),
+                SearchOrder::Relevance
+            )
+            .await,
+            vec!["quittance"]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_metadata_keeps_the_thumbnail_and_still_reindexes_the_text() {
+        let storage = setup().await;
+        let id = Uuid::now_v7();
+        save(&storage, searchable("quittance", 1).with_id(id)).await;
+        storage.set_thumbnail(id, b"png").await.unwrap();
+
+        storage
+            .update_metadata(id, &searchable("facture", 1).with_id(id).build(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.get_thumbnail(id).await.unwrap(),
+            Some(StoredThumbnail::Stored(b"png".to_vec()))
+        );
+        let filters = SearchFilters::default();
+        assert_eq!(
+            search_names(&storage, &["facture"], &filters, SearchOrder::Relevance).await,
+            vec!["facture"]
+        );
+        assert!(
+            search_names(&storage, &["quittance"], &filters, SearchOrder::Relevance)
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

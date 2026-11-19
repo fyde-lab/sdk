@@ -157,11 +157,18 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   no-op if it isn't cached. `get`/`list`/`search`/`search_facets` are local-only
   (`storage_sqlite.rs`, FTS5 `bm25` ranking over contentless `documents_fts`). `list`/`search`
   return `Metadata` only (their query never selects `content`; `size` is `length(content)`):
-  `get` is the only call that loads a document's content, for when it's actually shown, besides
-  `thumbnail(id, max_width, max_height)`: the first page as a PNG fitting the box (each side
-  clamped to `1..=MAX_THUMBNAIL_SIDE`, 2048), rendered by `thumbnail.rs` (`hayro`, white
-  background, on the blocking pool) from the cached content on every call and never stored, so
-  logout has nothing more to wipe; `None` for a document not cached here.
+  `get` is the only call that loads a document's content, for when it's actually shown.
+  `thumbnail(id)` reads the first page back as a PNG fitting `THUMBNAIL_SIDE` (512) square,
+  drawn by `thumbnail.rs` (`hayro`, white background, on the blocking pool) and stored in
+  `documents.thumbnail` (NULL = not drawn yet, empty = undrawable, `UnreadablePdf`; wiped with
+  the row, never selected by `list`/`search`); `None` for a document not cached here. The
+  thumbnail job (`start_thumbnail_job`, started by `Client::init`, aborted when it drops) draws
+  every missing one, newest first, one at a time (`documents_without_thumbnail`, through a
+  partial index), then sleeps until the `DocumentIndexer` wakes it (`ThumbnailWake`) after
+  caching a document; after a failure it looks again 30 s later. A thumbnail not drawn yet is
+  drawn by `thumbnail` itself. **Changing how thumbnails are drawn needs a migration resetting
+  the column to NULL.** The FTS update trigger only fires on the indexed columns, so storing a
+  thumbnail never re-tokenizes the transcript.
   `search_facets` counts each field with its own filter lifted so UIs only offer reachable
   choices. A document's place is `Metadata::folder_id` (`None` = the root, À classer; a
   folder deleted meanwhile counts as the root too): `upload` takes the source, an
