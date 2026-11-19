@@ -24,7 +24,7 @@ pub use models::FakeScript;
 pub(crate) use models::{FakeInstalledScript, FakeScriptMetadata};
 pub use models::{
     InstallScriptRequest, InstalledScript, MAX_INSTALLATION_LABEL_CHARS, Script, ScriptMetadata,
-    ScriptParameter, ScriptParameterType, ScriptType,
+    ScriptParameter, ScriptParameterChoice, ScriptParameterType, ScriptType,
 };
 
 use crate::Result;
@@ -86,8 +86,10 @@ pub trait Service: Send + Sync {
     /// a folder not synced here (one deleted later only makes runs file
     /// automatically), with
     /// [`crate::ErrorCode::MissingScriptParameter`] if a parameter the script
-    /// marks `required` has no value, and with
-    /// [`crate::ErrorCode::InvalidInstallationLabel`] if the trimmed label
+    /// marks `required` has no value, with
+    /// [`crate::ErrorCode::InvalidScriptParameterChoice`] if a parameter
+    /// with [`ScriptParameter::choices`] is given a value none of them has,
+    /// and with [`crate::ErrorCode::InvalidInstallationLabel`] if the trimmed label
     /// is over [`MAX_INSTALLATION_LABEL_CHARS`] characters or holds a control character. A blank
     /// label defaults to the first non-blank non-secret text parameter,
     /// `username` first then the others by name, else the script's name.

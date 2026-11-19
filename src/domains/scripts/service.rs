@@ -127,6 +127,22 @@ impl<S: Storage> Service for ScriptsClient<S> {
             .into());
         }
 
+        if let Some((name, _)) = script.parameters.iter().find(|(name, parameter)| {
+            !parameter.choices.is_empty()
+                && parameters.get(*name).is_some_and(|value| {
+                    !parameter
+                        .choices
+                        .iter()
+                        .any(|choice| value.as_str() == Some(choice.value.as_str()))
+                })
+        }) {
+            return Err(ErrorKind::InvalidScriptParameterChoice {
+                script_id,
+                parameter: name.clone(),
+            }
+            .into());
+        }
+
         let label = match label.trim() {
             "" => default_label(&script, &parameters),
             label => {
@@ -256,7 +272,8 @@ mod tests {
     use crate::domains::scripts::grpc_client::MockFydeClient;
     use crate::domains::scripts::storage::MockStorage;
     use crate::domains::scripts::{
-        FakeInstalledScript, FakeScript, FakeScriptMetadata, ScriptParameter, ScriptParameterType,
+        FakeInstalledScript, FakeScript, FakeScriptMetadata, ScriptParameter,
+        ScriptParameterChoice, ScriptParameterType,
     };
 
     /// A single `send` call recorded by [`RecordingChangelog`].
@@ -328,6 +345,7 @@ mod tests {
             parameter_type: ScriptParameterType::String,
             required: true,
             secret: false,
+            choices: Vec::new(),
         }
     }
 
@@ -735,6 +753,72 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(changelog.sent.lock().unwrap().is_empty());
+    }
+
+    fn channel_parameter() -> ScriptParameter {
+        ScriptParameter {
+            choices: vec![
+                ScriptParameterChoice {
+                    value: "email".to_string(),
+                    label: "E-mail".to_string(),
+                },
+                ScriptParameterChoice {
+                    value: "sms".to_string(),
+                    label: "SMS".to_string(),
+                },
+            ],
+            ..required_parameter()
+        }
+    }
+
+    /// Installs a script declaring [`channel_parameter`] as `otp_channel`
+    /// with `value` for it, returning the outcome and what was published.
+    async fn install_with_channel(value: Value) -> (Result<Uuid>, usize) {
+        let script = FakeScript::new()
+            .with_parameter("otp_channel", channel_parameter())
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = ScriptsClient::new(
+            grpc_fetching(script.clone()),
+            MockStorage::new(),
+            changelog.clone(),
+            unused_folders(),
+        );
+
+        let outcome = client
+            .install_script(InstallScriptRequest {
+                installation_id: None,
+                script_id: script.id(),
+                label: String::new(),
+                parameters: HashMap::from([("otp_channel".to_string(), value)]),
+                folder_id: None,
+            })
+            .await;
+        let sent = changelog.sent.lock().unwrap().len();
+        (outcome, sent)
+    }
+
+    #[tokio::test]
+    async fn install_script_accepts_one_of_a_parameters_choices() {
+        let (outcome, sent) = install_with_channel(json!("sms")).await;
+
+        outcome.unwrap();
+        assert_eq!(sent, 1);
+    }
+
+    #[tokio::test]
+    async fn install_script_rejects_a_value_outside_a_parameters_choices_without_publishing() {
+        for value in [json!("pigeon"), json!(""), json!(1)] {
+            let (outcome, sent) = install_with_channel(value.clone()).await;
+
+            let err = outcome.unwrap_err();
+            assert!(
+                matches!(err.kind(), ErrorKind::InvalidScriptParameterChoice { parameter, .. } if parameter == "otp_channel"),
+                "unexpected error for {value}: {err}"
+            );
+            assert_eq!(err.code(), crate::ErrorCode::InvalidScriptParameterChoice);
+            assert_eq!(sent, 0);
+        }
     }
 
     #[tokio::test]

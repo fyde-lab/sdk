@@ -13,6 +13,7 @@ use crate::{ErrorContext as _, Result};
 use super::Script;
 use super::ScriptMetadata;
 use super::ScriptParameter;
+use super::ScriptParameterChoice;
 use super::ScriptParameterType;
 
 /// Generated protobuf/gRPC bindings for the `scripts` service, compiled by
@@ -217,6 +218,14 @@ fn parameters_into_domain(
                     parameter_type: parameter_type_into_domain(parameter.r#type),
                     required: parameter.required,
                     secret: parameter.secret,
+                    choices: parameter
+                        .choices
+                        .into_iter()
+                        .map(|choice| ScriptParameterChoice {
+                            value: choice.value,
+                            label: choice.label,
+                        })
+                        .collect(),
                 },
             )
         })

@@ -77,6 +77,21 @@ pub struct ScriptParameter {
     /// masked/stored accordingly by the client. Opaque to the server beyond
     /// storage: it never sees the value either way.
     pub secret: bool,
+    /// The only values a string parameter accepts, for a client to render
+    /// as a select rather than a free text field. Empty (the default, also
+    /// for parameters stored before choices existed) means any value.
+    #[serde(default)]
+    pub choices: Vec<ScriptParameterChoice>,
+}
+
+/// One of the values a [`ScriptParameter`] restricted to
+/// [`ScriptParameter::choices`] accepts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScriptParameterChoice {
+    /// What the script receives, e.g. "sms".
+    pub value: String,
+    /// What the user picks it by, e.g. "SMS".
+    pub label: String,
 }
 
 /// A user-authored script, as returned by [`super::Service::fetch_script`]/
@@ -541,6 +556,7 @@ mod tests {
                             parameter_type: ScriptParameterType::String,
                             required: true,
                             secret: true,
+                            choices: Vec::new(),
                         },
                     )
                     .build(),
@@ -567,6 +583,20 @@ mod tests {
             serde_json::from_slice::<InstalledScript>(&json).unwrap(),
             installed
         );
+    }
+
+    #[test]
+    fn a_parameter_stored_before_choices_existed_reads_as_free_input() {
+        let parameter: ScriptParameter = serde_json::from_value(serde_json::json!({
+            "label": "Identifiant",
+            "placeholder": "jdoe",
+            "parameter_type": "string",
+            "required": true,
+            "secret": false,
+        }))
+        .unwrap();
+
+        assert!(parameter.choices.is_empty());
     }
 
     #[test]

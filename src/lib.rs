@@ -26,7 +26,8 @@ pub use domains::scrapers::{
 };
 pub use domains::scripts::{
     InstallScriptRequest, InstalledScript, MAX_INSTALLATION_LABEL_CHARS, Script, ScriptMetadata,
-    ScriptParameter, ScriptParameterType, ScriptType, Service as ScriptsService,
+    ScriptParameter, ScriptParameterChoice, ScriptParameterType, ScriptType,
+    Service as ScriptsService,
 };
 pub use domains::server_state::Service as ServerStateService;
 pub use domains::settings::Service as SettingsService;

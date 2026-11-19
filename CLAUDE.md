@@ -380,7 +380,10 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   each *installation* (`InstalledScript`) has its own id (a new one unless `install_script` is
   given one to replace) and a label (trimmed, ≤ `MAX_INSTALLATION_LABEL_CHARS`, no control
   chars, `InvalidInstallationLabel` 5012; a blank one defaults to the first non-blank
-  non-secret text parameter, `username` first then by name, else the script's name). `install_script` publishes an
+  non-secret text parameter, `username` first then by name, else the script's name). A string
+  `ScriptParameter` may carry `choices` (`ScriptParameterChoice { value, label }`, for a select;
+  empty = free input): `install_script` refuses a value none of them has
+  (`InvalidScriptParameterChoice` 5013). `install_script` publishes an
   encrypted `InstallScript` event (subject: the installation id), `uninstall_script` an
   `UninstallScript`; installations are read from the local `installed_scripts` table (keyed
   by installation id). Enabling/disabling (and the plan's `max_scripts` quota) stays per

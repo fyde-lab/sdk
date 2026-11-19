@@ -253,6 +253,10 @@ pub(super) fn user_message(code: ErrorCode, language: Language) -> &'static str 
             "This add-on is missing a required setting.",
             "Il manque un paramètre obligatoire à cette extension.",
         ),
+        ErrorCode::InvalidScriptParameterChoice => (
+            "One of this add-on's settings has a value it doesn't offer.",
+            "Un paramètre de cette extension a une valeur qu'elle ne propose pas.",
+        ),
         ErrorCode::InvalidScriptType => (
             "This add-on's type is not recognized.",
             "Le type de cette extension n'est pas reconnu.",

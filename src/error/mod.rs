@@ -206,6 +206,9 @@ macro_rules! for_each_error_code {
             /// An installation's label is too long or has control
             /// characters.
             InvalidInstallationLabel = 5012,
+            /// A script was installed with a value outside the choices one
+            /// of its parameters is restricted to.
+            InvalidScriptParameterChoice = 5013,
         }
     };
 }
@@ -309,6 +312,11 @@ pub(crate) enum ErrorKind {
     InvalidInstallationLabel(String),
     #[error("missing value for required parameter {parameter:?} of script {script_id}")]
     MissingScriptParameter {
+        script_id: uuid::Uuid,
+        parameter: String,
+    },
+    #[error("value of parameter {parameter:?} of script {script_id} is not one of its choices")]
+    InvalidScriptParameterChoice {
         script_id: uuid::Uuid,
         parameter: String,
     },
@@ -432,6 +440,9 @@ impl ErrorKind {
             ErrorKind::ScriptNotInstalled(_) => ErrorCode::ScriptNotInstalled,
             ErrorKind::InvalidInstallationLabel(_) => ErrorCode::InvalidInstallationLabel,
             ErrorKind::MissingScriptParameter { .. } => ErrorCode::MissingScriptParameter,
+            ErrorKind::InvalidScriptParameterChoice { .. } => {
+                ErrorCode::InvalidScriptParameterChoice
+            }
             ErrorKind::InvalidChangelogEvent(_) => ErrorCode::InvalidChangelogEvent,
             ErrorKind::InvalidDocumentType(_) => ErrorCode::InvalidDocumentType,
             ErrorKind::DocumentNotFound(_) => ErrorCode::DocumentNotFound,
