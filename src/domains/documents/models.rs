@@ -351,7 +351,8 @@ pub enum UploadSource {
 /// content from (its file name becomes the document's `original_name`),
 /// the name to give it, if not that one, and the folder to file it in (or
 /// within), if not the one it's guessed to belong in. Everything else (its
-/// type) is derived from the document itself.
+/// type, and its attributes for a scraper's) is derived from the document
+/// itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadRequest {
     pub source: UploadSource,
@@ -368,6 +369,13 @@ pub struct UploadRequest {
     /// synced here (deleted since, say) is ignored: the folder is then
     /// guessed across the whole vault, as without it.
     pub within_folder_id: Option<Uuid>,
+    /// Whether to read attributes from the document's text with GLiNER
+    /// before publishing it (see [`super::Service::upload`]). Only a
+    /// scraper's uploads do (`fyde.save_document`): that model is loaded
+    /// only while a scraper runs (see
+    /// [`super::Service::prepare_attribute_extraction`]), so another upload
+    /// never waits for it.
+    pub(crate) extract_attributes: bool,
 }
 
 impl UploadRequest {
@@ -378,6 +386,7 @@ impl UploadRequest {
             name: None,
             folder_id: None,
             within_folder_id: None,
+            extract_attributes: false,
         }
     }
 
@@ -392,6 +401,7 @@ impl UploadRequest {
             name: None,
             folder_id: None,
             within_folder_id: None,
+            extract_attributes: false,
         }
     }
 }

@@ -16,10 +16,11 @@ use crate::domains::changelog::{
 };
 use crate::domains::folders::{Folder, Service as FoldersService};
 
-use super::attributes::Service as AttributesService;
+use super::attributes::{Attribute, Service as AttributesService};
 use super::chunk;
 use super::classification::{Classification, FiledDocument, Service as ClassificationService};
 use super::embedder::Embedder;
+use super::extraction;
 use super::gliner::SpanFinder;
 use super::storage::{FacetField, Storage, UNFILED};
 use super::thumbnail;
@@ -89,8 +90,13 @@ pub(super) struct DocumentsClient<S: Storage> {
     folders: Arc<dyn FoldersService>,
     /// What reads uploads' scanned pages.
     ocr: Arc<dyn Ocr>,
+    /// What finds the attributes uploads asking for it carry (GLiNER).
+    span_finder: Arc<dyn SpanFinder>,
     /// When embedding an upload last failed (see [`UPLOAD_EMBED_RETRY_AFTER`]).
     embed_failed_at: Mutex<Option<tokio::time::Instant>>,
+    /// When extracting an upload's attributes last failed for want of the
+    /// model (see [`UPLOAD_EXTRACT_RETRY_AFTER`]).
+    extract_failed_at: Mutex<Option<tokio::time::Instant>>,
 }
 
 /// How long uploads skip embedding after it failed: failing usually means
@@ -98,6 +104,13 @@ pub(super) struct DocumentsClient<S: Storage> {
 /// would otherwise wait for again. The documents uploaded meanwhile are
 /// embedded once synced.
 const UPLOAD_EMBED_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// How long uploads skip extracting attributes after the model failed (its
+/// download, say), rather than each wait for it again: the documents
+/// uploaded meanwhile are published without attributes. The next scraper
+/// run tries loading it again anyway (see
+/// [`Service::prepare_attribute_extraction`]).
+const UPLOAD_EXTRACT_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// An upload's embeddings in the [`EmbeddingCache`], removed when dropped
 /// unless [`Self::keep`] is called once its event is published: when
@@ -144,8 +157,9 @@ impl<S: Storage> DocumentsClient<S> {
     /// documents through, `embedder` to embed uploads' and searches' text,
     /// `cache` to hand uploads' embeddings over to `indexer`, `classifier`
     /// to classify uploads, `folders` to check the folders documents are
-    /// moved to and count documents per folder, and `ocr` to read uploads'
-    /// scanned pages.
+    /// moved to and count documents per folder, `ocr` to read uploads'
+    /// scanned pages, and `span_finder` to extract the attributes of uploads
+    /// asking for it.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         storage: S,
@@ -158,6 +172,7 @@ impl<S: Storage> DocumentsClient<S> {
         classifier: Arc<dyn ClassificationService>,
         folders: Arc<dyn FoldersService>,
         ocr: Arc<dyn Ocr>,
+        span_finder: Arc<dyn SpanFinder>,
     ) -> Self {
         Self {
             storage,
@@ -170,7 +185,9 @@ impl<S: Storage> DocumentsClient<S> {
             classifier,
             folders,
             ocr,
+            span_finder,
             embed_failed_at: Mutex::new(None),
+            extract_failed_at: Mutex::new(None),
         }
     }
 }
@@ -304,6 +321,74 @@ impl<S: Storage> DocumentsClient<S> {
                     metadata.id
                 );
                 None
+            }
+        }
+    }
+
+    /// The attributes GLiNER finds in an upload's transcript, for each of
+    /// the user's attribute definitions it can look for (see
+    /// [`extraction::targets`]), read from its best span (see
+    /// [`extraction::attributes`]). None without text or such a definition,
+    /// and none if that fails (the model or the definitions can't be had,
+    /// say), or the model failed less than [`UPLOAD_EXTRACT_RETRY_AFTER`]
+    /// ago: the document is then published without attributes, rather
+    /// than not at all.
+    async fn extract_attributes(&self, metadata: &Metadata) -> BTreeMap<String, Attribute> {
+        if metadata.transcript.trim().is_empty() {
+            return BTreeMap::new();
+        }
+
+        let failed_at = *self
+            .extract_failed_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if failed_at.is_some_and(|at| at.elapsed() < UPLOAD_EXTRACT_RETRY_AFTER) {
+            tracing::debug!(
+                "not extracting the attributes of document {}, the model failed recently",
+                metadata.id
+            );
+            return BTreeMap::new();
+        }
+
+        let definitions = match self.attributes.list().await {
+            Ok(definitions) => definitions,
+            Err(err) => {
+                tracing::warn!(
+                    code = ?err.code(),
+                    "publishing document {} without attributes, its attribute definitions couldn't be listed: {err}",
+                    metadata.id
+                );
+                return BTreeMap::new();
+            }
+        };
+        let targets = extraction::targets(&definitions);
+        if targets.is_empty() {
+            return BTreeMap::new();
+        }
+
+        let labels = targets.iter().map(|target| target.label.clone()).collect();
+        match self
+            .span_finder
+            .spans(
+                metadata.transcript.clone(),
+                labels,
+                extraction::THRESHOLD,
+                extraction::MAX_WORDS,
+            )
+            .await
+        {
+            Ok(spans) => extraction::attributes(&metadata.transcript, &targets, &spans),
+            Err(err) => {
+                *self
+                    .extract_failed_at
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(tokio::time::Instant::now());
+                tracing::warn!(
+                    code = ?err.code(),
+                    "publishing document {} without attributes, they couldn't be extracted: {err}",
+                    metadata.id
+                );
+                BTreeMap::new()
             }
         }
     }
@@ -631,6 +716,14 @@ impl<S: Storage> Service for DocumentsClient<S> {
         if let Some(name) = request.name {
             metadata.name = name;
         }
+        // Before the event is published, which carries them, so they
+        // reach every device with the document.
+        if request.extract_attributes {
+            metadata.attributes = self
+                .extract_attributes(&metadata)
+                .instrument(tracing::debug_span!("extract_attributes"))
+                .await;
+        }
         // Checked with the rest of the metadata, so a folder not synced here
         // fails before embedding.
         metadata.folder_id = request.folder_id;
@@ -690,6 +783,13 @@ impl<S: Storage> Service for DocumentsClient<S> {
             cached.keep();
         }
         Ok(id)
+    }
+
+    async fn prepare_attribute_extraction(&self) -> Result<()> {
+        self.span_finder
+            .load()
+            .await
+            .context("failed to load the attribute extraction model")
     }
 
     async fn get(&self, id: Uuid) -> Result<Option<Document>> {
@@ -1471,18 +1571,13 @@ impl Drop for ModelLoading {
     }
 }
 
-/// Starts loading the models `embedder`, `span_finder` and `ocr` run
-/// (downloading them first if needed), each on its own task so they're
-/// fetched in parallel and their first use doesn't wait minutes for them. A
-/// failure is only logged: the model's first use tries again.
-pub(crate) fn start_model_loading(
-    embedder: Arc<dyn Embedder>,
-    span_finder: Arc<dyn SpanFinder>,
-    ocr: Arc<dyn Ocr>,
-) -> ModelLoading {
+/// Starts loading the models `embedder` and `ocr` run (downloading them
+/// first if needed), each on its own task so they're fetched in parallel
+/// and their first use doesn't wait minutes for them. A failure is only
+/// logged: the model's first use tries again.
+pub(crate) fn start_model_loading(embedder: Arc<dyn Embedder>, ocr: Arc<dyn Ocr>) -> ModelLoading {
     ModelLoading(vec![
         spawn_model_loading("embedding", async move { embedder.load().await }),
-        spawn_model_loading("GLiNER", async move { span_finder.load().await }),
         spawn_model_loading("OCR", async move { ocr.load().await }),
     ])
 }
@@ -1516,12 +1611,14 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
-    use super::super::attributes::MockService as MockAttributesService;
+    use super::super::attributes::{
+        AttributeType, FakeAttributeDefinition, MockService as MockAttributesService,
+    };
     use super::super::classification::{
         Classification, FakeClassification, MockService as MockClassificationService,
     };
     use super::super::embedder::MockEmbedder;
-    use super::super::gliner::MockSpanFinder;
+    use super::super::gliner::{MockSpanFinder, Span};
     use super::super::models::{FakeCachedEmbeddings, FakeChunkEmbedding, FakeDocumentEmbeddings};
     use super::super::storage::MockStorage;
     use super::super::transcript::MockOcr;
@@ -1563,6 +1660,12 @@ mod tests {
         ocr.expect_load()
             .returning(|| Err(ErrorKind::ModelNotDownloaded("ocr".to_string()).into()));
         Arc::new(ocr)
+    }
+
+    /// A [`SpanFinder`] whose every call panics: for uploads that never
+    /// extract attributes.
+    fn unused_span_finder() -> Arc<dyn SpanFinder> {
+        Arc::new(MockSpanFinder::new())
     }
 
     fn unused_classifier() -> Arc<dyn ClassificationService> {
@@ -1626,6 +1729,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let err = client
@@ -1763,6 +1867,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let id = client
@@ -1821,6 +1926,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let err = client
@@ -1850,6 +1956,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let result = client.upload(UploadRequest::from_path(file.path())).await;
@@ -1873,6 +1980,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let err = client
@@ -1909,6 +2017,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let request = UploadRequest {
@@ -1945,6 +2054,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
         let metadata = super::super::FakeMetadata::new()
             .with_attributes([("price".to_string(), Attribute::Integer(1))])
@@ -1970,6 +2080,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
         let attributes = BTreeMap::from([("price".to_string(), Attribute::Float(32.3))]);
         let metadata = super::super::FakeMetadata::new()
@@ -1996,6 +2107,7 @@ mod tests {
             unused_classifier(),
             folders_listing(vec![FakeFolder::new().build()]),
             no_ocr(),
+            unused_span_finder(),
         );
         let metadata = super::super::FakeMetadata::new()
             .with_folder(Uuid::now_v7())
@@ -2031,6 +2143,7 @@ mod tests {
             unused_classifier(),
             folders_listing(folders),
             no_ocr(),
+            unused_span_finder(),
         )
     }
 
@@ -2126,6 +2239,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let err = client
@@ -2176,6 +2290,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         assert_eq!(client.get(id).await.unwrap(), Some(document));
@@ -2207,6 +2322,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let page = client.list(1, 2).await.unwrap();
@@ -2255,6 +2371,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let documents = client
@@ -2291,6 +2408,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         client.search(SearchQuery::new(" - ", 0, 10)).await.unwrap();
@@ -2319,6 +2437,7 @@ mod tests {
                 unused_classifier(),
                 no_folders(),
                 no_ocr(),
+                unused_span_finder(),
             );
 
             let err = client.search(query.clone()).await.unwrap_err();
@@ -2427,6 +2546,7 @@ mod tests {
             unused_classifier(),
             folders_listing(vec![folder.clone()]),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let facets = client.search_facets(" facture ", &filters).await.unwrap();
@@ -2462,6 +2582,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let err = client
@@ -2559,6 +2680,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let err = client
@@ -2672,6 +2794,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         )
     }
 
@@ -3153,6 +3276,7 @@ mod tests {
             unused_classifier(),
             folders_listing(vec![folder.clone()]),
             no_ocr(),
+            unused_span_finder(),
         )
         .search_facets(" impôts ", &filters)
         .await
@@ -3194,6 +3318,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         client.update_metadata(metadata).await.unwrap();
@@ -3232,6 +3357,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         client.start_sync().await.unwrap();
@@ -3258,6 +3384,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         client.start_sync().await.unwrap();
@@ -3277,6 +3404,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         client.stop_sync();
@@ -3312,6 +3440,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         )
     }
 
@@ -3718,6 +3847,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         assert_eq!(
@@ -3934,6 +4064,7 @@ mod tests {
             classifier_returning(Classification::default(), 1),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let id = client
@@ -3981,6 +4112,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let id = client
@@ -4011,6 +4143,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         client
@@ -4047,6 +4180,7 @@ mod tests {
             classifier_returning(Classification::default(), 1),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let err = client
@@ -4089,6 +4223,7 @@ mod tests {
             classifier_returning(Classification::default(), 1),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let upload = client.upload(UploadRequest::from_raw(
@@ -4143,6 +4278,7 @@ mod tests {
             classifier_returning(Classification::default(), 1),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
         let upload = |text| client.upload(UploadRequest::from_raw("a.pdf", build_pdf(text)));
 
@@ -4206,6 +4342,7 @@ mod tests {
             classifier,
             folders_listing(folders),
             no_ocr(),
+            unused_span_finder(),
         )
     }
 
@@ -4525,6 +4662,7 @@ mod tests {
             unused_classifier(),
             folders_listing(tree.all.clone()),
             no_ocr(),
+            unused_span_finder(),
         );
 
         client.upload(upload_within(tree.chosen.id)).await.unwrap();
@@ -4681,6 +4819,7 @@ mod tests {
             unused_classifier(),
             folders_listing(vec![FakeFolder::new().build()]),
             no_ocr(),
+            unused_span_finder(),
         );
 
         let mut request = UploadRequest::from_raw("a.pdf", build_pdf("Montant : 42 €"));
@@ -4757,6 +4896,7 @@ mod tests {
             classifier_returning(Classification::default(), 1),
             no_folders(),
             no_ocr(),
+            unused_span_finder(),
         );
         let id = client
             .upload(UploadRequest::from_raw("Facture mars.pdf", pdf))
@@ -5066,6 +5206,7 @@ mod tests {
             unused_classifier(),
             no_folders(),
             Arc::new(MockOcr::new()),
+            unused_span_finder(),
         )
     }
 
@@ -5248,11 +5389,287 @@ mod tests {
             unused_classifier(),
             no_folders(),
             ocr,
+            unused_span_finder(),
         )
     }
 
+    /// An upload of `file` asking for its attributes.
+    fn extracting(file: &NamedTempFile) -> UploadRequest {
+        UploadRequest {
+            extract_attributes: true,
+            ..UploadRequest::from_path(file.path())
+        }
+    }
+
+    /// Storage expecting `times` uploads of new documents.
+    fn storage_for_uploads(times: usize) -> MockStorage {
+        let mut storage = MockStorage::new();
+        storage
+            .expect_find_document_by_checksum()
+            .times(times)
+            .returning(|_| Ok(None));
+        storage
+    }
+
+    /// The attributes of the one document `changelog` published.
+    fn published_attributes(changelog: &RecordingChangelog) -> BTreeMap<String, Attribute> {
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        sent[0].3.as_ref().unwrap().attributes.clone()
+    }
+
+    /// A [`SpanFinder`] whose model can't be had, expected to be asked for
+    /// spans `times` times.
+    fn span_finder_failing(times: usize) -> Arc<dyn SpanFinder> {
+        let mut span_finder = MockSpanFinder::new();
+        span_finder
+            .expect_spans()
+            .times(times)
+            .returning(|_, _, _, _| Err(ErrorKind::ModelDownloadStatus(503).into()));
+        Arc::new(span_finder)
+    }
+
+    #[tokio::test]
+    async fn upload_extracts_the_attributes_of_a_request_asking_for_it_before_publishing() {
+        let file = write_temp_file("pdf", &build_pdf("Total 1234,56 EUR le 15/10/2026"));
+
+        let mut attributes = MockAttributesService::new();
+        attributes.expect_list().times(1).returning(|| {
+            Ok(vec![
+                FakeAttributeDefinition::new()
+                    .with_name("total_amount")
+                    .with_type(AttributeType::Amount)
+                    .build(),
+                // Never looked for: no span of text is a yes or no.
+                FakeAttributeDefinition::new()
+                    .with_name("paid")
+                    .with_type(AttributeType::Boolean)
+                    .build(),
+                FakeAttributeDefinition::new()
+                    .with_name("issued_on")
+                    .with_type(AttributeType::Date)
+                    .build(),
+            ])
+        });
+        attributes
+            .expect_check()
+            .withf(|attributes| attributes.len() == 2)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let mut span_finder = MockSpanFinder::new();
+        span_finder
+            .expect_spans()
+            .withf(|_, labels, threshold, max_words| {
+                *labels == ["total amount", "issued on"]
+                    && *threshold == extraction::THRESHOLD
+                    && *max_words == extraction::MAX_WORDS
+            })
+            .times(1)
+            .returning(|text, _, _, _| {
+                let span = |needle: &str, label: usize, score: f32| {
+                    let start = text.find(needle).unwrap();
+                    Span {
+                        label,
+                        bytes: start..start + needle.len(),
+                        score,
+                    }
+                };
+                // Without its currency, the amount is in euros.
+                Ok(vec![span("1234,56", 0, 0.9), span("15/10/2026", 1, 0.8)])
+            });
+
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = DocumentsClient::new(
+            storage_for_uploads(1),
+            changelog.clone(),
+            None,
+            Arc::new(attributes),
+            unused_indexer(),
+            embedder_without_model(),
+            unused_cache(),
+            unused_classifier(),
+            no_folders(),
+            no_ocr(),
+            Arc::new(span_finder),
+        );
+
+        client.upload(extracting(&file)).await.unwrap();
+
+        assert_eq!(
+            published_attributes(&changelog),
+            BTreeMap::from([
+                (
+                    "issued_on".to_string(),
+                    Attribute::Date("2026-10-15".to_string())
+                ),
+                (
+                    "total_amount".to_string(),
+                    Attribute::Amount {
+                        minor_units: 123_456,
+                        currency: "EUR".to_string(),
+                    }
+                ),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_runs_no_model_when_no_attribute_definition_can_be_extracted() {
+        let file = write_temp_file("pdf", &build_pdf("Total 1234,56 EUR"));
+
+        let mut attributes = MockAttributesService::new();
+        attributes.expect_list().times(1).returning(|| {
+            Ok(vec![
+                FakeAttributeDefinition::new()
+                    .with_type(AttributeType::Boolean)
+                    .build(),
+            ])
+        });
+        attributes.expect_check().returning(|_| Ok(()));
+
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = DocumentsClient::new(
+            storage_for_uploads(1),
+            changelog.clone(),
+            None,
+            Arc::new(attributes),
+            unused_indexer(),
+            embedder_without_model(),
+            unused_cache(),
+            unused_classifier(),
+            no_folders(),
+            no_ocr(),
+            unused_span_finder(),
+        );
+
+        client.upload(extracting(&file)).await.unwrap();
+
+        assert!(published_attributes(&changelog).is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_publishes_without_attributes_when_definitions_cant_be_listed() {
+        let file = write_temp_file("pdf", &build_pdf("Total 1234,56 EUR"));
+
+        let mut attributes = MockAttributesService::new();
+        attributes
+            .expect_list()
+            .times(1)
+            .returning(|| Err(ErrorKind::InvalidAttribute("unreachable".to_string()).into()));
+        attributes.expect_check().returning(|_| Ok(()));
+
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = DocumentsClient::new(
+            storage_for_uploads(1),
+            changelog.clone(),
+            None,
+            Arc::new(attributes),
+            unused_indexer(),
+            embedder_without_model(),
+            unused_cache(),
+            unused_classifier(),
+            no_folders(),
+            no_ocr(),
+            unused_span_finder(),
+        );
+
+        client.upload(extracting(&file)).await.unwrap();
+
+        assert!(published_attributes(&changelog).is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_publishes_without_attributes_when_the_model_fails_then_skips_it_for_a_while() {
+        let first = write_temp_file("pdf", &build_pdf("Total 1234,56 EUR"));
+        let second = write_temp_file("pdf", &build_pdf("Total 99,00 EUR"));
+
+        let mut attributes = MockAttributesService::new();
+        attributes.expect_list().times(1).returning(|| {
+            Ok(vec![
+                FakeAttributeDefinition::new()
+                    .with_name("total_amount")
+                    .with_type(AttributeType::Amount)
+                    .build(),
+            ])
+        });
+        attributes.expect_check().returning(|_| Ok(()));
+
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = DocumentsClient::new(
+            storage_for_uploads(2),
+            changelog.clone(),
+            None,
+            Arc::new(attributes),
+            unused_indexer(),
+            embedder_without_model(),
+            unused_cache(),
+            unused_classifier(),
+            no_folders(),
+            no_ocr(),
+            // Once: the second upload doesn't wait for the model again.
+            span_finder_failing(1),
+        );
+
+        client.upload(extracting(&first)).await.unwrap();
+        client.upload(extracting(&second)).await.unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        for (_, _, _, metadata) in sent.iter() {
+            assert!(metadata.as_ref().unwrap().attributes.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_attribute_extraction_loads_the_model() {
+        let mut span_finder = MockSpanFinder::new();
+        span_finder.expect_load().times(1).returning(|| Ok(()));
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            Arc::new(RecordingChangelog::default()),
+            None,
+            accepting_attributes(),
+            unused_indexer(),
+            unused_embedder(),
+            unused_cache(),
+            unused_classifier(),
+            no_folders(),
+            no_ocr(),
+            Arc::new(span_finder),
+        );
+
+        client.prepare_attribute_extraction().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepare_attribute_extraction_fails_with_the_models_error() {
+        let mut span_finder = MockSpanFinder::new();
+        span_finder
+            .expect_load()
+            .times(1)
+            .returning(|| Err(ErrorKind::ModelDownloadStatus(503).into()));
+        let client = DocumentsClient::new(
+            MockStorage::new(),
+            Arc::new(RecordingChangelog::default()),
+            None,
+            accepting_attributes(),
+            unused_indexer(),
+            unused_embedder(),
+            unused_cache(),
+            unused_classifier(),
+            no_folders(),
+            no_ocr(),
+            Arc::new(span_finder),
+        );
+
+        let err = client.prepare_attribute_extraction().await.unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::ModelDownloadFailed);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn start_model_loading_loads_every_model_in_parallel() {
+    async fn start_model_loading_loads_the_embedding_and_ocr_models_in_parallel() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::{Duration, Instant};
 
@@ -5266,10 +5683,10 @@ mod tests {
             move || {
                 started.fetch_add(1, Ordering::SeqCst);
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while started.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+                while started.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                let saw_all = started.load(Ordering::SeqCst) == 3;
+                let saw_all = started.load(Ordering::SeqCst) == 2;
                 report.lock().unwrap().send(saw_all).unwrap();
             }
         };
@@ -5279,13 +5696,6 @@ mod tests {
             embedding();
             Ok(())
         });
-        let mut span_finder = MockSpanFinder::new();
-        let gliner = load();
-        span_finder.expect_load().times(1).returning(move || {
-            gliner();
-            Err(ErrorKind::ModelNotDownloaded("gliner".to_string()).into())
-        });
-
         let mut ocr = MockOcr::new();
         let ocr_load = load();
         ocr.expect_load().times(1).returning(move || {
@@ -5293,15 +5703,15 @@ mod tests {
             Ok(())
         });
 
-        let _loading =
-            start_model_loading(Arc::new(embedder), Arc::new(span_finder), Arc::new(ocr));
+        // GLiNER isn't among them: only scraper runs load it.
+        let _loading = start_model_loading(Arc::new(embedder), Arc::new(ocr));
 
         let saw_all = tokio::task::spawn_blocking(move || {
             let timeout = Duration::from_secs(10);
-            [(); 3].map(|()| reports.recv_timeout(timeout))
+            [(); 2].map(|()| reports.recv_timeout(timeout))
         })
         .await
         .unwrap();
-        assert_eq!(saw_all, [Ok(true), Ok(true), Ok(true)]);
+        assert_eq!(saw_all, [Ok(true), Ok(true)]);
     }
 }

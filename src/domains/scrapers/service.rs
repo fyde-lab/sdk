@@ -266,6 +266,27 @@ impl Service for ScrapersClient {
 }
 
 impl ScrapersClient {
+    /// Starts loading the model attributes are extracted with (see
+    /// [`DocumentsService::prepare_attribute_extraction`]) on a task of its
+    /// own, for the run under `name`, until the returned guard drops. A
+    /// failure is only logged: the run's uploads try again.
+    fn load_attribute_model(&self, name: &str) -> AbortOnDrop {
+        let documents = self.documents.clone();
+        let name = name.to_string();
+        AbortOnDrop(
+            tokio::spawn(async move {
+                if let Err(err) = documents.prepare_attribute_extraction().await {
+                    tracing::warn!(
+                        code = ?err.code(),
+                        scraper = %name,
+                        "failed to load the attribute extraction model, the run's documents will try again: {err}"
+                    );
+                }
+            })
+            .abort_handle(),
+        )
+    }
+
     /// [`Service::run`], filing every document the script saves within
     /// `folder_id` (`None`: anywhere, with the documents each one is the
     /// closest to; see [`DocumentsService::upload`]).
@@ -295,6 +316,11 @@ impl ScrapersClient {
                 slot.expect("the scraper run slots are never closed")
             }
         };
+        // The model the documents a script saves get their attributes from
+        // (see `fyde.save_document`), loaded only by a run, alongside its
+        // script, which never waits for it: a document saved before it's
+        // ready waits for it then. Given up on once the run ends.
+        let _attribute_model = self.load_attribute_model(name);
 
         let cookies = self
             .cookies
@@ -377,6 +403,15 @@ impl ScrapersClient {
             .with_context(|| format!("failed to save report for scraper {name:?}"))?;
 
         run_result
+    }
+}
+
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -608,11 +643,27 @@ mod tests {
         reports
     }
 
+    /// Documents whose attribute extraction model loads as every run
+    /// starts, for runs saving no document.
+    fn idle_documents() -> MockDocumentsService {
+        loading_documents(MockDocumentsService::new())
+    }
+
+    /// `documents`, loading the attribute extraction model as every run
+    /// starts.
+    fn loading_documents(mut documents: MockDocumentsService) -> MockDocumentsService {
+        documents
+            .expect_prepare_attribute_extraction()
+            .returning(|| Ok(()));
+        documents
+    }
+
     fn client(
         cookies: MockCookiesService,
         session: MockSessionService,
         documents: MockDocumentsService,
     ) -> ScrapersClient {
+        let documents = loading_documents(documents);
         ScrapersClient::new(
             Arc::new(cookies),
             Arc::new(session),
@@ -743,6 +794,72 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_loads_the_attribute_model_alongside_the_script_without_waiting_for_it() {
+        let mut cookies = MockCookiesService::new();
+        cookies.expect_load().returning(|_| Ok(Vec::new()));
+        cookies.expect_save().returning(|_, _| Ok(()));
+        let mut session = MockSessionService::new();
+        session.expect_load().returning(|_| Ok(json!({})));
+        session.expect_save().returning(|_, _| Ok(()));
+
+        // Loading until released, which only happens once the run has
+        // ended: the run never waits for it.
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let mut documents = MockDocumentsService::new();
+        documents
+            .expect_prepare_attribute_extraction()
+            .times(1)
+            .returning(move || {
+                started.send(()).unwrap();
+                let _ = release_rx.lock().unwrap().recv();
+                Ok(())
+            });
+        // The script runs while the model loads: its step waits for the
+        // loading to have started.
+        let started_rx = Mutex::new(started_rx);
+        let on_progress: OnScraperProgress = Arc::new(move |_name: &str, _event| {
+            let loading = started_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10));
+            assert_eq!(loading, Ok(()), "the model never started loading");
+        });
+        let client = ScrapersClient::new(
+            Arc::new(cookies),
+            Arc::new(session),
+            Arc::new(any_reports()),
+            Arc::new(documents),
+            Some(on_progress),
+            None,
+        );
+
+        let script = r#"
+            local M = {}
+            function M.run(parameters)
+                fyde.progress.step(fyde.progress.LOGGING_IN)
+            end
+            return M
+        "#;
+        client
+            .run(
+                "didaxis",
+                script,
+                json!({}),
+                false,
+                true,
+                true,
+                Vec::new(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        release.send(()).unwrap();
     }
 
     #[tokio::test]
@@ -891,7 +1008,7 @@ mod tests {
             Arc::new(cookies),
             Arc::new(session),
             Arc::new(any_reports()),
-            Arc::new(MockDocumentsService::new()),
+            Arc::new(idle_documents()),
             Some(on_progress),
             None,
         );
@@ -965,7 +1082,7 @@ mod tests {
             Arc::new(cookies),
             Arc::new(session),
             Arc::new(reports),
-            Arc::new(MockDocumentsService::new()),
+            Arc::new(idle_documents()),
             None,
             Some(on_question),
         ))
@@ -1193,7 +1310,7 @@ mod tests {
             Arc::new(cookies),
             Arc::new(session),
             Arc::new(any_reports()),
-            Arc::new(MockDocumentsService::new()),
+            Arc::new(idle_documents()),
             Some(on_progress),
             None,
         ));
