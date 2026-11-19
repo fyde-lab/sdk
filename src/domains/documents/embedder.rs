@@ -301,6 +301,7 @@ fn mean_pool(shape: &[i64], values: &[f32], mask: &[u32]) -> Result<Vec<f32>> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ThumbnailWake;
     use super::super::attributes::MockService as MockAttributesService;
     use super::super::classification::{Classification, MockService as MockClassifier};
     use super::super::embedding_cache::MemoryEmbeddingCache;
@@ -592,6 +593,7 @@ mod tests {
             SqliteStorage::new(pool.clone()),
             embedder.clone(),
             Arc::new(MemoryEmbeddingCache::new(0)),
+            Arc::new(ThumbnailWake::new()),
         );
         let documents = [
             (
@@ -770,6 +772,7 @@ mod tests {
             SqliteStorage::new(pool.clone()),
             embedder.clone(),
             cache.clone(),
+            Arc::new(ThumbnailWake::new()),
         );
         let changelog = Arc::new(CapturingChangelog::default());
         let mut attributes = MockAttributesService::new();
@@ -828,6 +831,7 @@ mod tests {
             SqliteStorage::new(reference_pool.clone()),
             embedder.clone(),
             Arc::new(MemoryEmbeddingCache::new(64 * 1024 * 1024)),
+            Arc::new(ThumbnailWake::new()),
         )
         .save_document(&document)
         .await

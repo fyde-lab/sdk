@@ -8,8 +8,8 @@ use hayro::kurbo::Affine;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::vello_cpu::{Pixmap, RasterizerSettings, RenderContext, Resources, TargetInit};
 use hayro::{RenderCache, RenderSettings, render_into};
-use image::ImageEncoder as _;
-use image::codecs::png::PngEncoder;
+use image::codecs::png::{PngDecoder, PngEncoder};
+use image::{ImageDecoder as _, ImageEncoder as _};
 
 use super::Thumbnail;
 use super::transcript;
@@ -17,7 +17,7 @@ use crate::{ErrorContext as _, ErrorKind, Result};
 
 /// The first page of the PDF in `content`, as large as fits within
 /// `max_width` x `max_height` pixels (each at least 1, and small enough to
-/// render: see `MAX_THUMBNAIL_SIDE`), never less than a pixel a side.
+/// render: see `THUMBNAIL_SIDE`), never less than a pixel a side.
 pub(super) fn render(content: &[u8], max_width: u32, max_height: u32) -> Result<Thumbnail> {
     let pdf = transcript::parse(content).context("failed to parse PDF document")?;
     let page = pdf
@@ -78,6 +78,15 @@ pub(super) fn render(content: &[u8], max_width: u32, max_height: u32) -> Result<
     Ok(Thumbnail { png, width, height })
 }
 
+/// The `png` [`render`] drew, with its size read back from its header.
+pub(super) fn from_png(png: Vec<u8>) -> Result<Thumbnail> {
+    let (width, height) = PngDecoder::new(std::io::Cursor::new(&png))
+        .map(|decoder| decoder.dimensions())
+        .map_err(ErrorKind::ImageEncoding)
+        .context("failed to read the thumbnail's PNG header")?;
+    Ok(Thumbnail { png, width, height })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::transcript::tests::{build_pdf, build_pdf_from, text_at};
@@ -133,6 +142,20 @@ mod tests {
         let image = decode(&render(&blank_first, 100, 100).unwrap());
 
         assert!(image.pixels().all(|pixel| pixel.0 == [255, 255, 255]));
+    }
+
+    #[test]
+    fn from_png_reads_back_what_render_drew() {
+        let thumbnail = render(&build_pdf("Hello"), 200, 200).unwrap();
+
+        assert_eq!(from_png(thumbnail.png.clone()).unwrap(), thumbnail);
+    }
+
+    #[test]
+    fn from_png_fails_on_anything_else() {
+        let err = from_png(b"not a png".to_vec()).unwrap_err();
+
+        assert!(err.has_context());
     }
 
     #[test]

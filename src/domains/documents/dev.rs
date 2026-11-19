@@ -96,12 +96,7 @@ impl Service for DevDocumentsClient {
         Ok(None)
     }
 
-    async fn thumbnail(
-        &self,
-        _id: Uuid,
-        _max_width: u32,
-        _max_height: u32,
-    ) -> Result<Option<Thumbnail>> {
+    async fn thumbnail(&self, _id: Uuid) -> Result<Option<Thumbnail>> {
         Ok(None)
     }
 

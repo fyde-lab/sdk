@@ -21,6 +21,16 @@ pub(crate) enum FacetField {
 /// folder under, for [`FacetField::Folder`].
 pub(crate) const UNFILED: &str = "unfiled";
 
+/// The thumbnail stored for a cached document (see
+/// [`Storage::get_thumbnail`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StoredThumbnail {
+    /// None stored yet.
+    Missing,
+    /// The bytes last stored by [`Storage::set_thumbnail`].
+    Stored(Vec<u8>),
+}
+
 /// Caches documents, unencrypted, locally, with their embeddings.
 /// Implementations are injected into [`super::service::DocumentsClient`]
 /// (to read cached documents back), [`super::service::DocumentIndexer`] (to
@@ -166,4 +176,17 @@ pub(crate) trait Storage: Send + Sync {
     /// Deletes every document directly in one of `folders`, with their
     /// embeddings, locally only.
     async fn delete_folder_documents(&self, folders: &[Uuid]) -> Result<()>;
+
+    /// The ids of at most `limit` documents previously saved locally by
+    /// [`Self::save_document`] with no thumbnail stored by
+    /// [`Self::set_thumbnail`] yet, newest first (ties by id).
+    async fn documents_without_thumbnail(&self, limit: i64) -> Result<Vec<Uuid>>;
+
+    /// Stores `thumbnail` as the document `id`'s, replacing any. Does
+    /// nothing if no document `id` was previously saved locally.
+    async fn set_thumbnail(&self, id: Uuid, thumbnail: &[u8]) -> Result<()>;
+
+    /// The thumbnail stored for the document `id`, or `None` if no document
+    /// `id` was previously saved locally. Never loads its content.
+    async fn get_thumbnail(&self, id: Uuid) -> Result<Option<StoredThumbnail>>;
 }

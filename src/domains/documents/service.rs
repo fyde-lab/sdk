@@ -21,13 +21,13 @@ use super::chunk;
 use super::classification::{Classification, FiledDocument, Service as ClassificationService};
 use super::embedder::Embedder;
 use super::extraction::Service as ExtractionService;
-use super::storage::{FacetField, Storage, UNFILED};
+use super::storage::{FacetField, Storage, StoredThumbnail, UNFILED};
 use super::thumbnail;
 use super::transcript::{self, Ocr, PAGE_SEPARATOR};
 use super::{
     CachedEmbeddings, ChunkEmbedding, Document, DocumentEmbeddings, EmbeddingCache, EmbeddingKey,
-    FacetCount, Indexer, MAX_THUMBNAIL_SIDE, Metadata, SearchFacets, SearchFilters, SearchOrder,
-    SearchQuery, Service, SimilarDocument, Thumbnail, UploadRequest, UploadSource,
+    FacetCount, Indexer, Metadata, SearchFacets, SearchFilters, SearchOrder, SearchQuery, Service,
+    SimilarDocument, THUMBNAIL_SIDE, Thumbnail, ThumbnailWake, UploadRequest, UploadSource,
 };
 
 /// The only content type [`Service::upload`] currently accepts.
@@ -757,29 +757,29 @@ impl<S: Storage> Service for DocumentsClient<S> {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn thumbnail(
-        &self,
-        id: Uuid,
-        max_width: u32,
-        max_height: u32,
-    ) -> Result<Option<Thumbnail>> {
-        let Some(document) = self
+    async fn thumbnail(&self, id: Uuid) -> Result<Option<Thumbnail>> {
+        let stored = self
             .storage
-            .get_document(id)
+            .get_thumbnail(id)
             .await
-            .with_context(|| format!("failed to load document {id} to draw its thumbnail"))?
-        else {
-            return Ok(None);
+            .with_context(|| format!("failed to load document {id}'s thumbnail"))?;
+        let png = match stored {
+            None => return Ok(None),
+            Some(StoredThumbnail::Stored(png)) => png,
+            // Not reached by the background job yet: shown now, so drawn
+            // now rather than after every document ahead of it.
+            Some(StoredThumbnail::Missing) => match draw_thumbnail(&self.storage, id).await? {
+                Some(png) => png,
+                None => return Ok(None),
+            },
         };
-        let (width, height) = (
-            max_width.clamp(1, MAX_THUMBNAIL_SIDE),
-            max_height.clamp(1, MAX_THUMBNAIL_SIDE),
-        );
 
-        tokio::task::spawn_blocking(move || thumbnail::render(&document.content, width, height))
-            .await
-            .context("the thumbnail task failed")?
-            .with_context(|| format!("failed to draw the thumbnail of document {id}"))
+        if png == UNDRAWABLE_THUMBNAIL {
+            return Err(ErrorKind::Pdf("its first page can't be drawn"))
+                .with_context(|| format!("document {id} has no thumbnail"));
+        }
+        thumbnail::from_png(png)
+            .with_context(|| format!("failed to read document {id}'s thumbnail"))
             .map(Some)
     }
 
@@ -1027,11 +1027,13 @@ impl<S: Storage> Service for DocumentsClient<S> {
 /// The default [`Indexer`]: embeds a document's text in chunks with an
 /// injected [`Embedder`], unless an injected [`EmbeddingCache`] holds the
 /// embeddings its upload computed, then caches it with its embeddings
-/// through an injected [`Storage`], in one call.
+/// through an injected [`Storage`], in one call, and wakes the thumbnail
+/// job (see [`start_thumbnail_job`]) to draw its thumbnail.
 pub(crate) struct DocumentIndexer<S: Storage> {
     storage: S,
     embedder: Arc<dyn Embedder>,
     cache: Arc<dyn EmbeddingCache>,
+    thumbnails: Arc<ThumbnailWake>,
     /// Why the last [`Indexer::prepare`] failed, if it did.
     model_error: Mutex<Option<ErrorCode>>,
 }
@@ -1041,11 +1043,13 @@ impl<S: Storage> DocumentIndexer<S> {
         storage: S,
         embedder: Arc<dyn Embedder>,
         cache: Arc<dyn EmbeddingCache>,
+        thumbnails: Arc<ThumbnailWake>,
     ) -> Self {
         Self {
             storage,
             embedder,
             cache,
+            thumbnails,
             model_error: Mutex::new(None),
         }
     }
@@ -1104,6 +1108,8 @@ impl<S: Storage> Indexer for DocumentIndexer<S> {
         if cached.is_some() {
             self.cache.remove(id);
         }
+        // A permit kept if the job is busy, so it looks again once done.
+        self.thumbnails.notify_one();
         Ok(())
     }
 
@@ -1562,6 +1568,126 @@ fn spawn_model_loading(
         .instrument(tracing::debug_span!("model_loading", model)),
     )
     .abort_handle()
+}
+
+/// What's stored as the thumbnail of a document whose first page can't be
+/// drawn, so it's never tried again (until a migration resets every
+/// thumbnail, for a renderer that might).
+const UNDRAWABLE_THUMBNAIL: &[u8] = &[];
+
+/// How many documents the thumbnail job looks up at a time.
+const THUMBNAIL_BATCH: i64 = 32;
+
+/// How long the thumbnail job waits after failing, unless woken first.
+const THUMBNAIL_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Draws the first page of the document `id` cached in `storage` (on the
+/// blocking pool) and stores it as its thumbnail ([`UNDRAWABLE_THUMBNAIL`]
+/// when it can't be drawn), returning what it stored, or `None` if there's
+/// no such document.
+async fn draw_thumbnail(storage: &impl Storage, id: Uuid) -> Result<Option<Vec<u8>>> {
+    let Some(document) = storage
+        .get_document(id)
+        .await
+        .with_context(|| format!("failed to load document {id} to draw its thumbnail"))?
+    else {
+        return Ok(None);
+    };
+
+    let task = tokio::task::spawn_blocking(move || {
+        thumbnail::render(&document.content, THUMBNAIL_SIDE, THUMBNAIL_SIDE)
+    });
+    let drawn = match task.await {
+        Ok(drawn) => drawn,
+        // As unreadable as a PDF `hayro` panics on (which `render` catches):
+        // drawing it again would only panic again.
+        Err(err) if err.is_panic() => Err(ErrorKind::Pdf("drawing it panicked").into()),
+        Err(err) => return Err(err).context("the thumbnail task failed"),
+    };
+    let png = match drawn {
+        Ok(thumbnail) => thumbnail.png,
+        Err(err) if err.code() == ErrorCode::UnreadablePdf => {
+            tracing::warn!(
+                document_id = %id,
+                "document {id}'s first page can't be drawn, it will have no thumbnail: {err}"
+            );
+            UNDRAWABLE_THUMBNAIL.to_vec()
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to draw document {id}'s thumbnail"));
+        }
+    };
+
+    // A document deleted meanwhile (or wiped by a logout) stays deleted.
+    storage
+        .set_thumbnail(id, &png)
+        .await
+        .with_context(|| format!("failed to store document {id}'s thumbnail"))?;
+    Ok(Some(png))
+}
+
+/// The background task [`start_thumbnail_job`] starts, aborted when dropped.
+pub(crate) struct ThumbnailJob(tokio::task::AbortHandle);
+
+impl Drop for ThumbnailJob {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Starts drawing, on its own task, the thumbnail of every document cached
+/// in `storage` that has none yet (see [`draw_missing_thumbnails`]).
+pub(crate) fn start_thumbnail_job<S: Storage + 'static>(
+    storage: S,
+    wake: Arc<ThumbnailWake>,
+) -> ThumbnailJob {
+    ThumbnailJob(
+        tokio::spawn(
+            draw_missing_thumbnails(storage, wake).instrument(tracing::debug_span!("thumbnails")),
+        )
+        .abort_handle(),
+    )
+}
+
+/// Draws the thumbnail of every document cached in `storage` that has none
+/// yet, a batch at a time, newest first, one document at a time (a
+/// background job, it shouldn't hold more than one blocking thread), then
+/// sleeps until `wake` is notified (by the [`DocumentIndexer`], once it
+/// caches a document) to look again. After a failure, looks again after
+/// [`THUMBNAIL_RETRY_AFTER`], or once woken. Never returns.
+async fn draw_missing_thumbnails(storage: impl Storage, wake: Arc<ThumbnailWake>) {
+    loop {
+        match draw_thumbnail_batch(&storage).await {
+            Ok(0) => wake.notified().await,
+            Ok(drawn) => tracing::debug!("drew {drawn} thumbnails"),
+            Err(err) => {
+                tracing::warn!(
+                    code = ?err.code(),
+                    "failed to draw the documents' thumbnails, trying again in {}s: {err}",
+                    THUMBNAIL_RETRY_AFTER.as_secs()
+                );
+                tokio::select! {
+                    () = wake.notified() => {}
+                    () = tokio::time::sleep(THUMBNAIL_RETRY_AFTER) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Draws the thumbnails of the next [`THUMBNAIL_BATCH`] documents with none
+/// in `storage`, returning how many it looked at (0 when there's none
+/// left). Every one it went through has one afterwards, so the next batch
+/// moves on.
+async fn draw_thumbnail_batch(storage: &impl Storage) -> Result<usize> {
+    let ids = storage
+        .documents_without_thumbnail(THUMBNAIL_BATCH)
+        .await
+        .context("failed to list the documents with no thumbnail")?;
+    for &id in &ids {
+        draw_thumbnail(storage, id).await?;
+    }
+    Ok(ids.len())
 }
 
 #[cfg(test)]
@@ -3457,7 +3583,24 @@ mod tests {
         embedder: MockEmbedder,
         cache: MockEmbeddingCache,
     ) -> DocumentIndexer<MockStorage> {
-        DocumentIndexer::new(storage, Arc::new(embedder), Arc::new(cache))
+        indexer_waking(storage, embedder, cache, Arc::new(ThumbnailWake::new()))
+    }
+
+    fn indexer_waking(
+        storage: MockStorage,
+        embedder: MockEmbedder,
+        cache: MockEmbeddingCache,
+        thumbnails: Arc<ThumbnailWake>,
+    ) -> DocumentIndexer<MockStorage> {
+        DocumentIndexer::new(storage, Arc::new(embedder), Arc::new(cache), thumbnails)
+    }
+
+    /// Whether `wake` holds a permit, i.e. the thumbnail job would look
+    /// again (consuming it).
+    async fn woken(wake: &ThumbnailWake) -> bool {
+        tokio::time::timeout(std::time::Duration::ZERO, wake.notified())
+            .await
+            .is_ok()
     }
 
     /// A cache holding nothing, expected to never be written to.
@@ -3632,6 +3775,48 @@ mod tests {
             err.to_string().contains("failed to cache document"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn indexer_save_document_wakes_the_thumbnail_job_once_saved() {
+        let document = document_with("a.pdf", "");
+        let mut storage = MockStorage::new();
+        storage.expect_save_document().returning(|_, _| Ok(()));
+        let wake = Arc::new(ThumbnailWake::new());
+
+        indexer_waking(
+            storage,
+            idle_embedder("e5.onnx"),
+            empty_cache(),
+            wake.clone(),
+        )
+        .save_document(&document)
+        .await
+        .unwrap();
+
+        assert!(woken(&wake).await);
+    }
+
+    #[tokio::test]
+    async fn indexer_save_document_does_not_wake_the_thumbnail_job_when_saving_fails() {
+        let document = document_with("a.pdf", "");
+        let mut storage = MockStorage::new();
+        storage
+            .expect_save_document()
+            .returning(|_, _| Err(ErrorKind::InvalidChangelogEvent("refused".to_string()).into()));
+        let wake = Arc::new(ThumbnailWake::new());
+
+        indexer_waking(
+            storage,
+            idle_embedder("e5.onnx"),
+            empty_cache(),
+            wake.clone(),
+        )
+        .save_document(&document)
+        .await
+        .unwrap_err();
+
+        assert!(!woken(&wake).await);
     }
 
     /// Updates a cached document from `previous` to `updated` metadata,
@@ -5146,16 +5331,8 @@ mod tests {
         assert_eq!(title(""), "");
     }
 
-    /// A client only `thumbnail` is called on, `document` being the one
-    /// document its storage has.
-    fn thumbnailing_client(document: Option<Document>) -> DocumentsClient<MockStorage> {
-        let mut storage = MockStorage::new();
-        let expected = document.as_ref().map(|document| document.id);
-        storage
-            .expect_get_document()
-            .times(1)
-            .withf(move |id| expected.is_none_or(|expected| *id == expected))
-            .returning(move |_| Ok(document.clone()));
+    /// A client only `thumbnail` is called on, over `storage`.
+    fn thumbnailing_client(storage: MockStorage) -> DocumentsClient<MockStorage> {
         DocumentsClient::new(
             storage,
             Arc::new(RecordingChangelog::default()),
@@ -5171,53 +5348,317 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn thumbnail_draws_the_first_page_of_a_cached_document_as_a_png() {
-        let document = FakeDocument::new().with_content(build_pdf("Hello")).build();
+    /// Expects `storage` to be asked once for the thumbnail of the document
+    /// `id`, answering `stored`.
+    fn expect_stored_thumbnail(
+        storage: &mut MockStorage,
+        id: Uuid,
+        stored: Option<StoredThumbnail>,
+    ) {
+        storage
+            .expect_get_thumbnail()
+            .withf(move |asked| *asked == id)
+            .times(1)
+            .returning(move |_| Ok(stored.clone()));
+    }
+
+    /// Expects `storage` to be asked once for `document`.
+    fn expect_document(storage: &mut MockStorage, document: Document) {
         let id = document.id;
-        let client = thumbnailing_client(Some(document));
+        storage
+            .expect_get_document()
+            .withf(move |asked| *asked == id)
+            .times(1)
+            .returning(move |_| Ok(Some(document.clone())));
+    }
 
-        let thumbnail = client.thumbnail(id, 120, 300).await.unwrap().unwrap();
+    /// Expects `storage` to be given once a thumbnail for the document
+    /// `id`, a PNG unless `undrawable`, recording it in the returned slot.
+    fn expect_set_thumbnail(
+        storage: &mut MockStorage,
+        id: Uuid,
+        undrawable: bool,
+    ) -> Arc<Mutex<Option<Vec<u8>>>> {
+        let stored = Arc::new(Mutex::new(None));
+        let slot = stored.clone();
+        storage
+            .expect_set_thumbnail()
+            .withf(move |asked, png| {
+                *asked == id
+                    && if undrawable {
+                        png.is_empty()
+                    } else {
+                        png.starts_with(b"\x89PNG\r\n\x1a\n")
+                    }
+            })
+            .times(1)
+            .returning(move |_, png| {
+                *slot.lock().unwrap() = Some(png.to_vec());
+                Ok(())
+            });
+        stored
+    }
 
-        // An A4 page, fitted by its width.
-        assert_eq!((thumbnail.width, thumbnail.height), (120, 170));
-        assert!(thumbnail.png.starts_with(b"\x89PNG\r\n\x1a\n"));
+    fn pdf_document() -> Document {
+        FakeDocument::new().with_content(build_pdf("Hello")).build()
+    }
+
+    fn unreadable_document() -> Document {
+        FakeDocument::new()
+            .with_content(b"not a pdf".to_vec())
+            .build()
+    }
+
+    #[tokio::test]
+    async fn thumbnail_reads_the_stored_one_back_without_loading_the_document() {
+        let id = Uuid::now_v7();
+        let drawn = thumbnail::render(&build_pdf("Hello"), THUMBNAIL_SIDE, THUMBNAIL_SIDE).unwrap();
+        let mut storage = MockStorage::new();
+        expect_stored_thumbnail(
+            &mut storage,
+            id,
+            Some(StoredThumbnail::Stored(drawn.png.clone())),
+        );
+
+        let thumbnail = thumbnailing_client(storage)
+            .thumbnail(id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // An A4 page, fitted by its height.
+        assert_eq!((thumbnail.width, thumbnail.height), (362, 512));
+        assert_eq!(thumbnail, drawn);
     }
 
     #[tokio::test]
     async fn thumbnail_of_a_document_not_cached_is_none() {
-        let client = thumbnailing_client(None);
+        let id = Uuid::now_v7();
+        let mut storage = MockStorage::new();
+        expect_stored_thumbnail(&mut storage, id, None);
 
         assert_eq!(
-            client.thumbnail(Uuid::now_v7(), 100, 100).await.unwrap(),
+            thumbnailing_client(storage).thumbnail(id).await.unwrap(),
             None
         );
     }
 
     #[tokio::test]
-    async fn thumbnail_clamps_the_box() {
-        let document = FakeDocument::new().with_content(build_pdf("Hello")).build();
+    async fn thumbnail_not_drawn_yet_is_drawn_and_stored_at_once() {
+        let document = pdf_document();
         let id = document.id;
-        let client = thumbnailing_client(Some(document));
+        let mut storage = MockStorage::new();
+        expect_stored_thumbnail(&mut storage, id, Some(StoredThumbnail::Missing));
+        expect_document(&mut storage, document);
+        let stored = expect_set_thumbnail(&mut storage, id, false);
 
-        let thumbnail = client.thumbnail(id, 0, u32::MAX).await.unwrap().unwrap();
+        let thumbnail = thumbnailing_client(storage)
+            .thumbnail(id)
+            .await
+            .unwrap()
+            .unwrap();
 
-        // Fitted in 1 x MAX_THUMBNAIL_SIDE.
-        assert_eq!(thumbnail.width, 1);
-        assert!(thumbnail.height >= 1 && thumbnail.height <= MAX_THUMBNAIL_SIDE);
+        assert_eq!((thumbnail.width, thumbnail.height), (362, 512));
+        assert_eq!(stored.lock().unwrap().as_ref(), Some(&thumbnail.png));
     }
 
     #[tokio::test]
-    async fn thumbnail_fails_as_an_unreadable_pdf_for_content_it_cannot_draw() {
-        let document = FakeDocument::new()
-            .with_content(b"not a pdf".to_vec())
-            .build();
-        let id = document.id;
-        let client = thumbnailing_client(Some(document));
+    async fn thumbnail_not_drawn_yet_of_a_document_deleted_meanwhile_is_none() {
+        let id = Uuid::now_v7();
+        let mut storage = MockStorage::new();
+        expect_stored_thumbnail(&mut storage, id, Some(StoredThumbnail::Missing));
+        storage
+            .expect_get_document()
+            .times(1)
+            .returning(|_| Ok(None));
 
-        let err = client.thumbnail(id, 100, 100).await.unwrap_err();
+        assert_eq!(
+            thumbnailing_client(storage).thumbnail(id).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn thumbnail_fails_as_an_unreadable_pdf_for_one_stored_as_undrawable() {
+        let id = Uuid::now_v7();
+        let mut storage = MockStorage::new();
+        expect_stored_thumbnail(
+            &mut storage,
+            id,
+            Some(StoredThumbnail::Stored(UNDRAWABLE_THUMBNAIL.to_vec())),
+        );
+
+        let err = thumbnailing_client(storage)
+            .thumbnail(id)
+            .await
+            .unwrap_err();
 
         assert_eq!(err.code(), ErrorCode::UnreadablePdf);
+        assert!(err.to_string().contains(&id.to_string()), "{err}");
+    }
+
+    #[tokio::test]
+    async fn thumbnail_not_drawn_yet_of_content_it_cannot_draw_is_stored_as_undrawable() {
+        let document = unreadable_document();
+        let id = document.id;
+        let mut storage = MockStorage::new();
+        expect_stored_thumbnail(&mut storage, id, Some(StoredThumbnail::Missing));
+        expect_document(&mut storage, document);
+        expect_set_thumbnail(&mut storage, id, true);
+
+        let err = thumbnailing_client(storage)
+            .thumbnail(id)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::UnreadablePdf);
+    }
+
+    #[tokio::test]
+    async fn thumbnail_batch_draws_and_stores_each_documents_thumbnail() {
+        let (first, second) = (pdf_document(), pdf_document());
+        let ids = vec![first.id, second.id];
+        let mut storage = MockStorage::new();
+        storage
+            .expect_documents_without_thumbnail()
+            .withf(|limit| *limit == THUMBNAIL_BATCH)
+            .times(1)
+            .returning(move |_| Ok(ids.clone()));
+        let (first_id, second_id) = (first.id, second.id);
+        expect_document(&mut storage, first);
+        expect_document(&mut storage, second);
+        expect_set_thumbnail(&mut storage, first_id, false);
+        expect_set_thumbnail(&mut storage, second_id, false);
+
+        assert_eq!(draw_thumbnail_batch(&storage).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn thumbnail_batch_stores_an_undrawable_documents_as_such_and_goes_on() {
+        let (unreadable, readable) = (unreadable_document(), pdf_document());
+        let ids = vec![unreadable.id, readable.id];
+        let mut storage = MockStorage::new();
+        storage
+            .expect_documents_without_thumbnail()
+            .returning(move |_| Ok(ids.clone()));
+        let (unreadable_id, readable_id) = (unreadable.id, readable.id);
+        expect_document(&mut storage, unreadable);
+        expect_document(&mut storage, readable);
+        expect_set_thumbnail(&mut storage, unreadable_id, true);
+        expect_set_thumbnail(&mut storage, readable_id, false);
+
+        assert_eq!(draw_thumbnail_batch(&storage).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn thumbnail_batch_with_none_left_draws_nothing() {
+        let mut storage = MockStorage::new();
+        storage
+            .expect_documents_without_thumbnail()
+            .times(1)
+            .returning(|_| Ok(Vec::new()));
+
+        assert_eq!(draw_thumbnail_batch(&storage).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn thumbnail_batch_skips_a_document_deleted_meanwhile() {
+        let id = Uuid::now_v7();
+        let mut storage = MockStorage::new();
+        storage
+            .expect_documents_without_thumbnail()
+            .returning(move |_| Ok(vec![id]));
+        // No `set_thumbnail` expected.
+        storage
+            .expect_get_document()
+            .times(1)
+            .returning(|_| Ok(None));
+
+        assert_eq!(draw_thumbnail_batch(&storage).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn thumbnail_batch_stops_at_the_first_storage_failure() {
+        let (first, second) = (pdf_document(), pdf_document());
+        let ids = vec![first.id, second.id];
+        let mut storage = MockStorage::new();
+        storage
+            .expect_documents_without_thumbnail()
+            .returning(move |_| Ok(ids.clone()));
+        // The second document is never loaded.
+        expect_document(&mut storage, first);
+        storage
+            .expect_set_thumbnail()
+            .times(1)
+            .returning(|_, _| Err(ErrorKind::InvalidChangelogEvent("refused".to_string()).into()));
+
+        let err = draw_thumbnail_batch(&storage).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("failed to store document"),
+            "{err}"
+        );
+    }
+
+    /// Storage the thumbnail job finds nothing left to draw in, except that
+    /// its first look fails if `failing_first`; each look sends on the
+    /// returned channel.
+    fn looked_at_storage(
+        failing_first: bool,
+    ) -> (MockStorage, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let (looked, looks) = tokio::sync::mpsc::unbounded_channel();
+        let mut first = failing_first;
+        let mut storage = MockStorage::new();
+        storage
+            .expect_documents_without_thumbnail()
+            .returning(move |_| {
+                looked.send(()).unwrap();
+                if std::mem::take(&mut first) {
+                    Err(ErrorKind::InvalidChangelogEvent("refused".to_string()).into())
+                } else {
+                    Ok(Vec::new())
+                }
+            });
+        (storage, looks)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn thumbnail_job_with_nothing_left_sleeps_until_woken() {
+        let (storage, mut looks) = looked_at_storage(false);
+        let wake = Arc::new(ThumbnailWake::new());
+        let _job = start_thumbnail_job(storage, wake.clone());
+        looks.recv().await.unwrap();
+
+        // Time only moves on when every task is idle: the job is asleep.
+        let slept = tokio::time::timeout(10 * THUMBNAIL_RETRY_AFTER, looks.recv()).await;
+        assert!(slept.is_err(), "looked again without being woken");
+
+        wake.notify_one();
+        looks.recv().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn thumbnail_job_looks_again_a_while_after_failing() {
+        let (storage, mut looks) = looked_at_storage(true);
+        let _job = start_thumbnail_job(storage, Arc::new(ThumbnailWake::new()));
+        looks.recv().await.unwrap();
+        let failed_at = tokio::time::Instant::now();
+
+        looks.recv().await.unwrap();
+
+        assert!(failed_at.elapsed() >= THUMBNAIL_RETRY_AFTER);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_thumbnail_job_stops_it() {
+        let (storage, mut looks) = looked_at_storage(false);
+        let job = start_thumbnail_job(storage, Arc::new(ThumbnailWake::new()));
+        looks.recv().await.unwrap();
+
+        drop(job);
+
+        // The aborted task drops its storage, closing the channel.
+        assert_eq!(looks.recv().await, None);
     }
 
     #[tokio::test]

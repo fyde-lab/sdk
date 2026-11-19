@@ -57,9 +57,9 @@ use crate::{ErrorCode, Result};
 /// by meaning.
 pub const DEFAULT_SIMILAR_MIN_CONFIDENCE: f32 = 0.25;
 
-/// The largest side, in pixels, [`Service::thumbnail`] renders: a full A4
-/// page at about 175 dpi, 12 MiB of pixels at most while it's drawn.
-pub const MAX_THUMBNAIL_SIDE: u32 = 2048;
+/// The side, in pixels, of the square every [`Thumbnail`] fits within: an A4
+/// page is drawn 362 x 512, about 44 dpi. Scale it down to show it smaller.
+pub const THUMBNAIL_SIDE: u32 = 512;
 
 /// Uploads documents by publishing them as encrypted changelog events, and
 /// reads back documents materialized locally from consumed events (see
@@ -119,21 +119,17 @@ pub trait Service: Send + Sync {
     async fn get(&self, id: Uuid) -> Result<Option<Document>>;
 
     /// The first page of a document previously cached in local storage by
-    /// [`Self::start_sync`], as a PNG as large as fits within `max_width` x
-    /// `max_height` pixels, its aspect ratio kept, on a white background;
-    /// `None` if the document doesn't exist. Each side of the box is
-    /// clamped to `1..=`[`MAX_THUMBNAIL_SIDE`]. Rendered from the document's
-    /// content on every call, never stored (about 10 ms for a card-sized
-    /// one, rarely over 100): cache it in memory while it's shown.
+    /// [`Self::start_sync`], as a PNG as large as fits within
+    /// [`THUMBNAIL_SIDE`] x [`THUMBNAIL_SIDE`] pixels, its aspect ratio
+    /// kept, on a white background; `None` if the document doesn't exist.
+    /// Drawn in the background once the document is cached, and stored
+    /// beside it, so this only reads it back; one not drawn yet is drawn
+    /// (and stored) right away instead of waiting its turn (about 10 ms,
+    /// rarely over 100).
     ///
     /// Fails with [`crate::ErrorCode::UnreadablePdf`] for a document whose
-    /// content can't be rendered.
-    async fn thumbnail(
-        &self,
-        id: Uuid,
-        max_width: u32,
-        max_height: u32,
-    ) -> Result<Option<Thumbnail>>;
+    /// first page can't be drawn.
+    async fn thumbnail(&self, id: Uuid) -> Result<Option<Thumbnail>>;
 
     /// Lists the metadata of documents previously cached in local storage,
     /// oldest first, one page at a time. Never loads their content (see
@@ -379,17 +375,33 @@ pub(crate) fn start_model_loading(
 /// Initializes the [`Indexer`] the changelog consumer caches documents
 /// through, into the database behind `pool`, embedding them with
 /// `embedder` (see [`init_embedder`]), unless `cache` holds the embeddings
-/// their upload computed.
+/// their upload computed, and waking `thumbnails` (see
+/// [`start_thumbnail_job`]) once one is cached.
 pub(crate) fn init_indexer(
     pool: SqlitePool,
     embedder: Arc<dyn embedder::Embedder>,
     cache: Arc<dyn EmbeddingCache>,
+    thumbnails: Arc<ThumbnailWake>,
 ) -> Arc<dyn Indexer> {
     Arc::new(service::DocumentIndexer::new(
         storage_sqlite::SqliteStorage::new(pool),
         embedder,
         cache,
+        thumbnails,
     ))
+}
+
+/// Wakes the job [`start_thumbnail_job`] starts when a document is cached.
+pub(crate) type ThumbnailWake = tokio::sync::Notify;
+
+pub(crate) use service::ThumbnailJob;
+
+/// Starts drawing, in the background, the thumbnail of every document
+/// cached in the database behind `pool` that has none yet, newest first,
+/// one at a time, then sleeping until `wake` is notified. Dropping the
+/// returned [`ThumbnailJob`] stops it.
+pub(crate) fn start_thumbnail_job(pool: SqlitePool, wake: Arc<ThumbnailWake>) -> ThumbnailJob {
+    service::start_thumbnail_job(storage_sqlite::SqliteStorage::new(pool), wake)
 }
 
 /// Initializes the documents service: publishes new documents through the
