@@ -132,6 +132,11 @@ tonic-prost = "0.14.6"
 # exercised on Linux while writing this; `wry`'s own docs cover macOS/Windows
 # as a different `build()` call, not `build_gtk()` — see `driver.rs`.
 tao = "0.37"
+# `fyde.http`'s browser headers under `browser_emulation`
+# (`domains/scrapers/host/http.rs`'s `browser_headers`): real browsers'
+# captured navigation headers. Pinned exactly: patch releases refresh the
+# captures, so a bump changes what scrapers send.
+uagent = "=0.1.0"
 uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
 # Already pulled in transitively by `reqwest`; declared directly here too since
 # `domains/scrapers/host/mod.rs`'s `ensure_domain_allowed` parses URLs with

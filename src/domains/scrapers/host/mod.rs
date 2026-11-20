@@ -1,5 +1,4 @@
 mod browser;
-mod browser_headers;
 mod cookie_jar;
 mod documents;
 pub(super) mod helpers;
@@ -182,7 +181,7 @@ pub(super) struct HostConfig {
 /// bodies for `fyde.http`, and the opened page's HTML for
 /// `fyde.browser:open`, on top of the method/url/status/timing always
 /// recorded. `browser_emulation` and `follow_redirects` are forwarded to
-/// `fyde.http` only — they toggle its Firefox-like headers and whether the
+/// `fyde.http` only — they toggle its browser headers (`uagent`'s) and whether the
 /// client automatically follows HTTP redirects.
 /// `allowed_domains` is forwarded to both `fyde.http` and `fyde.browser` —
 /// the only two tables with a network entry point of their own — and

@@ -13,7 +13,6 @@ use super::super::cookies::Cookie;
 use super::super::models::RunOptions;
 use super::super::reports::{Recorder, redact_url};
 use super::super::stop::StopSignal;
-use super::browser_headers::{RequestKind, browser_headers};
 use super::cookie_jar::CookieJar;
 
 /// How many redirects one request follows before failing, as `reqwest`'s
@@ -278,11 +277,11 @@ fn record_redirects(recorder: &Recorder, method: &str, hops: &[RedirectHop]) {
 /// for `get`/`post_form`/`post_json` (never the request side) — enable it
 /// only for a trusted, local debugging run.
 ///
-/// `options.browser_emulation` controls whether requests carry a desktop
-/// Firefox's headers (`browser_headers`: its `User-Agent`, `Accept`,
-/// `Accept-Language`, `Sec-Fetch-*`...) and its HTTP/2 flow-control windows,
-/// rather than `reqwest`'s bare defaults (no `User-Agent` at all). The TLS
-/// fingerprint stays rustls' either way. A scraper can opt out per its
+/// `options.browser_emulation` controls whether requests carry a browser's
+/// navigation headers ([`browser_headers`], from the `uagent` crate's
+/// captures: `User-Agent`, `Accept`, `Accept-Language`, `Sec-Fetch-*`...)
+/// rather than `reqwest`'s bare defaults (no `User-Agent` at all). The TLS and
+/// HTTP/2 fingerprints stay rustls' and hyper's either way. A scraper can opt out per its
 /// `scrapers/<name>/manifest.json`'s `wreq_emulation` field (in the
 /// `scripts` repo, named after the client this replaced) rather than
 /// carrying a global toggle.
@@ -329,7 +328,6 @@ pub(super) fn table(
         )?,
         jar,
         redirects,
-        browser_emulation: options.browser_emulation,
         visited_urls,
         recorder,
         runtime,
@@ -345,7 +343,7 @@ pub(super) fn table(
         "get",
         lua.create_function(move |lua, (url, headers): (String, Option<Table>)| {
             get.admit("http.get", &url)?;
-            let headers = get.headers(RequestKind::Navigation, &url, headers)?;
+            let headers = to_header_map(headers)?;
             let request = get.client.get(&url).headers(headers);
             get.send_text(lua, "http.get", "GET", &url, request, None)
         })?,
@@ -359,7 +357,7 @@ pub(super) fn table(
                 post_form.admit("http.post_form", &url)?;
                 let form_map = table_to_string_map(&form)?;
                 let form_fields = form_map.keys().cloned().collect();
-                let headers = post_form.headers(RequestKind::FormSubmission, &url, headers)?;
+                let headers = to_header_map(headers)?;
                 let request = post_form.client.post(&url).headers(headers).form(&form_map);
                 post_form.send_text(
                     lua,
@@ -380,7 +378,7 @@ pub(super) fn table(
             move |lua, (url, body, headers): (String, LuaValue, Option<Table>)| {
                 post_json.admit("http.post_json", &url)?;
                 let body_json: Value = lua.from_value(body)?;
-                let headers = post_json.headers(RequestKind::Fetch, &url, headers)?;
+                let headers = to_header_map(headers)?;
                 let request = post_json
                     .client
                     .post(&url)
@@ -414,7 +412,7 @@ pub(super) fn table(
         "download",
         lua.create_function(move |lua, (url, headers): (String, Option<Table>)| {
             download.admit("http.download", &url)?;
-            let headers = download.headers(RequestKind::Navigation, &url, headers)?;
+            let headers = to_header_map(headers)?;
             let request = download.client.get(&url).headers(headers);
             let started = Instant::now();
             let (resp, hops) = download.send("http.download", &url, request)?;
@@ -510,11 +508,34 @@ fn decode_text(content_type: &str, body: &[u8]) -> String {
     encoding.decode(body).0.into_owned()
 }
 
-/// Firefox's HTTP/2 flow-control windows (its `SETTINGS_INITIAL_WINDOW_SIZE`,
-/// and the connection window its first `WINDOW_UPDATE` opens), sent under
-/// `browser_emulation` instead of hyper's.
-const FIREFOX_H2_STREAM_WINDOW: u32 = 131_072;
-const FIREFOX_H2_CONNECTION_WINDOW: u32 = 12_582_912;
+/// The browser `fyde.http` presents itself as under `browser_emulation`:
+/// Firefox, the one `uagent` profiles without client hints (`sec-ch-ua`)
+/// whose claims rustls' TLS fingerprint would contradict, on macOS, the
+/// platform `uagent`'s headers were captured on.
+const EMULATED_BROWSER: uagent::Browser = uagent::Browser::Firefox;
+const EMULATED_PLATFORM: uagent::Platform = uagent::Platform::MacOs;
+/// French first: the sites scrapers visit are French, as are their users.
+const EMULATED_LANGUAGE: &str = "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7";
+
+/// The default headers of a client under `browser_emulation`: `uagent`'s
+/// navigation headers for [`EMULATED_BROWSER`] at its latest captured
+/// version. `reqwest` sends a default header only when the request has none
+/// of that name, so a script's own headers win.
+fn browser_headers() -> LuaResult<HeaderMap> {
+    let profile = uagent::Profile::new(EMULATED_BROWSER, EMULATED_PLATFORM)
+        .and_then(|profile| profile.with_language(EMULATED_LANGUAGE))
+        .map_err(mlua::Error::external)?;
+    profile
+        .headers()
+        .into_iter()
+        .map(|header| {
+            let name =
+                HeaderName::from_bytes(header.name.as_bytes()).map_err(mlua::Error::external)?;
+            let value = HeaderValue::from_str(&header.value).map_err(mlua::Error::external)?;
+            Ok((name, value))
+        })
+        .collect()
+}
 
 /// Builds this run's `reqwest` client on `jar`, per `options` (see
 /// [`table`]'s doc comment for `browser_emulation`/`follow_redirects`),
@@ -529,9 +550,7 @@ fn build_client(
 ) -> LuaResult<Client> {
     let mut builder = crate::tools::http::client_builder().cookie_provider(jar);
     if options.browser_emulation {
-        builder = builder
-            .http2_initial_stream_window_size(FIREFOX_H2_STREAM_WINDOW)
-            .http2_initial_connection_window_size(FIREFOX_H2_CONNECTION_WINDOW);
+        builder = builder.default_headers(browser_headers()?);
     }
     let redirect_policy = if options.follow_redirects {
         reqwest::redirect::Policy::custom(move |attempt| {
@@ -577,7 +596,6 @@ struct HttpHost {
     /// The hops `client`'s redirect policy followed for the request in
     /// flight (see [`build_client`]).
     redirects: Arc<Mutex<Vec<RedirectHop>>>,
-    browser_emulation: bool,
     visited_urls: Arc<Mutex<HashSet<String>>>,
     recorder: Arc<Recorder>,
     runtime: Handle,
@@ -594,22 +612,6 @@ impl HttpHost {
         ensure_domain_allowed_or_record(&self.recorder, action, url, &self.allowed_domains)?;
         track_url(&self.visited_urls, url);
         Ok(())
-    }
-
-    /// The headers for a `kind` request to `url`: the script's `headers`,
-    /// on top of a browser's under `browser_emulation`.
-    fn headers(
-        &self,
-        kind: RequestKind,
-        url: &str,
-        headers: Option<Table>,
-    ) -> LuaResult<HeaderMap> {
-        let headers = to_header_map(headers)?;
-        Ok(if self.browser_emulation {
-            browser_headers(kind, url, &headers)
-        } else {
-            headers
-        })
     }
 
     /// Sends `request`, recording an `error` entry if it fails; gives up on
@@ -1001,6 +1003,18 @@ mod tests {
         // The cause, not just "error sending request", and no query string.
         assert!(message.contains("onnect"), "{message}");
         assert!(!message.contains("secret"), "{message}");
+    }
+
+    #[test]
+    fn browser_headers_are_uagents_firefox_in_french() {
+        let headers = browser_headers().unwrap();
+
+        let user_agent = headers.get("user-agent").unwrap().to_str().unwrap();
+        assert!(user_agent.contains("Firefox/"), "{user_agent}");
+        assert_eq!(headers.get("accept-language").unwrap(), EMULATED_LANGUAGE);
+        assert!(headers.get("sec-fetch-mode").is_some());
+        // Firefox sends no client hints, which rustls' TLS couldn't back up.
+        assert!(headers.get("sec-ch-ua").is_none());
     }
 
     #[test]
