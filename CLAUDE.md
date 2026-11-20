@@ -461,10 +461,12 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `http`, `log`, `mo
     `rustls`' default features off everywhere, or `aws-lc-rs` comes back. It has a
     `cookie_store` jar (`host/cookie_jar.rs`, which can list each cookie's scope for saving), and
     redirects followed by a custom policy that checks each hop against `allowed_domains` and
-    records it. Under `browser_emulation` (a manifest's `wreq_emulation`), requests carry a desktop
-    Firefox's headers (`host/browser_headers.rs`: User-Agent, Accept-Language, `Sec-Fetch-*`...,
-    the script's own headers winning) and HTTP/2 windows; the TLS fingerprint stays rustls'.
-    Firefox rather than Chrome: no client hints or GREASE to fake. Bump its version now and then.
+    records it. Under `browser_emulation` (a manifest's `wreq_emulation`), the client's default
+    headers are the `uagent` crate's captured Firefox/macOS navigation headers (User-Agent,
+    Accept, `Sec-Fetch-*`...; Accept-Language French first), a script's own headers winning: the
+    SDK writes no header values itself. Firefox: no client hints for rustls' TLS to contradict.
+    `uagent` is pinned exactly (its patch releases refresh the captures); TLS and HTTP/2
+    fingerprints stay rustls' and hyper's.
   - `allowed_domains` fails closed: an empty list allows no host; an IP literal only matches
     exactly.
   - `browser/` — `wry`/`tao` webviews on one process-wide thread, started lazily (GTK panics if

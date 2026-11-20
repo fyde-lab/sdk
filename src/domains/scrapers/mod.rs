@@ -81,8 +81,8 @@ pub trait Service: Send + Sync {
     /// see `host::http::table`'s doc comment.
     ///
     /// `browser_emulation` makes `fyde.http` send a desktop Firefox's
-    /// headers (`User-Agent`, `Accept-Language`, `Sec-Fetch-*`...) and HTTP/2
-    /// windows instead of a bare client's for this run; a caller
+    /// navigation headers (`User-Agent`, `Accept-Language`, `Sec-Fetch-*`...,
+    /// from the `uagent` crate) instead of a bare client's for this run; a caller
     /// (conventionally reading a per-scraper `manifest.json`) can opt a
     /// scraper out.
     ///

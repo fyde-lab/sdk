@@ -2142,6 +2142,7 @@ dependencies = [
  "tracing",
  "tracing-log",
  "tracing-subscriber",
+ "uagent",
  "url",
  "uuid",
  "windows-native-keyring-store",
@@ -4501,6 +4502,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
 dependencies = [
  "ttf-parser",
+]
+
+[[package]]
+name = "oxilangtag"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d3b4eb570abd4a1dcb062c31fd37b832264d9dc7292c3e69acfe926c87b063f"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -7060,6 +7070,15 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
+name = "uagent"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "067a495f6d72cec8ef33ba3aeb95f67400615f92524bc802ed14a5cff9f087e8"
+dependencies = [
+ "oxilangtag",
+]
 
 [[package]]
 name = "unicase"
