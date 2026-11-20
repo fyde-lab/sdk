@@ -66,6 +66,30 @@ impl<C: FydeClient> Service for AttributesClient<C> {
             .context("failed to fetch the attribute definitions to check attributes against")?;
         check_against_definitions(attributes, &definitions)
     }
+
+    async fn retain_valid(
+        &self,
+        mut attributes: BTreeMap<String, Attribute>,
+    ) -> Result<BTreeMap<String, Attribute>> {
+        attributes.retain(|name, attribute| {
+            check_attribute_name(name).is_ok() && check_attribute_value(name, attribute).is_ok()
+        });
+        while attributes.len() > MAX_ATTRIBUTES {
+            attributes.pop_last();
+        }
+        if attributes.is_empty() {
+            return Ok(attributes);
+        }
+
+        let definitions = self
+            .list()
+            .await
+            .context("failed to fetch the attribute definitions to check attributes against")?;
+        attributes.retain(|name, attribute| {
+            check_against_definition(name, attribute, &definitions).is_ok()
+        });
+        Ok(attributes)
+    }
 }
 
 /// Rejects an attribute whose type isn't the one its definition, if any,
@@ -75,18 +99,30 @@ fn check_against_definitions(
     definitions: &[AttributeDefinition],
 ) -> Result<()> {
     for (name, attribute) in attributes {
-        if let Some(definition) = definitions
-            .iter()
-            .find(|definition| definition.name() == name)
-            && definition.r#type() != attribute.r#type()
-        {
-            return Err(ErrorKind::InvalidAttribute(format!(
-                "attribute {name:?} is a {}, but is defined as a {}",
-                attribute.r#type(),
-                definition.r#type()
-            ))
-            .into());
-        }
+        check_against_definition(name, attribute, definitions)?;
+    }
+
+    Ok(())
+}
+
+/// Rejects the attribute `name` if its type isn't the one its definition,
+/// if any, expects.
+fn check_against_definition(
+    name: &str,
+    attribute: &Attribute,
+    definitions: &[AttributeDefinition],
+) -> Result<()> {
+    if let Some(definition) = definitions
+        .iter()
+        .find(|definition| definition.name() == name)
+        && definition.r#type() != attribute.r#type()
+    {
+        return Err(ErrorKind::InvalidAttribute(format!(
+            "attribute {name:?} is a {}, but is defined as a {}",
+            attribute.r#type(),
+            definition.r#type()
+        ))
+        .into());
     }
 
     Ok(())
@@ -95,7 +131,7 @@ fn check_against_definitions(
 /// The most attributes a single document can carry: every one of them is
 /// re-encrypted into each of the document's changelog events, and cached on
 /// every device of the account.
-pub(crate) const MAX_ATTRIBUTES: usize = 64;
+const MAX_ATTRIBUTES: usize = 64;
 /// The longest an attribute name can be, in bytes.
 const MAX_ATTRIBUTE_NAME_LEN: usize = 64;
 /// The longest a string, or select option, attribute value can be, in bytes.
@@ -448,6 +484,92 @@ mod tests {
             .check(&BTreeMap::new())
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retain_valid_drops_each_invalid_attribute_and_keeps_the_others() {
+        let mut client = MockFydeClient::new();
+        client
+            .expect_list_attributes()
+            .times(1)
+            .return_once(|| Ok(vec![net_pay_definition()]));
+        let attributes = BTreeMap::from([
+            // Not the type its definition expects.
+            ("net_pay".to_string(), Attribute::Float(2150.5)),
+            // Invalid on its own.
+            ("Net Pay".to_string(), amount()),
+            (
+                "issued_on".to_string(),
+                Attribute::Date("2026-02-30".into()),
+            ),
+            ("gross_pay".to_string(), amount()),
+            ("issuer".to_string(), Attribute::String("Exemple".into())),
+        ]);
+
+        let valid = AttributesClient::new(client)
+            .retain_valid(attributes)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            valid,
+            BTreeMap::from([
+                ("gross_pay".to_string(), amount()),
+                ("issuer".to_string(), Attribute::String("Exemple".into())),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn retain_valid_keeps_no_more_attributes_than_a_document_can_carry() {
+        let mut client = MockFydeClient::new();
+        client
+            .expect_list_attributes()
+            .times(1)
+            .return_once(|| Ok(Vec::new()));
+        let attributes: BTreeMap<String, Attribute> = (0..=MAX_ATTRIBUTES)
+            .map(|i| (format!("attribute_{i:03}"), Attribute::Integer(1)))
+            .collect();
+
+        let valid = AttributesClient::new(client)
+            .retain_valid(attributes)
+            .await
+            .unwrap();
+
+        assert_eq!(valid.len(), MAX_ATTRIBUTES);
+        check_values(&valid).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retain_valid_never_lists_definitions_without_a_valid_attribute() {
+        // No `expect_list_attributes()`: the server must never be reached.
+        let client = AttributesClient::new(MockFydeClient::new());
+
+        assert!(
+            client
+                .retain_valid(BTreeMap::new())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let invalid = BTreeMap::from([("Net Pay".to_string(), amount())]);
+        assert!(client.retain_valid(invalid).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retain_valid_fails_with_context_when_definitions_cant_be_listed() {
+        let mut client = MockFydeClient::new();
+        client
+            .expect_list_attributes()
+            .times(1)
+            .return_once(|| Err(ErrorKind::InvalidAttribute("unreachable".into()).into()));
+
+        let err = AttributesClient::new(client)
+            .retain_valid(BTreeMap::from([("gross_pay".to_string(), amount())]))
+            .await
+            .unwrap_err();
+
+        assert!(err.has_context());
     }
 
     #[tokio::test]

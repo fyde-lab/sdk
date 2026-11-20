@@ -304,7 +304,7 @@ mod tests {
     use super::super::attributes::MockService as MockAttributesService;
     use super::super::classification::{Classification, MockService as MockClassifier};
     use super::super::embedding_cache::MemoryEmbeddingCache;
-    use super::super::gliner::MockSpanFinder;
+    use super::super::extraction::{MockService as MockExtractor, Service as ExtractionService};
     use super::super::service::{DocumentIndexer, DocumentsClient};
     use super::super::storage_sqlite::tests::stored_embeddings;
     use super::super::transcript::MockOcr;
@@ -637,7 +637,7 @@ mod tests {
             Arc::new(MockClassifier::new()),
             no_folders(),
             Arc::new(MockOcr::new()),
-            Arc::new(MockSpanFinder::new()),
+            Arc::new(MockExtractor::new()),
         );
         let text = "combien j'ai payé au fisc l'an dernier";
 
@@ -654,6 +654,15 @@ mod tests {
         eprintln!("found: {names:?}");
         assert!(by_terms.is_empty(), "{by_terms:?}");
         assert_eq!(found.first().map(|metadata| metadata.id), Some(ids[0]));
+    }
+
+    /// An extractor finding no attribute in any upload.
+    fn finding_no_attributes() -> Arc<dyn ExtractionService> {
+        let mut extractor = MockExtractor::new();
+        extractor
+            .expect_extract()
+            .returning(|_, _| Ok(std::collections::BTreeMap::new()));
+        Arc::new(extractor)
     }
 
     /// The real embedder, counting the passages calls it serves.
@@ -784,7 +793,7 @@ mod tests {
             no_folders(),
             // Every page has a text layer.
             Arc::new(MockOcr::new()),
-            Arc::new(MockSpanFinder::new()),
+            finding_no_attributes(),
         );
         // Pages are never chunked together.
         let pdf = build_pdf_pages(&[

@@ -23,8 +23,8 @@ use crate::domains::documents::{Service as DocumentsService, UploadRequest};
 /// `folder_id` if it's set (the one the user picked when installing the
 /// script: see [`UploadRequest::within_folder_id`]): any other key is
 /// ignored. Its attributes are read from its text before it's uploaded
-/// (see [`UploadRequest::extract_attributes`]), with the model the run
-/// started loading alongside the script. A
+/// (see [`DocumentsService::upload`]), with the model the run started
+/// loading alongside the script. A
 /// document whose content is already saved locally is silently skipped, not
 /// an error, so re-running a scraper doesn't fail on what it already
 /// fetched.
@@ -53,7 +53,6 @@ pub(super) fn save_document_fn(
             let leaf = name.rsplit(['/', '\\']).next().unwrap_or(&name);
             let mut request = UploadRequest::from_raw(sanitize_path_segment(leaf), bytes.to_vec());
             request.within_folder_id = folder_id;
-            request.extract_attributes = true;
             if let Some(fields) = fields {
                 apply_upload_fields(&mut request, &fields)?;
             }
@@ -143,19 +142,16 @@ mod tests {
     // calls work without needing `#[tokio::test]`'s own (potentially
     // reentrant) runtime context.
     #[test]
-    fn save_document_uploads_the_raw_content_directly_extracting_its_attributes() {
+    fn save_document_uploads_the_raw_content_directly() {
         let id = Uuid::now_v7();
         let mut documents = MockDocumentsService::new();
         documents
             .expect_upload()
-            .withf(|request| {
-                let raw = match &request.source {
-                    crate::domains::documents::UploadSource::Raw { name, content } => {
-                        name == "january.pdf" && content == b"the pdf content"
-                    }
-                    crate::domains::documents::UploadSource::Path(_) => false,
-                };
-                raw && request.extract_attributes
+            .withf(|request| match &request.source {
+                crate::domains::documents::UploadSource::Raw { name, content } => {
+                    name == "january.pdf" && content == b"the pdf content"
+                }
+                crate::domains::documents::UploadSource::Path(_) => false,
             })
             .times(1)
             .returning(move |_| Ok(id));
@@ -219,7 +215,6 @@ mod tests {
                 *request
                     == UploadRequest {
                         name: Some("January payslip".to_string()),
-                        extract_attributes: true,
                         ..UploadRequest::from_raw("january.pdf", b"the pdf content".to_vec())
                     }
             })

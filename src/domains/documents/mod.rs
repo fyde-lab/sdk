@@ -73,8 +73,8 @@ pub trait Service: Send + Sync {
     /// publishes it as a "created" changelog event, returning its
     /// generated id. Its original name is the source's file name, its name
     /// `request.name` or, without one, that file name without its
-    /// extension; it has no attribute, and its type and folder are guessed
-    /// on device. The type from its text. The folder from the documents
+    /// extension; its type, folder and attributes are guessed on device.
+    /// The type from its text. The folder from the documents
     /// already filed, by content only (never by folder names): the one whose
     /// documents directly in it are the closest to this one, compared as
     /// [`Self::similar`] does, from the embeddings stored for search (so
@@ -100,22 +100,22 @@ pub trait Service: Send + Sync {
     /// only `.pdf` is currently accepted, anything else is rejected with
     /// [`crate::ErrorCode::UnsupportedDocumentExtension`].
     ///
-    /// A request that asks for it ([`UploadRequest::extract_attributes`]:
-    /// a scraper's) also gets attributes read from its transcript before
-    /// it's published: every attribute definition (see
-    /// [`AttributesService::list`]) of a type text can give (strings,
-    /// integers, floats, dates, amounts) is looked for by the GLiNER model,
-    /// fetched and loaded first if [`Self::prepare_attribute_extraction`]
-    /// hasn't already, and each one found becomes an attribute of the
-    /// document. Never fails the upload: without the model or the
-    /// definitions, it's published without attributes.
+    /// Its attributes are read from its text by GLiNER (downloaded and
+    /// loaded first if [`Self::prepare_attribute_extraction`] hasn't
+    /// already), depending on its type: an invoice's issuer, reference,
+    /// date and total, a payslip's employer, period, gross and net pay, and
+    /// so on (an untyped document's issuer, date and amount). At most one
+    /// value each, and only those valid against the account's attribute
+    /// definitions. Never fails the upload: without the model, or if it
+    /// fails, the document is published without attributes, and uploads
+    /// don't try again for five minutes.
     async fn upload(&self, request: UploadRequest) -> Result<Uuid>;
 
     /// Fetches (if needed) and loads the model [`Self::upload`] extracts
-    /// attributes with, unless that's already done, so the uploads asking
-    /// for it don't wait for it. A scraper run calls it as its script
-    /// starts, alongside it: nothing else loads that model. A failure is
-    /// retried by the next call, or the next upload extracting attributes.
+    /// attributes with, unless that's already done, so uploads don't wait
+    /// for it. A scraper run calls it as its script starts, alongside it;
+    /// otherwise the first upload loads it. A failure is retried by the
+    /// next call, or the next upload.
     async fn prepare_attribute_extraction(&self) -> Result<()>;
 
     /// Fetches a document previously cached in local storage by
@@ -352,7 +352,7 @@ pub(crate) fn init_ocr(models: Arc<ModelStore>) -> Arc<dyn transcript::Ocr> {
 /// Initializes the GLiNER model the documents [`Service`] extracts uploads'
 /// attributes with, from the models `models` holds: fetched and loaded only
 /// by [`Service::prepare_attribute_extraction`] (a scraper run starting) or
-/// the first upload extracting attributes, never at startup.
+/// the first upload, never at startup.
 pub(crate) fn init_span_finder(models: Arc<ModelStore>) -> Arc<dyn gliner::SpanFinder> {
     Arc::new(gliner::OnnxGliner::new(models))
 }
@@ -397,8 +397,8 @@ pub(crate) fn init_indexer(
 /// consumes. Uploads and searches embed their text with `embedder` (see
 /// [`init_embedder`]), uploads leaving theirs in `cache` for `indexer`, and
 /// are classified with it; their scanned pages are read with `ocr` (see
-/// [`init_ocr`]), and their attributes, when asked for, extracted with
-/// `span_finder` (see [`init_span_finder`]).
+/// [`init_ocr`]), and their attributes extracted with `span_finder` (see
+/// [`init_span_finder`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn init(
     pool: SqlitePool,
@@ -425,7 +425,7 @@ pub(crate) fn init(
         classification::init(embedder),
         folders,
         ocr,
-        span_finder,
+        extraction::init(span_finder),
     ))
 }
 
