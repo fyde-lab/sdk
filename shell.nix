@@ -20,14 +20,6 @@ pkgs.mkShell {
     # required by build.rs to compile the BSR's (or ../server/protos') *.proto via tonic-prost-build
     protobuf
 
-    # aws-lc-sys, the crypto behind reqwest's rustls TLS (fyde.http and model
-    # downloads), builds C code with cmake/clang on targets without prebuilt
-    # bindings.
-    cmake
-    clang
-    # Sets up LIBCLANG_PATH/BINDGEN_EXTRA_CLANG_ARGS correctly for bindgen.
-    rustPlatform.bindgenHook
-
     # required (via pkg-config) to build wry/tao, the real embedded webview
     # behind fyde.browser (see src/domains/scrapers/browser/driver.rs and
     # src/domains/scrapers/host/browser.rs). webkitgtk_4_1/gtk3 are wry's

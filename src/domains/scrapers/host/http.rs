@@ -527,7 +527,7 @@ fn build_client(
     allowed_domains: Arc<Vec<String>>,
     redirects: Arc<Mutex<Vec<RedirectHop>>>,
 ) -> LuaResult<Client> {
-    let mut builder = Client::builder().cookie_provider(jar);
+    let mut builder = crate::tools::http::client_builder().cookie_provider(jar);
     if options.browser_emulation {
         builder = builder
             .http2_initial_stream_window_size(FIREFOX_H2_STREAM_WINDOW)
@@ -854,7 +854,15 @@ mod tests {
     fn read_body_returns_a_body_within_the_limit() {
         let runtime = runtime();
         let url = spawn_ok_server(&runtime, "hello");
-        let resp = runtime.block_on(Client::new().get(&url).send()).unwrap();
+        let resp = runtime
+            .block_on(
+                crate::tools::http::client_builder()
+                    .build()
+                    .unwrap()
+                    .get(&url)
+                    .send(),
+            )
+            .unwrap();
 
         let body = read_body(runtime.handle(), &StopSignal::new(), resp, 5).unwrap();
 
@@ -865,7 +873,15 @@ mod tests {
     fn read_body_fails_on_a_body_over_the_limit() {
         let runtime = runtime();
         let url = spawn_ok_server(&runtime, "hello");
-        let resp = runtime.block_on(Client::new().get(&url).send()).unwrap();
+        let resp = runtime
+            .block_on(
+                crate::tools::http::client_builder()
+                    .build()
+                    .unwrap()
+                    .get(&url)
+                    .send(),
+            )
+            .unwrap();
 
         let err = read_body(runtime.handle(), &StopSignal::new(), resp, 4).unwrap_err();
 

@@ -256,7 +256,7 @@ impl ModelStore {
     async fn http(&self) -> Result<&reqwest::Client> {
         self.http
             .get_or_try_init(|| async {
-                reqwest::Client::builder()
+                crate::tools::http::client_builder()
                     // Hugging Face redirects every download to its CDN.
                     .redirect(reqwest::redirect::Policy::default())
                     .connect_timeout(CONNECT_TIMEOUT)
