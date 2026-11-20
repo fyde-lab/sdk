@@ -80,21 +80,36 @@ const ABANDON_LOGIN_TIMEOUT: Duration = Duration::from_secs(10);
 const PASSWORD_CHECK_DEVICE_NAME: &str = "password check";
 
 /// The device's preferred interface language as a short code (e.g. "en",
-/// "fr"), read from the `LC_ALL`/`LC_MESSAGES`/`LANG` environment variables
-/// (checked in that order, matching POSIX locale precedence) and falling
-/// back to `"en"` if none is set or parses to something unexpected (e.g.
-/// the POSIX default `"C"`/`"POSIX"`). Sent to the server by `create` so it
-/// doesn't need to be asked for, and used as the fallback language for
+/// "fr"): the platform's own locale where it isn't in the environment
+/// (Android, see [`crate::tools::locale`]), otherwise the
+/// `LC_ALL`/`LC_MESSAGES`/`LANG` environment variables (checked in that
+/// order, matching POSIX locale precedence), falling back to `"en"` if
+/// none is set or parses to something unexpected (e.g. the POSIX default
+/// `"C"`/`"POSIX"`). Sent to the server by `create` so it doesn't need to
+/// be asked for, and used as the fallback language for
 /// [`crate::Client::user_message`] when the user hasn't picked one.
 pub fn system_language() -> String {
-    ["LC_ALL", "LC_MESSAGES", "LANG"]
-        .into_iter()
-        .find_map(|var| std::env::var(var).ok())
-        .and_then(|value| {
-            let code = value.split(['_', '.']).next().unwrap_or("").to_lowercase();
-            (code.len() == 2).then_some(code)
+    crate::tools::locale::device_language()
+        .and_then(|value| language_code(&value))
+        .or_else(|| {
+            ["LC_ALL", "LC_MESSAGES", "LANG"]
+                .into_iter()
+                .find_map(|var| std::env::var(var).ok())
+                .and_then(|value| language_code(&value))
         })
         .unwrap_or_else(|| "en".to_string())
+}
+
+/// The two-letter language code a locale string starts with
+/// (`"fr_FR.UTF-8"`, `"fr-FR"` and `"fr"` all give `"fr"`), or `None` for
+/// anything else (`"C"`, `"POSIX"`, an empty string).
+fn language_code(locale: &str) -> Option<String> {
+    let code = locale
+        .split(['_', '-', '.'])
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    (code.len() == 2 && code.chars().all(|c| c.is_ascii_alphabetic())).then_some(code)
 }
 
 /// A client for the fyde server's users service. Persists the session
@@ -2545,6 +2560,24 @@ mod tests {
         );
 
         assert_eq!(client.get_language().await.unwrap(), None);
+    }
+
+    #[test]
+    fn language_code_takes_the_language_of_posix_and_bcp47_locales() {
+        assert_eq!(language_code("fr"), Some("fr".to_string()));
+        assert_eq!(language_code("FR"), Some("fr".to_string()));
+        assert_eq!(language_code("fr_FR.UTF-8"), Some("fr".to_string()));
+        assert_eq!(language_code("fr-FR"), Some("fr".to_string()));
+        assert_eq!(language_code("en_US"), Some("en".to_string()));
+    }
+
+    #[test]
+    fn language_code_rejects_what_is_not_a_language() {
+        assert_eq!(language_code(""), None);
+        assert_eq!(language_code("C"), None);
+        assert_eq!(language_code("POSIX"), None);
+        assert_eq!(language_code("C.UTF-8"), None);
+        assert_eq!(language_code("12"), None);
     }
 
     #[tokio::test]
