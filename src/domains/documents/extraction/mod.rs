@@ -23,10 +23,6 @@ use crate::Result;
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(crate) trait Service: Send + Sync {
-    /// Fetches (if needed) and loads the model [`Self::extract`] runs,
-    /// unless that's already done: a failure is retried on the next call.
-    async fn load(&self) -> Result<()>;
-
     /// The attributes found in `transcript`, a document of type `r#type`
     /// (`None` when it couldn't be classified: then only what any document
     /// carries, an issuer, a date and an amount, is looked for). At most one

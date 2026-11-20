@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
-use crate::domains::documents::Service as DocumentsService;
+use crate::domains::documents::{AttributeModel, ModelHold, Service as DocumentsService};
 use crate::domains::scripts::InstalledScript;
 use crate::{ErrorContext as _, Result};
 
@@ -18,7 +18,7 @@ use super::models::RunOptions;
 use super::reports::{Recorder, Service as ReportsService};
 use super::session::Service as SessionService;
 use super::stop::{self, StopSignal};
-use super::{OnScraperProgress, OnScraperQuestion, ProgressEvent, Service};
+use super::{OnScraperProgress, OnScraperQuestion, ProgressEvent, ProgressStep, Service};
 
 /// The `wreq_emulation`/`follow_redirects` an installed script runs with.
 /// Each scraper's `manifest.json` (in `../scripts`) chooses these for a dev
@@ -61,6 +61,9 @@ pub(super) struct ScrapersClient {
     session: Arc<dyn SessionService>,
     reports: Arc<dyn ReportsService>,
     documents: Arc<dyn DocumentsService>,
+    /// What `documents` reads saved documents' attributes with: loaded and
+    /// held by each run while it sets up (see [`ScrapersClient::set_up`]).
+    attribute_model: Option<Arc<dyn AttributeModel>>,
     on_progress: Option<OnScraperProgress>,
     on_question: Option<OnScraperQuestion>,
     running: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -91,12 +94,14 @@ impl ScrapersClient {
         documents: Arc<dyn DocumentsService>,
         on_progress: Option<OnScraperProgress>,
         on_question: Option<OnScraperQuestion>,
+        attribute_model: Option<Arc<dyn AttributeModel>>,
     ) -> Self {
         Self {
             cookies,
             session,
             reports,
             documents,
+            attribute_model,
             on_progress,
             on_question,
             running: Arc::new(Mutex::new(HashMap::new())),
@@ -265,26 +270,57 @@ impl Service for ScrapersClient {
     }
 }
 
+/// What a run's setup (see [`ScrapersClient::set_up`]) leaves it with.
+struct Setup {
+    /// Keeps the attribute model loaded until the run is over.
+    _attribute_model: Option<ModelHold>,
+    /// Why loading the attribute model failed, if it did.
+    attribute_model_error: Option<String>,
+}
+
 impl ScrapersClient {
-    /// Starts loading the model attributes are extracted with (see
-    /// [`DocumentsService::prepare_attribute_extraction`]) on a task of its
-    /// own, for the run under `name`, until the returned guard drops. A
-    /// failure is only logged: the run's uploads try again.
-    fn load_attribute_model(&self, name: &str) -> AbortOnDrop {
-        let documents = self.documents.clone();
-        let name = name.to_string();
-        AbortOnDrop(
-            tokio::spawn(async move {
-                if let Err(err) = documents.prepare_attribute_extraction().await {
-                    tracing::warn!(
-                        code = ?err.code(),
-                        scraper = %name,
-                        "failed to load the attribute extraction model, the run's documents will try again: {err}"
-                    );
-                }
-            })
-            .abort_handle(),
-        )
+    /// Sets the run under `name` up before its script starts, as the
+    /// [`ProgressStep::SettingUp`] step it announces first: loads the model
+    /// documents' attributes are read with (downloading it first if
+    /// needed), holding it until the returned [`Setup`] drops. Failing to
+    /// load it doesn't fail the run (its uploads then try again, or are
+    /// saved without attributes): only `signal` stopping it does.
+    async fn set_up(&self, name: &str, signal: &StopSignal) -> Result<Setup> {
+        if let Some(on_progress) = &self.on_progress {
+            on_progress(
+                name,
+                ProgressEvent::Step {
+                    step: ProgressStep::SettingUp,
+                },
+            );
+        }
+
+        let Some(model) = &self.attribute_model else {
+            return Ok(Setup {
+                _attribute_model: None,
+                attribute_model_error: None,
+            });
+        };
+        let hold = model.hold();
+        let loaded = tokio::select! {
+            biased;
+            () = signal.stopped() => return Err(stop::stopped()),
+            loaded = model.load() => loaded,
+        };
+        let attribute_model_error = loaded.err().map(|err| {
+            tracing::warn!(
+                target: "fyde::scrapers",
+                scraper = %name,
+                code = ?err.code(),
+                "failed to load the attribute model while setting the run up, \
+                 its documents will try again: {err}"
+            );
+            err.to_string()
+        });
+        Ok(Setup {
+            _attribute_model: Some(hold),
+            attribute_model_error,
+        })
     }
 
     /// [`Service::run`], filing every document the script saves within
@@ -316,11 +352,9 @@ impl ScrapersClient {
                 slot.expect("the scraper run slots are never closed")
             }
         };
-        // The model the documents a script saves get their attributes from
-        // (see `fyde.save_document`), loaded only by a run, alongside its
-        // script, which never waits for it: a document saved before it's
-        // ready waits for it then. Given up on once the run ends.
-        let _attribute_model = self.load_attribute_model(name);
+        // Held until the run is over, so its uploads never wait for the
+        // model again. Stopped while setting up: nothing loaded nor saved.
+        let setup = self.set_up(name, &signal).await?;
 
         let cookies = self
             .cookies
@@ -334,6 +368,17 @@ impl ScrapersClient {
             .with_context(|| format!("failed to load session for scraper {name:?}"))?;
         let recorder = Arc::new(Recorder::new(name));
         recorder.record("run_started", json!({ "script": name }));
+        recorder.record(
+            "progress",
+            json!({ "kind": "step", "step": ProgressStep::SettingUp.as_str() }),
+        );
+        if let Some(message) = &setup.attribute_model_error {
+            // Recorded once the recorder exists: setup comes first.
+            recorder.record(
+                "error",
+                json!({ "action": "setup.attribute_model", "message": message }),
+            );
+        }
 
         let job = ScraperJob {
             name: name.to_string(),
@@ -356,10 +401,10 @@ impl ScrapersClient {
         // `stop` can cut short) keeps the name until the script has really
         // stopped, so no other run of it starts alongside, and can still be
         // stopped. Otherwise they're held here through the saves below.
-        let (_name_guard, _stop_registration, _slot, outcome) =
+        let (_name_guard, _stop_registration, _slot, _setup, outcome) =
             tokio::task::spawn_blocking(move || {
                 let outcome = run_script(job);
-                (name_guard, stop_registration, slot, outcome)
+                (name_guard, stop_registration, slot, setup, outcome)
             })
             .await
             .with_context(|| format!("scraper {name:?} task panicked"))?;
@@ -403,15 +448,6 @@ impl ScrapersClient {
             .with_context(|| format!("failed to save report for scraper {name:?}"))?;
 
         run_result
-    }
-}
-
-/// Aborts its task when dropped.
-struct AbortOnDrop(tokio::task::AbortHandle);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }
 
@@ -621,7 +657,7 @@ mod tests {
     use super::super::reports::MockService as MockReportsService;
     use super::super::session::MockService as MockSessionService;
     use super::*;
-    use crate::domains::documents::MockService as MockDocumentsService;
+    use crate::domains::documents::{MockAttributeModel, MockService as MockDocumentsService};
     use crate::domains::scripts::{FakeInstalledScript, FakeScript};
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -643,32 +679,17 @@ mod tests {
         reports
     }
 
-    /// Documents whose attribute extraction model loads as every run
-    /// starts, for runs saving no document.
-    fn idle_documents() -> MockDocumentsService {
-        loading_documents(MockDocumentsService::new())
-    }
-
-    /// `documents`, loading the attribute extraction model as every run
-    /// starts.
-    fn loading_documents(mut documents: MockDocumentsService) -> MockDocumentsService {
-        documents
-            .expect_prepare_attribute_extraction()
-            .returning(|| Ok(()));
-        documents
-    }
-
     fn client(
         cookies: MockCookiesService,
         session: MockSessionService,
         documents: MockDocumentsService,
     ) -> ScrapersClient {
-        let documents = loading_documents(documents);
         ScrapersClient::new(
             Arc::new(cookies),
             Arc::new(session),
             Arc::new(any_reports()),
             Arc::new(documents),
+            None,
             None,
             None,
         )
@@ -794,72 +815,6 @@ mod tests {
             )
             .await
             .unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_loads_the_attribute_model_alongside_the_script_without_waiting_for_it() {
-        let mut cookies = MockCookiesService::new();
-        cookies.expect_load().returning(|_| Ok(Vec::new()));
-        cookies.expect_save().returning(|_, _| Ok(()));
-        let mut session = MockSessionService::new();
-        session.expect_load().returning(|_| Ok(json!({})));
-        session.expect_save().returning(|_, _| Ok(()));
-
-        // Loading until released, which only happens once the run has
-        // ended: the run never waits for it.
-        let (started, started_rx) = std::sync::mpsc::channel();
-        let (release, release_rx) = std::sync::mpsc::channel::<()>();
-        let release_rx = Mutex::new(release_rx);
-        let mut documents = MockDocumentsService::new();
-        documents
-            .expect_prepare_attribute_extraction()
-            .times(1)
-            .returning(move || {
-                started.send(()).unwrap();
-                let _ = release_rx.lock().unwrap().recv();
-                Ok(())
-            });
-        // The script runs while the model loads: its step waits for the
-        // loading to have started.
-        let started_rx = Mutex::new(started_rx);
-        let on_progress: OnScraperProgress = Arc::new(move |_name: &str, _event| {
-            let loading = started_rx
-                .lock()
-                .unwrap()
-                .recv_timeout(std::time::Duration::from_secs(10));
-            assert_eq!(loading, Ok(()), "the model never started loading");
-        });
-        let client = ScrapersClient::new(
-            Arc::new(cookies),
-            Arc::new(session),
-            Arc::new(any_reports()),
-            Arc::new(documents),
-            Some(on_progress),
-            None,
-        );
-
-        let script = r#"
-            local M = {}
-            function M.run(parameters)
-                fyde.progress.step(fyde.progress.LOGGING_IN)
-            end
-            return M
-        "#;
-        client
-            .run(
-                "didaxis",
-                script,
-                json!({}),
-                false,
-                true,
-                true,
-                Vec::new(),
-                false,
-            )
-            .await
-            .unwrap();
-
-        release.send(()).unwrap();
     }
 
     #[tokio::test]
@@ -1008,8 +963,9 @@ mod tests {
             Arc::new(cookies),
             Arc::new(session),
             Arc::new(any_reports()),
-            Arc::new(idle_documents()),
+            Arc::new(MockDocumentsService::new()),
             Some(on_progress),
+            None,
             None,
         );
 
@@ -1042,6 +998,12 @@ mod tests {
                 (
                     "didaxis".to_string(),
                     ProgressEvent::Step {
+                        step: ProgressStep::SettingUp
+                    }
+                ),
+                (
+                    "didaxis".to_string(),
+                    ProgressEvent::Step {
                         step: ProgressStep::LoggingIn
                     }
                 ),
@@ -1054,6 +1016,169 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// Cookie and session storage accepting any load and save.
+    fn any_state() -> (MockCookiesService, MockSessionService) {
+        let mut cookies = MockCookiesService::new();
+        cookies.expect_load().returning(|_| Ok(Vec::new()));
+        cookies.expect_save().returning(|_, _| Ok(()));
+        let mut session = MockSessionService::new();
+        session.expect_load().returning(|_| Ok(json!({})));
+        session.expect_save().returning(|_, _| Ok(()));
+        (cookies, session)
+    }
+
+    /// An attribute model loading as `load` says, whose hold sets the
+    /// returned flag once released.
+    fn attribute_model(
+        load: impl Fn() -> Result<()> + Send + Sync + 'static,
+    ) -> (MockAttributeModel, Arc<std::sync::atomic::AtomicBool>) {
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut model = MockAttributeModel::new();
+        let flag = released.clone();
+        model.expect_hold().times(1).return_once(move || {
+            ModelHold::new(move || flag.store(true, std::sync::atomic::Ordering::SeqCst))
+        });
+        model.expect_load().times(1).returning(load);
+        (model, released)
+    }
+
+    async fn run_script_named(client: &ScrapersClient, name: &str, script: &str) -> Result<()> {
+        client
+            .run(
+                name,
+                script,
+                json!({}),
+                false,
+                true,
+                true,
+                Vec::new(),
+                false,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn run_sets_up_first_holding_the_attribute_model_until_it_ends() {
+        let (cookies, session) = any_state();
+        let (model, released) = attribute_model(|| Ok(()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = events.clone();
+        let held = released.clone();
+        // Each event also records whether the model was still held then.
+        let on_progress: OnScraperProgress = Arc::new(move |_name: &str, event| {
+            let held = !held.load(std::sync::atomic::Ordering::SeqCst);
+            seen.lock().unwrap().push((event, held));
+        });
+        let client = ScrapersClient::new(
+            Arc::new(cookies),
+            Arc::new(session),
+            Arc::new(any_reports()),
+            Arc::new(MockDocumentsService::new()),
+            Some(on_progress),
+            None,
+            Some(Arc::new(model)),
+        );
+        let script = r#"
+            return { run = function() fyde.progress.step(fyde.progress.LOGGING_IN) end }
+        "#;
+
+        run_script_named(&client, "didaxis", script).await.unwrap();
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                (
+                    ProgressEvent::Step {
+                        step: ProgressStep::SettingUp
+                    },
+                    true
+                ),
+                (
+                    ProgressEvent::Step {
+                        step: ProgressStep::LoggingIn
+                    },
+                    true
+                ),
+            ]
+        );
+        assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn run_goes_on_when_the_attribute_model_fails_to_load() {
+        let (cookies, session) = any_state();
+        let (model, released) =
+            attribute_model(|| Err(crate::ErrorKind::ModelDownloadStatus(503).into()));
+        let client = ScrapersClient::new(
+            Arc::new(cookies),
+            Arc::new(session),
+            Arc::new(any_reports()),
+            Arc::new(MockDocumentsService::new()),
+            None,
+            None,
+            Some(Arc::new(model)),
+        );
+
+        run_script_named(&client, "didaxis", TRIVIAL_SCRIPT)
+            .await
+            .unwrap();
+
+        assert!(released.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// An attribute model whose download never ends.
+    struct HangingModel {
+        loading: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl AttributeModel for HangingModel {
+        async fn load(&self) -> Result<()> {
+            self.loading.notify_one();
+            std::future::pending().await
+        }
+
+        fn hold(&self) -> ModelHold {
+            ModelHold::new(|| {})
+        }
+
+        async fn spans(
+            &self,
+            _text: String,
+            _labels: Vec<String>,
+            _threshold: f32,
+            _max_words: usize,
+        ) -> Result<Vec<crate::domains::documents::Span>> {
+            unreachable!("a run never finds spans itself")
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_ends_a_run_still_setting_up_before_it_loads_anything() {
+        let loading = Arc::new(tokio::sync::Notify::new());
+        // No cookie, session nor report expectation: none is touched.
+        let client = Arc::new(ScrapersClient::new(
+            Arc::new(MockCookiesService::new()),
+            Arc::new(MockSessionService::new()),
+            Arc::new(MockReportsService::new()),
+            Arc::new(MockDocumentsService::new()),
+            None,
+            None,
+            Some(Arc::new(HangingModel {
+                loading: loading.clone(),
+            })),
+        ));
+
+        let run = tokio::spawn({
+            let client = client.clone();
+            async move { run_script_named(&client, "didaxis", TRIVIAL_SCRIPT).await }
+        });
+        loading.notified().await;
+        assert!(client.stop("didaxis"));
+
+        assert_stopped(run.await.unwrap());
     }
 
     /// Script whose `run` asks one question, so a test's `on_question`
@@ -1082,9 +1207,10 @@ mod tests {
             Arc::new(cookies),
             Arc::new(session),
             Arc::new(reports),
-            Arc::new(idle_documents()),
+            Arc::new(MockDocumentsService::new()),
             None,
             Some(on_question),
+            None,
         ))
     }
 
@@ -1279,6 +1405,7 @@ mod tests {
             Arc::new(MockDocumentsService::new()),
             None,
             None,
+            None,
         );
 
         assert!(!client.stop("didaxis"));
@@ -1310,8 +1437,9 @@ mod tests {
             Arc::new(cookies),
             Arc::new(session),
             Arc::new(any_reports()),
-            Arc::new(idle_documents()),
+            Arc::new(MockDocumentsService::new()),
             Some(on_progress),
+            None,
             None,
         ));
 

@@ -752,10 +752,6 @@ impl<S: Storage> Service for DocumentsClient<S> {
         Ok(id)
     }
 
-    async fn prepare_attribute_extraction(&self) -> Result<()> {
-        self.extractor.load().await
-    }
-
     async fn get(&self, id: Uuid) -> Result<Option<Document>> {
         self.storage.get_document(id).await
     }
@@ -5567,53 +5563,6 @@ mod tests {
             .unwrap();
 
         assert!(published_metadata(&changelog).attributes.is_empty());
-    }
-
-    #[tokio::test]
-    async fn prepare_attribute_extraction_loads_the_extraction_model() {
-        let mut extractor = MockExtractionService::new();
-        extractor.expect_load().times(1).returning(|| Ok(()));
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            Arc::new(RecordingChangelog::default()),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
-            no_folders(),
-            no_ocr(),
-            Arc::new(extractor),
-        );
-
-        client.prepare_attribute_extraction().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn prepare_attribute_extraction_fails_with_the_models_error() {
-        let mut extractor = MockExtractionService::new();
-        extractor
-            .expect_load()
-            .times(1)
-            .returning(|| Err(ErrorKind::ModelDownloadStatus(503).into()));
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            Arc::new(RecordingChangelog::default()),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
-            no_folders(),
-            no_ocr(),
-            Arc::new(extractor),
-        );
-
-        let err = client.prepare_attribute_extraction().await.unwrap_err();
-
-        assert_eq!(err.code(), ErrorCode::ModelDownloadFailed);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]

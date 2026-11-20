@@ -175,13 +175,16 @@ pub(crate) enum StorageConfig {
 /// scraper's session data, cookie jar and per-run debug report (see the
 /// private `session`/`cookies`/`reports` sub-domains), `documents` so
 /// `fyde.save_document` can upload a downloaded document through the SDK's
-/// own encrypted upload path, and `on_progress`/`on_question` as the
+/// own encrypted upload path, `attribute_model` (the model `documents`
+/// reads attributes with, `None` if it reads none) for each run to load
+/// while it sets up, and `on_progress`/`on_question` as the
 /// callbacks `fyde.progress`/`fyde.input` invoke — see
 /// [`crate::ClientConfig::on_scraper_progress`]/
 /// [`crate::ClientConfig::on_scraper_question`].
 pub(crate) fn init(
     storage: StorageConfig,
     documents: Arc<dyn DocumentsService>,
+    attribute_model: Option<Arc<dyn crate::domains::documents::AttributeModel>>,
     on_progress: Option<OnScraperProgress>,
     on_question: Option<OnScraperQuestion>,
 ) -> Arc<dyn Service> {
@@ -212,5 +215,6 @@ pub(crate) fn init(
         documents,
         on_progress,
         on_question,
+        attribute_model,
     ))
 }

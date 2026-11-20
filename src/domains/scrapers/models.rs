@@ -24,6 +24,11 @@ pub enum ProgressEvent {
 /// language (see [`Self::user_message`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProgressStep {
+    /// Preparing what the run needs before its script starts: loading the
+    /// on-device model that reads saved documents' attributes, and
+    /// starting the browser for a script that drives one. Sent by the SDK
+    /// itself, first, before any step the script sends.
+    SettingUp,
     /// Submitting credentials, or otherwise opening a session on the site.
     LoggingIn,
     /// Checking whether a session saved by a previous run is still valid.
@@ -42,6 +47,7 @@ pub enum ProgressStep {
 
 impl ProgressStep {
     pub(crate) const ALL: &'static [ProgressStep] = &[
+        Self::SettingUp,
         Self::LoggingIn,
         Self::CheckingSession,
         Self::WaitingForVerificationCode,
@@ -54,6 +60,7 @@ impl ProgressStep {
     /// The name scripts pass to `fyde.progress.step`.
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::SettingUp => "setting_up",
             Self::LoggingIn => "logging_in",
             Self::CheckingSession => "checking_session",
             Self::WaitingForVerificationCode => "waiting_for_verification_code",
@@ -69,6 +76,10 @@ impl ProgressStep {
     /// language the SDK has no wording for.
     pub fn user_message(self, language: &str) -> &'static str {
         let (en, fr) = match self {
+            Self::SettingUp => (
+                "Preparing the environment",
+                "Préparation de l'environnement",
+            ),
             Self::LoggingIn => ("Logging in", "Connexion en cours"),
             Self::CheckingSession => (
                 "Checking the existing session",
