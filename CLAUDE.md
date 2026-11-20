@@ -17,8 +17,8 @@ FYDE_PROTO_DIR=../server/protos cargo build  # build without buf / network acces
 RUSTFLAGS="--cfg tokio_unstable" cargo build --features tokio-console  # serve tasks to tokio-console (127.0.0.1:6669)
 ```
 
-- Dev shell: `shell.nix` via direnv. Rust **1.95+** (`oar-ocr`'s MSRV); `protobuf`; `cmake`/`clang`
-  for `reqwest`'s TLS (`aws-lc-sys`); `webkitgtk_4_1`/`gtk3` for `wry`.
+- Dev shell: `shell.nix` via direnv. Rust **1.95+** (`oar-ocr`'s MSRV); `protobuf`; `webkitgtk_4_1`/`gtk3`
+  for `wry`. No `cmake`/`bindgen` (the C left builds with the plain C compiler).
 - `build.rs` runs `buf export buf.build/fyde-lab/api` (needs `buf` on `PATH` + network) unless
   `FYDE_PROTO_DIR` is set.
 - On static-ONNX-Runtime targets (see "ONNX Runtime" below), `ort-sys` downloads pyke's prebuilt
@@ -141,7 +141,7 @@ caller's callbacks (`on_log`, `on_document_change`,
 New server services follow the same pattern: a module under `src/domains/` with `mod.rs`
 (the `Service` trait, methods take `&self` so it can live behind `Arc<dyn Service>`),
 `models.rs` (plain structs), `service.rs`, and adapters; wired into `Client::init`.
-Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `onnx`, `sandbox`,
+Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `http`, `log`, `models`, `onnx`, `sandbox`,
 `sql`, `testing`).
 
 ### Domains (`src/domains/`)
@@ -455,7 +455,10 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     while it waits for the embedding model or publishes: one given up on while publishing
     may still be published). The run ends with `ScraperRunStopped` unless its script
     finished first.
-  - `fyde.http` (`host/http.rs`) is `reqwest` with its own rustls TLS (no custom TLS config), a
+  - `fyde.http` (`host/http.rs`) is `reqwest` with its own rustls TLS (no custom TLS config) on
+    `ring`, never `aws-lc-rs` (its C build is slow): every client starts from
+    `tools::http::client_builder`, which installs `ring` as rustls' default provider. Keep
+    `rustls`' default features off everywhere, or `aws-lc-rs` comes back. It has a
     `cookie_store` jar (`host/cookie_jar.rs`, which can list each cookie's scope for saving), and
     redirects followed by a custom policy that checks each hop against `allowed_domains` and
     records it. Under `browser_emulation` (a manifest's `wreq_emulation`), requests carry a desktop
