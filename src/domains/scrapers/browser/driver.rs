@@ -904,6 +904,13 @@ fn is_download_allowed(url: &str, allowed_domains: &[String]) -> bool {
 /// several), they never touch the network, and blocking them silently
 /// breaks whatever the page built them for.
 ///
+/// A `data:` URL is hostless too, and carries its content inline without
+/// touching the network: a page that downloads a file it fetched itself
+/// clicks a `<a href="data:application/pdf;base64,..." download>` it built,
+/// which WebKit runs through this handler before raising the download (see
+/// [`is_download_allowed`]) — e.g. espace-client.orange.fr's contract
+/// documents. Blocking it would silently cancel that download.
+///
 /// A `blob:` URL has no host of its own either, but embeds the origin of the
 /// page that created it (`blob:https://www.example.com/<uuid>`), so it's
 /// checked against that origin's host instead — e.g. bouyguestelecom.fr's
@@ -915,6 +922,9 @@ fn is_navigation_allowed(url: &str, allowed_domains: &[String]) -> bool {
     };
     if parsed.scheme() == "about" {
         return matches!(parsed.path(), "blank" | "srcdoc");
+    }
+    if parsed.scheme() == "data" {
+        return true;
     }
     if parsed.scheme() == "blob" {
         return match parsed.origin() {
@@ -1198,6 +1208,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn is_navigation_allowed_lets_a_data_url_through() {
+        let allowed = vec!["example.com".to_string()];
+        assert!(is_navigation_allowed(
+            "data:application/pdf;base64,JVBERi0=",
+            &allowed
+        ));
     }
 
     #[test]
