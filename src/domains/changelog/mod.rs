@@ -1,3 +1,31 @@
+//! The sync log every write goes through. The server is a blind relay of
+//! client-encrypted events (`crypto.rs`: AES-256-GCM, a per-event DEK wrapped
+//! by a KEK derived from the master key); every device rebuilds its local
+//! state by consuming them.
+//!
+//! The consume job replays from the persisted cursor, then tails live,
+//! materializing documents (through `documents::Indexer`), folders (through
+//! `folders::Applier`) and script installations. An `InstallScript` for
+//! another script version first deletes that installation's saved scraper
+//! session, so the new version refetches everything; an `UninstallScript`
+//! deletes its sessions, cookies and reports too.
+//!
+//! Each event's `previous_id` (the server chains a user's events) must equal
+//! the last event the pass went through, checked before decrypting: otherwise
+//! the pass fails rather than skip past a gap or apply another account's
+//! event. Applied events are recorded by ciphertext digest, so one the server
+//! serves again is skipped. Before a pass's first document event the job calls
+//! `Indexer::prepare`, so a missing model fails the pass rather than letting
+//! the cursor pass an unindexed document. A failed pass is retried after a
+//! backoff; a cleanly ended stream is reopened after a pause, never at once.
+//! An event failing `POISON_PILL_PASSES` passes in a row is logged
+//! at error level, but never skipped.
+//!
+//! [`SyncProgress`] counts events (not documents: the server can't tell them
+//! apart) gone through since the job started, against the server's
+//! `CountSince` from each pass's cursor. A failed count leaves `total` as it
+//! was and never fails the pass.
+
 mod crypto;
 mod grpc_client;
 mod models;

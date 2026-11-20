@@ -1,3 +1,54 @@
+//! The user's documents. No gRPC transport: every write is a `changelog`
+//! event, and reads only ever hit the local cache.
+//!
+//! **Writes.** `upload` needs a master key and rejects content over
+//! `changelog::MAX_EVENT_BYTES` (`DocumentTooLarge`) or with a known checksum
+//! (`DuplicateDocument`), both before parsing. It then transcribes
+//! (`transcript`), embeds, classifies (`classification`), extracts attributes
+//! (`extraction`) and publishes an encrypted `SaveDocument`. None of these
+//! steps but the transcript's parsing fails the upload, and none ever runs on
+//! consumption. The document reaches the local cache only when the sync job
+//! consumes it back. `delete` only publishes a `Deleted` (id only, no local
+//! check, so an unsynced upload can be deleted); consuming it removes the
+//! cached document through [`Indexer::delete_document`], a no-op if it isn't
+//! cached. `move_document`/`update_metadata` refuse a folder not synced here
+//! (`FolderNotFound`).
+//!
+//! **Placement.** A document's place is `Metadata::folder_id` (`None` = the
+//! root; a folder deleted meanwhile counts as the root too). `upload` takes an
+//! optional `folder_id` (then the document is only typed, and a folder not
+//! synced here is `FolderNotFound` before embedding) and an optional
+//! `within_folder_id` (a script installation's folder: compared only with that
+//! subtree, it lands in the winner, else in that folder itself, never outside
+//! it, even without the model; one not synced here falls back to filing across
+//! the whole vault, never failing). `folder_id` wins when both are set.
+//!
+//! **Reads.** `get`/`list`/`search`/`search_facets` are local-only.
+//! `list`/`search` return `Metadata` only (their queries never select
+//! `content`): `get` is the only call loading a document's content.
+//! `search_facets` counts each field with its own filter lifted, so UIs only
+//! offer reachable choices; folder facets count each folder with everything
+//! below it. `search` with `Relevance` and non-blank text fuses a bm25 and an
+//! embedding-similarity ranking with RRF; if the query can't be embedded (the
+//! model isn't downloaded: `ModelStore::find` never downloads) it falls back
+//! to bm25 alone, never failing. `similar` ranks by a document's stored
+//! vectors (never embeds), its confidence rescaled from
+//! `UNRELATED_SIMILARITY` so callers never handle e5 numbers.
+//!
+//! **Indexing.** A document is never cached without its embeddings: the
+//! changelog consumer applies `SaveDocument`/`UpdateMetadata` through
+//! [`Indexer`], which embeds then writes document and embeddings in one
+//! transaction. `upload` already embedded the same passages before publishing
+//! and parked the vectors in the in-memory [`EmbeddingCache`] (never in the
+//! event, never on disk), so the indexer reuses them when the `embedding_key`
+//! matches, and removes the entry only once its transaction committed. An
+//! upload that doesn't publish drops its entry (`CachedUntilPublished`).
+//!
+//! **Thumbnails.** `thumbnail(id)` reads the first page back as a PNG stored in
+//! `documents.thumbnail` (NULL = not drawn yet, empty = undrawable), drawing it
+//! if needed. The background job (`start_thumbnail_job`) draws the missing
+//! ones, newest first, and sleeps until the indexer wakes it.
+
 pub(crate) mod attributes;
 mod chunk;
 mod classification;

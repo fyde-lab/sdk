@@ -1,3 +1,32 @@
+//! Runs the Lua scripts that log into third-party sites and save the user's
+//! documents. A script returns `{ run = function(parameters) ... }` and only
+//! calls the `fyde` table built in `host/`.
+//!
+//! Each run gets its own VM, cookie jar, session table, recorder and webview.
+//! At most `MAX_CONCURRENT_RUNS` run at once, and runs sharing a `name` share
+//! persisted state, so they're serialized (`lock_name`). `run_installed` runs
+//! an installation under its installation id, so each account has its own
+//! state. `fyde.session` is saved even when a run fails; cookies only on
+//! success or stop.
+//!
+//! Once a run holds its name and a slot, it sets up (`set_up`): it announces
+//! `ProgressStep::SettingUp`, then holds and loads the attribute model
+//! (GLiNER) for the whole run, so its uploads never wait for it. A failed load
+//! is logged and recorded in the report, never failing the run. Every run
+//! keeps one report (`reports/`: outcome, steps, found and saved counts, debug
+//! log), completed however it ends.
+//!
+//! `stop(name)` goes through the run's `StopSignal`: the sandbox's instruction
+//! hook, every blocking host call, a pending `fyde.input.ask` and an upload
+//! (one given up on while publishing may still be published).
+//!
+//! A failed run keeps a code the UI can act on (`error::lua_code`): a host
+//! error keeps its own even when the script rethrows it, connect/timeout
+//! failures are `ScraperSiteUnreachable`, the login contract's
+//! `error("INVALID_CREDENTIALS", 0)` / `error("MFA_FAILED", 0)` map to
+//! `ScraperCredentialsRejected` / `ScraperVerificationFailed`, sandbox limits
+//! to `ScriptLimitExceeded`, anything else to `ScriptFailed`.
+
 mod browser;
 mod cookies;
 mod host;

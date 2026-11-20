@@ -1,3 +1,18 @@
+//! The vault's folders: a parent, a name, and a colour + icon on top-level
+//! folders only. No description: documents are filed by what folders hold.
+//!
+//! No gRPC transport: the service validates each change against the folders
+//! synced so far, then publishes a `SaveFolder` (the whole folder) or
+//! `DeleteFolder` (keep or delete its contents) changelog event; `list` reads
+//! the local table. The consumer applies them through [`Applier`], which
+//! resolves concurrent edits identically on every device: a missing parent or
+//! a cycle puts the folder at the top level, a sibling name clash gets a
+//! `" (2)"` suffix, and deleting either moves the children up or removes every
+//! descendant (the documents inside included).
+//!
+//! New vaults start with no folder. `layout.rs`'s sample vault is test data
+//! only.
+
 #[cfg(test)]
 mod layout;
 mod models;
