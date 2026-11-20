@@ -462,7 +462,9 @@ impl Client {
 /// otherwise drop the `tokio`/`runtime` events it reads.
 /// Does nothing when a subscriber is already installed, by the consuming
 /// binary or by a previous `Client::init` call: a library must not panic over
-/// it, nor start a second console server.
+/// it, nor start a second console server. Once it has installed one, it also
+/// logs panics through it (see [`tools::log::install_panic_hook`]), which
+/// would otherwise only reach stderr.
 fn install_tracing(
     log_level: LogLevel,
     on_log: Option<Arc<dyn Fn(LogLevel, String) + Send + Sync>>,
@@ -486,7 +488,9 @@ fn install_tracing(
     let subscriber = tracing_subscriber::registry().with(logs);
     #[cfg(feature = "tokio-console")]
     let subscriber = subscriber.with(console_subscriber::spawn());
-    let _ = subscriber.try_init();
+    if subscriber.try_init().is_ok() {
+        tools::log::install_panic_hook();
+    }
 }
 
 /// Where a [`Client`]'s local database lives, once its [`Storage`] and
