@@ -20,13 +20,13 @@ use super::session::Service as SessionService;
 use super::stop::{self, StopSignal};
 use super::{OnScraperProgress, OnScraperQuestion, ProgressEvent, ProgressStep, Service};
 
-/// The `wreq_emulation`/`follow_redirects` an installed script runs with.
-/// Each scraper's `manifest.json` (in `../scripts`) chooses these for a dev
-/// run, but a published script doesn't carry them, so an installed one gets
-/// what 110 of the 112 manifests choose — a real Chrome fingerprint, and
-/// redirects followed. (`ameli` and `cesu` opt out of emulation, so they
+/// The `browser_emulation`/`follow_redirects` an installed script runs
+/// with. Each scraper's `manifest.json` (in `../scripts`, as
+/// `wreq_emulation`) chooses these for a dev run, but a published script
+/// doesn't carry them, so an installed one gets what 110 of the 112 manifests
+/// choose — browser headers, and redirects followed. (`ameli` and `cesu` opt out of emulation, so they
 /// won't behave as in a dev run until scripts publish these flags too.)
-const INSTALLED_WREQ_EMULATION: bool = true;
+const INSTALLED_BROWSER_EMULATION: bool = true;
 const INSTALLED_FOLLOW_REDIRECTS: bool = true;
 
 /// How many scraper runs may go on at once, across every scraper. Each one
@@ -232,7 +232,7 @@ impl Service for ScrapersClient {
             parameters,
             RunOptions {
                 debug_http_dump: false,
-                wreq_emulation: INSTALLED_WREQ_EMULATION,
+                browser_emulation: INSTALLED_BROWSER_EMULATION,
                 follow_redirects: INSTALLED_FOLLOW_REDIRECTS,
                 allowed_domains: script.allowed_domains().to_vec(),
                 browser_visible: false,
@@ -248,7 +248,7 @@ impl Service for ScrapersClient {
         script: &str,
         parameters: Value,
         debug_http_dump: bool,
-        wreq_emulation: bool,
+        browser_emulation: bool,
         follow_redirects: bool,
         allowed_domains: Vec<String>,
         browser_visible: bool,
@@ -259,7 +259,7 @@ impl Service for ScrapersClient {
             parameters,
             RunOptions {
                 debug_http_dump,
-                wreq_emulation,
+                browser_emulation,
                 follow_redirects,
                 allowed_domains,
                 browser_visible,

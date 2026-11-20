@@ -1,4 +1,6 @@
 mod browser;
+mod browser_headers;
+mod cookie_jar;
 mod documents;
 pub(super) mod helpers;
 mod html;
@@ -17,10 +19,11 @@ use mlua::{Lua, LuaSerdeExt, Table, Value as LuaValue};
 use serde_json::Value as JsonValue;
 use tokio::runtime::Handle;
 use uuid::Uuid;
-use wreq::cookie::Jar;
 
 use crate::domains::documents::Service as DocumentsService;
 use crate::{ErrorContext as _, Result};
+
+use cookie_jar::CookieJar;
 
 use super::ProgressEvent;
 use super::browser::Service as BrowserService;
@@ -34,7 +37,7 @@ use super::stop::StopSignal;
 /// `fyde.session`'s final contents and every cookie this run's `fyde.http`
 /// picked up, once the script's `run` function has returned.
 pub(super) struct Installed {
-    cookie_jar: Arc<Jar>,
+    cookie_jar: Arc<CookieJar>,
     visited_urls: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -178,9 +181,9 @@ pub(super) struct HostConfig {
 /// `host::browser::table`) — it opts this run into also recording response
 /// bodies for `fyde.http`, and the opened page's HTML for
 /// `fyde.browser:open`, on top of the method/url/status/timing always
-/// recorded. `wreq_emulation` and `follow_redirects` are forwarded to
-/// `fyde.http` only — they toggle `wreq`'s Chrome TLS/HTTP2 fingerprint
-/// emulation and whether the client automatically follows HTTP redirects.
+/// recorded. `browser_emulation` and `follow_redirects` are forwarded to
+/// `fyde.http` only — they toggle its Firefox-like headers and whether the
+/// client automatically follows HTTP redirects.
 /// `allowed_domains` is forwarded to both `fyde.http` and `fyde.browser` —
 /// the only two tables with a network entry point of their own — and
 /// enforced by `ensure_domain_allowed` before any of their methods actually

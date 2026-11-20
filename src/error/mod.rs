@@ -385,10 +385,10 @@ pub(crate) enum ErrorKind {
     ScriptLimitExceeded(String),
     #[error("scraper run stopped on request")]
     ScraperRunStopped,
-    /// Not `#[from]`: only model downloads map a [`wreq::Error`] to
+    /// Not `#[from]`: only model downloads map a [`reqwest::Error`] to
     /// [`ErrorCode::ModelDownloadFailed`].
     #[error("model download error: {0}")]
-    ModelDownload(#[source] wreq::Error),
+    ModelDownload(#[source] reqwest::Error),
     #[error("model download answered HTTP {0}")]
     ModelDownloadStatus(u16),
     #[error("corrupted model file: {0}")]
@@ -512,9 +512,12 @@ fn lua_code(err: &mlua::Error) -> ErrorCode {
                 err.code()
             } else if let Some(err) = source.downcast_ref::<mlua::Error>() {
                 lua_code(err)
-            } else if source
-                .downcast_ref::<wreq::Error>()
-                .is_some_and(|err| err.is_connect() || err.is_timeout())
+            } else if std::iter::successors(
+                Some(&**source as &(dyn std::error::Error + 'static)),
+                |err| err.source(),
+            )
+            .filter_map(|err| err.downcast_ref::<reqwest::Error>())
+            .any(|err| err.is_connect() || err.is_timeout())
             {
                 ErrorCode::ScraperSiteUnreachable
             } else {

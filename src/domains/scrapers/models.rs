@@ -129,7 +129,7 @@ impl FromStr for ProgressStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct RunOptions {
     pub(super) debug_http_dump: bool,
-    pub(super) wreq_emulation: bool,
+    pub(super) browser_emulation: bool,
     pub(super) follow_redirects: bool,
     pub(super) allowed_domains: Vec<String>,
     pub(super) browser_visible: bool,

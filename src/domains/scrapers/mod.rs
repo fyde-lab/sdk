@@ -80,11 +80,11 @@ pub trait Service: Send + Sync {
     /// recorded, since they routinely carry credentials/session cookies —
     /// see `host::http::table`'s doc comment.
     ///
-    /// `wreq_emulation` toggles `fyde.http`'s Chrome TLS/HTTP2 fingerprint
-    /// emulation (`wreq_util::Profile::Chrome131`) on or off for this run —
-    /// some sites' WAFs block `wreq`'s TLS fingerprint outright regardless
-    /// of emulation, so a caller (conventionally reading a per-scraper
-    /// `manifest.json`) can opt a scraper out.
+    /// `browser_emulation` makes `fyde.http` send a desktop Firefox's
+    /// headers (`User-Agent`, `Accept-Language`, `Sec-Fetch-*`...) and HTTP/2
+    /// windows instead of a bare client's for this run; a caller
+    /// (conventionally reading a per-scraper `manifest.json`) can opt a
+    /// scraper out.
     ///
     /// `follow_redirects` toggles whether `fyde.http` automatically follows
     /// HTTP redirects for this run — on by default for a real-browser-like
@@ -123,7 +123,7 @@ pub trait Service: Send + Sync {
         script: &str,
         parameters: Value,
         debug_http_dump: bool,
-        wreq_emulation: bool,
+        browser_emulation: bool,
         follow_redirects: bool,
         allowed_domains: Vec<String>,
         browser_visible: bool,
