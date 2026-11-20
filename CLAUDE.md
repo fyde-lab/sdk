@@ -82,9 +82,9 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   itself never waits on a download: it starts loading the embedding and OCR models in
   memory in the background, downloading them first if needed (`documents::start_model_loading`,
   one task per model so they're fetched in parallel; aborted when the `Client` drops; a failure
-  is logged at warn, the first use trying again). Never GLiNER's: a scraper run loads it,
-  alongside its script (`documents::Service::prepare_attribute_extraction`), else the first
-  upload. Unit tests that `init` a
+  is logged at warn, the first use trying again). Never GLiNER's: each scraper run loads it
+  while setting up, else the first upload, and it's unloaded once idle (see `gliner.rs`). Unit
+  tests that `init` a
   `Client` pass a regular file as `models_dir` so that loading fails without the network.
 - Never write to the `documents_fts` FTS5 table directly (triggers maintain it). A new virtual
   table must support `'delete-all'` so `SqliteClient::wipe` can clear it.
@@ -132,7 +132,9 @@ Public accessors: `documents()`, `folders()`, `attributes()`, `users()`, `settin
 `save_new_session(token)`/`is_connected()` over the crate-private `sessions` domain.
 `ClientConfig::models_dir` is where on-device models are downloaded (see `tools::models`): `init`
 doesn't touch it, but rejects one inside a disk client directory (`InvalidModelsDirectory`,
-1013; lexical comparison of absolute paths). `ClientConfig` carries the
+1013; lexical comparison of absolute paths). `ClientConfig::attribute_model_idle_timeout`
+(`None` = `DEFAULT_ATTRIBUTE_MODEL_IDLE_TIMEOUT`, 60 s) is how long GLiNER stays loaded unused
+(see `gliner.rs`). `ClientConfig` carries the
 caller's callbacks (`on_log`, `on_document_change`,
 `on_scraper_progress`, `on_scraper_question`).
 
@@ -274,14 +276,20 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     classifies only after its embedding succeeded (model at hand, vectors to compare); a
     failure publishes untyped at the root. Never run on consumption.
   - `gliner.rs` — `SpanFinder` (`OnnxGliner`, GLiNER-X small; ported from `doc-ai-poc`'s
-    `gliner.rs`), the adapter `extraction/` runs (below): `spans(text, labels, threshold,
+    `gliner.rs`), the adapter `extraction/` runs (below; one per `Client`, `init_span_finder`,
+    re-exported as `documents::AttributeModel` for the scrapers' setup). Never preloaded by
+    `Client::init`. Memory: a `ModelHold` (`hold()`) keeps it loaded; each `load`/`spans` call
+    holds it while it runs, a scraper run for its whole length. Once the last hold drops, it's
+    unloaded after the idle timeout unless held again meanwhile (`released` counter; no Tokio
+    runtime = stays loaded); the next use reloads it from disk. `spans(text, labels, threshold,
     max_words)` returns every span (byte range, label index, sigmoid score) scoring at least
     `threshold`, best first, overlaps and window-boundary duplicates included. Keep the model's
     details as they are: `<<ENT>>` = 250100 / `<<SEP>>` = 250101 (not in `tokenizer.json`),
     `MAX_WIDTH` 12, 320-word windows overlapping by 12, `split_words` mimicking GLiNER's
     `\w+(?:[-_]\w+)*|\S`, only the inputs the model declares passed (an unknown one fails), logits
-    checked to be `[1, words, 12, labels]`. Loaded lazily on the first call with something to
-    look for (a failure is retried), or by `load`, run on the blocking pool.
+    checked to be `[1, words, 12, labels]`. Loaded on the first call with something to look
+    for, or by `load` (a failure is retried; concurrent calls load it once), run on the
+    blocking pool.
   - `extraction/` — attribute values read off every upload's transcript on device (ported
     from `doc-ai-poc`'s `attributes.rs`; keep its labels, decoys, threshold 0.3, 1200 words and
     parsers as they are unless re-tuned), so they travel in the `SaveDocument` event. `upload`
@@ -295,9 +303,8 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     Amounts are euros (`parse_amount` only reads euros). Never fails an upload: a GLiNER
     failure publishes without attributes and `extract` finds nothing for
     `EXTRACTION_RETRY_AFTER` (5 min); `retain_valid` failing (definitions unreachable) does
-    too. Never run on consumption. The model is loaded by `prepare_attribute_extraction`
-    (`ScrapersClient` spawns it as each run takes its slot, alongside the script, aborted when
-    the run ends), else by the first upload.
+    too. Never run on consumption. The model is loaded by each scraper run's setup (see
+    scrapers), else by the first upload.
   - `dev.rs` — `DevDocumentsClient`, plain-file writes for `init_dev_scrapers`.
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
   (`SaveDocument`, `UpdateMetadata`, `Deleted`, `InstallScript`, `UninstallScript`, `SaveFolder`, `DeleteFolder`). `crypto.rs`: AES-256-GCM, per-event DEK
@@ -421,9 +428,17 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   - `fyde.progress` carries no free text, so the UI can word it in the user's language:
     `step(name)` only accepts a `ProgressStep` name (`"logging_in"`, ...; anything else raises),
     each also exposed as a constant scripts use instead (`fyde.progress.LOGGING_IN`),
-    `update(current, total)` has no message. New steps need wording in every language in
+    `update(current, total)` has no message. `setting_up` is the SDK's own, sent first by every
+    run (see below), before the script starts. New steps need wording in every language in
     `ProgressStep::user_message`, plus a matching variant in the application's bindings
     (`../application/sdkBridge/rust`).
+  - Setup (`ScrapersClient::set_up`): once a run holds its name and a slot, it announces
+    `ProgressStep::SettingUp`, then holds and loads the `AttributeModel` (GLiNER; downloaded
+    first if needed), keeping the hold until the run's blocking job is over (it rides along
+    with the job like the name guard), so its uploads never wait for the model again. A load
+    failure is logged, recorded in the report (`setup.attribute_model`), and never fails the run
+    (uploads try again, else save without attributes). Stoppable: a run stopped while setting
+    up loads and saves nothing. `init_dev_scrapers` has no model (`None`).
   - `save_document` uploads via `documents::Service::upload`; `DuplicateDocument` is skipped.
     `helpers.save_pdf` records each URL it saved from in `fyde.session.saved_urls`
     (`helpers.already_saved`/`mark_saved`) and skips it on later runs without downloading,

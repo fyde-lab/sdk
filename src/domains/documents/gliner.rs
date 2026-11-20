@@ -10,6 +10,7 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use async_trait::async_trait;
 #[cfg(test)]
@@ -56,6 +57,11 @@ pub(crate) trait SpanFinder: Send + Sync {
     /// that's already done: a failure is retried on the next call.
     async fn load(&self) -> Result<()>;
 
+    /// Keeps the model in memory, once loaded, until the returned hold is
+    /// dropped: it's otherwise unloaded once unused for a while (see
+    /// [`OnnxGliner::new`]). Doesn't load it.
+    fn hold(&self) -> ModelHold;
+
     /// Every span of `text` matching one of `labels` with a score of at
     /// least `threshold`, best first. Overlapping spans are all kept, and a
     /// span on the boundary between two windows of the text can come twice.
@@ -71,43 +77,106 @@ pub(crate) trait SpanFinder: Send + Sync {
     ) -> Result<Vec<Span>>;
 }
 
+/// Keeps a [`SpanFinder`]'s model in memory until dropped (see
+/// [`SpanFinder::hold`]).
+#[must_use = "the model may be unloaded as soon as its hold is dropped"]
+pub(crate) struct ModelHold(Option<Box<dyn FnOnce() + Send>>);
+
+impl ModelHold {
+    /// A hold running `release` when dropped.
+    pub(crate) fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(release)))
+    }
+}
+
+impl Drop for ModelHold {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            release();
+        }
+    }
+}
+
+impl std::fmt::Debug for ModelHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ModelHold")
+    }
+}
+
 /// The [`SpanFinder`] running GLiNER-X small. Its session is loaded on the
-/// first call that needs it, then kept for the finder's lifetime.
+/// first call that needs it, and unloaded once nothing has used nor held it
+/// for its idle timeout: a call holds it while it runs.
 pub(crate) struct OnnxGliner {
     models: Arc<ModelStore>,
     threads: usize,
-    loaded: tokio::sync::OnceCell<Arc<Loaded>>,
+    idle_timeout: Duration,
+    slot: Arc<Mutex<Slot<Loaded>>>,
+    /// Taken while loading, so concurrent calls load the model once.
+    loading: tokio::sync::Mutex<()>,
+}
+
+/// What [`OnnxGliner`] keeps between calls: its loaded model `T`.
+struct Slot<T> {
+    loaded: Option<Arc<T>>,
+    /// How many [`ModelHold`]s are alive.
+    holds: usize,
+    /// Bumped whenever the last hold is released, so an unload scheduled
+    /// before then knows the model has been used since.
+    released: u64,
+}
+
+impl<T> Default for Slot<T> {
+    fn default() -> Self {
+        Self {
+            loaded: None,
+            holds: 0,
+            released: 0,
+        }
+    }
 }
 
 impl OnnxGliner {
-    pub(crate) fn new(models: Arc<ModelStore>) -> Self {
+    /// A finder fetching its model from `models`, and unloading it once
+    /// nothing has used nor held it for `idle_timeout`.
+    pub(crate) fn new(models: Arc<ModelStore>, idle_timeout: Duration) -> Self {
         let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
 
         Self {
             models,
             threads: (cores / 2).clamp(1, MAX_THREADS),
-            loaded: tokio::sync::OnceCell::new(),
+            idle_timeout,
+            slot: Arc::new(Mutex::new(Slot::default())),
+            loading: tokio::sync::Mutex::new(()),
         }
     }
 
-    async fn loaded(&self) -> Result<Arc<Loaded>> {
-        self.loaded
-            .get_or_try_init(|| async {
-                let model = self
-                    .models
-                    .ensure(&GLINER_X_SMALL)
-                    .await
-                    .context("failed to fetch the GLiNER model")?;
-                let tokenizer = self
-                    .models
-                    .ensure(&GLINER_X_SMALL_TOKENIZER)
-                    .await
-                    .context("failed to fetch the GLiNER model's tokenizer")?;
+    fn slot(&self) -> std::sync::MutexGuard<'_, Slot<Loaded>> {
+        lock(&self.slot)
+    }
 
-                self.open(model, tokenizer).await
-            })
+    async fn loaded(&self) -> Result<Arc<Loaded>> {
+        if let Some(loaded) = self.slot().loaded.clone() {
+            return Ok(loaded);
+        }
+        let _loading = self.loading.lock().await;
+        if let Some(loaded) = self.slot().loaded.clone() {
+            return Ok(loaded);
+        }
+
+        let model = self
+            .models
+            .ensure(&GLINER_X_SMALL)
             .await
-            .cloned()
+            .context("failed to fetch the GLiNER model")?;
+        let tokenizer = self
+            .models
+            .ensure(&GLINER_X_SMALL_TOKENIZER)
+            .await
+            .context("failed to fetch the GLiNER model's tokenizer")?;
+        let loaded = self.open(model, tokenizer).await?;
+        self.slot().loaded = Some(loaded.clone());
+        tracing::debug!("the GLiNER model is loaded");
+        Ok(loaded)
     }
 
     async fn open(&self, model: PathBuf, tokenizer: PathBuf) -> Result<Arc<Loaded>> {
@@ -120,10 +189,62 @@ impl OnnxGliner {
     }
 }
 
+fn lock<T>(slot: &Mutex<Slot<T>>) -> std::sync::MutexGuard<'_, Slot<T>> {
+    slot.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Holds `slot`'s model (see [`SpanFinder::hold`]), released (see
+/// [`release`]) when the returned hold is dropped.
+fn hold<T: Send + Sync + 'static>(slot: &Arc<Mutex<Slot<T>>>, idle_timeout: Duration) -> ModelHold {
+    lock(slot).holds += 1;
+    let slot = slot.clone();
+    ModelHold::new(move || release(&slot, idle_timeout))
+}
+
+/// Releases a hold on `slot`'s model: the last one released schedules it to
+/// be unloaded `idle_timeout` later, unless it's held again before then.
+/// Without a Tokio runtime to wait on, the model just stays loaded.
+fn release<T: Send + Sync + 'static>(slot: &Arc<Mutex<Slot<T>>>, idle_timeout: Duration) {
+    let released = {
+        let mut slot = lock(slot);
+        slot.holds -= 1;
+        if slot.holds > 0 {
+            return;
+        }
+        slot.released += 1;
+        if slot.loaded.is_none() {
+            return;
+        }
+        slot.released
+    };
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+
+    // From now, not from whenever the task first runs.
+    let deadline = tokio::time::Instant::now() + idle_timeout;
+    let slot = Arc::downgrade(slot);
+    runtime.spawn(async move {
+        tokio::time::sleep_until(deadline).await;
+        let Some(slot) = slot.upgrade() else {
+            return;
+        };
+        let mut slot = lock(&slot);
+        if slot.holds == 0 && slot.released == released && slot.loaded.take().is_some() {
+            tracing::debug!("unloaded the GLiNER model, unused for {idle_timeout:?}");
+        }
+    });
+}
+
 #[async_trait]
 impl SpanFinder for OnnxGliner {
     async fn load(&self) -> Result<()> {
+        let _hold = self.hold();
         self.loaded().await.map(|_| ())
+    }
+
+    fn hold(&self) -> ModelHold {
+        hold(&self.slot, self.idle_timeout)
     }
 
     async fn spans(
@@ -137,6 +258,7 @@ impl SpanFinder for OnnxGliner {
         if labels.is_empty() || max_words == 0 || text.trim().is_empty() {
             return Ok(Vec::new());
         }
+        let _hold = self.hold();
         let loaded = self.loaded().await?;
 
         tokio::task::spawn_blocking(move || loaded.spans(&text, &labels, threshold, max_words))
@@ -865,9 +987,86 @@ mod tests {
 
     #[test]
     fn new_runs_on_at_most_four_threads() {
-        let gliner = OnnxGliner::new(Arc::new(ModelStore::new("/models".into())));
+        let gliner = OnnxGliner::new(
+            Arc::new(ModelStore::new("/models".into())),
+            Duration::from_secs(60),
+        );
 
         assert!((1..=MAX_THREADS).contains(&gliner.threads));
+    }
+
+    const IDLE: Duration = Duration::from_secs(60);
+
+    /// A slot holding a loaded stand-in model.
+    fn loaded_slot() -> Arc<Mutex<Slot<()>>> {
+        Arc::new(Mutex::new(Slot {
+            loaded: Some(Arc::new(())),
+            ..Slot::default()
+        }))
+    }
+
+    /// Lets every task woken by now run.
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_model_is_unloaded_once_released_for_the_idle_timeout() {
+        let slot = loaded_slot();
+
+        drop(hold(&slot, IDLE));
+        tokio::time::advance(IDLE - Duration::from_millis(1)).await;
+        settle().await;
+        assert!(lock(&slot).loaded.is_some());
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        settle().await;
+        assert!(lock(&slot).loaded.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_model_is_never_unloaded() {
+        let slot = loaded_slot();
+        let run = hold(&slot, IDLE);
+
+        // Calls come and go while the run holds it.
+        drop(hold(&slot, IDLE));
+        tokio::time::advance(IDLE * 10).await;
+        settle().await;
+        assert!(lock(&slot).loaded.is_some());
+
+        drop(run);
+        tokio::time::advance(IDLE).await;
+        settle().await;
+        assert!(lock(&slot).loaded.is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn using_a_model_again_restarts_its_idle_timeout() {
+        let slot = loaded_slot();
+
+        drop(hold(&slot, IDLE));
+        tokio::time::advance(IDLE / 2).await;
+        drop(hold(&slot, IDLE));
+        tokio::time::advance(IDLE / 2).await;
+        settle().await;
+        assert!(lock(&slot).loaded.is_some());
+
+        tokio::time::advance(IDLE / 2).await;
+        settle().await;
+        assert!(lock(&slot).loaded.is_none());
+    }
+
+    #[test]
+    fn a_model_released_outside_a_runtime_stays_loaded() {
+        let slot = loaded_slot();
+
+        drop(hold(&slot, Duration::ZERO));
+
+        assert!(lock(&slot).loaded.is_some());
+        assert_eq!(lock(&slot).holds, 0);
     }
 
     /// A store whose models directory is a file: `ensure` can't create it,
@@ -881,12 +1080,12 @@ mod tests {
     #[tokio::test]
     async fn spans_fails_and_can_be_retried_when_the_model_cant_be_fetched() {
         let (_file, models) = unusable_models();
-        let gliner = OnnxGliner::new(models);
+        let gliner = OnnxGliner::new(models, Duration::from_secs(60));
         let spans = || gliner.spans("Total : 12 €".into(), vec!["total".into()], 0.5, 100);
 
         let err = spans().await.unwrap_err();
         assert!(err.has_context());
-        assert!(gliner.loaded.get().is_none());
+        assert!(gliner.slot().loaded.is_none());
 
         let err = spans().await.unwrap_err();
         assert!(err.has_context());
@@ -895,11 +1094,12 @@ mod tests {
     #[tokio::test]
     async fn load_fails_and_can_be_retried_when_the_model_cant_be_fetched() {
         let (_file, models) = unusable_models();
-        let gliner = OnnxGliner::new(models);
+        let gliner = OnnxGliner::new(models, Duration::from_secs(60));
 
         let err = gliner.load().await.unwrap_err();
         assert!(err.has_context());
-        assert!(gliner.loaded.get().is_none());
+        assert!(gliner.slot().loaded.is_none());
+        assert_eq!(gliner.slot().holds, 0);
 
         let err = gliner.load().await.unwrap_err();
         assert!(err.has_context());
@@ -908,7 +1108,7 @@ mod tests {
     #[tokio::test]
     async fn spans_never_fetches_the_model_with_nothing_to_look_for() {
         let (_file, models) = unusable_models();
-        let gliner = OnnxGliner::new(models);
+        let gliner = OnnxGliner::new(models, Duration::from_secs(60));
         let label = || vec!["total".to_string()];
 
         for (text, labels, max_words) in [
@@ -949,7 +1149,7 @@ mod tests {
     #[ignore = "downloads a 173 MB model from Hugging Face"]
     async fn gliner_x_small_finds_the_total_of_an_invoice() {
         let (_temp, models) = real_models();
-        let gliner = OnnxGliner::new(models);
+        let gliner = OnnxGliner::new(models, Duration::from_secs(60));
 
         let spans = gliner
             .spans(
@@ -986,7 +1186,7 @@ mod tests {
     #[ignore = "downloads a 173 MB model from Hugging Face"]
     async fn gliner_x_small_finds_the_total_of_an_invoice_past_the_first_window() {
         let (_temp, models) = real_models();
-        let gliner = OnnxGliner::new(models);
+        let gliner = OnnxGliner::new(models, Duration::from_secs(60));
         let preamble = "Conditions générales : les marchandises voyagent aux risques du \
             destinataire et restent la propriété du vendeur jusqu'au paiement complet. "
             .repeat(30);

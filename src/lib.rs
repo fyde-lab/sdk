@@ -59,6 +59,11 @@ pub enum Storage {
     Memory,
 }
 
+/// How long [`ClientConfig::attribute_model_idle_timeout`] keeps the model
+/// reading documents' attributes loaded unused, when not set.
+pub const DEFAULT_ATTRIBUTE_MODEL_IDLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
 /// Configuration for [`Client::init`].
 pub struct ClientConfig {
     /// The `http://` or `https://` base URL of the fyde server to connect
@@ -75,13 +80,22 @@ pub struct ClientConfig {
     /// missing. `Client::init` starts downloading every model there and
     /// loading it in memory, in the background and in parallel (stopped
     /// when the `Client` is dropped; a failure is only logged, and retried
-    /// when the model is first needed). Never inside
+    /// when the model is first needed), but the one reading documents'
+    /// attributes (see [`Self::attribute_model_idle_timeout`]). Never inside
     /// the client's own directory (`<dir>/<client_name>` of a
     /// [`Storage::Disk`]): logout deletes every file there, and models
     /// aren't user data, so `init` fails with
     /// [`ErrorCode::InvalidModelsDirectory`] there. Fit for a cache
     /// directory, and shareable by several clients.
     pub models_dir: std::path::PathBuf,
+    /// How long the on-device model reading documents' attributes (GLiNER,
+    /// about 190 MB in memory) stays loaded unused before it's unloaded:
+    /// with no scraper run going on and no upload reading attributes. Each
+    /// scraper run loads it while setting up (see
+    /// [`ProgressStep::SettingUp`]) and keeps it until it ends, and an
+    /// upload loads it if it isn't. `None` for
+    /// [`DEFAULT_ATTRIBUTE_MODEL_IDLE_TIMEOUT`].
+    pub attribute_model_idle_timeout: Option<std::time::Duration>,
     /// The verbosity of the SDK's internal logs.
     pub log_level: LogLevel,
     /// Called once for every log line emitted by the SDK, in addition to the
@@ -163,11 +177,17 @@ impl Client {
         let models = Arc::new(tools::models::ModelStore::new(config.models_dir));
         let embedder = domains::documents::init_embedder(models.clone());
         let ocr = domains::documents::init_ocr(models.clone());
+        // Not preloaded: loaded when a scraper run sets up, or by the first
+        // upload needing it, then unloaded once unused for a while.
+        let span_finder = domains::documents::init_span_finder(
+            models,
+            config
+                .attribute_model_idle_timeout
+                .unwrap_or(DEFAULT_ATTRIBUTE_MODEL_IDLE_TIMEOUT),
+        );
         // Downloaded and loaded as soon as the app starts, so their first
         // use (an upload or sync for the embedding model, a scanned upload
-        // for OCR) doesn't wait for them. Not GLiNER, which only scraper
-        // runs need: each one loads it as its script starts.
-        let span_finder = domains::documents::init_span_finder(models);
+        // for OCR) doesn't wait for them.
         let model_loading = domains::documents::start_model_loading(embedder.clone(), ocr.clone());
         // Shared by uploads (which fill it), the sync job (which empties
         // it) and logout (which clears it).
@@ -216,7 +236,7 @@ impl Client {
             embedding_cache.clone(),
             folders.clone(),
             ocr,
-            span_finder,
+            span_finder.clone(),
             config.on_document_change,
         );
         let users = domains::users::init(
@@ -234,6 +254,7 @@ impl Client {
         let scrapers = domains::scrapers::init(
             domains::scrapers::StorageConfig::Sqlite(sqlite.pool().clone()),
             documents.clone(),
+            Some(span_finder),
             config.on_scraper_progress,
             config.on_scraper_question,
         );
@@ -670,6 +691,8 @@ pub async fn init_dev_scrapers(
     Ok(domains::scrapers::init(
         domains::scrapers::StorageConfig::File(storage_dir),
         documents,
+        // The dev documents service reads no attributes.
+        None,
         on_progress,
         on_question,
     ))
@@ -693,6 +716,7 @@ mod tests {
             client_name: "test".to_string(),
             storage: Storage::Memory,
             models_dir: std::env::temp_dir().join("fyde-sdk-test-models"),
+            attribute_model_idle_timeout: None,
             log_level: LogLevel::Off,
             on_log: None,
             on_document_change: None,
@@ -828,6 +852,7 @@ mod tests {
             client_name: "desktop".to_string(),
             storage: Storage::Disk(data_dir.clone()),
             models_dir: models_dir.path().to_path_buf(),
+            attribute_model_idle_timeout: None,
             log_level: LogLevel::Off,
             on_log: None,
             on_document_change: None,
@@ -910,6 +935,7 @@ mod tests {
             client_name: "desktop".to_string(),
             storage: Storage::Disk(root.path().to_path_buf()),
             models_dir: root.path().join("desktop").join("models"),
+            attribute_model_idle_timeout: None,
             log_level: LogLevel::Off,
             on_log: None,
             on_document_change: None,

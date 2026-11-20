@@ -101,8 +101,8 @@ pub trait Service: Send + Sync {
     /// [`crate::ErrorCode::UnsupportedDocumentExtension`].
     ///
     /// Its attributes are read from its text by GLiNER (downloaded and
-    /// loaded first if [`Self::prepare_attribute_extraction`] hasn't
-    /// already), depending on its type: an invoice's issuer, reference,
+    /// loaded first if it isn't yet: a scraper run loads it while setting
+    /// up), depending on its type: an invoice's issuer, reference,
     /// date and total, a payslip's employer, period, gross and net pay, and
     /// so on (an untyped document's issuer, date and amount). At most one
     /// value each, and only those valid against the account's attribute
@@ -110,13 +110,6 @@ pub trait Service: Send + Sync {
     /// fails, the document is published without attributes, and uploads
     /// don't try again for five minutes.
     async fn upload(&self, request: UploadRequest) -> Result<Uuid>;
-
-    /// Fetches (if needed) and loads the model [`Self::upload`] extracts
-    /// attributes with, unless that's already done, so uploads don't wait
-    /// for it. A scraper run calls it as its script starts, alongside it;
-    /// otherwise the first upload loads it. A failure is retried by the
-    /// next call, or the next upload.
-    async fn prepare_attribute_extraction(&self) -> Result<()>;
 
     /// Fetches a document previously cached in local storage by
     /// [`Self::start_sync`], content included, or `None` if it doesn't
@@ -349,21 +342,32 @@ pub(crate) fn init_ocr(models: Arc<ModelStore>) -> Arc<dyn transcript::Ocr> {
     Arc::new(transcript::OnnxOcr::new(models))
 }
 
-/// Initializes the GLiNER model the documents [`Service`] extracts uploads'
-/// attributes with, from the models `models` holds: fetched and loaded only
-/// by [`Service::prepare_attribute_extraction`] (a scraper run starting) or
-/// the first upload, never at startup.
-pub(crate) fn init_span_finder(models: Arc<ModelStore>) -> Arc<dyn gliner::SpanFinder> {
-    Arc::new(gliner::OnnxGliner::new(models))
+/// Initializes GLiNER, which the documents [`Service`] reads uploads'
+/// attributes with, from the models `models` holds: fetched and loaded on
+/// its first use (or [`AttributeModel::load`], as a scraper run's setup
+/// does), never at startup, and unloaded once nothing has used nor held it
+/// for `idle_timeout`.
+pub(crate) fn init_span_finder(
+    models: Arc<ModelStore>,
+    idle_timeout: std::time::Duration,
+) -> Arc<dyn AttributeModel> {
+    Arc::new(gliner::OnnxGliner::new(models, idle_timeout))
 }
+
+#[cfg(test)]
+pub(crate) use gliner::{MockSpanFinder as MockAttributeModel, Span};
+/// The model the documents [`Service`] reads uploads' attributes with (see
+/// [`init_span_finder`]), which a scraper run loads, and holds, while it
+/// sets up.
+pub(crate) use gliner::{ModelHold, SpanFinder as AttributeModel};
 
 pub(crate) use service::ModelLoading;
 
 /// Starts downloading (if needed) and loading in memory, in the background,
 /// the models `embedder` (see [`init_embedder`]) and `ocr` (see
 /// [`init_ocr`]) run, each on its own task so they're fetched in parallel.
-/// Not GLiNER's: only a scraper run loads it (see
-/// [`Service::prepare_attribute_extraction`]). Dropping the returned
+/// Not GLiNER: it's loaded when a scraper run sets up, or by the first
+/// upload needing it (see [`init_span_finder`]). Dropping the returned
 /// [`ModelLoading`] stops whatever is still under way.
 pub(crate) fn start_model_loading(
     embedder: Arc<dyn embedder::Embedder>,
@@ -409,7 +413,7 @@ pub(crate) fn init(
     cache: Arc<dyn EmbeddingCache>,
     folders: Arc<dyn crate::domains::folders::Service>,
     ocr: Arc<dyn transcript::Ocr>,
-    span_finder: Arc<dyn gliner::SpanFinder>,
+    span_finder: Arc<dyn AttributeModel>,
     on_document_change: Option<Arc<dyn Fn(ChangelogEvent) + Send + Sync>>,
 ) -> Arc<dyn Service> {
     let storage = storage_sqlite::SqliteStorage::new(pool);

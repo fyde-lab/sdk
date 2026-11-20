@@ -190,13 +190,6 @@ impl Extractor {
 
 #[async_trait]
 impl Service for Extractor {
-    async fn load(&self) -> Result<()> {
-        self.spans
-            .load()
-            .await
-            .context("failed to load the attribute extraction model")
-    }
-
     async fn extract(
         &self,
         transcript: &str,
@@ -633,21 +626,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn load_loads_the_model_failing_with_its_error() {
-        let mut spans = MockSpanFinder::new();
-        spans
-            .expect_load()
-            .times(1)
-            .returning(|| Err(ErrorKind::ModelDownloadStatus(503).into()));
-        let extractor = Extractor::new(Arc::new(spans));
-
-        let err = extractor.load().await.unwrap_err();
-
-        assert_eq!(err.code(), crate::ErrorCode::ModelDownloadFailed);
-        assert!(err.has_context());
-    }
-
     #[tokio::test(start_paused = true)]
     async fn extract_fails_then_finds_nothing_for_a_while_after_the_model_fails() {
         let mut spans = MockSpanFinder::new();
@@ -895,7 +873,10 @@ mod tests {
     #[ignore = "downloads a 173 MB model from Hugging Face"]
     async fn gliner_x_small_extracts_the_attributes_of_a_payslip() {
         let (_temp, models) = real_models();
-        let extractor = Extractor::new(Arc::new(OnnxGliner::new(models)));
+        let extractor = Extractor::new(Arc::new(OnnxGliner::new(
+            models,
+            std::time::Duration::from_secs(60),
+        )));
 
         let found = extractor
             .extract(PAYSLIP_TEXT, Some(DocumentType::Payslip))
