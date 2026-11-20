@@ -1,3 +1,21 @@
+//! Accounts: OPAQUE (RFC 9807) registration and login, sessions, password
+//! changes and recovery keys. The password never leaves the SDK.
+//!
+//! The master key is wrapped under a key HKDF'd from the OPAQUE export key, so
+//! a wrong password usually fails locally (`InvalidCredentials`). The server's
+//! pending exchange (`login_id`, single-use) is then still closed with a decoy
+//! finalization that can't verify (`abandon_login`), as `change_password`
+//! always does after checking the old password, so none is left behind. For
+//! the same reason a `SessionLimitReached` login is re-run whole with
+//! `replace_session_id`. One account per local database (`AlreadyLoggedIn`).
+//!
+//! `create`, `change_password` and `recover_account` refuse a `Weak` new
+//! password before any other check or server call.
+//!
+//! A recovery key is a 24-word BIP39 mnemonic, never stored. Its entropy
+//! derives an auth key (the server keeps a digest) and a wrapping key for the
+//! master key. An account has at most one.
+
 mod crypto;
 mod grpc_client;
 mod service;
