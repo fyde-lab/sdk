@@ -7,7 +7,7 @@
 }:
 
 let
-  # wreq/wreq-util (`domains/scrapers/host/http.rs`) require rustc >=1.98.
+  # Any rustc >= 1.95 (oar-ocr's MSRV) builds the crate.
   rustToolchain = pkgs.rust-bin.stable."1.98.1".default.override {
     extensions = [ "rust-src" "clippy" "rustfmt" "rust-analyzer" ];
   };
@@ -20,12 +20,10 @@ pkgs.mkShell {
     # required by build.rs to compile the BSR's (or ../server/protos') *.proto via tonic-prost-build
     protobuf
 
-    # required to build wreq's vendored, patched BoringSSL (btls-sys), used by the
-    # scrapers domain's fyde.http (see src/domains/scrapers/host/http.rs) for a real
-    # Chrome TLS/HTTP2 fingerprint.
+    # aws-lc-sys, the crypto behind reqwest's rustls TLS (fyde.http and model
+    # downloads), builds C code with cmake/clang on targets without prebuilt
+    # bindings.
     cmake
-    perl
-    go
     clang
     # Sets up LIBCLANG_PATH/BINDGEN_EXTRA_CLANG_ARGS correctly for bindgen.
     rustPlatform.bindgenHook

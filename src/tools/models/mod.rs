@@ -128,7 +128,7 @@ pub(crate) struct ModelStore {
     dir: PathBuf,
     /// Built on the first download, so a store that never downloads (most
     /// `Client`s, most of the time) never sets up TLS.
-    http: tokio::sync::OnceCell<wreq::Client>,
+    http: tokio::sync::OnceCell<reqwest::Client>,
     /// One lock per model file, held across checking and downloading it so
     /// concurrent [`ModelStore::ensure`] calls download it once. Holds
     /// whether this store already checked the file's SHA-256.
@@ -253,12 +253,12 @@ impl ModelStore {
             .clone()
     }
 
-    async fn http(&self) -> Result<&wreq::Client> {
+    async fn http(&self) -> Result<&reqwest::Client> {
         self.http
             .get_or_try_init(|| async {
-                wreq::Client::builder()
+                reqwest::Client::builder()
                     // Hugging Face redirects every download to its CDN.
-                    .redirect(wreq::redirect::Policy::default())
+                    .redirect(reqwest::redirect::Policy::default())
                     .connect_timeout(CONNECT_TIMEOUT)
                     .read_timeout(READ_TIMEOUT)
                     .build()

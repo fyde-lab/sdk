@@ -17,8 +17,8 @@ FYDE_PROTO_DIR=../server/protos cargo build  # build without buf / network acces
 RUSTFLAGS="--cfg tokio_unstable" cargo build --features tokio-console  # serve tasks to tokio-console (127.0.0.1:6669)
 ```
 
-- Dev shell: `shell.nix` via direnv. Rust **1.98+** (`wreq`'s MSRV); `protobuf`; `cmake`/`perl`/
-  `go`/`clang` for `wreq`'s vendored BoringSSL; `webkitgtk_4_1`/`gtk3` for `wry`.
+- Dev shell: `shell.nix` via direnv. Rust **1.95+** (`oar-ocr`'s MSRV); `protobuf`; `cmake`/`clang`
+  for `reqwest`'s TLS (`aws-lc-sys`); `webkitgtk_4_1`/`gtk3` for `wry`.
 - `build.rs` runs `buf export buf.build/fyde-lab/api` (needs `buf` on `PATH` + network) unless
   `FYDE_PROTO_DIR` is set.
 - On static-ONNX-Runtime targets (see "ONNX Runtime" below), `ort-sys` downloads pyke's prebuilt
@@ -75,7 +75,7 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
 - Scraper debug reports never record request headers, request/download bodies, form values or
   `fyde.input.ask` answers; response bodies only with `debug_http_dump`. Every URL a report or
   log line carries goes through `reports::redact_url` (no query, fragment or userinfo), and
-  `wreq` errors are recorded `without_uri()`.
+  `reqwest` errors are recorded `without_url()`.
 - On-device model files (`tools::models`) live in `ClientConfig::models_dir`, never the client
   directory, and only ever land there through `ModelStore::ensure` (size + SHA-256 checked, then
   renamed into place). Pin a new model to a fixed revision, never a branch. `Client::init`
@@ -455,6 +455,13 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     while it waits for the embedding model or publishes: one given up on while publishing
     may still be published). The run ends with `ScraperRunStopped` unless its script
     finished first.
+  - `fyde.http` (`host/http.rs`) is `reqwest` with its own rustls TLS (no custom TLS config), a
+    `cookie_store` jar (`host/cookie_jar.rs`, which can list each cookie's scope for saving), and
+    redirects followed by a custom policy that checks each hop against `allowed_domains` and
+    records it. Under `browser_emulation` (a manifest's `wreq_emulation`), requests carry a desktop
+    Firefox's headers (`host/browser_headers.rs`: User-Agent, Accept-Language, `Sec-Fetch-*`...,
+    the script's own headers winning) and HTTP/2 windows; the TLS fingerprint stays rustls'.
+    Firefox rather than Chrome: no client hints or GREASE to fake. Bump its version now and then.
   - `allowed_domains` fails closed: an empty list allows no host; an IP literal only matches
     exactly.
   - `browser/` — `wry`/`tao` webviews on one process-wide thread, started lazily (GTK panics if
@@ -473,7 +480,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     run is `ScraperRunStopped`; anything else is `ScriptFailed`.
   - `run_installed` runs an installation under its installation id as the run's `name`, so each
     account has its own session, cookies and reports, and runs in parallel with the others
-    (`wreq_emulation`/`follow_redirects` default on).
+    (`browser_emulation`/`follow_redirects` default on).
   - `crate::init_dev_scrapers` builds a scrapers service without a `Client` (file storage +
     `DevDocumentsClient`); `../scripts` is its caller.
 
@@ -485,7 +492,7 @@ SHA-256); today `MULTILINGUAL_E5_SMALL` (MIT) and `GLINER_X_SMALL` (Apache-2.0,
 `knowledgator/gliner-x-small`), both int8 ONNX, each with its `_TOKENIZER`, and
 `PP_OCRV5_MOBILE_DET` + `LATIN_PP_OCRV5_MOBILE_REC` (Apache-2.0, `PaddlePaddle`'s ONNX exports). `ModelStore::ensure` returns `<models_dir>/<sha256[..16]>-<name>`. A file
 already there is SHA-256-checked the first time the store sees it (replaced on mismatch), then
-trusted by size. Otherwise it's downloaded over `wreq` (client built on the first download;
+trusted by size. Otherwise it's downloaded over `reqwest` (client built on the first download;
 redirects followed) into a `.<file>.<uuid>.part` beside it, removed on any failure or
 cancellation, then renamed. A per-file lock makes concurrent `ensure`s download once. Before
 downloading, `ensure` removes the model's other revisions (`<other hash>-<name>`) and its stale

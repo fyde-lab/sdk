@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// One cookie captured from a scraper run, recorded against the origin
 /// (`scheme://host`) it was seen on — enough to replay into a fresh cookie
-/// jar on a later run (via `wreq::cookie::Jar::add`), reproducing the same
+/// jar on a later run (via `host::CookieJar::add`), reproducing the same
 /// host-only-or-`Domain` scope it originally had. See
 /// `host::http::{build_jar, export_cookies}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

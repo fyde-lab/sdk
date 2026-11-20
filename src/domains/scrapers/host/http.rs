@@ -4,24 +4,28 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
 use mlua::{Lua, LuaSerdeExt, Result as LuaResult, Table, Value as LuaValue};
+use reqwest::Client;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
-use wreq::Client;
-use wreq::cookie::Jar;
-use wreq::header::{HeaderMap, HeaderName, HeaderValue};
-use wreq_util::Profile;
 
 use super::super::cookies::Cookie;
 use super::super::models::RunOptions;
 use super::super::reports::{Recorder, redact_url};
 use super::super::stop::StopSignal;
+use super::browser_headers::{RequestKind, browser_headers};
+use super::cookie_jar::CookieJar;
+
+/// How many redirects one request follows before failing, as `reqwest`'s
+/// default policy.
+const MAX_REDIRECTS: usize = 10;
 
 /// Builds a fresh cookie jar pre-populated from `cookies` (as previously
 /// saved by `cookies::Service` for this scraper), so this run's `fyde.http`
 /// client can pick up an already-authenticated session instead of being
 /// forced to log in again.
-pub(crate) fn build_jar(cookies: &[Cookie]) -> Arc<Jar> {
-    let jar = Jar::default();
+pub(crate) fn build_jar(cookies: &[Cookie]) -> Arc<CookieJar> {
+    let jar = CookieJar::default();
     for cookie in cookies {
         jar.add(cookie.set_cookie.as_str(), cookie.origin.as_str());
     }
@@ -30,18 +34,19 @@ pub(crate) fn build_jar(cookies: &[Cookie]) -> Arc<Jar> {
 
 /// Exports every unexpired cookie `jar` holds for each URL in
 /// `visited_urls` (see `track_url` below), ready to be persisted via
-/// `cookies::Service::save`. `Jar::get_all` can't be used here: by design it
-/// drops the `Domain` of host-only cookies entirely (see its docs), which
-/// would make them unreplayable against the right host on the next run.
-/// Querying `matches()` per URL `fyde.http` actually visited instead means
-/// a cookie's host is always known from the origin it was found under, even
-/// when the jar itself doesn't carry it on the cookie. Querying the visited
+/// `cookies::Service::save`. Querying `matches()` per URL `fyde.http`
+/// actually visited means a host-only cookie's host is always known from the
+/// origin it was found under, though the cookie itself carries no `Domain`.
+/// Querying the visited
 /// URLs' paths, not just their origins' `/`, is what keeps a cookie scoped to
 /// a narrower `Path` (e.g. Keycloak's `Path=/realms/<realm>/` SSO cookies):
 /// `matches()` path-matches like a browser, so it never returns one for `/`.
 /// A cookie matched under several URLs of the same origin is exported once.
 /// Ported from `demo-rust-fyde`'s `host/session.rs::export_cookies`.
-pub(crate) fn export_cookies(jar: &Jar, visited_urls: &Mutex<HashSet<String>>) -> Vec<Cookie> {
+pub(crate) fn export_cookies(
+    jar: &CookieJar,
+    visited_urls: &Mutex<HashSet<String>>,
+) -> Vec<Cookie> {
     let mut urls: Vec<String> = match visited_urls.lock() {
         Ok(urls) => urls.iter().cloned().collect(),
         Err(poisoned) => poisoned.into_inner().iter().cloned().collect(),
@@ -56,18 +61,19 @@ pub(crate) fn export_cookies(jar: &Jar, visited_urls: &Mutex<HashSet<String>>) -
             continue;
         };
         for cookie in jar.matches(url.as_str()) {
-            let mut set_cookie = format!("{}={}", cookie.name(), cookie.value());
+            let mut set_cookie = format!("{}={}", cookie.name, cookie.value);
             // Only set when the original cookie carried an explicit `Domain`
             // attribute (i.e. it isn't host-only) — reproduced here so
-            // `Jar::add` restores the same scope on load instead of
+            // `CookieJar::add` restores the same scope on load instead of
             // narrowing a multi-subdomain cookie down to just this origin.
-            if let Some(domain) = cookie.domain() {
+            if let Some(domain) = &cookie.domain {
                 set_cookie.push_str(&format!("; Domain={domain}"));
             }
-            if let Some(path) = cookie.path() {
-                set_cookie.push_str(&format!("; Path={path}"));
-            }
-            if cookie.secure() {
+            // Always written, even when it was the default path the setting
+            // URL gave it: replayed against the bare origin, a cookie without
+            // one would get `/` instead.
+            set_cookie.push_str(&format!("; Path={}", cookie.path));
+            if cookie.secure {
                 set_cookie.push_str("; Secure");
             }
             if seen.insert((origin.clone(), set_cookie.clone())) {
@@ -92,17 +98,50 @@ fn track_url(urls: &Mutex<HashSet<String>>, url: &str) {
     }
 }
 
-/// Tracks every URL `resp`'s redirect chain went through, and the one it
-/// landed on: a hop can set cookies (an OIDC bounce through an identity
-/// provider the script never requests itself), which would otherwise be
-/// lost with the run.
-fn track_redirects(urls: &Mutex<HashSet<String>>, resp: &wreq::Response) {
-    if let Some(history) = resp.extensions().get::<wreq::redirect::History>() {
-        for hop in history {
-            track_url(urls, &hop.uri.to_string());
+/// A `reqwest` error worded with its causes: its own message alone says
+/// only "error following redirect" or "error sending request", while the
+/// reason (a redirect outside `allowed_domains`, a refused connection...) is
+/// in its sources. `error::lua_code` finds the `reqwest::Error` through
+/// [`std::error::Error::source`].
+#[derive(Debug)]
+struct HttpError(reqwest::Error);
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = std::error::Error::source(&self.0);
+        while let Some(err) = source {
+            write!(f, ": {err}")?;
+            source = err.source();
         }
+        Ok(())
     }
-    track_url(urls, &resp.uri().to_string());
+}
+
+impl std::error::Error for HttpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// One redirect a request followed, as `build_client`'s redirect policy
+/// saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RedirectHop {
+    status: u16,
+    from: String,
+    to: String,
+}
+
+/// Tracks every URL a request's redirect chain (`hops`) went through, and
+/// the one it landed on (`final_url`): a hop can set cookies (an OIDC bounce
+/// through an identity provider the script never requests itself), which
+/// would otherwise be lost with the run.
+fn track_redirects(urls: &Mutex<HashSet<String>>, hops: &[RedirectHop], final_url: &str) {
+    for hop in hops {
+        track_url(urls, &hop.to);
+    }
+    track_url(urls, final_url);
 }
 
 fn origin_of(url: &str) -> Option<String> {
@@ -149,17 +188,17 @@ fn response_to_table(
     lua: &Lua,
     runtime: &Handle,
     stop: &StopSignal,
-    resp: wreq::Response,
+    resp: reqwest::Response,
 ) -> LuaResult<Table> {
     let status = resp.status().as_u16();
     // The final URL after following any redirects - scripts need this to
     // know where they actually landed (e.g. to use as a Referer on a later
     // request, mimicking a real browser submitting a form from the page it
     // was just redirected to).
-    let url = resp.uri().to_string();
+    let url = resp.url().to_string();
     let content_type = resp
         .headers()
-        .get(wreq::header::CONTENT_TYPE)
+        .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
@@ -195,44 +234,39 @@ fn ensure_domain_allowed_or_record(
     Ok(())
 }
 
-/// Records one `http_redirect` entry per hop in `resp`'s redirect chain —
-/// `wreq` stashes it as a [`wreq::redirect::History`] response extension
-/// whenever its (non-`none`) [`wreq::redirect::Policy`] actually follows a
-/// redirect (see `table`'s client builder). Each entry is independent of the
+/// Records one `http_redirect` entry per hop a request followed (`hops`, as
+/// `build_client`'s redirect policy saw them). Each entry is independent of the
 /// final `http_request` entry `get`/`post_form`/`post_json`/`download` also
 /// record, so a report shows every intermediate hop (e.g. an OAuth/OIDC
 /// bounce) even though the script itself only ever sees the start URL and
 /// the final one.
-fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
-    let Some(history) = resp.extensions().get::<wreq::redirect::History>() else {
-        return;
-    };
-    for hop in history {
+fn record_redirects(recorder: &Recorder, method: &str, hops: &[RedirectHop]) {
+    for hop in hops {
         recorder.record(
             "http_redirect",
             json!({
                 "method": method,
-                "status": hop.status.as_u16(),
-                "from": redact_url(&hop.previous.to_string()),
-                "to": redact_url(&hop.uri.to_string()),
+                "status": hop.status,
+                "from": redact_url(&hop.from),
+                "to": redact_url(&hop.to),
             }),
         );
     }
 }
 
 /// `fyde.http.get/post_form/post_json/download`, ported from
-/// `demo-rust-fyde`'s own `host/http.rs` (same client configuration, cookie
-/// jar, and Chrome TLS/HTTP2 fingerprint via `wreq`/`wreq_util`), plus
+/// `demo-rust-fyde`'s own `host/http.rs` (same cookie jar and redirect
+/// handling, on `reqwest`), plus
 /// `post_json` (not present in `demo-rust-fyde`): some sites' login/session
 /// APIs take a JSON body instead of a form-encoded one (confirmed against a
 /// real login HAR capture for `caf/script.lua`), which `post_form`'s
 /// hardcoded `.form(&form_map)` can't send — `post_json` takes any Lua
 /// value (typically a table), converts it to `serde_json::Value` via
-/// `LuaSerdeExt`, and sends it with `wreq`'s `.json(...)`, which also sets
+/// `LuaSerdeExt`, and sends it with `reqwest`'s `.json(...)`, which also sets
 /// `Content-Type: application/json` unless `headers` overrides it. `runtime`
 /// is a handle onto the SDK's ambient tokio runtime — captured by
 /// `service.rs` before the Lua VM moves onto its own blocking thread — used
-/// to drive `wreq`'s async calls from these synchronous Lua callbacks,
+/// to drive `reqwest`'s async calls from these synchronous Lua callbacks,
 /// instead of demo-rust-fyde's private, per-run `Runtime`.
 ///
 /// Each call writes an `http_request` (or `error`) entry to `recorder` —
@@ -244,19 +278,20 @@ fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
 /// for `get`/`post_form`/`post_json` (never the request side) — enable it
 /// only for a trusted, local debugging run.
 ///
-/// `options.wreq_emulation` controls whether the client applies `wreq_util`'s
-/// Chrome TLS/HTTP2 fingerprint emulation (`Profile::Chrome131`) — some
-/// sites' WAFs block `wreq`'s TLS fingerprint outright regardless of
-/// whether emulation is on, so a scraper can opt out per its
+/// `options.browser_emulation` controls whether requests carry a desktop
+/// Firefox's headers (`browser_headers`: its `User-Agent`, `Accept`,
+/// `Accept-Language`, `Sec-Fetch-*`...) and its HTTP/2 flow-control windows,
+/// rather than `reqwest`'s bare defaults (no `User-Agent` at all). The TLS
+/// fingerprint stays rustls' either way. A scraper can opt out per its
 /// `scrapers/<name>/manifest.json`'s `wreq_emulation` field (in the
-/// `scripts` repo) rather than carrying a global toggle.
+/// `scripts` repo, named after the client this replaced) rather than
+/// carrying a global toggle.
 ///
-/// `options.follow_redirects` controls whether the client follows HTTP redirects at
-/// all. Unlike `reqwest`, `wreq`'s builder defaults to not following
-/// redirects (`redirect::Policy::none()`); scripts generally rely on a
-/// real-browser-like client that follows them (e.g. to pick up cookies set
-/// along an OAuth/OIDC redirect chain before a login POST), so this matches
-/// `reqwest`'s own default (`redirect::Policy::default()`) when `true`. A
+/// `options.follow_redirects` controls whether the client follows HTTP
+/// redirects at all. Scripts generally rely on a real-browser-like client
+/// that follows them (e.g. to pick up cookies set along an OAuth/OIDC
+/// redirect chain before a login POST), up to [`MAX_REDIRECTS`] as
+/// `reqwest`'s default policy when `true`. A
 /// scraper can opt out per its `scrapers/<name>/manifest.json`'s
 /// `follow_redirects` field when it needs to inspect a redirect response
 /// itself (e.g. reading a `Location` header) rather than carrying a global
@@ -270,14 +305,13 @@ fn record_redirects(recorder: &Recorder, method: &str, resp: &wreq::Response) {
 /// script unless it's wrapped in `pcall`. It also gates every hop of a
 /// redirect chain, not just the initial URL: when `follow_redirects` is on,
 /// the client's redirect policy itself checks each `Location` target
-/// against `allowed_domains` before following it (delegating to
-/// `redirect::Policy::default()`'s own loop/max-hop handling once a hop
-/// passes that check) — otherwise a page on an allowed domain could redirect
-/// a request straight to a disallowed one and `wreq` would follow it
-/// automatically, bypassing the check above entirely.
+/// against `allowed_domains` before following it — otherwise a page on an
+/// allowed domain could redirect a request straight to a disallowed one and
+/// `reqwest` would follow it automatically, bypassing the check above
+/// entirely.
 pub(super) fn table(
     lua: &Lua,
-    jar: Arc<Jar>,
+    jar: Arc<CookieJar>,
     visited_urls: Arc<Mutex<HashSet<String>>>,
     recorder: Arc<Recorder>,
     runtime: Handle,
@@ -285,9 +319,17 @@ pub(super) fn table(
     options: &RunOptions,
 ) -> LuaResult<Table> {
     let allowed_domains = Arc::new(options.allowed_domains.clone());
+    let redirects = Arc::new(Mutex::new(Vec::new()));
     let host = Arc::new(HttpHost {
-        client: build_client(options, jar.clone(), allowed_domains.clone())?,
+        client: build_client(
+            options,
+            jar.clone(),
+            allowed_domains.clone(),
+            redirects.clone(),
+        )?,
         jar,
+        redirects,
+        browser_emulation: options.browser_emulation,
         visited_urls,
         recorder,
         runtime,
@@ -303,7 +345,8 @@ pub(super) fn table(
         "get",
         lua.create_function(move |lua, (url, headers): (String, Option<Table>)| {
             get.admit("http.get", &url)?;
-            let request = get.client.get(&url).headers(to_header_map(headers)?);
+            let headers = get.headers(RequestKind::Navigation, &url, headers)?;
+            let request = get.client.get(&url).headers(headers);
             get.send_text(lua, "http.get", "GET", &url, request, None)
         })?,
     )?;
@@ -316,11 +359,8 @@ pub(super) fn table(
                 post_form.admit("http.post_form", &url)?;
                 let form_map = table_to_string_map(&form)?;
                 let form_fields = form_map.keys().cloned().collect();
-                let request = post_form
-                    .client
-                    .post(&url)
-                    .headers(to_header_map(headers)?)
-                    .form(&form_map);
+                let headers = post_form.headers(RequestKind::FormSubmission, &url, headers)?;
+                let request = post_form.client.post(&url).headers(headers).form(&form_map);
                 post_form.send_text(
                     lua,
                     "http.post_form",
@@ -340,10 +380,11 @@ pub(super) fn table(
             move |lua, (url, body, headers): (String, LuaValue, Option<Table>)| {
                 post_json.admit("http.post_json", &url)?;
                 let body_json: Value = lua.from_value(body)?;
+                let headers = post_json.headers(RequestKind::Fetch, &url, headers)?;
                 let request = post_json
                     .client
                     .post(&url)
-                    .headers(to_header_map(headers)?)
+                    .headers(headers)
                     .json(&body_json);
                 post_json.send_text(lua, "http.post_json", "POST", &url, request, None)
             },
@@ -354,7 +395,7 @@ pub(super) fn table(
     // if `url` had answered with a `Set-Cookie: <set_cookie>` header, for
     // sites that set a cookie from inline JS (e.g. a `document.cookie = ...`
     // anti-bot challenge) that a plain HTTP client never runs. A manual
-    // `Cookie` request header can't stand in for this: `wreq` skips the jar
+    // `Cookie` request header can't stand in for this: `reqwest` skips the jar
     // entirely for a request that already carries one. Records nothing (the
     // value may be a session secret); gated by `allowed_domains` like every
     // other method here so a script can't plant cookies for other hosts.
@@ -373,16 +414,17 @@ pub(super) fn table(
         "download",
         lua.create_function(move |lua, (url, headers): (String, Option<Table>)| {
             download.admit("http.download", &url)?;
-            let request = download.client.get(&url).headers(to_header_map(headers)?);
+            let headers = download.headers(RequestKind::Navigation, &url, headers)?;
+            let request = download.client.get(&url).headers(headers);
             let started = Instant::now();
-            let resp = download.send("http.download", &url, request)?;
+            let (resp, hops) = download.send("http.download", &url, request)?;
 
             let status = resp.status().as_u16();
-            record_redirects(&download.recorder, "DOWNLOAD", &resp);
-            track_redirects(&download.visited_urls, &resp);
+            record_redirects(&download.recorder, "DOWNLOAD", &hops);
+            track_redirects(&download.visited_urls, &hops, resp.url().as_str());
             let content_type = resp
                 .headers()
-                .get(wreq::header::CONTENT_TYPE)
+                .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
@@ -428,14 +470,14 @@ pub(super) fn table(
 fn read_body(
     runtime: &Handle,
     stop: &StopSignal,
-    resp: wreq::Response,
+    resp: reqwest::Response,
     max_bytes: usize,
 ) -> std::result::Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     stop.block_on(runtime, async {
         let mut stream = resp.bytes_stream();
         let mut body = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(wreq::Error::without_uri)?;
+            let chunk = chunk.map_err(|err| HttpError(err.without_url()))?;
             if body.len() + chunk.len() > max_bytes {
                 return Err(
                     crate::Error::from(crate::ErrorKind::ScriptLimitExceeded(format!(
@@ -450,7 +492,7 @@ fn read_body(
     })?
 }
 
-/// Decodes `body` the way `wreq::Response::text` does: in the `charset` of
+/// Decodes `body` the way `reqwest::Response::text` does: in the `charset` of
 /// `content_type` (UTF-8 by default), BOM-sniffed, with malformed sequences
 /// replaced.
 fn decode_text(content_type: &str, body: &[u8]) -> String {
@@ -468,30 +510,57 @@ fn decode_text(content_type: &str, body: &[u8]) -> String {
     encoding.decode(body).0.into_owned()
 }
 
-/// Builds this run's `wreq` client on `jar`, per `options` (see [`table`]'s
-/// doc comment for `wreq_emulation`/`follow_redirects`), checking every
-/// redirect hop against `allowed_domains`.
+/// Firefox's HTTP/2 flow-control windows (its `SETTINGS_INITIAL_WINDOW_SIZE`,
+/// and the connection window its first `WINDOW_UPDATE` opens), sent under
+/// `browser_emulation` instead of hyper's.
+const FIREFOX_H2_STREAM_WINDOW: u32 = 131_072;
+const FIREFOX_H2_CONNECTION_WINDOW: u32 = 12_582_912;
+
+/// Builds this run's `reqwest` client on `jar`, per `options` (see
+/// [`table`]'s doc comment for `browser_emulation`/`follow_redirects`),
+/// checking every redirect hop against `allowed_domains` and pushing each one
+/// it follows onto `redirects` (a run's Lua calls are sequential, so
+/// [`HttpHost::send`] takes the hops of the request it just sent).
 fn build_client(
     options: &RunOptions,
-    jar: Arc<Jar>,
+    jar: Arc<CookieJar>,
     allowed_domains: Arc<Vec<String>>,
+    redirects: Arc<Mutex<Vec<RedirectHop>>>,
 ) -> LuaResult<Client> {
     let mut builder = Client::builder().cookie_provider(jar);
-    if options.wreq_emulation {
-        builder = builder.emulation(Profile::Chrome131);
+    if options.browser_emulation {
+        builder = builder
+            .http2_initial_stream_window_size(FIREFOX_H2_STREAM_WINDOW)
+            .http2_initial_connection_window_size(FIREFOX_H2_CONNECTION_WINDOW);
     }
     let redirect_policy = if options.follow_redirects {
-        wreq::redirect::Policy::custom(move |attempt| {
-            let target = attempt.uri.to_string();
+        reqwest::redirect::Policy::custom(move |attempt| {
+            let target = attempt.url().to_string();
             if let Err(message) = super::ensure_domain_allowed(&target, &allowed_domains) {
                 return attempt.error(message);
             }
-            // Delegates everything else (loop detection, the 10-hop cap) to
-            // the default policy — `custom` doesn't get that for free.
-            wreq::redirect::Policy::default().redirect(attempt)
+            // `previous` starts with the request's own URL, so this allows
+            // `MAX_REDIRECTS` hops, as `reqwest`'s default policy does.
+            if attempt.previous().len() > MAX_REDIRECTS {
+                return attempt.error(format!("more than {MAX_REDIRECTS} redirects"));
+            }
+            let hop = RedirectHop {
+                status: attempt.status().as_u16(),
+                from: attempt
+                    .previous()
+                    .last()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                to: target,
+            };
+            redirects
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(hop);
+            attempt.follow()
         })
     } else {
-        wreq::redirect::Policy::none()
+        reqwest::redirect::Policy::none()
     };
     builder
         .timeout(Duration::from_secs(30))
@@ -504,7 +573,11 @@ fn build_client(
 /// captures a single `Arc` of it instead of its own copy of every field.
 struct HttpHost {
     client: Client,
-    jar: Arc<Jar>,
+    jar: Arc<CookieJar>,
+    /// The hops `client`'s redirect policy followed for the request in
+    /// flight (see [`build_client`]).
+    redirects: Arc<Mutex<Vec<RedirectHop>>>,
+    browser_emulation: bool,
     visited_urls: Arc<Mutex<HashSet<String>>>,
     recorder: Arc<Recorder>,
     runtime: Handle,
@@ -523,19 +596,50 @@ impl HttpHost {
         Ok(())
     }
 
+    /// The headers for a `kind` request to `url`: the script's `headers`,
+    /// on top of a browser's under `browser_emulation`.
+    fn headers(
+        &self,
+        kind: RequestKind,
+        url: &str,
+        headers: Option<Table>,
+    ) -> LuaResult<HeaderMap> {
+        let headers = to_header_map(headers)?;
+        Ok(if self.browser_emulation {
+            browser_headers(kind, url, &headers)
+        } else {
+            headers
+        })
+    }
+
     /// Sends `request`, recording an `error` entry if it fails; gives up on
-    /// it as soon as the run is stopped.
+    /// it as soon as the run is stopped. Returns the response with the
+    /// redirects followed to reach it.
     fn send(
         &self,
         action: &str,
         url: &str,
-        request: wreq::RequestBuilder,
-    ) -> LuaResult<wreq::Response> {
-        self.stop
-            .block_on(&self.runtime, request.send())?
-            // `wreq` appends the request's full URI to its messages, query
+        request: reqwest::RequestBuilder,
+    ) -> LuaResult<(reqwest::Response, Vec<RedirectHop>)> {
+        self.take_redirects();
+        // `send` inside the future: `reqwest` starts the request's timeout
+        // there, which needs the runtime's context.
+        let resp = self
+            .stop
+            .block_on(&self.runtime, async move { request.send().await })?
+            // `reqwest` appends the request's full URL to its messages, query
             // string included: the report records a redacted one instead.
-            .map_err(|err| self.record_error(action, url, err.without_uri()))
+            .map_err(|err| self.record_error(action, url, HttpError(err.without_url())))?;
+        Ok((resp, self.take_redirects()))
+    }
+
+    fn take_redirects(&self) -> Vec<RedirectHop> {
+        std::mem::take(
+            &mut *self
+                .redirects
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 
     /// Sends `request` for `get`/`post_form`/`post_json` and returns its
@@ -548,14 +652,14 @@ impl HttpHost {
         action: &str,
         method: &str,
         url: &str,
-        request: wreq::RequestBuilder,
+        request: reqwest::RequestBuilder,
         form_fields: Option<Vec<String>>,
     ) -> LuaResult<Table> {
         let started = Instant::now();
-        let resp = self.send(action, url, request)?;
+        let (resp, hops) = self.send(action, url, request)?;
         let status = resp.status().as_u16();
-        record_redirects(&self.recorder, method, &resp);
-        track_redirects(&self.visited_urls, &resp);
+        record_redirects(&self.recorder, method, &hops);
+        track_redirects(&self.visited_urls, &hops, resp.url().as_str());
         let out = response_to_table(lua, &self.runtime, &self.stop, resp)?;
 
         let mut entry = json!({
@@ -608,14 +712,14 @@ mod tests {
         let recorder = Arc::new(Recorder::new("didaxis"));
         let http_table = table(
             &lua,
-            Jar::default().into(),
+            Arc::new(CookieJar::default()),
             Arc::new(Mutex::new(HashSet::new())),
             recorder.clone(),
             runtime.handle().clone(),
             StopSignal::new(),
             &RunOptions {
                 debug_http_dump: false,
-                wreq_emulation: true,
+                browser_emulation: true,
                 follow_redirects: true,
                 allowed_domains: vec!["allowed.example.com".to_string()],
                 browser_visible: false,
@@ -645,7 +749,7 @@ mod tests {
     /// URL to hit it at. Used to prove the redirect policy itself checks
     /// `allowed_domains` on each hop, not just the request's starting URL —
     /// a real request/response round trip is the only way to exercise
-    /// `wreq`'s own redirect-following machinery.
+    /// `reqwest`'s own redirect-following machinery.
     fn spawn_redirecting_server(runtime: &tokio::runtime::Runtime, location: &str) -> String {
         let listener = runtime
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -684,14 +788,14 @@ mod tests {
         let recorder = Arc::new(Recorder::new("didaxis"));
         let http_table = table(
             &lua,
-            Jar::default().into(),
+            Arc::new(CookieJar::default()),
             Arc::new(Mutex::new(HashSet::new())),
             recorder.clone(),
             runtime.handle().clone(),
             StopSignal::new(),
             &RunOptions {
                 debug_http_dump: false,
-                wreq_emulation: false,
+                browser_emulation: false,
                 follow_redirects: true,
                 // Allows the redirecting server's own host, but not the host
                 // it redirects to — proving the block happens on the redirect
@@ -798,14 +902,14 @@ mod tests {
         let recorder = Arc::new(Recorder::new("didaxis"));
         let http_table = table(
             &lua,
-            Jar::default().into(),
+            Arc::new(CookieJar::default()),
             Arc::new(Mutex::new(HashSet::new())),
             recorder.clone(),
             runtime.handle().clone(),
             StopSignal::new(),
             &RunOptions {
                 debug_http_dump: false,
-                wreq_emulation: false,
+                browser_emulation: false,
                 follow_redirects: true,
                 // Both servers are on 127.0.0.1 (just different ports, which
                 // the domain check ignores) — proving an allowed redirect still
@@ -824,6 +928,63 @@ mod tests {
 
         assert_eq!(result.get::<u16>("status").unwrap(), 200);
         assert_eq!(result.get::<String>("body").unwrap(), "hello");
+        assert_eq!(result.get::<String>("url").unwrap(), target_url);
+        let report = recorder.finish();
+        let redirect = report
+            .entries
+            .iter()
+            .find(|entry| entry.event == "http_redirect")
+            .expect("the hop is recorded");
+        assert_eq!(redirect.value["status"], 302);
+        assert_eq!(redirect.value["from"], redirect_url.as_str());
+        assert_eq!(redirect.value["to"], target_url.as_str());
+    }
+
+    #[test]
+    fn get_fails_on_a_refused_connection_as_site_unreachable() {
+        let runtime = runtime();
+        // Bound then dropped: nothing listens on the port any more.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let http_table = table(
+            &lua,
+            Arc::new(CookieJar::default()),
+            Arc::new(Mutex::new(HashSet::new())),
+            recorder.clone(),
+            runtime.handle().clone(),
+            StopSignal::new(),
+            &RunOptions {
+                debug_http_dump: false,
+                browser_emulation: true,
+                follow_redirects: true,
+                allowed_domains: vec!["127.0.0.1".to_string()],
+                browser_visible: false,
+            },
+        )
+        .unwrap();
+        lua.globals().set("http", http_table).unwrap();
+
+        let err = lua
+            .load(format!(
+                r#"return http.get("http://127.0.0.1:{port}/?token=secret")"#
+            ))
+            .eval::<Table>()
+            .unwrap_err();
+
+        assert_eq!(
+            crate::Error::from(err).code(),
+            crate::ErrorCode::ScraperSiteUnreachable
+        );
+        let report = recorder.finish();
+        let message = report.entries[0].value["message"].as_str().unwrap();
+        // The cause, not just "error sending request", and no query string.
+        assert!(message.contains("onnect"), "{message}");
+        assert!(!message.contains("secret"), "{message}");
     }
 
     #[test]
@@ -843,7 +1004,7 @@ mod tests {
     fn set_cookie_adds_to_the_jar_and_respects_allowed_domains() {
         let runtime = runtime();
         let lua = Lua::new();
-        let jar: Arc<Jar> = Jar::default().into();
+        let jar = Arc::new(CookieJar::default());
         let recorder = Arc::new(Recorder::new("didaxis"));
         let http_table = table(
             &lua,
@@ -854,7 +1015,7 @@ mod tests {
             StopSignal::new(),
             &RunOptions {
                 debug_http_dump: false,
-                wreq_emulation: true,
+                browser_emulation: true,
                 follow_redirects: true,
                 allowed_domains: vec!["allowed.example.com".to_string()],
                 browser_visible: false,
@@ -866,9 +1027,9 @@ mod tests {
         lua.load(r#"http.set_cookie("https://allowed.example.com/", "mit=abc; Path=/")"#)
             .exec()
             .unwrap();
-        let matches: Vec<_> = jar.matches("https://allowed.example.com").collect();
+        let matches = jar.matches("https://allowed.example.com");
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].value(), "abc");
+        assert_eq!(matches[0].value, "abc");
 
         let result = lua
             .load(r#"http.set_cookie("https://evil.example.net/", "mit=abc")"#)
@@ -885,10 +1046,10 @@ mod tests {
 
         let jar = build_jar(&cookies);
 
-        let matches: Vec<_> = jar.matches("https://example.com").collect();
+        let matches = jar.matches("https://example.com");
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].name(), "session");
-        assert_eq!(matches[0].value(), "abc");
+        assert_eq!(matches[0].name, "session");
+        assert_eq!(matches[0].value, "abc");
     }
 
     #[test]
@@ -915,7 +1076,7 @@ mod tests {
 
     #[test]
     fn export_cookies_keeps_a_cookie_scoped_to_a_visited_path() {
-        let jar = Jar::default();
+        let jar = CookieJar::default();
         jar.add(
             "KEYCLOAK_IDENTITY=abc; Path=/realms/societaire/; Secure",
             "https://login.example.com/realms/societaire/login-actions/authenticate",
@@ -937,11 +1098,10 @@ mod tests {
 
         // ...and it replays into a fresh jar under the same scope.
         let restored = build_jar(&exported);
-        let matched: Vec<_> = restored
-            .matches("https://login.example.com/realms/societaire/protocol/openid-connect/auth")
-            .collect();
+        let matched = restored
+            .matches("https://login.example.com/realms/societaire/protocol/openid-connect/auth");
         assert_eq!(matched.len(), 1);
-        assert_eq!(matched[0].value(), "abc");
+        assert_eq!(matched[0].value, "abc");
     }
 
     #[test]
