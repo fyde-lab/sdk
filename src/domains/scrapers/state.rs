@@ -19,7 +19,7 @@ pub(crate) trait StateStorage: Send + Sync {
     async fn delete_session(&self, name: &str) -> Result<()>;
 
     /// Forgets everything kept under `name`: its `fyde.session` data, its
-    /// cookie jar (a live session on the scraper's site) and its debug
+    /// cookie jar (a live session on the scraper's site) and its run
     /// reports. A no-op for what there's none of.
     async fn delete_all(&self, name: &str) -> Result<()>;
 }
@@ -101,8 +101,10 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO scraper_reports (scraper_name, started_at_ms, entries) VALUES (?1, 0, '[]')",
+            "INSERT INTO scraper_reports (id, scraper_name, started_at_ms, outcome, saved, entries)
+             VALUES (?1, ?2, 0, 'succeeded', 0, '[]')",
         )
+        .bind(uuid::Uuid::now_v7().to_string())
         .bind(name)
         .execute(pool)
         .await

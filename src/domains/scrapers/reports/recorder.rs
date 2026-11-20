@@ -3,18 +3,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use super::models::{Report, ReportEntry};
+use super::models::ReportEntry;
 
-/// Accumulates one scraper run's debug report in memory as it happens —
+/// Accumulates one scraper run's debug log in memory as it happens —
 /// ported from `demo-rust-fyde`'s `Report` (`report.rs`): every `fyde.log`,
 /// `fyde.http`, `fyde.progress`, `fyde.input` and `fyde.browser` call
 /// records a `(event_type, value)` entry via [`Recorder::record`]. Unlike
 /// `demo-rust-fyde`, which rewrote a file to disk on every entry so a crash
 /// mid-run never lost debug output, this just keeps entries in memory —
-/// [`Recorder::finish`] hands the finished [`Report`] to
-/// `super::Service::save` once the run is over, whether it succeeded or
-/// failed. `scrapers::service`
-/// builds one per run and `host::install` threads it (behind an `Arc`) into
+/// `super::Service::finish` saves them in the run's report once it's over,
+/// whether it succeeded or failed. `super::Service::start` builds one per
+/// run and `host::install` threads it (behind an `Arc`) into
 /// `host::log`/`http`/`progress`/`input`/`browser`.
 pub(crate) struct Recorder {
     scraper_name: String,
@@ -29,6 +28,15 @@ impl Recorder {
             started_at_ms: now_ms(),
             entries: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn scraper_name(&self) -> &str {
+        &self.scraper_name
+    }
+
+    /// When this run started, in milliseconds since the Unix epoch.
+    pub(crate) fn started_at_ms(&self) -> i64 {
+        self.started_at_ms
     }
 
     /// Adds one `(event_type, value)` entry to the report.
@@ -46,23 +54,16 @@ impl Recorder {
         entries.push(entry);
     }
 
-    /// Snapshots every entry recorded so far into a finished [`Report`],
-    /// ready to persist via `super::Service::save`.
-    pub(crate) fn finish(&self) -> Report {
-        let entries = match self.entries.lock() {
-            Ok(entries) => entries,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-
-        Report {
-            scraper_name: self.scraper_name.clone(),
-            started_at_ms: self.started_at_ms,
-            entries: entries.clone(),
+    /// Snapshots every entry recorded so far, in order.
+    pub(crate) fn entries(&self) -> Vec<ReportEntry> {
+        match self.entries.lock() {
+            Ok(entries) => entries.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -74,7 +75,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn finish_returns_every_recorded_entry_in_order() {
+    fn entries_returns_every_recorded_entry_in_order() {
         let recorder = Recorder::new("didaxis");
 
         recorder.record(
@@ -86,20 +87,19 @@ mod tests {
             serde_json::json!({ "kind": "step", "step": "done" }),
         );
 
-        let report = recorder.finish();
+        let entries = recorder.entries();
 
-        assert_eq!(report.scraper_name, "didaxis");
-        assert_eq!(report.entries.len(), 2);
-        assert_eq!(report.entries[0].event, "log");
-        assert_eq!(report.entries[1].event, "progress");
+        assert_eq!(recorder.scraper_name(), "didaxis");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].event, "log");
+        assert_eq!(entries[1].event, "progress");
+        assert!(entries[0].ts_ms >= recorder.started_at_ms());
     }
 
     #[test]
-    fn finish_can_be_called_without_any_entries_recorded() {
+    fn entries_can_be_read_without_any_recorded() {
         let recorder = Recorder::new("didaxis");
 
-        let report = recorder.finish();
-
-        assert_eq!(report.entries, Vec::new());
+        assert_eq!(recorder.entries(), Vec::new());
     }
 }

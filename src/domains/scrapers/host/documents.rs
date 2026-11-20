@@ -27,12 +27,13 @@ use crate::domains::documents::{Service as DocumentsService, UploadRequest};
 /// loading alongside the script. A
 /// document whose content is already saved locally is silently skipped, not
 /// an error, so re-running a scraper doesn't fail on what it already
-/// fetched.
+/// fetched. `on_saved` is called for each document actually saved.
 pub(super) fn save_document_fn(
     lua: &Lua,
     documents: Arc<dyn DocumentsService>,
     scraper_name: &str,
     folder_id: Option<Uuid>,
+    on_saved: Option<Arc<dyn Fn() + Send + Sync>>,
     runtime: Handle,
     stop: StopSignal,
 ) -> mlua::Result<Function> {
@@ -76,6 +77,9 @@ pub(super) fn save_document_fn(
                 }
                 Err(err) => return Err(mlua::Error::external(err)),
             };
+            if let Some(on_saved) = &on_saved {
+                on_saved();
+            }
 
             tracing::debug!(
                 target: "fyde::scrapers",
@@ -163,6 +167,7 @@ mod tests {
             Arc::new(documents),
             "didaxis",
             None,
+            None,
             runtime.handle().clone(),
             StopSignal::new(),
         )
@@ -193,6 +198,7 @@ mod tests {
             Arc::new(documents),
             "didaxis",
             Some(folder_id),
+            None,
             runtime.handle().clone(),
             StopSignal::new(),
         )
@@ -228,6 +234,7 @@ mod tests {
             Arc::new(documents),
             "didaxis",
             None,
+            None,
             runtime.handle().clone(),
             StopSignal::new(),
         )
@@ -262,6 +269,7 @@ mod tests {
             Arc::new(documents),
             "didaxis",
             None,
+            None,
             runtime.handle().clone(),
             StopSignal::new(),
         )
@@ -271,6 +279,50 @@ mod tests {
         lua.load(r#"save_document("january.pdf", "the pdf content")"#)
             .exec()
             .unwrap();
+    }
+
+    #[test]
+    fn save_document_tells_on_saved_of_each_new_document_only() {
+        let mut documents = MockDocumentsService::new();
+        let mut uploads = 0;
+        documents.expect_upload().times(3).returning(move |_| {
+            uploads += 1;
+            if uploads == 2 {
+                Err(crate::ErrorKind::DuplicateDocument(Uuid::now_v7()).into())
+            } else {
+                Ok(Uuid::now_v7())
+            }
+        });
+        let saved = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = saved.clone();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let lua = Lua::new();
+        let f = save_document_fn(
+            &lua,
+            Arc::new(documents),
+            "didaxis",
+            None,
+            Some(Arc::new(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+            runtime.handle().clone(),
+            StopSignal::new(),
+        )
+        .unwrap();
+        lua.globals().set("save_document", f).unwrap();
+
+        lua.load(
+            r#"
+            save_document("a.pdf", "a")
+            save_document("b.pdf", "b")
+            save_document("c.pdf", "c")
+        "#,
+        )
+        .exec()
+        .unwrap();
+
+        assert_eq!(saved.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -286,6 +338,7 @@ mod tests {
             &lua,
             Arc::new(documents),
             "didaxis",
+            None,
             None,
             runtime.handle().clone(),
             StopSignal::new(),
@@ -310,6 +363,7 @@ mod tests {
             &lua,
             Arc::new(documents),
             "didaxis",
+            None,
             None,
             runtime.handle().clone(),
             StopSignal::new(),
@@ -336,6 +390,7 @@ mod tests {
             Arc::new(documents),
             "didaxis",
             None,
+            None,
             runtime.handle().clone(),
             stop,
         )
@@ -361,6 +416,7 @@ mod tests {
             &lua,
             Arc::new(documents),
             "didaxis",
+            None,
             None,
             runtime.handle().clone(),
             stop,

@@ -204,9 +204,9 @@ mod tests {
             .exec()
             .unwrap();
 
-        let report = recorder.finish();
-        assert_eq!(report.entries.len(), 2);
-        assert_eq!(report.entries[0].event, "progress");
-        assert_eq!(report.entries[1].event, "progress");
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].event, "progress");
+        assert_eq!(entries[1].event, "progress");
     }
 }

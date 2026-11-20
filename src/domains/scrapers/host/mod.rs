@@ -148,6 +148,9 @@ pub(super) struct HostConfig {
     pub(super) documents: Arc<dyn DocumentsService>,
     pub(super) browser: Arc<dyn BrowserService>,
     pub(super) on_progress: Option<Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
+    /// Called each time `fyde.save_document` saves a document the vault
+    /// didn't hold yet (not for one it skips as already saved).
+    pub(super) on_document_saved: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) on_question: Option<Arc<dyn Fn(String) -> String + Send + Sync>>,
     pub(super) recorder: Arc<Recorder>,
     pub(super) runtime: Handle,
@@ -197,6 +200,7 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
         documents,
         browser,
         on_progress,
+        on_document_saved,
         on_question,
         recorder,
         runtime,
@@ -253,6 +257,7 @@ pub(super) fn install(lua: &Lua, config: HostConfig) -> Result<Installed> {
             documents,
             scraper_name,
             folder_id,
+            on_document_saved,
             runtime.clone(),
             stop.clone(),
         )?,

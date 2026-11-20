@@ -244,6 +244,14 @@ impl ErrorCode {
         self as u32
     }
 
+    /// The code whose [`Self::as_u32`] is `value`, if there's one.
+    pub fn from_u32(value: u32) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|code| code.as_u32() == value)
+    }
+
     /// The wording to show an end user for this code, in `language` (a
     /// short code such as `"en"` or `"fr"`, or a locale such as `"fr_FR"`),
     /// falling back to English for any language the SDK has no
@@ -350,6 +358,10 @@ pub(crate) enum ErrorKind {
     InvalidScriptType(String),
     #[error("invalid progress step: {0:?}")]
     InvalidProgressStep(String),
+    /// A scraper run kept in the local database that this SDK can't read
+    /// back (an outcome or error code it doesn't know).
+    #[error("invalid scraper run record: {0}")]
+    InvalidScraperRun(String),
     #[error("invalid server response: {0}")]
     InvalidResponse(String),
     #[error("encryption error: {0}")]
@@ -456,6 +468,7 @@ impl ErrorKind {
             ErrorKind::InvalidSearchQuery(_) => ErrorCode::InvalidSearchQuery,
             ErrorKind::InvalidScriptType(_) => ErrorCode::InvalidScriptType,
             ErrorKind::InvalidProgressStep(_) => ErrorCode::ScriptFailed,
+            ErrorKind::InvalidScraperRun(_) => ErrorCode::Database,
             ErrorKind::InvalidResponse(_) => ErrorCode::InvalidServerResponse,
             ErrorKind::Encryption(_) => ErrorCode::Encryption,
             ErrorKind::InvalidCredentials => ErrorCode::InvalidCredentials,
@@ -896,6 +909,14 @@ mod tests {
         let err: Error = std::io::Error::other("/home/alice/secret.pdf").into();
 
         assert!(!err.user_message("en").contains("secret"));
+    }
+
+    #[test]
+    fn every_code_round_trips_through_its_value() {
+        for code in ErrorCode::ALL {
+            assert_eq!(ErrorCode::from_u32(code.as_u32()), Some(*code));
+        }
+        assert_eq!(ErrorCode::from_u32(0), None);
     }
 
     #[test]
