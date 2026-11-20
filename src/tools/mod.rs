@@ -1,11 +1,12 @@
 //! Cross-domain building blocks that aren't a domain of their own: logging,
-//! hex encoding, the HTTP clients' starting point, the Lua sandbox, the local SQLite client, the client's own
+//! hex encoding, the HTTP clients' starting point, the device's locale, the Lua sandbox, the local SQLite client, the client's own
 //! directory, the on-device models (their files and their runtime) and test
 //! fixtures.
 
 pub(crate) mod client_dir;
 pub(crate) mod hex;
 pub(crate) mod http;
+pub(crate) mod locale;
 pub(crate) mod log;
 pub(crate) mod models;
 pub(crate) mod onnx;

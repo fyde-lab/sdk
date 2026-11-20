@@ -153,7 +153,8 @@ methods, used behind `Arc<dyn Service>`), `models.rs`, `service.rs` and adapters
   sessions and BIP39 recovery keys.
 - **secrets** (crate-private): OS credential store (`keyring-core`, only Linux tested), with an
   `insecure_secrets` table fallback only when `allow_insecure_storage` is passed. Android apps
-  must call `Keyring.initializeNdkContext(context)` before `Client::init`.
+  must call `Keyring.initializeNdkContext(context)` before `Client::init` (`system_language`
+  reads the device locale over JNI through it too: Android has no `LANG`).
 - **sessions** (crate-private): `authenticated_request`, `check_response`, `is_connected`.
 - **scripts**: reads scripts from `scripts.v1` and enables/disables them per script on the
   server, where the plan quota is also enforced. Writing scripts and icons is admin-only and not
