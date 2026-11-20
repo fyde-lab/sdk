@@ -15,10 +15,12 @@ use crate::{ErrorContext as _, Result};
 use super::cookies::{Cookie, Service as CookiesService};
 use super::host::{self, HostConfig};
 use super::models::RunOptions;
-use super::reports::{Recorder, Service as ReportsService};
+use super::reports::{Recorder, RunTracker, Service as ReportsService};
 use super::session::Service as SessionService;
 use super::stop::{self, StopSignal};
-use super::{OnScraperProgress, OnScraperQuestion, ProgressEvent, ProgressStep, Service};
+use super::{
+    OnScraperProgress, OnScraperQuestion, ProgressEvent, ProgressStep, ScraperRun, Service,
+};
 
 /// The `browser_emulation`/`follow_redirects` an installed script runs
 /// with. Each scraper's `manifest.json` (in `../scripts`, as
@@ -43,9 +45,10 @@ const LUA_MEMORY_BYTES: usize = 25 * 1024 * 1024;
 
 /// The default [`Service`] implementation, running scripts in a fresh
 /// `mlua::Lua` VM per call, delegating session/cookie persistence to
-/// injected [`SessionService`]/[`CookiesService`] implementations, this
-/// run's debug report to an injected [`ReportsService`], and document
-/// uploads to an injected [`DocumentsService`].
+/// injected [`SessionService`]/[`CookiesService`] implementations, each
+/// run's report (how it went and its debug log) to an injected
+/// [`ReportsService`], and document uploads to an injected
+/// [`DocumentsService`].
 ///
 /// Runs share nothing but these injected services, so any number can run
 /// at once — except two under the same name, which would load the same
@@ -220,6 +223,13 @@ impl Service for ScrapersClient {
         }
     }
 
+    async fn last_runs(&self) -> Result<Vec<ScraperRun>> {
+        self.reports
+            .last_runs()
+            .await
+            .context("failed to read the scrapers' latest runs")
+    }
+
     async fn run_installed(&self, installed: &InstalledScript) -> Result<()> {
         let script = installed.script();
         let installation_id = installed.installation_id();
@@ -284,16 +294,20 @@ impl ScrapersClient {
     /// documents' attributes are read with (downloading it first if
     /// needed), holding it until the returned [`Setup`] drops. Failing to
     /// load it doesn't fail the run (its uploads then try again, or are
-    /// saved without attributes): only `signal` stopping it does.
-    async fn set_up(&self, name: &str, signal: &StopSignal) -> Result<Setup> {
-        if let Some(on_progress) = &self.on_progress {
-            on_progress(
-                name,
-                ProgressEvent::Step {
-                    step: ProgressStep::SettingUp,
-                },
-            );
-        }
+    /// saved without attributes): only `signal` stopping it does. The step
+    /// is announced through `on_progress`, the run's own progress callback.
+    async fn set_up(
+        &self,
+        name: &str,
+        signal: &StopSignal,
+        on_progress: &OnScraperProgress,
+    ) -> Result<Setup> {
+        on_progress(
+            name,
+            ProgressEvent::Step {
+                step: ProgressStep::SettingUp,
+            },
+        );
 
         let Some(model) = &self.attribute_model else {
             return Ok(Setup {
@@ -343,6 +357,50 @@ impl ScrapersClient {
             () = signal.stopped() => return Err(stop::stopped()),
             guard = self.lock_name(name) => guard,
         };
+        // Its report is opened once the name is this run's, so it starts
+        // after the one of a run queued ahead of it. Stopped before this, it
+        // leaves none: the run it waited on shares its stop signal, so ends
+        // as stopped too.
+        let tracker = self
+            .reports
+            .start(name)
+            .await
+            .with_context(|| format!("failed to start a run of scraper {name:?}"))?;
+        let result = self
+            .run_holding_name(
+                name,
+                script,
+                parameters,
+                options,
+                folder_id,
+                (name_guard, stop_registration),
+                &tracker,
+            )
+            .await;
+        // However the run ended, its report says how: completed here rather
+        // than within it so every early return is on record too. Failing to
+        // save it doesn't change how the run ended.
+        if let Err(err) = self.reports.finish(tracker, &result).await {
+            tracing::warn!(target: "fyde::scrapers", scraper = %name, "{err}");
+        }
+        result
+    }
+
+    /// The rest of [`Self::run_filing_in`], once the run holds `name`:
+    /// waits for a slot, loads the scraper's state, runs the script and
+    /// saves its state back, recording its log and progress in `tracker`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_holding_name(
+        &self,
+        name: &str,
+        script: &str,
+        parameters: Value,
+        options: RunOptions,
+        folder_id: Option<Uuid>,
+        (name_guard, stop_registration): (NameGuard, StopRegistration),
+        tracker: &RunTracker,
+    ) -> Result<()> {
+        let signal = stop_registration.signal.clone();
         // Taken once the name is this run's, so a run queued behind another
         // of the same scraper never sits on a slot it can't use yet.
         let slot = tokio::select! {
@@ -352,9 +410,34 @@ impl ScrapersClient {
                 slot.expect("the scraper run slots are never closed")
             }
         };
+        let recorder = tracker.recorder();
+        let progress = tracker.progress();
+        let on_progress: OnScraperProgress = {
+            let progress = progress.clone();
+            let forward = self.on_progress.clone();
+            Arc::new(move |name: &str, event: ProgressEvent| {
+                progress.record(&event);
+                if let Some(forward) = &forward {
+                    forward(name, event);
+                }
+            })
+        };
+        let on_document_saved: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || progress.document_saved());
+
         // Held until the run is over, so its uploads never wait for the
         // model again. Stopped while setting up: nothing loaded nor saved.
-        let setup = self.set_up(name, &signal).await?;
+        recorder.record(
+            "progress",
+            json!({ "kind": "step", "step": ProgressStep::SettingUp.as_str() }),
+        );
+        let setup = self.set_up(name, &signal, &on_progress).await?;
+        if let Some(message) = &setup.attribute_model_error {
+            recorder.record(
+                "error",
+                json!({ "action": "setup.attribute_model", "message": message }),
+            );
+        }
 
         let cookies = self
             .cookies
@@ -366,19 +449,6 @@ impl ScrapersClient {
             .load(name)
             .await
             .with_context(|| format!("failed to load session for scraper {name:?}"))?;
-        let recorder = Arc::new(Recorder::new(name));
-        recorder.record("run_started", json!({ "script": name }));
-        recorder.record(
-            "progress",
-            json!({ "kind": "step", "step": ProgressStep::SettingUp.as_str() }),
-        );
-        if let Some(message) = &setup.attribute_model_error {
-            // Recorded once the recorder exists: setup comes first.
-            recorder.record(
-                "error",
-                json!({ "action": "setup.attribute_model", "message": message }),
-            );
-        }
 
         let job = ScraperJob {
             name: name.to_string(),
@@ -387,9 +457,10 @@ impl ScrapersClient {
             session_data,
             cookies,
             documents: self.documents.clone(),
-            on_progress: self.on_progress.clone(),
+            on_progress,
+            on_document_saved,
             on_question: self.on_question.clone(),
-            recorder: recorder.clone(),
+            recorder,
             runtime: Handle::current(),
             stop: signal.clone(),
             options,
@@ -420,15 +491,6 @@ impl ScrapersClient {
             run_result
         };
 
-        match &run_result {
-            Ok(()) => recorder.record("run_finished", json!({ "status": "ok" })),
-            Err(_) if stopped => recorder.record("run_stopped", json!({})),
-            Err(err) => recorder.record(
-                "error",
-                json!({ "action": "run", "message": err.to_string() }),
-            ),
-        }
-
         self.session
             .save(name, session_data)
             .await
@@ -442,10 +504,6 @@ impl ScrapersClient {
             .save(name, cookies)
             .await
             .with_context(|| format!("failed to save cookies for scraper {name:?}"))?;
-        self.reports
-            .save(recorder.finish())
-            .await
-            .with_context(|| format!("failed to save report for scraper {name:?}"))?;
 
         run_result
     }
@@ -460,7 +518,8 @@ struct ScraperJob {
     session_data: Value,
     cookies: Vec<Cookie>,
     documents: Arc<dyn DocumentsService>,
-    on_progress: Option<OnScraperProgress>,
+    on_progress: OnScraperProgress,
+    on_document_saved: Arc<dyn Fn() + Send + Sync>,
     on_question: Option<OnScraperQuestion>,
     recorder: Arc<Recorder>,
     runtime: Handle,
@@ -486,6 +545,7 @@ fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
         cookies,
         documents,
         on_progress,
+        on_document_saved,
         on_question,
         recorder,
         runtime,
@@ -496,10 +556,10 @@ fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
 
     // Bound to this run's name, so the caller can tell its events and
     // questions apart from those of any other run going on at the same time.
-    let on_progress = on_progress.map(|callback| -> Arc<dyn Fn(ProgressEvent) + Send + Sync> {
+    let on_progress: Arc<dyn Fn(ProgressEvent) + Send + Sync> = {
         let name = name.clone();
-        Arc::new(move |event| callback(&name, event))
-    });
+        Arc::new(move |event| on_progress(&name, event))
+    };
     let on_question = on_question.map(|callback| -> Arc<dyn Fn(String) -> String + Send + Sync> {
         let name = name.clone();
         Arc::new(move |question| callback(&name, question))
@@ -530,7 +590,8 @@ fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
             cookies,
             documents,
             browser,
-            on_progress,
+            on_progress: Some(on_progress),
+            on_document_saved: Some(on_document_saved),
             on_question,
             recorder,
             runtime,
@@ -654,7 +715,6 @@ mod tests {
 
     use super::super::ProgressStep;
     use super::super::cookies::{FakeCookie, MockService as MockCookiesService};
-    use super::super::reports::MockService as MockReportsService;
     use super::super::session::MockService as MockSessionService;
     use super::*;
     use crate::domains::documents::{MockAttributeModel, MockService as MockDocumentsService};
@@ -669,14 +729,11 @@ mod tests {
         return M
     "#;
 
-    /// A [`MockReportsService`] that accepts exactly one `save` call,
-    /// without asserting anything about the report's contents — the
-    /// `reports::service`/`recorder` tests already cover what gets
-    /// recorded; these tests only care that a run always saves a report.
-    fn any_reports() -> MockReportsService {
-        let mut reports = MockReportsService::new();
-        reports.expect_save().times(1).returning(|_| Ok(()));
-        reports
+    /// A reports service held in memory: the `reports::service` tests
+    /// already cover what a report holds; these tests read runs back
+    /// through `last_runs` when they care.
+    fn any_reports() -> Arc<dyn ReportsService> {
+        super::super::reports::in_memory()
     }
 
     fn client(
@@ -687,7 +744,7 @@ mod tests {
         ScrapersClient::new(
             Arc::new(cookies),
             Arc::new(session),
-            Arc::new(any_reports()),
+            any_reports(),
             Arc::new(documents),
             None,
             None,
@@ -898,6 +955,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_installed_records_its_run_with_how_far_it_got_under_its_installation_id() {
+        let script = FakeScript::new()
+            .with_script(
+                r#"
+                local M = {}
+                function M.run(parameters)
+                    fyde.progress.step(fyde.progress.LISTING_DOCUMENTS)
+                    fyde.progress.update(0, 2)
+                    fyde.progress.step(fyde.progress.DOWNLOADING_DOCUMENTS)
+                    fyde.save_document("a.pdf", "first")
+                    fyde.progress.update(1, 2)
+                    fyde.save_document("b.pdf", "already saved")
+                    fyde.progress.update(2, 2)
+                end
+                return M
+            "#,
+            )
+            .build();
+        let installed = FakeInstalledScript::new().with_script(script).build();
+        let (cookies, session) = any_state();
+        let mut documents = MockDocumentsService::new();
+        documents
+            .expect_upload()
+            .returning(|request| match &request.source {
+                crate::domains::documents::UploadSource::Raw { name, .. } if name == "b.pdf" => {
+                    Err(crate::ErrorKind::DuplicateDocument(Uuid::now_v7()).into())
+                }
+                _ => Ok(Uuid::now_v7()),
+            });
+        let client = client(cookies, session, documents);
+        assert_eq!(client.last_runs().await.unwrap(), Vec::new());
+
+        client.run_installed(&installed).await.unwrap();
+
+        let runs = client.last_runs().await.unwrap();
+        assert_eq!(runs.len(), 1);
+        let run = &runs[0];
+        assert_eq!(run.name, installed.installation_id().to_string());
+        assert_eq!(run.outcome, super::super::ScraperRunOutcome::Succeeded);
+        assert!(run.ended_at_ms.unwrap() >= run.started_at_ms);
+        assert_eq!(run.step, Some(ProgressStep::DownloadingDocuments));
+        assert_eq!(
+            run.update,
+            Some(super::super::ScraperRunUpdate {
+                current: 2,
+                total: 2
+            })
+        );
+        assert_eq!(run.found, Some(2));
+        assert_eq!(run.saved, 1);
+    }
+
+    #[tokio::test]
+    async fn run_records_a_failed_run_with_its_error_code() {
+        let (cookies, session) = any_state();
+        let client = client(cookies, session, MockDocumentsService::new());
+        let script = r#"
+            local M = {}
+            function M.run(parameters)
+                fyde.progress.step(fyde.progress.LOGGING_IN)
+                error("INVALID_CREDENTIALS", 0)
+            end
+            return M
+        "#;
+
+        let result = client
+            .run(
+                "didaxis",
+                script,
+                json!({}),
+                false,
+                true,
+                true,
+                Vec::new(),
+                false,
+            )
+            .await;
+
+        assert_eq!(
+            result.unwrap_err().code(),
+            crate::ErrorCode::ScraperCredentialsRejected
+        );
+        let run = client.last_runs().await.unwrap().remove(0);
+        assert_eq!(run.name, "didaxis");
+        assert_eq!(
+            run.outcome,
+            super::super::ScraperRunOutcome::Failed {
+                code: crate::ErrorCode::ScraperCredentialsRejected
+            }
+        );
+        assert_eq!(run.step, Some(ProgressStep::LoggingIn));
+        assert_eq!(run.saved, 0);
+    }
+
+    #[tokio::test]
     async fn run_saves_session_but_deletes_cookies_when_the_script_fails() {
         let mut cookies = MockCookiesService::new();
         let stale = FakeCookie::new().build();
@@ -962,7 +1114,7 @@ mod tests {
         let client = ScrapersClient::new(
             Arc::new(cookies),
             Arc::new(session),
-            Arc::new(any_reports()),
+            any_reports(),
             Arc::new(MockDocumentsService::new()),
             Some(on_progress),
             None,
@@ -1074,7 +1226,7 @@ mod tests {
         let client = ScrapersClient::new(
             Arc::new(cookies),
             Arc::new(session),
-            Arc::new(any_reports()),
+            any_reports(),
             Arc::new(MockDocumentsService::new()),
             Some(on_progress),
             None,
@@ -1114,7 +1266,7 @@ mod tests {
         let client = ScrapersClient::new(
             Arc::new(cookies),
             Arc::new(session),
-            Arc::new(any_reports()),
+            any_reports(),
             Arc::new(MockDocumentsService::new()),
             None,
             None,
@@ -1162,7 +1314,7 @@ mod tests {
         let client = Arc::new(ScrapersClient::new(
             Arc::new(MockCookiesService::new()),
             Arc::new(MockSessionService::new()),
-            Arc::new(MockReportsService::new()),
+            any_reports(),
             Arc::new(MockDocumentsService::new()),
             None,
             None,
@@ -1200,13 +1352,10 @@ mod tests {
         let mut session = MockSessionService::new();
         session.expect_load().returning(|_| Ok(json!({})));
         session.expect_save().returning(|_, _| Ok(()));
-        let mut reports = MockReportsService::new();
-        reports.expect_save().returning(|_| Ok(()));
-
         Arc::new(ScrapersClient::new(
             Arc::new(cookies),
             Arc::new(session),
-            Arc::new(reports),
+            any_reports(),
             Arc::new(MockDocumentsService::new()),
             None,
             Some(on_question),
@@ -1401,7 +1550,7 @@ mod tests {
         let client = ScrapersClient::new(
             Arc::new(MockCookiesService::new()),
             Arc::new(MockSessionService::new()),
-            Arc::new(MockReportsService::new()),
+            any_reports(),
             Arc::new(MockDocumentsService::new()),
             None,
             None,
@@ -1436,7 +1585,7 @@ mod tests {
         let client = Arc::new(ScrapersClient::new(
             Arc::new(cookies),
             Arc::new(session),
-            Arc::new(any_reports()),
+            any_reports(),
             Arc::new(MockDocumentsService::new()),
             Some(on_progress),
             None,

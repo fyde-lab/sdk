@@ -454,6 +454,15 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `http`, `log`, `mo
   - `session/`, `cookies/`, `reports/` persist per scraper through a `StorageConfig`
     (`Sqlite` for a `Client`, `File` for `init_dev_scrapers`). `fyde.session` is saved even
     on failure; cookies only on success or stop (a failed run deletes them).
+  - `reports/` keeps one report per run (`scraper_reports`, one row per run; a JSON file per run
+    for `File`): how it went (start/end, outcome with its `ErrorCode`, last step and update,
+    found and newly saved counts) and its debug log. `ScrapersClient` opens it once the run
+    holds its name (`start`, which builds the run's `Recorder`) and completes it however the
+    run ends (`finish`; a failure to save it is only logged), fed by the run's progress
+    callback and `fyde.save_document`'s `on_document_saved` (new documents only).
+    `last_runs` reads each scraper's latest report, a `running` one not started by this
+    process as `Interrupted`. Its rules (what counts as found, outcome from the run's result)
+    live in `reports/service.rs`. `StateStorage::delete_all` forgets them on uninstall.
   - `stop(name)` stops the run under `name` (and one queued behind it) through its
     `StopSignal` (`stop.rs`): the sandbox's instruction hook (`new_vm`'s `interrupt`), every
     blocking host call (`StopSignal::block_on` instead of a bare `Handle::block_on` — keep it

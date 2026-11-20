@@ -736,14 +736,11 @@ mod tests {
 
         let err = result.unwrap_err().to_string();
         assert!(!err.contains("secret"), "{err}");
-        let report = recorder.finish();
-        assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].event, "error");
-        assert_eq!(
-            report.entries[0].value["url"],
-            "https://evil.com/steal?[redacted]"
-        );
-        assert!(!report.entries[0].value.to_string().contains("secret"));
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event, "error");
+        assert_eq!(entries[0].value["url"], "https://evil.com/steal?[redacted]");
+        assert!(!entries[0].value.to_string().contains("secret"));
     }
 
     /// Spawns a tiny local server that unconditionally 302-redirects every
@@ -947,9 +944,8 @@ mod tests {
         assert_eq!(result.get::<u16>("status").unwrap(), 200);
         assert_eq!(result.get::<String>("body").unwrap(), "hello");
         assert_eq!(result.get::<String>("url").unwrap(), target_url);
-        let report = recorder.finish();
-        let redirect = report
-            .entries
+        let entries = recorder.entries();
+        let redirect = entries
             .iter()
             .find(|entry| entry.event == "http_redirect")
             .expect("the hop is recorded");
@@ -998,8 +994,8 @@ mod tests {
             crate::Error::from(err).code(),
             crate::ErrorCode::ScraperSiteUnreachable
         );
-        let report = recorder.finish();
-        let message = report.entries[0].value["message"].as_str().unwrap();
+        let entries = recorder.entries();
+        let message = entries[0].value["message"].as_str().unwrap();
         // The cause, not just "error sending request", and no query string.
         assert!(message.contains("onnect"), "{message}");
         assert!(!message.contains("secret"), "{message}");

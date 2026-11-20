@@ -95,11 +95,11 @@ mod tests {
 
         lua.load(r#"log.info("hello")"#).exec().unwrap();
 
-        let report = recorder.finish();
-        assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].event, "log");
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event, "log");
         assert_eq!(
-            report.entries[0].value,
+            entries[0].value,
             serde_json::json!({ "level": "info", "message": "hello" })
         );
     }

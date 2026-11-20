@@ -10,6 +10,7 @@ mod stop;
 
 pub use host::helpers::SOURCE as HELPERS_LUA;
 pub use models::{ProgressEvent, ProgressStep};
+pub use reports::{ScraperRun, ScraperRunOutcome, ScraperRunUpdate};
 #[cfg(test)]
 pub(crate) use state::MockStateStorage;
 pub(crate) use state::{StateSqliteStorage, StateStorage};
@@ -152,6 +153,20 @@ pub trait Service: Send + Sync {
     /// document is never half-published. A run started under `name` after
     /// this call isn't affected.
     fn stop(&self, name: &str) -> bool;
+
+    /// Every scraper's latest run on this device, latest first: when it
+    /// started and ended, how it ended (a failure with its
+    /// [`crate::ErrorCode`]), its last step and update, how many documents
+    /// it found and how many new ones it saved. Read from the run's report
+    /// (the private `reports` sub-domain, which also keeps its debug log),
+    /// opened by [`Self::run`] and [`Self::run_installed`] (under the run's
+    /// name, an installation's id for the latter) as each run starts and
+    /// completed as it ends, so it outlives the process: a run whose
+    /// process ended before it did reads as
+    /// [`ScraperRunOutcome::Interrupted`]. Never synced to other devices;
+    /// forgotten with the rest of an installation's state when it's
+    /// uninstalled.
+    async fn last_runs(&self) -> Result<Vec<ScraperRun>>;
 }
 
 /// Selects which storage backend [`init`] builds the `session`/`cookies`/
@@ -172,8 +187,9 @@ pub(crate) enum StorageConfig {
 }
 
 /// Initializes the scrapers service: uses `storage` to persist each
-/// scraper's session data, cookie jar and per-run debug report (see the
-/// private `session`/`cookies`/`reports` sub-domains), `documents` so
+/// scraper's session data, cookie jar and per-run report (how the run went
+/// and its debug log; see the private `session`/`cookies`/`reports`
+/// sub-domains), `documents` so
 /// `fyde.save_document` can upload a downloaded document through the SDK's
 /// own encrypted upload path, `attribute_model` (the model `documents`
 /// reads attributes with, `None` if it reads none) for each run to load

@@ -274,10 +274,10 @@ mod tests {
             .exec()
             .unwrap();
 
-        let report = recorder.finish();
-        assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].event, "browser_open");
-        assert!(report.entries[0].value.get("html").is_none());
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event, "browser_open");
+        assert!(entries[0].value.get("html").is_none());
     }
 
     #[test]
@@ -312,11 +312,11 @@ mod tests {
             .exec()
             .unwrap();
 
-        let report = recorder.finish();
-        assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].event, "browser_open");
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event, "browser_open");
         assert_eq!(
-            report.entries[0].value.get("html").and_then(Value::as_str),
+            entries[0].value.get("html").and_then(Value::as_str),
             Some("<html><body>login page</body></html>")
         );
     }
@@ -344,9 +344,9 @@ mod tests {
         let result: LuaResult<()> = lua.load(r#"browser:open("https://evil.com/login")"#).exec();
 
         assert!(result.is_err());
-        let report = recorder.finish();
-        assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].event, "error");
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event, "error");
     }
 
     #[test]
@@ -464,8 +464,8 @@ mod tests {
             .exec()
             .unwrap();
 
-        let report = recorder.finish();
-        let serialized = serde_json::to_string(&report.entries).unwrap();
+        let entries = recorder.entries();
+        let serialized = serde_json::to_string(&entries).unwrap();
         assert!(!serialized.contains("s3cret"));
     }
 
@@ -550,9 +550,9 @@ mod tests {
         let result: String = lua.load(r##"return browser:html()"##).eval().unwrap();
 
         assert_eq!(result, "<html><body>hi</body></html>");
-        let report = recorder.finish();
-        assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].event, "browser_html");
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event, "browser_html");
     }
 
     #[test]
@@ -614,18 +614,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.as_bytes().as_ref(), b"%PDF-1.4 fake bytes");
-        let report = recorder.finish();
-        assert_eq!(report.entries.len(), 1);
-        assert_eq!(report.entries[0].event, "browser_download");
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event, "browser_download");
         assert_eq!(
-            report.entries[0].value.get("bytes").and_then(Value::as_u64),
+            entries[0].value.get("bytes").and_then(Value::as_u64),
             Some(19)
         );
-        assert!(
-            !serde_json::to_string(&report.entries)
-                .unwrap()
-                .contains("PDF-1.4")
-        );
+        assert!(!serde_json::to_string(&entries).unwrap().contains("PDF-1.4"));
     }
 
     #[test]

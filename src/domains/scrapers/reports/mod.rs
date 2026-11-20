@@ -6,33 +6,44 @@ mod storage;
 mod storage_file;
 mod storage_sqlite;
 
-pub(super) use models::Report;
+pub use models::{ScraperRun, ScraperRunOutcome, ScraperRunUpdate};
 pub(super) use recorder::Recorder;
 pub(crate) use redact::redact_url;
+pub(super) use service::RunTracker;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-#[cfg(test)]
-use mockall::automock;
 use sqlx::SqlitePool;
 
 use crate::Result;
 
-/// Persists a scraper run's debug report — the logs, HTTP requests,
-/// browser steps, progress updates, input prompts and errors recorded by
-/// [`Recorder`] while the run was in progress — ported from
-/// `demo-rust-fyde`'s `report.rs`. Trait methods take `&self` (not `&mut
+/// Keeps a report of each scraper run: how it went — when it ran, how it
+/// ended, how far it got and how many documents it saved — and its debug
+/// log, the logs, HTTP requests, browser steps, progress updates, input
+/// prompts and errors recorded by [`Recorder`] while it ran (ported from
+/// `demo-rust-fyde`'s `report.rs`). A run's report is opened as it starts
+/// and completed once it ends, so a run cut short by its process ending is
+/// still on record. Unlike `super::cookies`/`super::session`, which persist
+/// state read back and built on by the next run, every run adds its own
+/// report to the scraper's history. Trait methods take `&self` (not `&mut
 /// self`) so implementations can be shared behind `Arc<dyn Service>`.
-#[cfg_attr(test, automock)]
 #[async_trait]
 pub(super) trait Service: Send + Sync {
-    /// Saves `report`, a completed run's full entry list. Unlike
-    /// `super::cookies`/`super::session`, which persist state read back and
-    /// built on by the next run, a report is never read back — every call
-    /// just adds another run's report to this scraper's history.
-    async fn save(&self, report: Report) -> Result<()>;
+    /// Opens the report of a run of `name` starting now. Returns where to
+    /// record its log and progress, to hand to [`Self::finish`].
+    async fn start(&self, name: &str) -> Result<RunTracker>;
+
+    /// Completes `tracker`'s report with how its run ended — `result` is
+    /// what it returned (`ScraperRunStopped` meaning it was stopped) — and
+    /// everything it recorded.
+    async fn finish(&self, tracker: RunTracker, result: &Result<()>) -> Result<()>;
+
+    /// Each scraper's latest run, latest first. One still marked running
+    /// but not started by this service (its process ended mid-run) reads
+    /// as [`ScraperRunOutcome::Interrupted`].
+    async fn last_runs(&self) -> Result<Vec<ScraperRun>>;
 }
 
 /// Selects which [`storage::Storage`] backend [`init`] builds the reports
@@ -60,4 +71,12 @@ pub(super) fn init(config: StorageConfig) -> Arc<dyn Service> {
             Arc::new(service::ReportsClient::new(storage))
         }
     }
+}
+
+/// A reports service held in memory, for tests of the scrapers service.
+#[cfg(test)]
+pub(super) fn in_memory() -> Arc<dyn Service> {
+    Arc::new(service::ReportsClient::new(
+        storage::MemoryStorage::default(),
+    ))
 }

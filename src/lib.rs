@@ -21,7 +21,7 @@ pub use domains::folders::{
 pub use domains::icons::{Icon, Service as IconsService};
 pub use domains::scrapers::{
     HELPERS_LUA as SCRAPER_HELPERS_LUA, OnScraperProgress, OnScraperQuestion, ProgressEvent,
-    ProgressStep, Service as ScrapersService,
+    ProgressStep, ScraperRun, ScraperRunOutcome, ScraperRunUpdate, Service as ScrapersService,
 };
 pub use domains::scripts::{
     InstallScriptRequest, InstalledScript, MAX_INSTALLATION_LABEL_CHARS, Script, ScriptMetadata,
