@@ -70,6 +70,9 @@ rand = "0.10.2"
 # comes from — nothing in this crate names `rand08` directly.
 rand08 = { package = "rand", version = "0.8.5", features = ["getrandom"] }
 rmp-serde = "1.3.0"
+# Parsing the amounts `documents::extraction` reads off documents (already
+# in the tree through `tokenizers`).
+regex = "1.13.1"
 # `fyde.html.select` (`domains/scrapers/host/html.rs`) — re-parses the given
 # HTML string on every call rather than keeping long-lived document handles,
 # same approach and version as `demo-rust-fyde`.

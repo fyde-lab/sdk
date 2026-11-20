@@ -82,8 +82,9 @@ responses; `crypto.rs` only encrypts/decrypts; storage adapters (`storage_sqlite
   itself never waits on a download: it starts loading the embedding and OCR models in
   memory in the background, downloading them first if needed (`documents::start_model_loading`,
   one task per model so they're fetched in parallel; aborted when the `Client` drops; a failure
-  is logged at warn, the first use trying again). Never GLiNER's: only a scraper run loads it,
-  alongside its script (`documents::Service::prepare_attribute_extraction`). Unit tests that `init` a
+  is logged at warn, the first use trying again). Never GLiNER's: a scraper run loads it,
+  alongside its script (`documents::Service::prepare_attribute_extraction`), else the first
+  upload. Unit tests that `init` a
   `Client` pass a regular file as `models_dir` so that loading fails without the network.
 - Never write to the `documents_fts` FTS5 table directly (triggers maintain it). A new virtual
   table must support `'delete-all'` so `SqliteClient::wipe` can clear it.
@@ -178,8 +179,10 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
   - `attributes/` — typed per-document values (`Metadata::attributes`, name → `Attribute`;
     amounts are `i64` minor units, never floats) and their server-side *definitions*
     (`AttributesService::list`/`set`/`check`). Checks (`check_values`, then defined types) run on
-    upload and `update_metadata`. Promote anything that needs filtering/sorting to a real
-    `Metadata` field instead of querying attributes JSON.
+    upload and `update_metadata`; `retain_valid` drops each attribute `check` would refuse
+    instead of failing (for extracted values; lists definitions only if one is valid on its
+    own). Promote anything that needs filtering/sorting to a real `Metadata` field instead of
+    querying attributes JSON.
   - `transcript/` — adapters extracting a PDF's text into `Metadata::transcript` on upload,
     pages joined by `PAGE_SEPARATOR` (`chunk.rs` splits on it); `service.rs`'s `transcribe`
     decides which page gets what. All PDF work runs on the blocking pool.
@@ -271,7 +274,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     classifies only after its embedding succeeded (model at hand, vectors to compare); a
     failure publishes untyped at the root. Never run on consumption.
   - `gliner.rs` — `SpanFinder` (`OnnxGliner`, GLiNER-X small; ported from `doc-ai-poc`'s
-    `gliner.rs`), the adapter attribute extraction runs (below): `spans(text, labels, threshold,
+    `gliner.rs`), the adapter `extraction/` runs (below): `spans(text, labels, threshold,
     max_words)` returns every span (byte range, label index, sigmoid score) scoring at least
     `threshold`, best first, overlaps and window-boundary duplicates included. Keep the model's
     details as they are: `<<ENT>>` = 250100 / `<<SEP>>` = 250101 (not in `tokenizer.json`),
@@ -279,21 +282,22 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     `\w+(?:[-_]\w+)*|\S`, only the inputs the model declares passed (an unknown one fails), logits
     checked to be `[1, words, 12, labels]`. Loaded lazily on the first call with something to
     look for (a failure is retried), or by `load`, run on the blocking pool.
-  - Attribute extraction: an `UploadRequest` with `extract_attributes` (`pub(crate)`: only
-    `fyde.save_document` sets it, so only scrapers' uploads extract) gets attributes from its
-    transcript before publishing, so they travel in the `SaveDocument` event. Every attribute
-    definition (`AttributesService::list`) of a type text can give (string, integer, float,
-    date, amount; never boolean or select) is looked for under its name in plain words
-    (`net_pay` → "net pay"); each takes its best span that parses as its type and passes
-    `check_values` (`extraction.rs`, pure rules tested directly: numbers French or English
-    style, a span's only number, amounts in the currency it names else EUR, day-first numeric
-    and French/English month-name dates), `extraction::THRESHOLD` 0.5 over the first
-    `MAX_WORDS` (2000). Never fails an upload: no definitions, no model or a GLiNER failure
-    publishes without attributes; after a model failure uploads skip extracting for
-    `UPLOAD_EXTRACT_RETRY_AFTER` (5 min). Never run on consumption. The model is loaded by
-    `prepare_attribute_extraction` only: `ScrapersClient` spawns it as each run takes its slot,
-    alongside the script (aborted when the run ends), so the script never waits for it, and a
-    document saved while it's still loading waits for it then.
+  - `extraction/` — attribute values read off every upload's transcript on device (ported
+    from `doc-ai-poc`'s `attributes.rs`; keep its labels, decoys, threshold 0.3, 1200 words and
+    parsers as they are unless re-tuned), so they travel in the `SaveDocument` event. `upload`
+    runs it after classifying: what's looked for depends on the `DocumentType` (invoice/receipt,
+    payslip, tax notice, statement, reimbursement statement, tax certificate (donations), else
+    a generic issuer/date/amount), then keeps what `retain_valid` accepts. Each target has a
+    short French GLiNER label; `DECOYS` (SIRET, share capital, ...) are asked for too so their
+    spans can't become an attribute. Best span first, one per attribute, overlapping spans
+    dropped, a span that doesn't parse skipped. Names are the server's default definitions
+    where one fits (`net_pay`, `period_start`/`period_end`, `tax_year` as an integer...).
+    Amounts are euros (`parse_amount` only reads euros). Never fails an upload: a GLiNER
+    failure publishes without attributes and `extract` finds nothing for
+    `EXTRACTION_RETRY_AFTER` (5 min); `retain_valid` failing (definitions unreachable) does
+    too. Never run on consumption. The model is loaded by `prepare_attribute_extraction`
+    (`ScrapersClient` spawns it as each run takes its slot, alongside the script, aborted when
+    the run ends), else by the first upload.
   - `dev.rs` — `DevDocumentsClient`, plain-file writes for `init_dev_scrapers`.
 - **changelog** (crate-private) — the server is a blind relay of client-encrypted events
   (`SaveDocument`, `UpdateMetadata`, `Deleted`, `InstallScript`, `UninstallScript`, `SaveFolder`, `DeleteFolder`). `crypto.rs`: AES-256-GCM, per-event DEK
@@ -420,8 +424,7 @@ Non-domain helpers live in `src/tools/` (`client_dir`, `hex`, `log`, `models`, `
     `update(current, total)` has no message. New steps need wording in every language in
     `ProgressStep::user_message`, plus a matching variant in the application's bindings
     (`../application/sdkBridge/rust`).
-  - `save_document` uploads via `documents::Service::upload` with `extract_attributes` (see
-    documents' attribute extraction); `DuplicateDocument` is skipped.
+  - `save_document` uploads via `documents::Service::upload`; `DuplicateDocument` is skipped.
     `helpers.save_pdf` records each URL it saved from in `fyde.session.saved_urls`
     (`helpers.already_saved`/`mark_saved`) and skips it on later runs without downloading,
     unless called with `{ refresh = true }` (a fixed URL whose document changes). Installing

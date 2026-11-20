@@ -10,7 +10,8 @@ mod service;
 #[cfg(test)]
 pub(crate) use models::FakeAttributeDefinition;
 pub use models::{Attribute, AttributeDefinition, AttributeType, SetAttributeRequest};
-pub(crate) use service::{MAX_ATTRIBUTES, check_values};
+#[cfg(test)]
+pub(crate) use service::check_values;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -48,6 +49,17 @@ pub trait Service: Send + Sync {
     /// as is. Only lists definitions from the server when there's an
     /// attribute to check.
     async fn check(&self, attributes: &BTreeMap<String, Attribute>) -> Result<()>;
+
+    /// The attributes among `attributes` that [`Self::check`] would accept
+    /// one by one, the others dropped (past the 64 a document can carry,
+    /// the last by name): for values read off a document rather than set by
+    /// its user, where one bad value shouldn't cost the others. Fails only
+    /// if the definitions can't be listed, which it only does when an
+    /// attribute is valid on its own.
+    async fn retain_valid(
+        &self,
+        attributes: BTreeMap<String, Attribute>,
+    ) -> Result<BTreeMap<String, Attribute>>;
 }
 
 /// Initializes the attributes [`Service`] over the shared `channel` to the
