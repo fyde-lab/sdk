@@ -141,3 +141,84 @@ fn into_domain(attribute: proto::Attribute) -> Result<AttributeDefinition> {
         is_default: attribute.is_default,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EVERY_TYPE: [AttributeType; 7] = [
+        AttributeType::String,
+        AttributeType::Integer,
+        AttributeType::Float,
+        AttributeType::Boolean,
+        AttributeType::Date,
+        AttributeType::Amount,
+        AttributeType::Select,
+    ];
+
+    fn proto_attribute(id: &str, r#type: ProtoType) -> proto::Attribute {
+        proto::Attribute {
+            id: id.to_string(),
+            name: "net_pay".to_string(),
+            r#type: r#type as i32,
+            description: "The pay".to_string(),
+            is_default: true,
+        }
+    }
+
+    #[test]
+    fn every_type_round_trips_through_its_proto() {
+        for r#type in EVERY_TYPE {
+            assert_eq!(
+                type_into_domain(type_into_proto(r#type) as i32).unwrap(),
+                r#type
+            );
+        }
+    }
+
+    #[test]
+    fn type_into_domain_rejects_an_unspecified_or_unknown_type() {
+        for r#type in [ProtoType::Unspecified as i32, 42] {
+            assert_eq!(
+                type_into_domain(r#type).unwrap_err().code(),
+                crate::ErrorCode::InvalidServerResponse
+            );
+        }
+    }
+
+    #[test]
+    fn into_domain_keeps_every_field() {
+        let id = Uuid::new_v4();
+
+        let definition = into_domain(proto_attribute(&id.to_string(), ProtoType::Amount)).unwrap();
+
+        assert_eq!(
+            definition,
+            AttributeDefinition {
+                id,
+                name: "net_pay".to_string(),
+                r#type: AttributeType::Amount,
+                description: "The pay".to_string(),
+                is_default: true,
+            }
+        );
+    }
+
+    #[test]
+    fn into_domain_rejects_a_malformed_id() {
+        let err = into_domain(proto_attribute("not-a-uuid", ProtoType::Amount)).unwrap_err();
+
+        assert!(err.has_context());
+    }
+
+    #[test]
+    fn into_domain_rejects_an_unknown_type() {
+        let err = into_domain(proto_attribute(
+            &Uuid::new_v4().to_string(),
+            ProtoType::Unspecified,
+        ))
+        .unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::InvalidServerResponse);
+    }
+}
