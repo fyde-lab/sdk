@@ -10,8 +10,8 @@ use crate::{ErrorCode, ErrorContext as _, Result};
 
 use super::grpc_client::FydeClient;
 use super::models::{
-    DeviceType, Report, ReportCursor, ReportSummary, ReportUpload, ReportedScript, ScraperRun,
-    ScraperRunOutcome, ScraperRunUpdate,
+    DeviceType, Report, ReportSummary, ReportUpload, ReportedScript, ScraperRun, ScraperRunOutcome,
+    ScraperRunUpdate,
 };
 use super::recorder::{Recorder, now_ms};
 use super::storage::{Storage, UploadStorage, outcome_columns};
@@ -279,8 +279,10 @@ impl<S: UploadStorage, C: FydeClient> ReportUploader<S, C> {
     }
 
     /// Uploads every report not uploaded yet, oldest first, and returns how
-    /// many it uploaded. One the server refuses as invalid is left to try
-    /// again on the next pass, and the pass goes on with the others. Any
+    /// many it uploaded. One the server refuses as invalid, or whose row
+    /// can't be read, is left to try again on the next pass, and the pass
+    /// goes on with the others: it's never dropped, and never holds them
+    /// back. Any
     /// other failure to upload (the server unreachable, no session...)
     /// would fail the next ones too, so ends the pass with it.
     pub(super) async fn upload_pending(&self) -> Result<usize> {
@@ -295,10 +297,21 @@ impl<S: UploadStorage, C: FydeClient> ReportUploader<S, C> {
             let Some(last) = batch.last() else {
                 return Ok(uploaded);
             };
-            after = Some(ReportCursor::from(last));
+            after = Some(last.cursor.clone());
             let complete = batch.len() < UPLOAD_BATCH as usize;
 
-            for report in &batch {
+            for listed in batch {
+                let report = match listed.report {
+                    Ok(report) => report,
+                    Err(err) => {
+                        tracing::warn!(
+                            report = %listed.cursor.id,
+                            "can't read scraper report, keeping it to try again: {err}"
+                        );
+                        continue;
+                    }
+                };
+                let report = &report;
                 let Some(upload) = self.upload_of(report).with_context(|| {
                     format!("failed to prepare scraper report {} for upload", report.id)
                 })?
@@ -525,7 +538,7 @@ fn client_id(client_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::grpc_client::MockFydeClient;
-    use super::super::models::{FakeReport, ReportEntry};
+    use super::super::models::{FakeReport, ListedReport, ReportCursor, ReportEntry};
     use super::super::storage::{MemoryStorage, MockStorage, MockUploadStorage};
     use super::*;
     use crate::{Error, ErrorKind};
@@ -801,7 +814,7 @@ mod tests {
             .expect_list_to_upload()
             .withf(|after, limit| after.is_none() && *limit == UPLOAD_BATCH)
             .times(1)
-            .return_once(move |_, _| Ok(vec![report]));
+            .return_once(move |_, _| Ok(vec![report.into()]));
         storage
             .expect_mark_uploaded()
             .withf(move |marked| *marked == id)
@@ -846,13 +859,13 @@ mod tests {
             .withf(|after, _| after.is_none())
             .times(1)
             .in_sequence(&mut sequence)
-            .return_once(move |_, _| Ok(first));
+            .return_once(move |_, _| Ok(first.into_iter().map(Into::into).collect()));
         storage
             .expect_list_to_upload()
-            .withf(move |after, _| *after == Some(cursor))
+            .withf(move |after, _| after.as_ref() == Some(&cursor))
             .times(1)
             .in_sequence(&mut sequence)
-            .return_once(move |_, _| Ok(vec![last]));
+            .return_once(move |_, _| Ok(vec![last.into()]));
         storage
             .expect_mark_uploaded()
             .times(UPLOAD_BATCH as usize + 1)
@@ -877,7 +890,7 @@ mod tests {
         storage
             .expect_list_to_upload()
             .times(1)
-            .return_once(move |_, _| Ok(vec![refused, accepted]));
+            .return_once(move |_, _| Ok(vec![refused.into(), accepted.into()]));
         storage
             .expect_mark_uploaded()
             .withf(move |marked| *marked == accepted_id)
@@ -901,12 +914,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_report_that_cannot_be_read_is_kept_and_the_others_still_go() {
+        let unreadable = ListedReport {
+            cursor: ReportCursor {
+                started_at_ms: 1_000,
+                id: "not-a-uuid".to_string(),
+            },
+            report: Err(std::io::Error::other("corrupted log").into()),
+        };
+        let readable = FakeReport::new().with_started_at_ms(2_000).build();
+        let readable_id = readable.id;
+        let mut storage = MockUploadStorage::new();
+        storage
+            .expect_list_to_upload()
+            .times(1)
+            .return_once(move |_, _| Ok(vec![unreadable, readable.into()]));
+        storage
+            .expect_mark_uploaded()
+            .withf(move |marked| *marked == readable_id)
+            .times(1)
+            .returning(|_| Ok(()));
+        let mut client = MockFydeClient::new();
+        client.expect_upload_report().times(1).returning(|_| Ok(()));
+
+        let uploaded = uploader(storage, client).upload_pending().await.unwrap();
+
+        assert_eq!(uploaded, 1);
+    }
+
+    #[tokio::test]
+    async fn a_batch_ending_in_an_unreadable_report_pages_on_past_it() {
+        let mut first: Vec<ListedReport> = (1..UPLOAD_BATCH)
+            .map(|_| FakeReport::new().build().into())
+            .collect();
+        let unreadable_cursor = ReportCursor {
+            started_at_ms: i64::MAX,
+            id: "not-a-uuid".to_string(),
+        };
+        first.push(ListedReport {
+            cursor: unreadable_cursor.clone(),
+            report: Err(std::io::Error::other("corrupted log").into()),
+        });
+        let mut storage = MockUploadStorage::new();
+        let mut sequence = mockall::Sequence::new();
+        storage
+            .expect_list_to_upload()
+            .withf(|after, _| after.is_none())
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(move |_, _| Ok(first));
+        storage
+            .expect_list_to_upload()
+            .withf(move |after, _| after.as_ref() == Some(&unreadable_cursor))
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(|_, _| Ok(Vec::new()));
+        storage
+            .expect_mark_uploaded()
+            .times(UPLOAD_BATCH as usize - 1)
+            .returning(|_| Ok(()));
+        let mut client = MockFydeClient::new();
+        client
+            .expect_upload_report()
+            .times(UPLOAD_BATCH as usize - 1)
+            .returning(|_| Ok(()));
+
+        let uploaded = uploader(storage, client).upload_pending().await.unwrap();
+
+        assert_eq!(uploaded, UPLOAD_BATCH as usize - 1);
+    }
+
+    #[tokio::test]
     async fn any_other_upload_failure_ends_the_pass_with_context() {
         let mut storage = MockUploadStorage::new();
         storage
             .expect_list_to_upload()
             .times(1)
-            .return_once(|_, _| Ok(vec![FakeReport::new().build(), FakeReport::new().build()]));
+            .return_once(|_, _| {
+                Ok(vec![
+                    FakeReport::new().build().into(),
+                    FakeReport::new().build().into(),
+                ])
+            });
         storage.expect_mark_uploaded().never();
         let mut client = MockFydeClient::new();
         client
@@ -930,7 +1019,7 @@ mod tests {
         let mut storage = MockUploadStorage::new();
         storage
             .expect_list_to_upload()
-            .return_once(move |_, _| Ok(vec![report]));
+            .return_once(move |_, _| Ok(vec![report.into()]));
         storage.expect_mark_uploaded().returning(|_| Ok(()));
         let mut client = MockFydeClient::new();
         client

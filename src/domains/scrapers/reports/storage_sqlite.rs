@@ -6,7 +6,8 @@ use uuid::Uuid;
 use crate::{ErrorContext as _, Result};
 
 use super::models::{
-    Report, ReportCursor, ReportEntry, ReportSummary, ReportedScript, ScraperRun, ScraperRunUpdate,
+    ListedReport, Report, ReportCursor, ReportEntry, ReportSummary, ReportedScript, ScraperRun,
+    ScraperRunUpdate,
 };
 use super::storage::{Storage, UploadStorage, outcome_columns, outcome_from_columns};
 
@@ -109,7 +110,11 @@ impl Storage for SqliteStorage {
 
 #[async_trait]
 impl UploadStorage for SqliteStorage {
-    async fn list_to_upload(&self, after: Option<ReportCursor>, limit: u32) -> Result<Vec<Report>> {
+    async fn list_to_upload(
+        &self,
+        after: Option<ReportCursor>,
+        limit: u32,
+    ) -> Result<Vec<ListedReport>> {
         let rows = sqlx::query(
             "SELECT id, scraper_name, started_at_ms, ended_at_ms, outcome, error_code, step,
                     update_current, update_total, found, saved, script_id, script_version,
@@ -123,14 +128,23 @@ impl UploadStorage for SqliteStorage {
              ORDER BY started_at_ms, id
              LIMIT ?3",
         )
-        .bind(after.map(|cursor| cursor.started_at_ms))
-        .bind(after.map(|cursor| cursor.id.to_string()))
+        .bind(after.as_ref().map(|cursor| cursor.started_at_ms))
+        .bind(after.map(|cursor| cursor.id))
         .bind(limit)
         .fetch_all(&self.pool)
         .await
         .context("failed to list the scraper reports to upload from local database")?;
 
-        rows.iter().map(report_from_row).collect()
+        Ok(rows
+            .iter()
+            .map(|row| ListedReport {
+                cursor: ReportCursor {
+                    started_at_ms: row.get("started_at_ms"),
+                    id: row.get("id"),
+                },
+                report: report_from_row(row).context("failed to read a scraper report to upload"),
+            })
+            .collect())
     }
 
     async fn mark_uploaded(&self, id: Uuid) -> Result<()> {
@@ -307,6 +321,36 @@ mod tests {
         assert_eq!(saved_script(&storage, bare.id).await, (None, None));
     }
 
+    /// `listed`'s reports, each of which must have been read.
+    fn readable(listed: Vec<ListedReport>) -> Vec<Report> {
+        listed
+            .into_iter()
+            .map(|listed| listed.report.unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn list_to_upload_lists_a_row_it_cannot_read_with_where_it_sits() {
+        let storage = setup().await;
+        let corrupted = FakeReport::new().with_started_at_ms(1_000).build();
+        let fine = FakeReport::new().with_started_at_ms(2_000).build();
+        storage.save(&corrupted).await.unwrap();
+        storage.save(&fine).await.unwrap();
+        sqlx::query("UPDATE scraper_reports SET entries = 'not json' WHERE id = ?1")
+            .bind(corrupted.id.to_string())
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+
+        let listed = storage.list_to_upload(None, 10).await.unwrap();
+
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].cursor, ReportCursor::from(&corrupted));
+        let err = listed[0].report.as_ref().unwrap_err();
+        assert!(err.has_context());
+        assert_eq!(listed[1].report.as_ref().unwrap(), &fine);
+    }
+
     #[tokio::test]
     async fn list_to_upload_lists_finished_runs_of_a_known_script_oldest_first() {
         let storage = setup().await;
@@ -325,7 +369,7 @@ mod tests {
         }
 
         assert_eq!(
-            storage.list_to_upload(None, 10).await.unwrap(),
+            readable(storage.list_to_upload(None, 10).await.unwrap()),
             vec![older, newer]
         );
     }
@@ -342,11 +386,13 @@ mod tests {
         let mut by_id = reports.clone();
         by_id.sort_by_key(|report| report.id.to_string());
 
-        let first = storage.list_to_upload(None, 2).await.unwrap();
-        let rest = storage
-            .list_to_upload(Some(ReportCursor::from(&first[1])), 2)
-            .await
-            .unwrap();
+        let first = readable(storage.list_to_upload(None, 2).await.unwrap());
+        let rest = readable(
+            storage
+                .list_to_upload(Some(ReportCursor::from(&first[1])), 2)
+                .await
+                .unwrap(),
+        );
 
         assert_eq!(first, by_id[..2]);
         assert_eq!(rest, by_id[2..]);
@@ -364,7 +410,7 @@ mod tests {
         storage.save(&uploaded).await.unwrap();
 
         assert_eq!(
-            storage.list_to_upload(None, 10).await.unwrap(),
+            readable(storage.list_to_upload(None, 10).await.unwrap()),
             vec![pending]
         );
     }

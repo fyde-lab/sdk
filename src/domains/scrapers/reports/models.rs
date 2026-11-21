@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::ErrorCode;
 use crate::domains::scrapers::ProgressStep;
+use crate::{ErrorCode, Result};
 
 /// One `(event_type, value)` entry recorded during a scraper run — e.g. a
 /// log call, an HTTP request, a browser step, a progress update, an input
@@ -101,18 +101,37 @@ pub(crate) struct ReportedScript {
 
 /// Where a listing of reports left off: the last one it returned, by when
 /// its run started then its id (see
-/// [`super::storage::UploadStorage::list_to_upload`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// [`super::storage::UploadStorage::list_to_upload`]). The id is kept as
+/// stored, so a report whose row can't be read still has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReportCursor {
     pub(crate) started_at_ms: i64,
-    pub(crate) id: Uuid,
+    pub(crate) id: String,
 }
 
 impl From<&Report> for ReportCursor {
     fn from(report: &Report) -> Self {
         Self {
             started_at_ms: report.run.started_at_ms,
-            id: report.id,
+            id: report.id.to_string(),
+        }
+    }
+}
+
+/// A report [`super::storage::UploadStorage::list_to_upload`] listed:
+/// where it sits in the listing, and the report itself unless its row
+/// can't be read (a corrupted log, say).
+#[derive(Debug)]
+pub(crate) struct ListedReport {
+    pub(crate) cursor: ReportCursor,
+    pub(crate) report: Result<Report>,
+}
+
+impl From<Report> for ListedReport {
+    fn from(report: Report) -> Self {
+        Self {
+            cursor: ReportCursor::from(&report),
+            report: Ok(report),
         }
     }
 }
