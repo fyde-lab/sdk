@@ -108,10 +108,17 @@ pub enum FolderContents {
     Delete,
 }
 
-/// The content of a `FolderDeleted` changelog event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DeleteFolderEvent {
-    pub(crate) contents: FolderContents,
+/// A change to a folder synced here, as a `FolderRenamed`,
+/// `FolderAppearanceChanged` or `FolderMoved` event carries it (see
+/// [`super::Applier::apply_patch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FolderPatch {
+    Rename(String),
+    Appearance(FolderAppearance),
+    Move {
+        parent_id: Option<Uuid>,
+        appearance: Option<FolderAppearance>,
+    },
 }
 
 /// Builds a [`Folder`] with random-but-plausible data, overridable field by

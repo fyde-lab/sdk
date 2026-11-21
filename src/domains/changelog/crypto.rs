@@ -6,12 +6,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::domains::documents::Metadata;
 use crate::domains::secrets::{MASTER_KEY_SECRET, Service as SecretsService};
 use crate::domains::users::decode_master_key;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
-use super::models::EventType;
+use super::models::Change;
 
 /// Length in bytes of an AES-256 key (DEK or KEK).
 const KEY_LEN: usize = 32;
@@ -30,13 +29,17 @@ const WRAPPED_KEY_LEN: usize = NONCE_LEN + KEY_LEN + TAG_LEN;
 /// encrypted as a whole. Mirrors [`super::ChangelogEvent`] minus `id`
 /// (assigned by the server, sent alongside the encrypted blob in the
 /// clear).
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct EventPayload {
-    event_type: EventType,
     subject_id: Uuid,
-    #[serde(with = "serde_bytes")]
-    content: Option<Vec<u8>>,
-    metadata: Option<Metadata>,
+    change: Change,
+}
+
+/// [`EventPayload`], borrowing its change to serialize it.
+#[derive(Serialize)]
+struct EventPayloadRef<'a> {
+    subject_id: Uuid,
+    change: &'a Change,
 }
 
 /// Generates a fresh random 256-bit data encryption key (DEK) using the OS
@@ -142,7 +145,7 @@ fn aead_decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> 
 /// used for document uploads before the documents service was folded into
 /// the changelog:
 ///
-/// 1. MessagePack-serializes `{event_type, subject_id, content, metadata}`.
+/// 1. MessagePack-serializes `{subject_id, change}`.
 /// 2. Generates a fresh, random DEK and encrypts the serialized bytes under
 ///    it (AES-256-GCM, random nonce).
 /// 3. Wraps the DEK itself under a KEK (AES-256-GCM), so only the wrapped
@@ -152,17 +155,10 @@ fn aead_decrypt(key: &[u8; KEY_LEN], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>> 
 /// server's `changelog` table has no separate column for the DEK.
 pub(super) async fn encrypt_event(
     secrets: &dyn SecretsService,
-    event_type: EventType,
     subject_id: Uuid,
-    content: Option<&[u8]>,
-    metadata: Option<&Metadata>,
+    change: &Change,
 ) -> Result<Vec<u8>> {
-    let payload = EventPayload {
-        event_type,
-        subject_id,
-        content: content.map(<[u8]>::to_vec),
-        metadata: metadata.cloned(),
-    };
+    let payload = EventPayloadRef { subject_id, change };
     // The plaintext event (a document's content, a script's credentials).
     let bytes =
         Zeroizing::new(rmp_serde::to_vec(&payload).context("failed to serialize changelog event")?);
@@ -183,9 +179,9 @@ pub(super) async fn encrypt_event(
     Ok(encrypted_content)
 }
 
-/// The plaintext fields of a decrypted changelog event: `event_type`,
-/// `subject_id`, `content`, `metadata`.
-pub(super) type DecryptedEvent = (EventType, Uuid, Option<Vec<u8>>, Option<Metadata>);
+/// The plaintext fields of a decrypted changelog event: its `subject_id`
+/// and [`Change`].
+pub(super) type DecryptedEvent = (Uuid, Change);
 
 /// Decrypts an `encrypted_content` blob produced by [`encrypt_event`].
 pub(super) async fn decrypt_event(
@@ -212,12 +208,7 @@ pub(super) async fn decrypt_event(
     let payload: EventPayload =
         rmp_serde::from_slice(&bytes).context("failed to deserialize changelog event")?;
 
-    Ok((
-        payload.event_type,
-        payload.subject_id,
-        payload.content,
-        payload.metadata,
-    ))
+    Ok((payload.subject_id, payload.change))
 }
 
 #[cfg(test)]
@@ -243,65 +234,93 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encrypt_event_roundtrips_a_save_document_event() {
+    async fn encrypt_event_roundtrips_an_upload() {
         let secrets = secrets_with_master_key();
         let subject_id = Uuid::now_v7();
-        let metadata = FakeMetadata::new().build();
+        let change = Change::DocumentUploaded {
+            content: b"body".to_vec(),
+            metadata: FakeMetadata::new().build(),
+        };
 
-        let encrypted = encrypt_event(
-            &secrets,
-            EventType::DocumentUploaded,
-            subject_id,
-            Some(b"body"),
-            Some(&metadata),
-        )
-        .await
-        .unwrap();
+        let encrypted = encrypt_event(&secrets, subject_id, &change).await.unwrap();
 
-        let (event_type, decrypted_id, content, decrypted_metadata) =
-            decrypt_event(&secrets, &encrypted).await.unwrap();
-
-        assert_eq!(event_type, EventType::DocumentUploaded);
-        assert_eq!(decrypted_id, subject_id);
-        assert_eq!(content, Some(b"body".to_vec()));
-        assert_eq!(decrypted_metadata, Some(metadata));
+        let decrypted = decrypt_event(&secrets, &encrypted).await.unwrap();
+        assert_eq!(decrypted, (subject_id, change));
     }
 
     #[tokio::test]
-    async fn encrypt_event_roundtrips_a_deleted_event_with_no_content_or_metadata() {
+    async fn encrypt_event_roundtrips_a_deletion_carrying_nothing() {
         let secrets = secrets_with_master_key();
         let subject_id = Uuid::now_v7();
 
-        let encrypted = encrypt_event(&secrets, EventType::DocumentDeleted, subject_id, None, None)
+        let encrypted = encrypt_event(&secrets, subject_id, &Change::DocumentDeleted)
             .await
             .unwrap();
 
-        let (event_type, decrypted_id, content, metadata) =
-            decrypt_event(&secrets, &encrypted).await.unwrap();
+        let decrypted = decrypt_event(&secrets, &encrypted).await.unwrap();
+        assert_eq!(decrypted, (subject_id, Change::DocumentDeleted));
+    }
 
-        assert_eq!(event_type, EventType::DocumentDeleted);
-        assert_eq!(decrypted_id, subject_id);
-        assert_eq!(content, None);
-        assert_eq!(metadata, None);
+    #[tokio::test]
+    async fn a_rename_is_far_smaller_than_an_upload() {
+        let secrets = secrets_with_master_key();
+        let metadata = FakeMetadata::new()
+            .with_transcript("x".repeat(2_000))
+            .build();
+        let upload = Change::DocumentUploaded {
+            content: Vec::new(),
+            metadata,
+        };
+        let rename = Change::DocumentRenamed {
+            name: "Facture.pdf".to_string(),
+        };
+
+        let upload = encrypt_event(&secrets, Uuid::now_v7(), &upload)
+            .await
+            .unwrap();
+        let rename = encrypt_event(&secrets, Uuid::now_v7(), &rename)
+            .await
+            .unwrap();
+
+        // The wrapped DEK, nonce and tag, then the id, variant and name.
+        assert!(rename.len() < 160, "{} bytes", rename.len());
+        assert!(upload.len() > 2_000);
     }
 
     #[tokio::test]
     async fn decrypt_event_rejects_content_tampered_with_after_encryption() {
         let secrets = secrets_with_master_key();
         let subject_id = Uuid::now_v7();
-        let mut encrypted = encrypt_event(
-            &secrets,
-            EventType::DocumentUploaded,
-            subject_id,
-            Some(b"body"),
-            None,
-        )
-        .await
-        .unwrap();
+        let mut encrypted = encrypt_event(&secrets, subject_id, &Change::DocumentDeleted)
+            .await
+            .unwrap();
         let last = encrypted.len() - 1;
         encrypted[last] ^= 0xff;
 
         assert!(decrypt_event(&secrets, &encrypted).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn decrypt_event_rejects_a_payload_that_isnt_a_change() {
+        let secrets = secrets_with_master_key();
+        #[derive(Serialize)]
+        struct Other {
+            subject_id: Uuid,
+            change: &'static str,
+        }
+        let bytes = rmp_serde::to_vec(&Other {
+            subject_id: Uuid::now_v7(),
+            change: "SaveFolder",
+        })
+        .unwrap();
+        let dek = generate_dek();
+        let kek = derive_kek(&secrets).await.unwrap();
+        let mut encrypted = aead_encrypt(&kek, dek.as_slice()).unwrap();
+        encrypted.extend(aead_encrypt(&dek, &bytes).unwrap());
+
+        let err = decrypt_event(&secrets, &encrypted).await.unwrap_err();
+
+        assert!(err.has_context(), "missing context: {err}");
     }
 
     #[tokio::test]
@@ -334,15 +353,9 @@ mod tests {
             .returning(|_| Ok(None));
         let subject_id = Uuid::now_v7();
 
-        let err = encrypt_event(
-            &secrets,
-            EventType::DocumentUploaded,
-            subject_id,
-            Some(b"body"),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = encrypt_event(&secrets, subject_id, &Change::DocumentDeleted)
+            .await
+            .unwrap_err();
 
         assert!(matches!(err.kind(), ErrorKind::Encryption(_)));
     }

@@ -34,6 +34,7 @@ mod service;
 mod storage;
 mod storage_settings;
 
+pub(crate) use models::Change;
 #[cfg(any(test, feature = "testing"))]
 pub use models::FakeChangelogEvent;
 pub use models::{ChangelogEvent, EventType, SyncProgress};
@@ -52,7 +53,7 @@ use sqlx::SqlitePool;
 use tonic::transport::Channel;
 
 use crate::Result;
-use crate::domains::documents::{self, Metadata};
+use crate::domains::documents;
 use crate::domains::secrets::Service as SecretsService;
 use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
@@ -81,17 +82,10 @@ pub(crate) trait Service: Send + Sync {
     /// whatever that other work happens to fail with first.
     async fn ensure_master_key(&self) -> Result<()>;
 
-    /// Encrypts and publishes a new event about `subject_id` — a document
-    /// or script id depending on `event_type` (see [`ChangelogEvent`]).
-    /// `content`/`metadata` are `None` for event types that don't carry
-    /// them (e.g. a `Deleted` event only carries `subject_id`).
-    async fn send(
-        &self,
-        event_type: EventType,
-        subject_id: uuid::Uuid,
-        content: Option<&[u8]>,
-        metadata: Option<&Metadata>,
-    ) -> Result<()>;
+    /// Encrypts and publishes `change` as a new event about `subject_id`:
+    /// a document, folder or installation id depending on its event type
+    /// (see [`ChangelogEvent`]).
+    async fn send(&self, subject_id: uuid::Uuid, change: &Change) -> Result<()>;
 
     /// Spawns a background task that streams and decrypts every event since
     /// the last consumed id, oldest first (replaying persisted history,

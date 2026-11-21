@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::{ErrorCode, ErrorContext as _, ErrorKind, Result};
 
 use crate::domains::changelog::{
-    ChangelogEvent, EventType, MAX_EVENT_BYTES, Service as ChangelogService, SyncProgress,
+    Change, ChangelogEvent, MAX_EVENT_BYTES, Service as ChangelogService, SyncProgress,
 };
 use crate::domains::folders::{Folder, Service as FoldersService};
 
@@ -271,11 +271,11 @@ impl<S: Storage> DocumentsClient<S> {
             .context("invalid document attributes")
     }
 
-    /// Publishes `metadata` as the `event_type` event of its document.
-    async fn publish_metadata(&self, event_type: EventType, metadata: &Metadata) -> Result<()> {
-        let id = metadata.id;
+    /// Publishes `change` to document `id`.
+    async fn publish(&self, id: Uuid, change: Change) -> Result<()> {
+        let event_type = change.event_type();
         self.changelog
-            .send(event_type, id, None, Some(metadata))
+            .send(id, &change)
             .await
             .with_context(|| format!("failed to publish {event_type:?} for document {id}"))
     }
@@ -769,12 +769,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
         });
 
         self.changelog
-            .send(
-                EventType::DocumentUploaded,
-                id,
-                Some(&content),
-                Some(&metadata),
-            )
+            .send(id, &Change::DocumentUploaded { content, metadata })
             .instrument(tracing::debug_span!("publish_event"))
             .await
             .with_context(|| format!("failed to publish changelog event for document {id}"))?;
@@ -1011,29 +1006,41 @@ impl<S: Storage> Service for DocumentsClient<S> {
         self.check_metadata(&metadata)
             .await
             .with_context(|| format!("invalid metadata for document {id}"))?;
-        let mut current = self
+        let current = self
             .storage
             .get_metadata(id)
             .await
             .with_context(|| format!("failed to load document {id}'s metadata"))?
             .ok_or(ErrorKind::DocumentNotFound(id))?;
 
-        // One event per action, each carrying the metadata once it's done.
+        // One event per action, each carrying only what it changes.
         if current.name != metadata.name {
-            current.name = metadata.name;
-            self.publish_metadata(EventType::DocumentRenamed, &current)
-                .await?;
+            self.publish(
+                id,
+                Change::DocumentRenamed {
+                    name: metadata.name,
+                },
+            )
+            .await?;
         }
         if current.r#type != metadata.r#type || current.attributes != metadata.attributes {
-            current.r#type = metadata.r#type;
-            current.attributes = metadata.attributes;
-            self.publish_metadata(EventType::DocumentAttributesUpdated, &current)
-                .await?;
+            self.publish(
+                id,
+                Change::DocumentAttributesUpdated {
+                    r#type: metadata.r#type,
+                    attributes: metadata.attributes,
+                },
+            )
+            .await?;
         }
         if current.folder_id != metadata.folder_id {
-            current.folder_id = metadata.folder_id;
-            self.publish_metadata(EventType::DocumentMoved, &current)
-                .await?;
+            self.publish(
+                id,
+                Change::DocumentMoved {
+                    folder_id: metadata.folder_id,
+                },
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1052,13 +1059,12 @@ impl<S: Storage> Service for DocumentsClient<S> {
         self.check_metadata(&metadata)
             .await
             .with_context(|| format!("invalid metadata for document {id}"))?;
-        self.publish_metadata(EventType::DocumentMoved, &metadata)
-            .await
+        self.publish(id, Change::DocumentMoved { folder_id }).await
     }
 
     async fn delete(&self, id: Uuid) -> Result<()> {
         self.changelog
-            .send(EventType::DocumentDeleted, id, None, None)
+            .send(id, &Change::DocumentDeleted)
             .await
             .with_context(|| format!("failed to publish the deletion of document {id}"))
     }
@@ -1895,8 +1901,21 @@ mod tests {
         );
     }
 
-    /// A single `send` call recorded by [`RecordingChangelog`].
-    type SentEvent = (EventType, Uuid, Option<Vec<u8>>, Option<Metadata>);
+    /// A single `send` call recorded by [`RecordingChangelog`]:
+    /// `(subject_id, change)`.
+    type SentEvent = (Uuid, Change);
+
+    impl RecordingChangelog {
+        /// The one upload published: its document's id, content and
+        /// metadata.
+        fn upload(&self) -> (Uuid, Vec<u8>, Metadata) {
+            let sent = self.sent.lock().unwrap();
+            let [(id, Change::DocumentUploaded { content, metadata })] = &sent[..] else {
+                panic!("not one upload: {sent:?}");
+            };
+            (*id, content.clone(), metadata.clone())
+        }
+    }
 
     /// A [`ChangelogService`] fake recording every event passed to
     /// [`ChangelogService::send`], and replaying `to_consume` through
@@ -1933,19 +1952,8 @@ mod tests {
             Ok(())
         }
 
-        async fn send(
-            &self,
-            event_type: EventType,
-            subject_id: Uuid,
-            content: Option<&[u8]>,
-            metadata: Option<&Metadata>,
-        ) -> Result<()> {
-            self.sent.lock().unwrap().push((
-                event_type,
-                subject_id,
-                content.map(<[u8]>::to_vec),
-                metadata.cloned(),
-            ));
+        async fn send(&self, subject_id: Uuid, change: &Change) -> Result<()> {
+            self.sent.lock().unwrap().push((subject_id, change.clone()));
             if self.fail_send {
                 return Err(ErrorKind::InvalidChangelogEvent("refused".to_string()).into());
             }
@@ -2027,13 +2035,9 @@ mod tests {
             .await
             .unwrap();
 
-        let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        let (event_type, document_id, content, sent_metadata) = &sent[0];
-        assert_eq!(*event_type, EventType::DocumentUploaded);
-        assert_eq!(*document_id, id);
-        assert_eq!(content.as_deref(), Some(pdf.as_slice()));
-        let sent_metadata = sent_metadata.as_ref().unwrap();
+        let (document_id, content, sent_metadata) = changelog.upload();
+        assert_eq!(document_id, id);
+        assert_eq!(content, pdf);
         assert_eq!(sent_metadata.id, id);
         assert_eq!(sent_metadata.original_name, file_name);
         assert_eq!(sent_metadata.name, file_name.strip_suffix(".pdf").unwrap());
@@ -2184,10 +2188,7 @@ mod tests {
 
         client.upload(request).await.unwrap();
 
-        let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        let (_, _, _, sent_metadata) = &sent[0];
-        let sent_metadata = sent_metadata.as_ref().unwrap();
+        let (_, _, sent_metadata) = changelog.upload();
         assert_eq!(sent_metadata.original_name, "raw.pdf");
         assert_eq!(sent_metadata.name, "overridden.pdf");
     }
@@ -2236,9 +2237,16 @@ mod tests {
             .unwrap();
 
         let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].0, EventType::DocumentAttributesUpdated);
-        assert_eq!(sent[0].3.as_ref().unwrap().attributes, attributes);
+        assert_eq!(
+            *sent,
+            vec![(
+                cached.id,
+                Change::DocumentAttributesUpdated {
+                    r#type: cached.r#type,
+                    attributes,
+                }
+            )]
+        );
     }
 
     #[tokio::test]
@@ -2258,14 +2266,15 @@ mod tests {
             .unwrap();
 
         let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].0, EventType::DocumentAttributesUpdated);
         assert_eq!(
-            sent[0].3.as_ref().unwrap(),
-            &Metadata {
-                r#type: Some(DocumentType::Payslip),
-                ..cached
-            }
+            *sent,
+            vec![(
+                cached.id,
+                Change::DocumentAttributesUpdated {
+                    r#type: Some(DocumentType::Payslip),
+                    attributes: cached.attributes,
+                }
+            )]
         );
     }
 
@@ -2292,30 +2301,29 @@ mod tests {
             .await
             .unwrap();
 
-        let renamed = Metadata {
-            name: "new.pdf".to_string(),
-            ..cached
-        };
-        let updated = Metadata {
-            attributes,
-            ..renamed.clone()
-        };
-        let moved = Metadata {
-            folder_id: Some(folder.id),
-            ..updated.clone()
-        };
         let sent = changelog.sent.lock().unwrap();
         assert_eq!(
             *sent,
             vec![
-                (EventType::DocumentRenamed, renamed.id, None, Some(renamed)),
                 (
-                    EventType::DocumentAttributesUpdated,
-                    updated.id,
-                    None,
-                    Some(updated)
+                    cached.id,
+                    Change::DocumentRenamed {
+                        name: "new.pdf".to_string()
+                    }
                 ),
-                (EventType::DocumentMoved, moved.id, None, Some(moved)),
+                (
+                    cached.id,
+                    Change::DocumentAttributesUpdated {
+                        r#type: cached.r#type,
+                        attributes,
+                    }
+                ),
+                (
+                    cached.id,
+                    Change::DocumentMoved {
+                        folder_id: Some(folder.id)
+                    }
+                ),
             ]
         );
     }
@@ -2340,13 +2348,14 @@ mod tests {
             .unwrap();
 
         let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
         assert_eq!(
-            sent[0].3.as_ref().unwrap(),
-            &Metadata {
-                name: "new.pdf".to_string(),
-                ..cached
-            }
+            *sent,
+            vec![(
+                cached.id,
+                Change::DocumentRenamed {
+                    name: "new.pdf".to_string()
+                }
+            )]
         );
     }
 
@@ -2454,14 +2463,14 @@ mod tests {
             .unwrap();
 
         let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].0, EventType::DocumentMoved);
         assert_eq!(
-            sent[0].3.as_ref().unwrap(),
-            &Metadata {
-                folder_id: Some(folder.id),
-                ..metadata
-            }
+            *sent,
+            vec![(
+                metadata.id,
+                Change::DocumentMoved {
+                    folder_id: Some(folder.id)
+                }
+            )]
         );
     }
 
@@ -2477,12 +2486,8 @@ mod tests {
         client.move_document(metadata.id, None).await.unwrap();
 
         assert_eq!(
-            changelog.sent.lock().unwrap()[0]
-                .3
-                .as_ref()
-                .unwrap()
-                .folder_id,
-            None
+            *changelog.sent.lock().unwrap(),
+            vec![(metadata.id, Change::DocumentMoved { folder_id: None })]
         );
     }
 
@@ -3611,13 +3616,15 @@ mod tests {
             .unwrap();
 
         let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        let (event_type, document_id, content, metadata) = &sent[0];
-        assert_eq!(*event_type, EventType::DocumentRenamed);
-        assert_eq!(*document_id, id);
-        assert_eq!(*content, None);
-        let metadata = metadata.as_ref().unwrap();
-        assert_eq!(metadata.name, "new.pdf");
+        assert_eq!(
+            *sent,
+            vec![(
+                id,
+                Change::DocumentRenamed {
+                    name: "new.pdf".to_string()
+                }
+            )]
+        );
     }
 
     #[tokio::test]
@@ -3742,7 +3749,7 @@ mod tests {
         client.delete(id).await.unwrap();
 
         let sent = changelog.sent.lock().unwrap();
-        assert_eq!(*sent, vec![(EventType::DocumentDeleted, id, None, None)]);
+        assert_eq!(*sent, vec![(id, Change::DocumentDeleted)]);
     }
 
     #[tokio::test]
@@ -4418,18 +4425,14 @@ mod tests {
             .await
             .unwrap();
 
-        let sent = changelog.sent.lock().unwrap();
-        let [(EventType::DocumentUploaded, sent_id, Some(content), Some(metadata))] = &sent[..]
-        else {
-            panic!("unexpected events: {sent:?}");
-        };
-        assert_eq!((*sent_id, metadata.id), (id, id));
-        assert_eq!(*content, pdf);
-        let expected = passages(metadata);
+        let (sent_id, content, metadata) = changelog.upload();
+        assert_eq!((sent_id, metadata.id), (id, id));
+        assert_eq!(content, pdf);
+        let expected = passages(&metadata);
         assert!(!expected.texts.is_empty());
         assert_eq!(*given.lock().unwrap(), expected.texts);
         let put = put.lock().unwrap().clone().unwrap();
-        assert_eq!(put.key, key_for(metadata, "e5.onnx", CHUNKER_VERSION));
+        assert_eq!(put.key, key_for(&metadata, "e5.onnx", CHUNKER_VERSION));
         assert_eq!(
             put.embeddings,
             embeddings(
@@ -4470,9 +4473,7 @@ mod tests {
             .await
             .unwrap();
 
-        let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].1, id);
+        assert_eq!(changelog.upload().0, id);
     }
 
     #[tokio::test]
@@ -4498,8 +4499,7 @@ mod tests {
             .await
             .unwrap();
 
-        let sent = changelog.sent.lock().unwrap();
-        assert!(sent[0].3.as_ref().unwrap().transcript.trim().is_empty());
+        assert!(changelog.upload().2.transcript.trim().is_empty());
     }
 
     #[tokio::test]
@@ -4541,7 +4541,7 @@ mod tests {
         assert!(err.to_string().contains("failed to publish"), "{err}");
         let put = put.lock().unwrap().clone().unwrap();
         assert_eq!(*removed.lock().unwrap(), Some(put.key.document_id));
-        assert_eq!(put.key.document_id, changelog.sent.lock().unwrap()[0].1);
+        assert_eq!(put.key.document_id, changelog.sent.lock().unwrap()[0].0);
     }
 
     #[tokio::test]
@@ -4695,11 +4695,7 @@ mod tests {
 
     /// The metadata of the only document `changelog` published.
     fn published_metadata(changelog: &RecordingChangelog) -> Metadata {
-        let sent = changelog.sent.lock().unwrap();
-        let [(EventType::DocumentUploaded, _, _, Some(metadata))] = &sent[..] else {
-            panic!("unexpected events: {sent:?}");
-        };
-        metadata.clone()
+        changelog.upload().2
     }
 
     /// An embedder for `"e5.onnx"` embedding every passage as
@@ -5250,8 +5246,8 @@ mod tests {
             .await
             .unwrap();
         let put = put.lock().unwrap().clone().unwrap();
-        let (_, subject_id, content, metadata) = changelog.sent.lock().unwrap()[0].clone();
-        let document = Document::new(subject_id, content.unwrap(), metadata.unwrap());
+        let (subject_id, content, metadata) = changelog.upload();
+        let document = Document::new(subject_id, content, metadata);
 
         let mut cache = MockEmbeddingCache::new();
         let cached = put.clone();

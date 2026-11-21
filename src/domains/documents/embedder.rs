@@ -317,13 +317,13 @@ mod tests {
     use super::super::transcript::MockOcr;
     use super::super::transcript::tests::build_pdf_pages;
     use super::super::{
-        ChangelogEvent, Document, EmbeddingCache as _, EventType, FakeDocument, FakeMetadata,
-        Indexer as _, Metadata, MockIndexer, SearchOrder, SearchQuery, Service as _, SqliteStorage,
+        ChangelogEvent, Document, EmbeddingCache as _, FakeDocument, FakeMetadata, Indexer as _,
+        Metadata, MockIndexer, SearchOrder, SearchQuery, Service as _, SqliteStorage,
         UploadRequest,
     };
     use super::*;
     use crate::ErrorCode;
-    use crate::domains::changelog::Service as ChangelogService;
+    use crate::domains::changelog::{Change, Service as ChangelogService};
     use crate::domains::folders::no_folders;
 
     /// A `[1, tokens.len(), DIMENSIONS]` output whose token `i` is
@@ -556,13 +556,7 @@ mod tests {
             unreachable!("searches never publish")
         }
 
-        async fn send(
-            &self,
-            _: EventType,
-            _: uuid::Uuid,
-            _: Option<&[u8]>,
-            _: Option<&Metadata>,
-        ) -> Result<()> {
+        async fn send(&self, _: uuid::Uuid, _: &Change) -> Result<()> {
             unreachable!("searches never publish")
         }
 
@@ -720,19 +714,14 @@ mod tests {
             Ok(())
         }
 
-        async fn send(
-            &self,
-            event_type: EventType,
-            subject_id: uuid::Uuid,
-            content: Option<&[u8]>,
-            metadata: Option<&Metadata>,
-        ) -> Result<()> {
-            assert_eq!(event_type, EventType::DocumentUploaded);
-            self.sent.lock().unwrap().push((
-                subject_id,
-                content.unwrap().to_vec(),
-                metadata.unwrap().clone(),
-            ));
+        async fn send(&self, subject_id: uuid::Uuid, change: &Change) -> Result<()> {
+            let Change::DocumentUploaded { content, metadata } = change else {
+                panic!("not an upload: {change:?}");
+            };
+            self.sent
+                .lock()
+                .unwrap()
+                .push((subject_id, content.clone(), metadata.clone()));
             Ok(())
         }
 

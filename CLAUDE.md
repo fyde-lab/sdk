@@ -48,10 +48,11 @@ encrypts/decrypts, storage adapters (`storage_sqlite.rs`, `SqliteClient`) only r
   because older clients then fail to decode the whole metadata.
 - `Metadata` is positional MessagePack (`MetadataWire`, which keeps slots for removed fields):
   never remove a field, and give new fields `#[serde(default)]`.
-- Changelog event payloads must keep decoding forever, e.g. never add `deny_unknown_fields` to
-  `Folder`. `EventType` has one variant per action (`DocumentUploaded`, `FolderRenamed`,
-  `InstallationCredentialsUpdated`...), each event carrying its subject's whole state once the
-  action is done; a call doing several actions publishes one event per action.
+- Changelog event payloads must keep decoding forever. `EventType` has one variant per action
+  (`DocumentUploaded`, `FolderRenamed`, `InstallationCredentialsUpdated`...), and each event's
+  `changelog::Change` carries only the fields its action changes (positional MessagePack: never
+  reorder a variant's fields), so the consumer patches local state; a call doing several actions
+  publishes one event per action.
 
 **Security invariants:**
 - Every authenticated gRPC call goes through `sessions::authenticated_request` **and**
