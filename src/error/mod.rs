@@ -595,6 +595,13 @@ impl Error {
         self.code().user_message(language)
     }
 
+    /// A [`crate::browser::WebviewEngine`]'s failure, coded
+    /// [`ErrorCode::BrowserFailed`]: how an engine outside this crate
+    /// raises one.
+    pub fn browser(message: impl Into<String>) -> Self {
+        ErrorKind::Browser(message.into()).into()
+    }
+
     #[cfg(test)]
     pub(crate) fn kind(&self) -> &ErrorKind {
         &self.kind

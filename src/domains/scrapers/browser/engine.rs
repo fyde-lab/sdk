@@ -1,5 +1,5 @@
-//! What [`super::driver::BrowserDriver`] needs from a real webview: the
-//! platform-specific half of `fyde.browser`.
+//! What `fyde.browser` needs from a real webview: its platform-specific
+//! half.
 //!
 //! An engine only opens webviews, loads URLs, runs JS and reads/writes
 //! cookies. Every decision (which navigations, popups and downloads to
@@ -49,6 +49,22 @@ pub trait WebviewEngine: Send + Sync {
         config: WebviewConfig,
         handler: Arc<dyn WebviewHandler>,
     ) -> Result<Box<dyn WebviewSession>>;
+}
+
+/// The engine of a caller that passed none: `fyde.browser` fails.
+pub(crate) struct Unavailable;
+
+impl WebviewEngine for Unavailable {
+    fn open_session(
+        &self,
+        _config: WebviewConfig,
+        _handler: Arc<dyn WebviewHandler>,
+    ) -> Result<Box<dyn WebviewSession>> {
+        Err(crate::ErrorKind::Browser(
+            "no browser engine is available on this platform".to_string(),
+        )
+        .into())
+    }
 }
 
 /// One run's webview, opened by [`WebviewEngine::open_session`].
@@ -143,4 +159,28 @@ pub enum WebviewSameSite {
     Strict,
     Lax,
     None,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ErrorCode;
+
+    #[test]
+    fn unavailable_refuses_to_open_a_session() {
+        let handler: Arc<dyn WebviewHandler> = Arc::new(MockWebviewHandler::new());
+
+        let err = match Unavailable.open_session(
+            WebviewConfig {
+                visible: false,
+                cookies: Vec::new(),
+            },
+            handler,
+        ) {
+            Ok(_) => panic!("no engine must open no session"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), ErrorCode::BrowserFailed);
+    }
 }

@@ -12,6 +12,7 @@ use crate::domains::documents::{AttributeModel, ModelHold, Service as DocumentsS
 use crate::domains::scripts::InstalledScript;
 use crate::{ErrorContext as _, Result};
 
+use super::browser::engine::WebviewEngine;
 use super::cookies::{Cookie, Service as CookiesService};
 use super::host::{self, HostConfig};
 use super::models::RunOptions;
@@ -69,6 +70,8 @@ pub(super) struct ScrapersClient {
     attribute_model: Option<Arc<dyn AttributeModel>>,
     on_progress: Option<OnScraperProgress>,
     on_question: Option<OnScraperQuestion>,
+    /// What each run's `fyde.browser` webview runs on (see `browser::init`).
+    browser_engine: Option<Arc<dyn WebviewEngine>>,
     running: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// One permit per run going on (see [`MAX_CONCURRENT_RUNS`]).
     slots: Arc<tokio::sync::Semaphore>,
@@ -90,6 +93,7 @@ struct NameStops {
 }
 
 impl ScrapersClient {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         cookies: Arc<dyn CookiesService>,
         session: Arc<dyn SessionService>,
@@ -98,6 +102,7 @@ impl ScrapersClient {
         on_progress: Option<OnScraperProgress>,
         on_question: Option<OnScraperQuestion>,
         attribute_model: Option<Arc<dyn AttributeModel>>,
+        browser_engine: Option<Arc<dyn WebviewEngine>>,
     ) -> Self {
         Self {
             cookies,
@@ -107,6 +112,7 @@ impl ScrapersClient {
             attribute_model,
             on_progress,
             on_question,
+            browser_engine,
             running: Arc::new(Mutex::new(HashMap::new())),
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_RUNS)),
             stops: Arc::new(Mutex::new(HashMap::new())),
@@ -460,6 +466,7 @@ impl ScrapersClient {
             on_progress,
             on_document_saved,
             on_question: self.on_question.clone(),
+            browser_engine: self.browser_engine.clone(),
             recorder,
             runtime: Handle::current(),
             stop: signal.clone(),
@@ -521,6 +528,7 @@ struct ScraperJob {
     on_progress: OnScraperProgress,
     on_document_saved: Arc<dyn Fn() + Send + Sync>,
     on_question: Option<OnScraperQuestion>,
+    browser_engine: Option<Arc<dyn WebviewEngine>>,
     recorder: Arc<Recorder>,
     runtime: Handle,
     stop: StopSignal,
@@ -547,6 +555,7 @@ fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
         on_progress,
         on_document_saved,
         on_question,
+        browser_engine,
         recorder,
         runtime,
         stop,
@@ -575,6 +584,7 @@ fn run_script(job: ScraperJob) -> Result<(Value, Vec<Cookie>, Result<()>)> {
     // of this function. Its only state carried across runs is cookies,
     // seeded here from the same saved jar `fyde.http` gets.
     let browser = super::browser::init(
+        browser_engine,
         Arc::new(options.allowed_domains.clone()),
         options.browser_visible,
         cookies.clone(),
@@ -746,6 +756,7 @@ mod tests {
             Arc::new(session),
             any_reports(),
             Arc::new(documents),
+            None,
             None,
             None,
             None,
@@ -1119,6 +1130,7 @@ mod tests {
             Some(on_progress),
             None,
             None,
+            None,
         );
 
         let script = r#"
@@ -1231,6 +1243,7 @@ mod tests {
             Some(on_progress),
             None,
             Some(Arc::new(model)),
+            None,
         );
         let script = r#"
             return { run = function() fyde.progress.step(fyde.progress.LOGGING_IN) end }
@@ -1271,6 +1284,7 @@ mod tests {
             None,
             None,
             Some(Arc::new(model)),
+            None,
         );
 
         run_script_named(&client, "didaxis", TRIVIAL_SCRIPT)
@@ -1321,6 +1335,7 @@ mod tests {
             Some(Arc::new(HangingModel {
                 loading: loading.clone(),
             })),
+            None,
         ));
 
         let run = tokio::spawn({
@@ -1359,6 +1374,7 @@ mod tests {
             Arc::new(MockDocumentsService::new()),
             None,
             Some(on_question),
+            None,
             None,
         ))
     }
@@ -1555,6 +1571,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(!client.stop("didaxis"));
@@ -1588,6 +1605,7 @@ mod tests {
             any_reports(),
             Arc::new(MockDocumentsService::new()),
             Some(on_progress),
+            None,
             None,
             None,
         ));
