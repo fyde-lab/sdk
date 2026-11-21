@@ -40,13 +40,15 @@ impl<S: Storage> FoldersClient<S> {
             .context("failed to list local folders")
     }
 
-    async fn publish(&self, folder: &Folder) -> Result<()> {
+    /// Publishes `folder`, as it is once the action is done, as the
+    /// `event_type` event.
+    async fn publish(&self, event_type: EventType, folder: &Folder) -> Result<()> {
         let content = serde_json::to_vec(folder)
             .with_context(|| format!("failed to serialize folder {}", folder.id))?;
         self.changelog
-            .send(EventType::SaveFolder, folder.id, Some(&content), None)
+            .send(event_type, folder.id, Some(&content), None)
             .await
-            .with_context(|| format!("failed to publish folder {}", folder.id))
+            .with_context(|| format!("failed to publish {event_type:?} for folder {}", folder.id))
     }
 }
 
@@ -78,7 +80,7 @@ impl<S: Storage> Service for FoldersClient<S> {
             name,
             appearance: request.appearance,
         };
-        self.publish(&folder).await?;
+        self.publish(EventType::FolderCreated, &folder).await?;
         Ok(folder)
     }
 
@@ -86,17 +88,34 @@ impl<S: Storage> Service for FoldersClient<S> {
         let folders = self.folders().await?;
         let mut folder = find(&folders, request.id)?.clone();
 
-        if let Some(name) = &request.name {
-            let name = valid_name(name)?;
-            check_name_free(&folders, folder.parent_id, &name, Some(folder.id))?;
-            folder.name = name;
-        }
-        if let Some(appearance) = request.appearance {
-            check_appearance(folder.parent_id, Some(appearance))?;
-            folder.appearance = Some(appearance);
-        }
+        let name = match &request.name {
+            Some(name) => {
+                let name = valid_name(name)?;
+                check_name_free(&folders, folder.parent_id, &name, Some(folder.id))?;
+                Some(name).filter(|name| *name != folder.name)
+            }
+            None => None,
+        };
+        let appearance = match request.appearance {
+            Some(appearance) => {
+                check_appearance(folder.parent_id, Some(appearance))?;
+                Some(appearance).filter(|appearance| folder.appearance != Some(*appearance))
+            }
+            None => None,
+        };
 
-        self.publish(&folder).await
+        // Everything is checked before anything is published, then one
+        // event per action, each carrying the folder once it's done.
+        if let Some(name) = name {
+            folder.name = name;
+            self.publish(EventType::FolderRenamed, &folder).await?;
+        }
+        if let Some(appearance) = appearance {
+            folder.appearance = Some(appearance);
+            self.publish(EventType::FolderAppearanceChanged, &folder)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn move_folder(&self, id: Uuid, parent_id: Option<Uuid>) -> Result<()> {
@@ -121,7 +140,7 @@ impl<S: Storage> Service for FoldersClient<S> {
             None => Some(top_level_appearance(&folders, &folder)),
         };
         folder.parent_id = parent_id;
-        self.publish(&folder).await
+        self.publish(EventType::FolderMoved, &folder).await
     }
 
     async fn delete(&self, id: Uuid, contents: FolderContents) -> Result<()> {
@@ -131,7 +150,7 @@ impl<S: Storage> Service for FoldersClient<S> {
         let content = serde_json::to_vec(&DeleteFolderEvent { contents })
             .with_context(|| format!("failed to serialize deletion of folder {id}"))?;
         self.changelog
-            .send(EventType::DeleteFolder, id, Some(&content), None)
+            .send(EventType::FolderDeleted, id, Some(&content), None)
             .await
             .with_context(|| format!("failed to publish deletion of folder {id}"))
     }
@@ -443,11 +462,12 @@ mod tests {
         (FoldersClient::new(storage, changelog.clone()), changelog)
     }
 
-    fn published_folder(changelog: &RecordingChangelog) -> Folder {
+    /// The one folder published to `changelog`, as an `expected` event.
+    fn published_folder(changelog: &RecordingChangelog, expected: EventType) -> Folder {
         let sent = changelog.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
         let (event_type, subject_id, content) = &sent[0];
-        assert_eq!(*event_type, EventType::SaveFolder);
+        assert_eq!(*event_type, expected);
         let folder: Folder = serde_json::from_slice(content.as_deref().unwrap()).unwrap();
         assert_eq!(*subject_id, folder.id);
         folder
@@ -488,7 +508,7 @@ mod tests {
             .await
             .unwrap();
 
-        let published = published_folder(&changelog);
+        let published = published_folder(&changelog, EventType::FolderCreated);
         assert_eq!(published, created);
         assert_eq!(published.name, "Travail");
         assert_eq!(published.parent_id, None);
@@ -509,7 +529,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(published_folder(&changelog).parent_id, Some(parent.id));
+        assert_eq!(
+            published_folder(&changelog, EventType::FolderCreated).parent_id,
+            Some(parent.id)
+        );
     }
 
     #[tokio::test]
@@ -612,7 +635,7 @@ mod tests {
             .await
             .unwrap();
 
-        let published = published_folder(&changelog);
+        let published = published_folder(&changelog, EventType::FolderRenamed);
         assert_eq!(
             published,
             Folder {
@@ -636,7 +659,109 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(published_folder(&changelog).name, "Travail");
+        assert_eq!(
+            published_folder(&changelog, EventType::FolderRenamed).name,
+            "Travail"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_publishes_a_rename_then_a_new_appearance_each_with_the_folder_so_far() {
+        let folder = FakeFolder::new()
+            .with_name("Travail")
+            .with_appearance(Some(DEFAULT_APPEARANCE))
+            .build();
+        let (client, changelog) = client(storage_with(vec![folder.clone()]));
+
+        client
+            .update(UpdateFolderRequest {
+                id: folder.id,
+                name: Some("Emploi".to_string()),
+                appearance: Some(APPEARANCE),
+            })
+            .await
+            .unwrap();
+
+        let renamed = Folder {
+            name: "Emploi".to_string(),
+            ..folder
+        };
+        let recoloured = Folder {
+            appearance: Some(APPEARANCE),
+            ..renamed.clone()
+        };
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(
+            *sent,
+            vec![
+                (
+                    EventType::FolderRenamed,
+                    renamed.id,
+                    Some(serde_json::to_vec(&renamed).unwrap())
+                ),
+                (
+                    EventType::FolderAppearanceChanged,
+                    recoloured.id,
+                    Some(serde_json::to_vec(&recoloured).unwrap())
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_publishes_only_a_new_appearance_as_an_appearance_change() {
+        let folder = FakeFolder::new()
+            .with_appearance(Some(DEFAULT_APPEARANCE))
+            .build();
+        let (client, changelog) = client(storage_with(vec![folder.clone()]));
+
+        client
+            .update(UpdateFolderRequest {
+                id: folder.id,
+                name: Some(folder.name.clone()),
+                appearance: Some(APPEARANCE),
+            })
+            .await
+            .unwrap();
+
+        let published = published_folder(&changelog, EventType::FolderAppearanceChanged);
+        assert_eq!(published.appearance, Some(APPEARANCE));
+    }
+
+    #[tokio::test]
+    async fn update_to_what_the_folder_already_is_publishes_nothing() {
+        let folder = FakeFolder::new().with_appearance(Some(APPEARANCE)).build();
+        let (client, changelog) = client(storage_with(vec![folder.clone()]));
+
+        client
+            .update(UpdateFolderRequest {
+                id: folder.id,
+                name: Some(folder.name.clone()),
+                appearance: Some(APPEARANCE),
+            })
+            .await
+            .unwrap();
+
+        assert!(changelog.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_publishes_no_rename_when_the_appearance_is_refused() {
+        let parent = FakeFolder::new().build();
+        let child = FakeFolder::new().with_parent(parent.id).build();
+        let (client, changelog) = client(storage_with(vec![parent, child.clone()]));
+
+        let err = client
+            .update(UpdateFolderRequest {
+                id: child.id,
+                name: Some("Autre".to_string()),
+                appearance: Some(APPEARANCE),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::InvalidFolderAppearance);
+        assert!(changelog.sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -680,7 +805,7 @@ mod tests {
 
         client.move_folder(moved.id, Some(target.id)).await.unwrap();
 
-        let published = published_folder(&changelog);
+        let published = published_folder(&changelog, EventType::FolderMoved);
         assert_eq!(published.parent_id, Some(target.id));
         assert_eq!(published.appearance, None);
     }
@@ -694,7 +819,7 @@ mod tests {
 
         client.move_folder(moved.id, None).await.unwrap();
 
-        let published = published_folder(&changelog);
+        let published = published_folder(&changelog, EventType::FolderMoved);
         assert_eq!(published.parent_id, None);
         assert_eq!(published.appearance, Some(APPEARANCE));
     }
@@ -760,7 +885,7 @@ mod tests {
 
         let sent = changelog.sent.lock().unwrap();
         let (event_type, subject_id, content) = &sent[0];
-        assert_eq!(*event_type, EventType::DeleteFolder);
+        assert_eq!(*event_type, EventType::FolderDeleted);
         assert_eq!(*subject_id, folder.id);
         let event: DeleteFolderEvent = serde_json::from_slice(content.as_deref().unwrap()).unwrap();
         assert_eq!(event.contents, FolderContents::Delete);
