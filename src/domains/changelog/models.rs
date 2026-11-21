@@ -289,6 +289,7 @@ impl FakeChangelogEvent {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_change(mut self, change: Change) -> Self {
         self.event.change = change;
         self
