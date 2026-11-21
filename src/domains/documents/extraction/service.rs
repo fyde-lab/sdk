@@ -318,13 +318,15 @@ fn attributes(text: &str, class: &Class, mut spans: Vec<Span>) -> BTreeMap<Strin
 /// "- 1 138,93 €-" → minor units. Anything else (an id, "10 jours",
 /// "Page 1/1", "203,49 hrs", a bare "83") is no amount.
 fn parse_amount(s: &str) -> Option<i64> {
+    // `[0-9]`, not `\d`, which takes any script's digits: they'd then be
+    // dropped below ("1２3,45 €" read as 13,45 €).
     static AMOUNT: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
             r"(?ix)^
               (?P<prefix>€\s*)?
               (?P<sign>-)?\s*
-              (?P<units>\d{1,3}(?:[\ .'\u{a0}\u{202f}]\d{3})+|\d{1,7})
-              (?:[.,](?P<decimals>\d{1,2}))?
+              (?P<units>[0-9]{1,3}(?:[\ .'\u{a0}\u{202f}][0-9]{3})+|[0-9]{1,7})
+              (?:[.,](?P<decimals>[0-9]{1,2}))?
               \s*(?P<currency>€|eur|euros?|euro\(s\))?
               (?P<padding>-)?
               (?:\s*(?:ttc|ht))?
@@ -788,6 +790,15 @@ mod tests {
         assert_eq!(parse_amount("0 €"), Some(0));
         assert_eq!(parse_amount("€ 12"), Some(1_200));
         assert_eq!(parse_amount("12 eur"), Some(1_200));
+    }
+
+    #[test]
+    fn amounts_with_non_ascii_digits_are_no_amount() {
+        // Full-width digits, as OCR can read them, or other scripts'.
+        assert_eq!(parse_amount("1\u{ff12}3,45 €"), None);
+        assert_eq!(parse_amount("\u{ff11}\u{ff12} €"), None);
+        assert_eq!(parse_amount("12,\u{ff15}0 €"), None);
+        assert_eq!(parse_amount("\u{663}\u{662} €"), None);
     }
 
     #[test]
