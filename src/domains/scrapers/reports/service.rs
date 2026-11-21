@@ -297,7 +297,10 @@ impl<S: UploadStorage, C: FydeClient> ReportUploader<S, C> {
             let complete = batch.len() < UPLOAD_BATCH as usize;
 
             for report in &batch {
-                let Some(upload) = self.upload_of(report)? else {
+                let Some(upload) = self.upload_of(report).with_context(|| {
+                    format!("failed to prepare scraper report {} for upload", report.id)
+                })?
+                else {
                     continue;
                 };
                 match self.client.upload_report(upload).await {
