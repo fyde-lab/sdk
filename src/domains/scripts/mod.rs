@@ -77,15 +77,14 @@ pub trait Service: Send + Sync {
     /// `request.installation_id` is `None` (a user can install the same
     /// script several times, once per account on its site), else replacing
     /// that installation, which is how its parameters, label or folder
-    /// change. Fetches the script (see
-    /// [`Self::fetch_script`]), then serializes it together with the
-    /// installation's id, label, parameters and folder as an
-    /// [`InstalledScript`] JSON document and publishes it, encrypted, as
-    /// changelog events whose subject is the installation id, which it
-    /// returns: a `ScriptInstalled` event for a new installation (or one not
-    /// synced here yet); else one event per change to the installation
-    /// synced here, in turn, each carrying it once that change is done
-    /// (`InstallationUpgraded` for another script version,
+    /// change. Fetches the script (see [`Self::fetch_script`]), then
+    /// publishes, encrypted, changelog events whose subject is the
+    /// installation id, which it returns: a `ScriptInstalled` event
+    /// carrying the script with the installation's label, parameters and
+    /// folder for a new installation (or one not synced here yet); else one
+    /// event per change to the installation synced here, in turn, each
+    /// carrying only what it changes (`InstallationUpgraded` for another
+    /// script version,
     /// `InstallationCredentialsUpdated` for new parameters,
     /// `InstallationRenamed` for a new label, `InstallationFolderChanged`
     /// for a new folder), and none if nothing changed. Fails with [`crate::ErrorCode::FolderNotFound`] for

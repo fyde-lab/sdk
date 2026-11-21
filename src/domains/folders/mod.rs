@@ -4,8 +4,8 @@
 //! No gRPC transport: the service validates each change against the folders
 //! synced so far, then publishes one changelog event per action:
 //! `FolderCreated`, `FolderRenamed`, `FolderAppearanceChanged` or
-//! `FolderMoved` (each carrying the whole folder once it's done), or
-//! `FolderDeleted` (keep or delete its contents); `list` reads
+//! `FolderMoved` (each carrying only what it changes), or `FolderDeleted`
+//! (keep or delete its contents); `list` reads
 //! the local table. The consumer applies them through [`Applier`], which
 //! resolves concurrent edits identically on every device: a missing parent or
 //! a cycle puts the folder at the top level, a sibling name clash gets a
@@ -30,9 +30,9 @@ use mockall::automock;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-pub(crate) use models::DeleteFolderEvent;
 #[cfg(any(test, feature = "testing"))]
 pub use models::FakeFolder;
+pub(crate) use models::FolderPatch;
 pub use models::{
     CreateFolderRequest, Folder, FolderAppearance, FolderColor, FolderContents, FolderIcon,
     MAX_FOLDER_NAME_CHARS, UpdateFolderRequest,
@@ -93,9 +93,14 @@ pub trait Service: Send + Sync {
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(crate) trait Applier: Send + Sync {
-    /// Saves `folder` as a `FolderCreated`, `FolderRenamed`,
-    /// `FolderAppearanceChanged` or `FolderMoved` event carries it.
+    /// Saves `folder` as a `FolderCreated` event carries it.
     async fn apply_save(&self, folder: Folder) -> Result<()>;
+
+    /// Changes folder `id` as a `FolderRenamed`, `FolderAppearanceChanged`
+    /// or `FolderMoved` event says, resolving what that leaves inconsistent
+    /// as [`Self::apply_save`] does. A folder that isn't there (deleted
+    /// meanwhile) is ignored.
+    async fn apply_patch(&self, id: Uuid, patch: FolderPatch) -> Result<()>;
 
     /// Deletes folder `id` as a `FolderDeleted` event says: moving its
     /// subfolders and documents up to its parent, or deleting every folder

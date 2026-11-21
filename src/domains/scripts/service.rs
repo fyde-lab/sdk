@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::domains::changelog::{EventType, Service as ChangelogService};
+use crate::domains::changelog::{Change, Service as ChangelogService};
 use crate::domains::folders::Service as FoldersService;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
@@ -65,19 +65,12 @@ impl<S: Storage> ScriptsClient<S> {
 }
 
 impl<S: Storage> ScriptsClient<S> {
-    /// Publishes `installed`, as it is once the action is done, as the
-    /// `event_type` event.
-    async fn publish_installation(
-        &self,
-        event_type: EventType,
-        installed: &InstalledScript,
-    ) -> Result<()> {
-        let installation_id = installed.installation_id;
-        let script_id = installed.script.id();
-        let content = serde_json::to_vec(installed)
-            .with_context(|| format!("failed to serialize installation {installation_id}"))?;
+    /// Publishes `change` to installation `installation_id` of script
+    /// `script_id`.
+    async fn publish(&self, installation_id: Uuid, script_id: Uuid, change: Change) -> Result<()> {
+        let event_type = change.event_type();
         self.changelog
-            .send(event_type, installation_id, Some(&content), None)
+            .send(installation_id, &change)
             .await
             .with_context(|| {
                 format!(
@@ -173,13 +166,6 @@ impl<S: Storage> Service for ScriptsClient<S> {
                 label.to_string()
             }
         };
-        let installed = InstalledScript {
-            installation_id: installation_id.unwrap_or_else(Uuid::now_v7),
-            label,
-            script,
-            parameters,
-            folder_id,
-        };
         let previous = match installation_id {
             Some(installation_id) => self
                 .storage
@@ -191,49 +177,64 @@ impl<S: Storage> Service for ScriptsClient<S> {
             None => None,
         };
 
-        let Some(mut current) = previous else {
+        let Some(current) = previous else {
             // A new installation, or one not synced here yet: published
             // whole.
-            self.publish_installation(EventType::ScriptInstalled, &installed)
-                .await?;
-            return Ok(installed.installation_id);
+            let installation_id = installation_id.unwrap_or_else(Uuid::now_v7);
+            self.publish(
+                installation_id,
+                script_id,
+                Change::ScriptInstalled {
+                    label,
+                    script,
+                    parameters,
+                    folder_id,
+                },
+            )
+            .await?;
+            return Ok(installation_id);
         };
 
-        // One event per action, each carrying the installation once it's
-        // done.
-        let InstalledScript {
-            installation_id,
-            label,
-            script,
-            parameters,
-            folder_id,
-        } = installed;
+        // One event per action, each carrying only what it changes.
+        let installation_id = current.installation_id;
         if current.script.id() != script.id() || current.script.version() != script.version() {
-            current.script = script;
-            self.publish_installation(EventType::InstallationUpgraded, &current)
-                .await?;
+            self.publish(
+                installation_id,
+                script_id,
+                Change::InstallationUpgraded { script },
+            )
+            .await?;
         }
         if current.parameters != parameters {
-            current.parameters = parameters;
-            self.publish_installation(EventType::InstallationCredentialsUpdated, &current)
-                .await?;
+            self.publish(
+                installation_id,
+                script_id,
+                Change::InstallationCredentialsUpdated { parameters },
+            )
+            .await?;
         }
         if current.label != label {
-            current.label = label;
-            self.publish_installation(EventType::InstallationRenamed, &current)
-                .await?;
+            self.publish(
+                installation_id,
+                script_id,
+                Change::InstallationRenamed { label },
+            )
+            .await?;
         }
         if current.folder_id != folder_id {
-            current.folder_id = folder_id;
-            self.publish_installation(EventType::InstallationFolderChanged, &current)
-                .await?;
+            self.publish(
+                installation_id,
+                script_id,
+                Change::InstallationFolderChanged { folder_id },
+            )
+            .await?;
         }
         Ok(installation_id)
     }
 
     async fn uninstall_script(&self, installation_id: Uuid) -> Result<()> {
         self.changelog
-            .send(EventType::ScriptUninstalled, installation_id, None, None)
+            .send(installation_id, &Change::ScriptUninstalled)
             .await
             .with_context(|| format!("failed to publish uninstallation {installation_id}"))
     }
@@ -321,7 +322,6 @@ mod tests {
 
     use super::*;
     use crate::domains::changelog::ChangelogEvent;
-    use crate::domains::documents::Metadata;
     use crate::domains::folders::{
         FakeFolder, MockService as MockFoldersService, folders_listing, no_folders,
     };
@@ -333,7 +333,7 @@ mod tests {
     };
 
     /// A single `send` call recorded by [`RecordingChangelog`].
-    type SentEvent = (EventType, Uuid, Option<Vec<u8>>, Option<Metadata>);
+    type SentEvent = (Uuid, Change);
 
     /// A [`ChangelogService`] fake recording every event passed to
     /// [`ChangelogService::send`]. Hand-written rather than `automock`ed
@@ -350,19 +350,8 @@ mod tests {
             unimplemented!("not used by the scripts service")
         }
 
-        async fn send(
-            &self,
-            event_type: EventType,
-            subject_id: Uuid,
-            content: Option<&[u8]>,
-            metadata: Option<&Metadata>,
-        ) -> Result<()> {
-            self.sent.lock().unwrap().push((
-                event_type,
-                subject_id,
-                content.map(<[u8]>::to_vec),
-                metadata.cloned(),
-            ));
+        async fn send(&self, subject_id: Uuid, change: &Change) -> Result<()> {
+            self.sent.lock().unwrap().push((subject_id, change.clone()));
             Ok(())
         }
 
@@ -422,11 +411,18 @@ mod tests {
     fn sent_installation(changelog: &RecordingChangelog, installation_id: Uuid) -> InstalledScript {
         let sent = changelog.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
-        let (event_type, id, content, metadata) = &sent[0];
-        assert_eq!(*event_type, EventType::ScriptInstalled);
+        let (id, change) = &sent[0];
         assert_eq!(*id, installation_id);
-        assert_eq!(*metadata, None);
-        serde_json::from_slice(content.as_deref().unwrap()).unwrap()
+        let Change::ScriptInstalled {
+            label,
+            script,
+            parameters,
+            folder_id,
+        } = change.clone()
+        else {
+            panic!("not an installation: {change:?}");
+        };
+        InstalledScript::new(*id, label, script, parameters, folder_id)
     }
 
     #[tokio::test]
@@ -570,48 +566,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(returned, installation_id);
-        let upgraded = InstalledScript {
-            script: new_script,
-            ..installed
-        };
-        let credentials = InstalledScript {
-            parameters,
-            ..upgraded.clone()
-        };
-        let renamed = InstalledScript {
-            label: "Marie D.".to_string(),
-            ..credentials.clone()
-        };
-        let refiled = InstalledScript {
-            folder_id: Some(folder.id),
-            ..renamed.clone()
-        };
         let sent = changelog.sent.lock().unwrap();
-        let sent: Vec<(EventType, Uuid, InstalledScript)> = sent
-            .iter()
-            .map(|(event_type, id, content, metadata)| {
-                assert_eq!(*metadata, None);
-                (
-                    *event_type,
-                    *id,
-                    serde_json::from_slice(content.as_deref().unwrap()).unwrap(),
-                )
-            })
-            .collect();
         assert_eq!(
-            sent,
+            *sent,
             vec![
-                (EventType::InstallationUpgraded, installation_id, upgraded),
                 (
-                    EventType::InstallationCredentialsUpdated,
                     installation_id,
-                    credentials
+                    Change::InstallationUpgraded { script: new_script }
                 ),
-                (EventType::InstallationRenamed, installation_id, renamed),
                 (
-                    EventType::InstallationFolderChanged,
                     installation_id,
-                    refiled
+                    Change::InstallationCredentialsUpdated { parameters }
+                ),
+                (
+                    installation_id,
+                    Change::InstallationRenamed {
+                        label: "Marie D.".to_string()
+                    }
+                ),
+                (
+                    installation_id,
+                    Change::InstallationFolderChanged {
+                        folder_id: Some(folder.id)
+                    }
                 ),
             ]
         );
@@ -646,8 +623,15 @@ mod tests {
             .unwrap();
 
         let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].0, EventType::InstallationRenamed);
+        assert_eq!(
+            *sent,
+            vec![(
+                installation_id,
+                Change::InstallationRenamed {
+                    label: "Compte pro".to_string()
+                }
+            )]
+        );
     }
 
     #[tokio::test]
@@ -877,10 +861,7 @@ mod tests {
         client.uninstall_script(installation_id).await.unwrap();
 
         let sent = changelog.sent.lock().unwrap();
-        assert_eq!(
-            *sent,
-            vec![(EventType::ScriptUninstalled, installation_id, None, None)]
-        );
+        assert_eq!(*sent, vec![(installation_id, Change::ScriptUninstalled)]);
     }
 
     #[tokio::test]

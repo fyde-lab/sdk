@@ -239,8 +239,8 @@ pub trait Service: Send + Sync {
 
     /// Changes the cached document `metadata.id`'s name, type, attributes
     /// and folder to `metadata`'s, publishing one changelog event per
-    /// action, in turn, each carrying the document's metadata once it's
-    /// done: `DocumentRenamed` for a new name, `DocumentAttributesUpdated`
+    /// action, in turn, each carrying only what it changes:
+    /// `DocumentRenamed` for a new name, `DocumentAttributesUpdated`
     /// for a new type or attributes (an attribute left out of `metadata`
     /// is removed), `DocumentMoved` for a new folder (as
     /// [`Self::move_document`]). `metadata`'s other fields are ignored: the
@@ -252,7 +252,7 @@ pub trait Service: Send + Sync {
 
     /// Moves the document `id` into the folder `folder_id` (`None` for the
     /// root, À classer), publishing a `DocumentMoved` changelog event
-    /// carrying its metadata. Fails with [`crate::ErrorCode::DocumentNotFound`] for a
+    /// carrying the new folder. Fails with [`crate::ErrorCode::DocumentNotFound`] for a
     /// document not synced here, and [`crate::ErrorCode::FolderNotFound`]
     /// for a folder not synced here. Moving it where it already is
     /// publishes nothing.
