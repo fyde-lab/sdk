@@ -330,9 +330,11 @@ impl Classifier {
         for label in TYPES {
             let mut vectors = Vec::with_capacity(label.descriptions.len());
             for description in label.descriptions {
-                vectors.push(self.embed_query(description).await.with_context(|| {
-                    "failed to embed the document type descriptions".to_string()
-                })?);
+                vectors.push(
+                    self.embed_query(description)
+                        .await
+                        .context("failed to embed the document type descriptions")?,
+                );
             }
             types.push(vectors);
         }
@@ -366,7 +368,10 @@ impl Service for Classifier {
             ))
             .into());
         }
-        let types = self.type_descriptions().await?;
+        let types = self
+            .type_descriptions()
+            .await
+            .context("failed to get the document type descriptions' embeddings")?;
 
         Ok(classify(&normalized(document), &types, filed))
     }
