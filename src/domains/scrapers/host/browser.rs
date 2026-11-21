@@ -15,7 +15,7 @@ const DEFAULT_WAIT_FOR_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `fyde.browser` — `open`/`wait_for`/`fill`/`click`/`html`/`download`,
-/// backed by [`BrowserService`] (a real `wry` webview, see
+/// backed by [`BrowserService`] (a real webview, see
 /// `browser::driver::BrowserDriver`), so a login flow blocked by a
 /// client-rendered SPA or a JS-driven WAF challenge can drive a real
 /// browser engine instead of `fyde.http`'s plain HTTP client.

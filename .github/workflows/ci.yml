@@ -18,7 +18,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
-      - run: cargo fmt --check
+      - run: cargo fmt --all --check
 
   clippy-and-test:
     runs-on: ubuntu-24.04
@@ -44,7 +44,7 @@ jobs:
           workspaces: sdk
       - name: Clippy
         working-directory: sdk
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         working-directory: sdk
-        run: cargo test
+        run: cargo test --workspace

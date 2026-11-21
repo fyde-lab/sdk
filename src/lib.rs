@@ -37,6 +37,17 @@ pub use domains::users::{
 };
 pub use tools::log::LogLevel;
 
+/// What a platform provides for `fyde.browser` to run on (see
+/// [`ClientConfig::browser_engine`]): the desktop one is the
+/// `fyde-browser-wry` crate. [`WebviewEngine`](browser::WebviewEngine)'s
+/// docs are the contract an engine must follow.
+pub mod browser {
+    pub use crate::domains::scrapers::browser::engine::{
+        WebviewConfig, WebviewCookie, WebviewEngine, WebviewHandler, WebviewSameSite,
+        WebviewSession,
+    };
+}
+
 use domains::secrets::SecretLocation;
 use domains::sessions::{Service as SessionsService, SessionsClient};
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
@@ -172,6 +183,12 @@ pub struct ClientConfig {
     /// instead of blocking forever waiting for an answer that can never
     /// come.
     pub on_scraper_question: Option<OnScraperQuestion>,
+    /// What scraper scripts' `fyde.browser` webviews run on: the
+    /// `fyde-browser-wry` crate's engine on desktop, the app's native
+    /// webview on mobile. `None` where there's none: `fyde.browser` calls
+    /// then fail with [`ErrorCode::BrowserFailed`], as on a desktop with no
+    /// display.
+    pub browser_engine: Option<Arc<dyn browser::WebviewEngine>>,
 }
 
 /// A connection to a fyde server.
@@ -328,6 +345,7 @@ impl Client {
             Some(span_finder),
             config.on_scraper_progress,
             config.on_scraper_question,
+            config.browser_engine,
             Some(report_upload_wake),
         );
 
@@ -755,14 +773,16 @@ pub mod testing {
 /// `documents_dir/scraper_name` instead of being encrypted and uploaded —
 /// see [`domains::documents::init_dev`] — so documents from different
 /// scrapers never collide or mix together under the same `documents_dir`.
-/// `on_progress`/`on_question` are the same callbacks as
-/// [`ClientConfig::on_scraper_progress`]/[`ClientConfig::on_scraper_question`].
+/// `on_progress`/`on_question`/`browser_engine` are the same as
+/// [`ClientConfig::on_scraper_progress`]/[`ClientConfig::on_scraper_question`]/
+/// [`ClientConfig::browser_engine`].
 pub async fn init_dev_scrapers(
     storage_dir: std::path::PathBuf,
     documents_dir: std::path::PathBuf,
     scraper_name: impl Into<String>,
     on_progress: Option<OnScraperProgress>,
     on_question: Option<OnScraperQuestion>,
+    browser_engine: Option<Arc<dyn browser::WebviewEngine>>,
 ) -> Result<Arc<dyn ScrapersService>> {
     let documents = domains::documents::init_dev(documents_dir, scraper_name);
 
@@ -773,6 +793,7 @@ pub async fn init_dev_scrapers(
         None,
         on_progress,
         on_question,
+        browser_engine,
         // Reports kept as files are never uploaded.
         None,
     ))
@@ -803,6 +824,7 @@ mod tests {
             on_document_change: None,
             on_scraper_progress: None,
             on_scraper_question: None,
+            browser_engine: None,
         };
 
         let err = match Client::init(config).await {
@@ -940,6 +962,7 @@ mod tests {
             on_document_change: None,
             on_scraper_progress: None,
             on_scraper_question: None,
+            browser_engine: None,
         };
 
         let first = Client::init(config()).await.unwrap();
@@ -1024,6 +1047,7 @@ mod tests {
             on_document_change: None,
             on_scraper_progress: None,
             on_scraper_question: None,
+            browser_engine: None,
         })
         .await
         {

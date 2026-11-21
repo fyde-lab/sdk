@@ -1,0 +1,22 @@
+[package]
+name = "fyde-browser-wry"
+version = "0.1.0"
+edition = "2024"
+description = "The desktop webview fyde-sdk's `fyde.browser` runs on"
+
+[dependencies]
+# The cookie type `wry`'s `WebView::cookies`/`set_cookie` speak: must stay on
+# the same major version `wry` itself depends on.
+cookie = "0.18"
+fyde-sdk = { path = ".." }
+rand = "0.10.2"
+# `tao` provides the event loop and window `wry`'s `WebView` attaches to (on
+# Linux via `WebViewBuilder::build_gtk`, pairing with `tao`'s GTK main-loop
+# integration; the plain `winit` crate doesn't drive GTK's own main loop,
+# which WebKitGTK needs). Needs `webkit2gtk-4.1`/`gtk+-3.0`/`dbus-1`
+# (`pkg-config`-discovered) at build time on Linux — see `../shell.nix`. Only
+# exercised on Linux while writing this; `wry`'s own docs cover macOS/Windows
+# as a different `build()` call, not `build_gtk()`.
+tao = "0.37"
+tracing = "0.1.44"
+wry = "0.57"

@@ -1,6 +1,8 @@
 # CLAUDE.md
 
-`fyde-sdk`: the Rust client library (no binary) for `../server`, built standalone. Consumed by
+`fyde-sdk`: the Rust client library (no binary) for `../server`, built standalone, in a workspace
+with `browser-wry/` (`fyde-browser-wry`, the desktop webview engine `fyde.browser` runs on, kept
+out of `fyde-sdk` so mobile builds never pull in tao/wry/GTK). Consumed by
 `../scripts`, `../cli` and `../application` through its bindings crate
 `../application/sdkBridge/rust`, which mirrors this crate's public API: **update it with any API
 change**. Protos come from the BSR (`buf.build/fyde-lab/api`, published from `../server/protos`).
@@ -10,16 +12,18 @@ Shared layering and error conventions are in `../CLAUDE.md`. Each domain's `mod.
 ## Commands
 
 ```sh
-cargo build
-cargo test                                   # or: cargo test <name>
-cargo clippy --all-targets -- -D warnings    # CI: this + cargo fmt --check + cargo test
+cargo build --workspace
+cargo test --workspace                       # or: cargo test <name>
+cargo clippy --workspace --all-targets -- -D warnings  # CI: this + cargo fmt --all --check + cargo test --workspace
+xvfb-run -a cargo test -p fyde-browser-wry -- --ignored  # the real wry webview (needs a display)
 FYDE_PROTO_DIR=../server/protos cargo build  # without buf / network
 RUSTFLAGS="--cfg tokio_unstable" cargo build --features tokio-console  # tokio-console on 127.0.0.1:6669
 FYDE_TEST_MODELS_DIR=/some/dir cargo test -- --ignored multilingual_e5  # real-model tests (also: gliner_x_small, pp_ocrv5)
 ```
 
-- Dev shell: `shell.nix` via direnv. Rust **1.95+** (`oar-ocr`'s MSRV), `protobuf`, and the
-  `webkitgtk`/`gtk3` that `wry` needs. No `cmake`/`bindgen`.
+- Dev shell: `shell.nix` via direnv. Rust **1.95+** (`oar-ocr`'s MSRV), `protobuf`, `dbus` (the
+  Secret Service keyring), and the `webkitgtk`/`gtk3` that `fyde-browser-wry`'s `wry` needs (not
+  `fyde-sdk` itself). No `cmake`/`bindgen`.
 - `build.rs` runs `buf export` (needs `buf` + network) unless `FYDE_PROTO_DIR` is set. On
   static-ONNX targets, `ort-sys` downloads pyke's library on the first build (`ORT_LIB_PATH` to
   use a local one).
@@ -108,7 +112,7 @@ encrypts/decrypts, storage adapters (`storage_sqlite.rs`, `SqliteClient`) only r
   `tools/sql/sqlite.rs`, `tools/client_dir.rs`, `tools/models` (a local HTTP server),
   `tools/onnx`, `documents/{embedder,gliner}.rs`, `documents/transcript/` (PDFs built with
   `lopdf`), `secrets/storage_keystore.rs`, `changelog/storage_settings.rs`,
-  `scrapers/browser/wry_engine.rs` (needs a display: `xvfb-run`). Real-model and real-webview
+  `browser-wry/` (needs a display: `xvfb-run`). Real-model and real-webview
   tests are `#[ignore]`. `browser/driver.rs` tests against mocked engines (its engine traits are
   sync: an engine answers from its UI thread). `changelog::Service` can't be automocked (its
   `start_consume_job` takes a boxed `FnMut`), so use `RecordingChangelog`-style fakes.
@@ -171,9 +175,13 @@ methods, used behind `Arc<dyn Service>`), `models.rs`, `service.rs` and adapters
   `Handle::block_on`. `fyde.http` is `reqwest` with a `cookie_store` jar, and redirects are
   checked hop by hop against `allowed_domains`. Reports' rules live in `reports/service.rs`.
   `browser/`: `driver.rs` holds every rule (allowed navigations, popups and downloads, the JS,
-  the cookies kept); a `WebviewEngine` (`engine.rs`, whose module doc is the contract) only hosts
-  webviews: one isolated, ephemeral data store per session, decisions asked of the driver's
-  `WebviewHandler`. `wry_engine.rs` runs every `wry` webview on one process-wide thread (GTK).
+  the cookies kept); a `WebviewEngine` (`engine.rs`, public as `fyde_sdk::browser`, whose module
+  doc is the contract) only hosts webviews: one isolated, ephemeral data store per session,
+  decisions asked of the driver's `WebviewHandler`. Callers pass one as
+  `ClientConfig::browser_engine` / `init_dev_scrapers`'s `browser_engine` (`None`: `fyde.browser`
+  fails with `BrowserFailed`): `fyde_browser_wry::WryEngine` on desktop (every `wry` webview on
+  one process-wide thread, for GTK), the app's native webviews on Android/iOS. Never put a rule
+  in an engine. Engines raise errors with `fyde_sdk::Error::browser`.
   Forms are submitted with `click`, never an in-page `fetch`, and downloads never touch the disk.
   A finished run's report of a known script (an installation's) is uploaded once to the server's
   `reports.v1`, which links it to no user, by a background job (`reports::start_upload_job`),

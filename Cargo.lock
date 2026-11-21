@@ -2088,6 +2088,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fyde-browser-wry"
+version = "0.1.0"
+dependencies = [
+ "cookie",
+ "fyde-sdk",
+ "rand 0.10.2",
+ "tao",
+ "tracing",
+ "wry",
+]
+
+[[package]]
 name = "fyde-sdk"
 version = "0.1.0"
 dependencies = [
@@ -2132,7 +2144,6 @@ dependencies = [
  "sha2 0.10.9",
  "sha2 0.11.0",
  "sqlx",
- "tao",
  "tempfile",
  "thiserror 2.0.20",
  "tokenizers",
@@ -2148,7 +2159,6 @@ dependencies = [
  "url",
  "uuid",
  "windows-native-keyring-store",
- "wry",
  "xdg",
  "zeroize",
 ]

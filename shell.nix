@@ -20,11 +20,11 @@ pkgs.mkShell {
     # required by build.rs to compile the BSR's (or ../server/protos') *.proto via tonic-prost-build
     protobuf
 
-    # required (via pkg-config) to build wry/tao, the real embedded webview
-    # behind fyde.browser (see src/domains/scrapers/browser/driver.rs and
-    # src/domains/scrapers/host/browser.rs). webkitgtk_4_1/gtk3 are wry's
-    # WebKitGTK backend on Linux; dbus is tao's optional single-instance/
-    # app-id support, pulled in by its "dbus" feature.
+    # required (via pkg-config) to build browser-wry's wry/tao, the desktop
+    # webview behind fyde.browser (fyde-sdk itself needs only dbus, for the
+    # Secret Service keyring). webkitgtk_4_1/gtk3 are wry's WebKitGTK backend
+    # on Linux; dbus is also tao's optional single-instance/app-id support,
+    # pulled in by its "dbus" feature.
     pkg-config
     webkitgtk_4_1
     gtk3

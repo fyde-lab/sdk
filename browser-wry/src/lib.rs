@@ -1,5 +1,7 @@
-//! The desktop [`WebviewEngine`]: `wry` webviews in `tao` windows, all on
-//! one process-wide browser thread.
+//! The desktop [`WebviewEngine`] `fyde-sdk`'s `fyde.browser` runs on
+//! (`fyde_sdk::ClientConfig::browser_engine`): `wry` webviews in `tao`
+//! windows, all on one process-wide browser thread. Pass
+//! `Arc::new(WryEngine)`.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Sender, SyncSender, sync_channel};
@@ -13,11 +15,10 @@ use tao::platform::run_return::EventLoopExtRunReturn as _;
 use tao::window::{Window, WindowBuilder};
 use wry::{WebView, WebViewBuilder};
 
-use crate::{ErrorKind, Result};
-
-use super::engine::{
+use fyde_sdk::browser::{
     WebviewConfig, WebviewCookie, WebviewEngine, WebviewHandler, WebviewSameSite, WebviewSession,
 };
+use fyde_sdk::{Error, ErrorContext as _, Result};
 
 /// Sent to the process-wide browser thread (see [`host_proxy`]) holding the
 /// `tao` event loop and every session's `wry` webview — neither type is
@@ -82,23 +83,23 @@ fn host_proxy() -> Result<EventLoopProxy<Command>> {
     std::thread::Builder::new()
         .name("fyde-browser".to_string())
         .spawn(move || run_event_loop(ready_tx))
-        .map_err(|err| ErrorKind::Browser(format!("failed to spawn browser thread: {err}")))?;
-    let proxy = ready_rx.recv().map_err(|_| {
-        ErrorKind::Browser("browser thread exited before it finished starting up".to_string())
-    })?;
+        .map_err(|err| Error::browser(format!("failed to spawn browser thread: {err}")))?;
+    let proxy = ready_rx
+        .recv()
+        .map_err(|_| Error::browser("browser thread exited before it finished starting up"))?;
 
     *host = Some(proxy.clone());
     Ok(proxy)
 }
 
-fn thread_gone() -> crate::Error {
-    ErrorKind::Browser("browser thread is no longer running".to_string()).into()
+fn thread_gone() -> Error {
+    Error::browser("browser thread is no longer running")
 }
 
 /// `wry` webviews in `tao` windows (hidden unless
 /// [`WebviewConfig::visible`]), on a browser thread started on the first
 /// [`open_session`](WebviewEngine::open_session).
-pub(crate) struct WryEngine;
+pub struct WryEngine;
 
 impl WebviewEngine for WryEngine {
     fn open_session(
@@ -106,7 +107,7 @@ impl WebviewEngine for WryEngine {
         config: WebviewConfig,
         handler: Arc<dyn WebviewHandler>,
     ) -> Result<Box<dyn WebviewSession>> {
-        let proxy = host_proxy()?;
+        let proxy = host_proxy().context("failed to start the browser thread")?;
         let session = rand::rng().random::<u64>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
         let create = Command::Create {
@@ -123,9 +124,10 @@ impl WebviewEngine for WryEngine {
 
         // Block until the webview has actually been created (or failed to
         // be), so a command sent right after can never race its setup.
-        ready_rx.recv().map_err(|_| {
-            ErrorKind::Browser("browser thread exited before opening a window".to_string())
-        })??;
+        ready_rx
+            .recv()
+            .map_err(|_| Error::browser("browser thread exited before opening a window"))?
+            .context("failed to open the browser's window")?;
 
         Ok(Box::new(WrySession {
             proxy: Mutex::new(proxy),
@@ -172,12 +174,11 @@ impl WebviewSession for WrySession {
         self.send(Command::Cookies {
             session: self.session,
             reply: tx,
-        })?;
+        })
+        .context("failed to ask for the browser's cookies")?;
         rx.recv_timeout(Duration::from_secs(10))
-            .map_err(|_| ErrorKind::Browser("timed out reading the browser's cookies".to_string()))?
-            .map_err(|err| {
-                ErrorKind::Browser(format!("reading the browser's cookies: {err}")).into()
-            })
+            .map_err(|_| Error::browser("timed out reading the browser's cookies"))?
+            .map_err(|err| Error::browser(format!("reading the browser's cookies: {err}")))
     }
 
     fn close(&self) {
@@ -233,8 +234,8 @@ fn open_session(
     config: WebviewConfig,
     handler: Arc<dyn WebviewHandler>,
 ) -> Result<Session> {
-    let window = build_window(target, config.visible)?;
-    let webview = build_webview(&window, handler.clone())?;
+    let window = build_window(target, config.visible).context("failed to open a session")?;
+    let webview = build_webview(&window, handler.clone()).context("failed to open a session")?;
 
     for saved in &config.cookies {
         if let Err(err) = webview.set_cookie(&to_wry_cookie(saved)) {
@@ -277,7 +278,7 @@ fn build_window(target: &EventLoopWindowTarget<Command>, visible: bool) -> Resul
     }
     window_builder
         .build(target)
-        .map_err(|err| ErrorKind::Browser(format!("failed to create browser window: {err}")).into())
+        .map_err(|err| Error::browser(format!("failed to create browser window: {err}")))
 }
 
 /// Builds the webview inside `window`, every request of which `handler`
@@ -332,7 +333,7 @@ fn build_webview(window: &Window, handler: Arc<dyn WebviewHandler>) -> Result<We
     #[cfg(not(target_os = "linux"))]
     let webview = builder.build(&window);
 
-    webview.map_err(|err| ErrorKind::Browser(format!("failed to create webview: {err}")).into())
+    webview.map_err(|err| Error::browser(format!("failed to create webview: {err}")))
 }
 
 /// Carries out one [`Command`], on the browser thread, against the
