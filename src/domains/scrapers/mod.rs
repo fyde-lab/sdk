@@ -14,7 +14,9 @@
 //! (GLiNER) for the whole run, so its uploads never wait for it. A failed load
 //! is logged and recorded in the report, never failing the run. Every run
 //! keeps one report (`reports/`: outcome, steps, found and saved counts, debug
-//! log), completed however it ends.
+//! log), completed however it ends. A `Client` uploads every finished run's
+//! report of an installation once, in the background, to the server, which
+//! links it to no user (`reports::start_upload_job`).
 //!
 //! `stop(name)` goes through the run's `StopSignal`: the sandbox's instruction
 //! hook, every blocking host call, a pending `fyde.input.ask` and an upload
@@ -40,6 +42,10 @@ mod stop;
 pub use host::helpers::SOURCE as HELPERS_LUA;
 pub use models::{ProgressEvent, ProgressStep};
 pub use reports::{ScraperRun, ScraperRunOutcome, ScraperRunUpdate};
+pub(crate) use reports::{
+    UploadJob as ReportUploadJob, UploadWake as ReportUploadWake,
+    start_upload_job as start_report_upload_job,
+};
 #[cfg(test)]
 pub(crate) use state::MockStateStorage;
 pub(crate) use state::{StateSqliteStorage, StateStorage};
@@ -225,13 +231,16 @@ pub(crate) enum StorageConfig {
 /// while it sets up, and `on_progress`/`on_question` as the
 /// callbacks `fyde.progress`/`fyde.input` invoke — see
 /// [`crate::ClientConfig::on_scraper_progress`]/
-/// [`crate::ClientConfig::on_scraper_question`].
+/// [`crate::ClientConfig::on_scraper_question`]. `report_upload_wake`, if
+/// given, is notified each time a run's report is completed, for
+/// [`start_report_upload_job`]'s job to upload it.
 pub(crate) fn init(
     storage: StorageConfig,
     documents: Arc<dyn DocumentsService>,
     attribute_model: Option<Arc<dyn crate::domains::documents::AttributeModel>>,
     on_progress: Option<OnScraperProgress>,
     on_question: Option<OnScraperQuestion>,
+    report_upload_wake: Option<Arc<ReportUploadWake>>,
 ) -> Arc<dyn Service> {
     let (cookies_storage, session_storage, reports_storage) = match storage {
         // Each sub-domain already names its files distinctly
@@ -251,7 +260,7 @@ pub(crate) fn init(
 
     let cookies = cookies::init(cookies_storage);
     let session = session::init(session_storage);
-    let reports = reports::init(reports_storage);
+    let reports = reports::init(reports_storage, report_upload_wake);
 
     Arc::new(service::ScrapersClient::new(
         cookies,

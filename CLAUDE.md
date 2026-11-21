@@ -124,9 +124,10 @@ encrypts/decrypts, storage adapters (`storage_sqlite.rs`, `SqliteClient`) only r
 `Client::init(ClientConfig)` (`src/lib.rs`) opens a lazy gRPC channel (rustls + webpki roots),
 opens the SQLite DB (`Storage::Disk(dir)` → `<dir>/<client_name>/fyde.db`, or `Storage::Memory`),
 wires every domain and starts the background jobs (changelog consumer, thumbnails, model
-loading), which are aborted when the `Client` drops. A disk DB is guarded by an exclusive `flock`
-(`ClientAlreadyRunning`), so every domain may write local storage freely. `ClientConfig` also
-carries the caller's callbacks (`on_log`, `on_document_change`, `on_scraper_*`).
+loading, scraper report uploads), which are aborted when the `Client` drops. A disk DB is
+guarded by an exclusive `flock` (`ClientAlreadyRunning`), so every domain may write local storage
+freely. `ClientConfig` also carries the caller's callbacks (`on_log`, `on_document_change`,
+`on_scraper_*`).
 
 A new domain is a module under `src/domains/` with `mod.rs` (the `Service` trait, `&self`
 methods, used behind `Arc<dyn Service>`), `models.rs`, `service.rs` and adapters, wired into
@@ -167,6 +168,10 @@ methods, used behind `Arc<dyn Service>`), `models.rs`, `service.rs` and adapters
   checked hop by hop against `allowed_domains`. Reports' rules live in `reports/service.rs`.
   `browser/` runs every `wry` webview on one process-wide thread (GTK);
   forms are submitted with `click`, never an in-page `fetch`, and downloads never touch the disk.
+  A finished run's report of a known script (an installation's) is uploaded once to the server's
+  `reports.v1`, which links it to no user, by a background job (`reports::start_upload_job`),
+  without the run's name (scrubbed from its log too) or start time
+  (`reports::service::report_json`, at most 1 MiB).
   `crate::init_dev_scrapers` (for `../scripts`) runs scrapers without a `Client`.
 - **icons** (read-through cache, never revalidated), **settings** (callers' keys are prefixed
   `app.`), **server_state** (never fails), **usage** (never cached).
