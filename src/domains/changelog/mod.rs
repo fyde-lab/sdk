@@ -109,7 +109,8 @@ pub(crate) trait Service: Send + Sync {
     /// resumes right after the last event seen.
     ///
     /// Returns as soon as the task is spawned, not when consumption stops.
-    /// The spawned task never exits on its own. If a pass over the stream
+    /// The spawned task never exits on its own; starting a job ends any job
+    /// still running, so only one task ever consumes. If a pass over the stream
     /// fails — including with [`crate::ErrorCode::InvalidChangelogEvent`] if a
     /// `SaveDocument` event is missing its `content` or `metadata`, since a
     /// `SaveDocument` event must carry both, or if an `InstallScript` event's

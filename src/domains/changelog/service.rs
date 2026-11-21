@@ -129,12 +129,16 @@ pub(super) struct ChangelogClient<
     cursor_storage: O,
     server_state: Arc<dyn ServerStateService>,
     secrets: Arc<dyn SecretsService>,
-    /// Signals [`Service::stop_consume_job`] to the task spawned by
-    /// [`Service::start_consume_job`]. A `watch` channel (rather than
-    /// [`tokio::sync::Notify`]) so the signal is level-triggered: a
-    /// `stop_consume_job()` call is never lost even if it lands before the
+    /// The generation of the job allowed to run: [`Service::start_consume_job`]
+    /// and [`Service::stop_consume_job`] each move it on, and a task spawned
+    /// by `start_consume_job` runs only while it's still the one it was
+    /// started as. A generation rather than a stop flag, so a job stopped
+    /// then started again before the stopped task has seen the stop can't
+    /// read the new start as its own and keep consuming beside the new one.
+    /// A `watch` channel (rather than [`tokio::sync::Notify`]) so the signal
+    /// is level-triggered: a stop is never lost even if it lands before the
     /// task starts watching it or between two of its passes.
-    stop: watch::Sender<bool>,
+    job: watch::Sender<u64>,
     /// The event the last passes failed on (by its id as the server sent
     /// it), and how many passes in a row did.
     failure_streak: Mutex<Option<(String, u32)>>,
@@ -180,7 +184,7 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
             cursor_storage,
             server_state,
             secrets,
-            stop: watch::Sender::new(false),
+            job: watch::Sender::new(0),
             failure_streak: Mutex::new(None),
             progress: Mutex::new(SyncProgress::default()),
         }
@@ -564,21 +568,31 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
         Ok(())
     }
 
+    /// Moves [`Self::job`] on to a new generation and returns it.
+    fn next_job(&self) -> u64 {
+        self.job.send_modify(|generation| *generation += 1);
+        *self.job.borrow()
+    }
+
     /// The retry loop spawned by [`Service::start_consume_job`] onto its own
-    /// background task: repeats [`Self::consume_once`] from the persisted
-    /// cursor — after [`CONSUME_RECONNECT_DELAY`] after a clean end of
-    /// stream, after a growing delay (see [`CONSUME_RETRY_INITIAL_DELAY`])
-    /// after an error, which it
-    /// logs — until [`Service::stop_consume_job`] signals it to return, even
-    /// mid-delay. Split out as its own inherent method (rather than inlined
+    /// background task as job `generation`: repeats [`Self::consume_once`]
+    /// from the persisted cursor — after [`CONSUME_RECONNECT_DELAY`] after a
+    /// clean end of stream, after a growing delay (see
+    /// [`CONSUME_RETRY_INITIAL_DELAY`]) after an error, which it logs — until
+    /// [`Self::job`] moves past `generation` ([`Service::stop_consume_job`],
+    /// or another `start_consume_job`), even mid-delay. Split out as its own inherent method (rather than inlined
     /// in `start_consume_job`'s spawned task) so tests can exercise the loop
     /// directly, synchronously, without needing to observe a detached task's
     /// completion.
-    async fn run_consume_loop(&self, callback: &mut (dyn FnMut(ChangelogEvent) + Send)) {
-        let mut stop = self.stop.subscribe();
+    async fn run_consume_loop(
+        &self,
+        generation: u64,
+        callback: &mut (dyn FnMut(ChangelogEvent) + Send),
+    ) {
+        let mut stop = self.job.subscribe();
         let mut retry_delay = CONSUME_RETRY_INITIAL_DELAY;
 
-        while !*stop.borrow() {
+        while *stop.borrow_and_update() == generation {
             let delay = tokio::select! {
                 result = self.consume_once(callback) => match result {
                     Ok(()) => {
@@ -651,26 +665,24 @@ impl<
         self: Arc<Self>,
         mut callback: Box<dyn FnMut(ChangelogEvent) + Send>,
     ) -> Result<()> {
-        // Reset in case a previous job on this same client was stopped: the
-        // `stop` signal is level-triggered (see the field's doc comment)
-        // and would otherwise still read as `true` here, making this job
-        // return immediately without ever streaming.
-        self.stop.send_replace(false);
+        // A new generation, which also ends any job still running: only
+        // one task ever consumes.
+        let generation = self.next_job();
         *self.progress() = SyncProgress::default();
 
-        tokio::spawn(async move { self.run_consume_loop(&mut *callback).await });
+        tokio::spawn(async move { self.run_consume_loop(generation, &mut *callback).await });
 
         Ok(())
     }
 
     fn stop_consume_job(&self) {
-        // `send_replace`, not `send`: `send` is a no-op (doesn't even
-        // update the value) when there are currently no receivers, which
-        // is exactly the case where `stop_consume_job` is called before
-        // `start_consume_job`'s task has subscribed — `send_replace`
-        // updates the value unconditionally, so a task that starts
-        // afterwards still sees it immediately via `subscribe`.
-        self.stop.send_replace(true);
+        // `send_modify`, not `send`: `send` is a no-op (doesn't even update
+        // the value) when there are currently no receivers, which is
+        // exactly the case where `stop_consume_job` is called before
+        // `start_consume_job`'s task has subscribed — `send_modify` updates
+        // the value unconditionally, so a task that starts afterwards still
+        // sees it immediately via `subscribe`.
+        self.next_job();
     }
 
     fn sync_progress(&self) -> SyncProgress {
@@ -2170,7 +2182,7 @@ mod tests {
         );
 
         let mut callback = |_| {};
-        let consume_fut = client.run_consume_loop(&mut callback);
+        let consume_fut = client.run_consume_loop(0, &mut callback);
         tokio::pin!(consume_fut);
 
         // The first attempt fails immediately; the loop waits before retrying.
@@ -2216,7 +2228,7 @@ mod tests {
         );
 
         let mut callback = |_| {};
-        let consume_fut = client.run_consume_loop(&mut callback);
+        let consume_fut = client.run_consume_loop(0, &mut callback);
         tokio::pin!(consume_fut);
 
         tokio::time::timeout(std::time::Duration::from_millis(0), &mut consume_fut)
@@ -2276,7 +2288,7 @@ mod tests {
         let client = always_failing_client(attempts.clone());
 
         let mut callback = |_| {};
-        let consume_fut = client.run_consume_loop(&mut callback);
+        let consume_fut = client.run_consume_loop(0, &mut callback);
         tokio::pin!(consume_fut);
 
         tokio::time::timeout(std::time::Duration::from_millis(0), &mut consume_fut)
@@ -2314,7 +2326,7 @@ mod tests {
 
         let loop_client = client.clone();
         let loop_task =
-            tokio::spawn(async move { loop_client.run_consume_loop(&mut |_| {}).await });
+            tokio::spawn(async move { loop_client.run_consume_loop(0, &mut |_| {}).await });
 
         // Let the first attempt fail and the loop start waiting to retry.
         while attempts.load(Ordering::SeqCst) == 0 {
@@ -2358,7 +2370,7 @@ mod tests {
 
         let loop_client = client.clone();
         let loop_task =
-            tokio::spawn(async move { loop_client.run_consume_loop(&mut |_| {}).await });
+            tokio::spawn(async move { loop_client.run_consume_loop(0, &mut |_| {}).await });
 
         // Give the loop a chance to actually start and park on the
         // never-ending stream before stopping it.
@@ -2393,11 +2405,13 @@ mod tests {
             fake_secrets(),
         );
 
+        // The job the loop runs as, stopped before it starts.
+        let generation = *client.job.borrow();
         client.stop_consume_job();
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            client.run_consume_loop(&mut |_| {}),
+            client.run_consume_loop(generation, &mut |_| {}),
         )
         .await
         .expect("run_consume_loop did not return promptly");
@@ -2442,6 +2456,60 @@ mod tests {
 
         // Stop the background task the call above spawned, so it doesn't
         // keep running after the test ends.
+        client.stop_consume_job();
+    }
+
+    /// A job stopped then started again before its task ever ran (as at a
+    /// logout followed by a login) must not resume beside the new one: two
+    /// tasks would apply the same events at once.
+    #[tokio::test]
+    async fn start_consume_job_right_after_a_stop_leaves_only_the_new_job_consuming() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let streams_opened = Arc::new(AtomicU32::new(0));
+        let mut mock_grpc = counting_grpc();
+        let opened = streams_opened.clone();
+        mock_grpc.expect_consume_since().returning(move |_| {
+            opened.fetch_add(1, Ordering::SeqCst);
+            Ok(futures::stream::pending().boxed())
+        });
+
+        let mut cursor_storage = MockCursorStorage::new();
+        cursor_storage
+            .expect_get_cursor()
+            .returning(|| Ok(Uuid::nil()));
+
+        let client = Arc::new(ChangelogClient::new(
+            mock_grpc,
+            MockStorage::new(),
+            idle_indexer(),
+            MockScriptStorage::new(),
+            MockStateStorage::new(),
+            Arc::new(MockApplier::new()),
+            cursor_storage,
+            reachable_server_state(),
+            fake_secrets(),
+        ));
+
+        // `#[tokio::test]`'s single-threaded runtime runs neither spawned
+        // task until this test yields.
+        client
+            .clone()
+            .start_consume_job(Box::new(|_| {}))
+            .await
+            .unwrap();
+        client.stop_consume_job();
+        client
+            .clone()
+            .start_consume_job(Box::new(|_| {}))
+            .await
+            .unwrap();
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(streams_opened.load(Ordering::SeqCst), 1);
+
         client.stop_consume_job();
     }
 
