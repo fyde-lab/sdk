@@ -27,7 +27,7 @@
 //! `ScraperCredentialsRejected` / `ScraperVerificationFailed`, sandbox limits
 //! to `ScriptLimitExceeded`, anything else to `ScriptFailed`.
 
-mod browser;
+pub(crate) mod browser;
 mod cookies;
 mod host;
 mod models;
@@ -232,6 +232,7 @@ pub(crate) fn init(
     attribute_model: Option<Arc<dyn crate::domains::documents::AttributeModel>>,
     on_progress: Option<OnScraperProgress>,
     on_question: Option<OnScraperQuestion>,
+    browser_engine: Option<Arc<dyn browser::engine::WebviewEngine>>,
 ) -> Arc<dyn Service> {
     let (cookies_storage, session_storage, reports_storage) = match storage {
         // Each sub-domain already names its files distinctly
@@ -261,5 +262,6 @@ pub(crate) fn init(
         on_progress,
         on_question,
         attribute_model,
+        browser_engine,
     ))
 }

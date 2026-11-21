@@ -1,6 +1,5 @@
 mod driver;
-mod engine;
-mod wry_engine;
+pub(crate) mod engine;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,18 +35,15 @@ use crate::Result;
 /// per scraper run (see `service.rs::run_script`), lives only for that
 /// run, and has its window and webview closed once the run's
 /// `Arc<dyn Service>` is dropped — see `driver::BrowserDriver`'s `Drop`
-/// impl. Every run's webview lives on one process-wide browser thread (GTK
-/// can only ever be used from the thread that initialized it), but each is
-/// incognito with a data store of its own, so concurrent runs never share
-/// cookies, storage or cache.
+/// impl. Each run's webview is incognito with a data store of its own, so
+/// concurrent runs never share cookies, storage or cache.
 ///
 /// The driver holds every rule (allowed navigations, popups and downloads,
-/// the JS it runs, the cookies it keeps); the [`engine::WebviewEngine`] it
-/// runs on only hosts webviews. Today that's always
-/// [`wry_engine::WryEngine`], verified only on Linux/WebKitGTK: a real
-/// webview needs a live window-system connection (X11/Wayland on Linux; the
-/// OS-native webview framework elsewhere) that a headless server or CI
-/// runner may simply not have — see [`init`]/
+/// the JS it runs, the cookies it keeps); the [`engine::WebviewEngine`] the
+/// caller passed (`ClientConfig::browser_engine`) only hosts webviews:
+/// `fyde-browser-wry` on desktop, the app's native webview on mobile. A real
+/// webview needs a live window-system connection (X11/Wayland on Linux)
+/// that a headless server or CI runner may simply not have — see [`init`]/
 /// `driver::BrowserDriver::with_session` for why that's deferred to first
 /// use rather than failing every scraper run that never touches
 /// `fyde.browser`.
@@ -137,13 +133,17 @@ pub(super) trait Service: Send + Sync {
 /// `cookies` (this scraper's saved cookie jar, see the `cookies`
 /// sub-domain) is loaded into the webview as soon as it starts, before
 /// anything navigates — see [`Service::cookies`] for the way back out.
+///
+/// Without an `engine`, every `fyde.browser` call fails with
+/// [`ErrorKind::Browser`](crate::ErrorKind::Browser).
 pub(super) fn init(
+    engine: Option<Arc<dyn engine::WebviewEngine>>,
     allowed_domains: Arc<Vec<String>>,
     visible: bool,
     cookies: Vec<Cookie>,
 ) -> Arc<dyn Service> {
     Arc::new(driver::BrowserDriver::new(
-        Arc::new(wry_engine::WryEngine),
+        engine.unwrap_or_else(|| Arc::new(engine::Unavailable)),
         allowed_domains,
         visible,
         cookies,

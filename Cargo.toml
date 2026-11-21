@@ -1,3 +1,8 @@
+# `fyde-browser-wry` (`browser-wry/`) is the desktop webview `fyde.browser`
+# runs on, kept out of this crate so mobile builds never pull in tao/wry.
+[workspace]
+members = [".", "browser-wry"]
+
 [package]
 name = "fyde-sdk"
 version = "0.1.0"
@@ -12,8 +17,8 @@ async-trait = "0.1.92"
 # `fyde.browser:download` gets its bytes back over IPC base64-encoded
 # (`domains/scrapers/browser/driver.rs`'s `fetch_script`).
 base64 = "0.22.1"
-# Cookie type `wry`'s `WebView::cookies`/`set_cookie` speak — must stay on the
-# same major version `wry` itself depends on.
+# Parses saved cookies into the `WebviewCookie`s `fyde.browser`'s engines set
+# (`domains/scrapers/browser/driver.rs`).
 cookie = "0.18"
 # `fyde.http`'s cookie jar (`domains/scrapers/host/cookie_jar.rs`), handed to
 # `reqwest` as its cookie provider. The same version `reqwest`'s own `Jar`
@@ -122,16 +127,6 @@ tracing-log = "0.2.0"
 tonic = { version = "0.14.6", features = ["transport", "tls-ring", "tls-webpki-roots"] }
 tonic-health = "0.14.6"
 tonic-prost = "0.14.6"
-# Windows the real webview `fyde.browser` (`domains/scrapers/host/browser.rs`,
-# `domains/scrapers/browser/driver.rs`) drives — `tao` provides the
-# event-loop/window `wry`'s `WebView` attaches to (on Linux via
-# `WebViewBuilder::build_gtk`, pairing with `tao`'s GTK main-loop
-# integration; the plain `winit` crate doesn't drive GTK's own main loop,
-# which WebKitGTK needs). Needs `webkit2gtk-4.1`/`gtk+-3.0`/`dbus-1`
-# (`pkg-config`-discovered) at build time on Linux — see `shell.nix`. Only
-# exercised on Linux while writing this; `wry`'s own docs cover macOS/Windows
-# as a different `build()` call, not `build_gtk()` — see `driver.rs`.
-tao = "0.37"
 # `fyde.http`'s browser headers under `browser_emulation`
 # (`domains/scrapers/host/http.rs`'s `browser_headers`): real browsers'
 # captured navigation headers. Pinned exactly: patch releases refresh the
@@ -142,8 +137,6 @@ uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
 # `domains/scrapers/host/mod.rs`'s `ensure_domain_allowed` parses URLs with
 # it (host extraction for the `fyde.http`/`fyde.browser` domain allowlist).
 url = "2.5.8"
-# `fyde.browser` (see the `tao` entry above) — the actual webview.
-wry = "0.57"
 xdg = "2.5.2"
 # Wipes key material (master key, DEKs, KEKs, export and recovery keys) and
 # cached secrets from memory once dropped.
@@ -180,8 +173,8 @@ android-native-keyring-store = "1.0.0"
 jni = "0.21"
 ndk-context = "0.1"
 
-# Freedesktop Secret Service (GNOME Keyring, KWallet, ...) over `libdbus`,
-# which `wry`/`tao` already need on Linux (see `shell.nix`).
+# Freedesktop Secret Service (GNOME Keyring, KWallet, ...) over `libdbus`
+# (see `shell.nix`).
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
 dbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
 
