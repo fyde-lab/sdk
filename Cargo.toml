@@ -137,7 +137,7 @@ tao = "0.37"
 # captured navigation headers. Pinned exactly: patch releases refresh the
 # captures, so a bump changes what scrapers send.
 uagent = "=0.1.0"
-uuid = { version = "1.26.1", features = ["v4", "v7", "serde"] }
+uuid = { version = "1.26.1", features = ["v4", "v5", "v7", "serde"] }
 # Already pulled in transitively by `reqwest`; declared directly here too since
 # `domains/scrapers/host/mod.rs`'s `ensure_domain_allowed` parses URLs with
 # it (host extraction for the `fyde.http`/`fyde.browser` domain allowlist).
