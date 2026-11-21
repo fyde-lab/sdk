@@ -24,10 +24,12 @@ use crate::Result;
 #[async_trait]
 pub(crate) trait Service: Send + Sync {
     /// The attributes found in `transcript`, a document of type `r#type`
-    /// (`None` when it couldn't be classified: then only what any document
-    /// carries, an issuer, a date and an amount, is looked for). At most one
-    /// value per attribute, its best match; nothing is returned for an
-    /// attribute GLiNER finds no span for, or none that reads as its type.
+    /// (`None` when it couldn't be classified). For a type with no
+    /// attributes of its own (a letter, say), or none, only what any
+    /// document carries, an issuer, a date and an amount, is looked for.
+    /// At most one value per attribute, its best match; nothing is returned
+    /// for an attribute GLiNER finds no span for, or none that reads as its
+    /// type.
     /// Values are valid on their own, but not checked against the user's
     /// attribute definitions. Fetches and loads the model first if needed;
     /// for [`EXTRACTION_RETRY_AFTER`] after that fails, finds nothing
