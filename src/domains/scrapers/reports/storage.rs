@@ -6,7 +6,7 @@ use crate::{ErrorCode, ErrorKind, Result};
 
 use uuid::Uuid;
 
-use super::models::{Report, ReportCursor, ReportSummary, ScraperRunOutcome};
+use super::models::{ListedReport, Report, ReportCursor, ReportSummary, ScraperRunOutcome};
 
 /// Persists scraper runs' reports. Implementations are injected into
 /// [`super::service::ReportsClient`] at construction.
@@ -32,8 +32,13 @@ pub(crate) trait Storage: Send + Sync {
 pub(crate) trait UploadStorage: Send + Sync {
     /// Up to `limit` reports not uploaded yet of runs that ended and whose
     /// script is known, with their log, by when they started then by id
-    /// (oldest first), after `after` if given.
-    async fn list_to_upload(&self, after: Option<ReportCursor>, limit: u32) -> Result<Vec<Report>>;
+    /// (oldest first), after `after` if given. A row that can't be read is
+    /// still listed, its report failing, so it doesn't fail the listing.
+    async fn list_to_upload(
+        &self,
+        after: Option<ReportCursor>,
+        limit: u32,
+    ) -> Result<Vec<ListedReport>>;
 
     /// Notes that the report `id` was uploaded, so it's never listed by
     /// [`Self::list_to_upload`] again. Saving its run again doesn't undo it.
