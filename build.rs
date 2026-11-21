@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::compile_protos(proto_dir.join("usage/v1/usage.proto"))?;
     tonic_prost_build::compile_protos(proto_dir.join("attributes/v1/attributes.proto"))?;
     tonic_prost_build::compile_protos(proto_dir.join("icons/v1/icons.proto"))?;
+    tonic_prost_build::compile_protos(proto_dir.join("reports/v1/reports.proto"))?;
 
     Ok(())
 }

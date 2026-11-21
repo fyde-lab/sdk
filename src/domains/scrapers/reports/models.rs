@@ -80,12 +80,66 @@ pub struct ScraperRunUpdate {
 /// scraper. Its `run.outcome` is never [`ScraperRunOutcome::Interrupted`]:
 /// that's read from a `Running` one no longer going on (see
 /// `super::service::ReportsClient::last_runs`). The log is purely a
-/// debugging aid — never read back by a scraper script itself.
+/// debugging aid — never read back by a scraper script itself. `script` is
+/// the script that ran, when it's known: a run of an installation
+/// (`run_installed`) knows it, one of a bare script source (`run`) doesn't.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Report {
     pub(crate) id: Uuid,
     pub(crate) run: ScraperRun,
+    pub(crate) script: Option<ReportedScript>,
     pub(crate) entries: Vec<ReportEntry>,
+}
+
+/// The script a [`Report`]'s run ran: its id and the version it ran at, as
+/// the server's `scripts.v1` lists them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReportedScript {
+    pub(crate) id: Uuid,
+    pub(crate) version: u64,
+}
+
+/// Where a listing of reports left off: the last one it returned, by when
+/// its run started then its id (see
+/// [`super::storage::UploadStorage::list_to_upload`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReportCursor {
+    pub(crate) started_at_ms: i64,
+    pub(crate) id: Uuid,
+}
+
+impl From<&Report> for ReportCursor {
+    fn from(report: &Report) -> Self {
+        Self {
+            started_at_ms: report.run.started_at_ms,
+            id: report.id,
+        }
+    }
+}
+
+/// The kind of device reports are uploaded from: the one the SDK was built
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeviceType {
+    Android,
+    Ios,
+    Desktop,
+}
+
+/// A [`Report`] as it's uploaded to the server's `reports.v1`, which links
+/// it to no user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReportUpload {
+    /// The report itself, a JSON object (see
+    /// `super::service::report_json`).
+    pub(crate) report: String,
+    pub(crate) device_type: DeviceType,
+    /// The client application it comes from (`ClientConfig::client_name`,
+    /// as the server accepts it).
+    pub(crate) client_id: String,
+    pub(crate) script_id: Uuid,
+    pub(crate) script_version: u64,
+    pub(crate) duration_ms: u64,
 }
 
 /// A [`Report`] without its log, as [`super::storage::Storage::list_latest`]
@@ -129,6 +183,10 @@ impl FakeReport {
                     found: None,
                     saved: 0,
                 },
+                script: Some(ReportedScript {
+                    id: Uuid::new_v4(),
+                    version: 1,
+                }),
                 entries: vec![ReportEntry {
                     ts_ms: started_at_ms + 1,
                     event: "log".to_string(),
@@ -146,6 +204,12 @@ impl FakeReport {
     pub(crate) fn with_started_at_ms(mut self, started_at_ms: i64) -> Self {
         self.report.run.started_at_ms = started_at_ms;
         self.report.run.ended_at_ms = self.report.run.ended_at_ms.map(|_| started_at_ms + 60_000);
+        self
+    }
+
+    /// `None`: a run of a bare script source, whose script isn't known.
+    pub(crate) fn with_script(mut self, script: Option<ReportedScript>) -> Self {
+        self.report.script = script;
         self
     }
 

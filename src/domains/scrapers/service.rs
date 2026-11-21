@@ -16,7 +16,7 @@ use super::browser::engine::WebviewEngine;
 use super::cookies::{Cookie, Service as CookiesService};
 use super::host::{self, HostConfig};
 use super::models::RunOptions;
-use super::reports::{Recorder, RunTracker, Service as ReportsService};
+use super::reports::{Recorder, ReportedScript, RunTracker, Service as ReportsService};
 use super::session::Service as SessionService;
 use super::stop::{self, StopSignal};
 use super::{
@@ -254,6 +254,10 @@ impl Service for ScrapersClient {
                 browser_visible: false,
             },
             installed.folder_id(),
+            Some(ReportedScript {
+                id: script.id(),
+                version: script.version(),
+            }),
         )
         .await
     }
@@ -280,6 +284,7 @@ impl Service for ScrapersClient {
                 allowed_domains,
                 browser_visible,
             },
+            None,
             None,
         )
         .await
@@ -345,7 +350,8 @@ impl ScrapersClient {
 
     /// [`Service::run`], filing every document the script saves within
     /// `folder_id` (`None`: anywhere, with the documents each one is the
-    /// closest to; see [`DocumentsService::upload`]).
+    /// closest to; see [`DocumentsService::upload`]). `reported` is the
+    /// script its report says ran, if known.
     async fn run_filing_in(
         &self,
         name: &str,
@@ -353,6 +359,7 @@ impl ScrapersClient {
         parameters: Value,
         options: RunOptions,
         folder_id: Option<Uuid>,
+        reported: Option<ReportedScript>,
     ) -> Result<()> {
         let stop_registration = self.register_stop(name);
         let signal = stop_registration.signal.clone();
@@ -369,7 +376,7 @@ impl ScrapersClient {
         // as stopped too.
         let tracker = self
             .reports
-            .start(name)
+            .start(name, reported)
             .await
             .with_context(|| format!("failed to start a run of scraper {name:?}"))?;
         let result = self

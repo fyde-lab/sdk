@@ -5,8 +5,10 @@ use uuid::Uuid;
 
 use crate::{ErrorContext as _, Result};
 
-use super::models::{Report, ReportSummary, ScraperRun, ScraperRunUpdate};
-use super::storage::{Storage, outcome_columns, outcome_from_columns};
+use super::models::{
+    Report, ReportCursor, ReportEntry, ReportSummary, ReportedScript, ScraperRun, ScraperRunUpdate,
+};
+use super::storage::{Storage, UploadStorage, outcome_columns, outcome_from_columns};
 
 /// A [`Storage`] backed by the SDK's local SQLite database (the
 /// `scraper_reports` table, one row per run).
@@ -35,8 +37,9 @@ impl Storage for SqliteStorage {
         sqlx::query(
             "INSERT INTO scraper_reports
                  (id, scraper_name, started_at_ms, ended_at_ms, outcome, error_code, step,
-                  update_current, update_total, found, saved, entries)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                  update_current, update_total, found, saved, script_id, script_version,
+                  entries)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
                  scraper_name = excluded.scraper_name,
                  started_at_ms = excluded.started_at_ms,
@@ -48,6 +51,8 @@ impl Storage for SqliteStorage {
                  update_total = excluded.update_total,
                  found = excluded.found,
                  saved = excluded.saved,
+                 script_id = excluded.script_id,
+                 script_version = excluded.script_version,
                  entries = excluded.entries",
         )
         .bind(report.id.to_string())
@@ -62,6 +67,13 @@ impl Storage for SqliteStorage {
         .bind(run.found)
         // SQLite has no unsigned integers; no run saves 2^63 documents.
         .bind(i64::try_from(run.saved).unwrap_or(i64::MAX))
+        .bind(report.script.map(|script| script.id.to_string()))
+        // A script's version never reaches 2^63 either.
+        .bind(
+            report
+                .script
+                .map(|script| i64::try_from(script.version).unwrap_or(i64::MAX)),
+        )
         .bind(entries)
         .execute(&self.pool)
         .await
@@ -93,6 +105,68 @@ impl Storage for SqliteStorage {
 
         rows.iter().map(summary_from_row).collect()
     }
+}
+
+#[async_trait]
+impl UploadStorage for SqliteStorage {
+    async fn list_to_upload(&self, after: Option<ReportCursor>, limit: u32) -> Result<Vec<Report>> {
+        let rows = sqlx::query(
+            "SELECT id, scraper_name, started_at_ms, ended_at_ms, outcome, error_code, step,
+                    update_current, update_total, found, saved, script_id, script_version,
+                    entries
+             FROM scraper_reports
+             WHERE uploaded = 0
+               AND ended_at_ms IS NOT NULL
+               AND script_id IS NOT NULL
+               AND script_version IS NOT NULL
+               AND (?1 IS NULL OR (started_at_ms, id) > (?1, ?2))
+             ORDER BY started_at_ms, id
+             LIMIT ?3",
+        )
+        .bind(after.map(|cursor| cursor.started_at_ms))
+        .bind(after.map(|cursor| cursor.id.to_string()))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list the scraper reports to upload from local database")?;
+
+        rows.iter().map(report_from_row).collect()
+    }
+
+    async fn mark_uploaded(&self, id: Uuid) -> Result<()> {
+        sqlx::query("UPDATE scraper_reports SET uploaded = 1 WHERE id = ?1")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("failed to mark scraper report {id} uploaded"))?;
+        Ok(())
+    }
+}
+
+/// A row with every column of `scraper_reports` as the [`Report`] it holds.
+fn report_from_row(row: &SqliteRow) -> Result<Report> {
+    let ReportSummary { id, run } =
+        summary_from_row(row).context("failed to read a scraper report's run")?;
+    let script = match (
+        row.get::<Option<String>, _>("script_id"),
+        row.get::<Option<i64>, _>("script_version"),
+    ) {
+        (Some(script_id), Some(version)) => Some(ReportedScript {
+            id: Uuid::parse_str(&script_id)
+                .with_context(|| format!("failed to parse the script id of scraper report {id}"))?,
+            version: u64::try_from(version).unwrap_or(0),
+        }),
+        _ => None,
+    };
+    let entries: String = row.get("entries");
+    let entries: Vec<ReportEntry> = serde_json::from_str(&entries)
+        .with_context(|| format!("failed to parse the log of scraper report {id}"))?;
+    Ok(Report {
+        id,
+        run,
+        script,
+        entries,
+    })
 }
 
 fn summary_from_row(row: &SqliteRow) -> Result<ReportSummary> {
@@ -132,7 +206,7 @@ fn summary_from_row(row: &SqliteRow) -> Result<ReportSummary> {
 mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use super::super::models::{FakeReport, ReportEntry, ScraperRunOutcome};
+    use super::super::models::{FakeReport, ScraperRunOutcome};
     use super::*;
     use crate::ErrorCode;
     use crate::domains::scrapers::ProgressStep;
@@ -147,6 +221,16 @@ mod tests {
         sqlx::migrate!().run(&pool).await.unwrap();
 
         SqliteStorage::new(pool)
+    }
+
+    async fn saved_script(storage: &SqliteStorage, id: Uuid) -> (Option<String>, Option<i64>) {
+        let row =
+            sqlx::query("SELECT script_id, script_version FROM scraper_reports WHERE id = ?1")
+                .bind(id.to_string())
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap();
+        (row.get("script_id"), row.get("script_version"))
     }
 
     async fn saved_entries(storage: &SqliteStorage, scraper_name: &str) -> Vec<Vec<ReportEntry>> {
@@ -200,6 +284,88 @@ mod tests {
         assert_eq!(
             storage.list_latest().await.unwrap(),
             vec![ReportSummary::from(&report)]
+        );
+    }
+
+    #[tokio::test]
+    async fn save_keeps_the_script_that_ran_if_known() {
+        let storage = setup().await;
+        let script = ReportedScript {
+            id: Uuid::new_v4(),
+            version: 7,
+        };
+        let installed = FakeReport::new().with_script(Some(script)).build();
+        let bare = FakeReport::new().with_script(None).build();
+
+        storage.save(&installed).await.unwrap();
+        storage.save(&bare).await.unwrap();
+
+        assert_eq!(
+            saved_script(&storage, installed.id).await,
+            (Some(script.id.to_string()), Some(7))
+        );
+        assert_eq!(saved_script(&storage, bare.id).await, (None, None));
+    }
+
+    #[tokio::test]
+    async fn list_to_upload_lists_finished_runs_of_a_known_script_oldest_first() {
+        let storage = setup().await;
+        let newer = FakeReport::new().with_started_at_ms(3_000).build();
+        let older = FakeReport::new().with_started_at_ms(1_000).build();
+        let running = FakeReport::new()
+            .with_started_at_ms(2_000)
+            .running()
+            .build();
+        let bare = FakeReport::new()
+            .with_started_at_ms(2_000)
+            .with_script(None)
+            .build();
+        for report in [&newer, &older, &running, &bare] {
+            storage.save(report).await.unwrap();
+        }
+
+        assert_eq!(
+            storage.list_to_upload(None, 10).await.unwrap(),
+            vec![older, newer]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_to_upload_pages_through_the_reports_after_a_cursor() {
+        let storage = setup().await;
+        let reports: Vec<Report> = (0..3)
+            .map(|_| FakeReport::new().with_started_at_ms(1_000).build())
+            .collect();
+        for report in &reports {
+            storage.save(report).await.unwrap();
+        }
+        let mut by_id = reports.clone();
+        by_id.sort_by_key(|report| report.id.to_string());
+
+        let first = storage.list_to_upload(None, 2).await.unwrap();
+        let rest = storage
+            .list_to_upload(Some(ReportCursor::from(&first[1])), 2)
+            .await
+            .unwrap();
+
+        assert_eq!(first, by_id[..2]);
+        assert_eq!(rest, by_id[2..]);
+    }
+
+    #[tokio::test]
+    async fn an_uploaded_report_is_never_listed_again_even_saved_again() {
+        let storage = setup().await;
+        let uploaded = FakeReport::new().build();
+        let pending = FakeReport::new().build();
+        storage.save(&uploaded).await.unwrap();
+        storage.save(&pending).await.unwrap();
+
+        storage.mark_uploaded(uploaded.id).await.unwrap();
+        storage.save(&uploaded).await.unwrap();
+
+        assert_eq!(
+            storage.list_to_upload(None, 10).await.unwrap(),
+            vec![pending]
         );
     }
 
