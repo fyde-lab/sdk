@@ -603,8 +603,8 @@ impl<S: Storage> DocumentsClient<S> {
 
 #[async_trait]
 impl<S: Storage> Service for DocumentsClient<S> {
-    /// Reads the PDF file at `path`, encrypts it and its metadata, then
-    /// publishes it as a "created" changelog event, returning its
+    /// Reads the PDF `request.source` holds, encrypts it and its metadata,
+    /// then publishes it as a "created" changelog event, returning its
     /// generated id.
     ///
     /// This follows an envelope encryption scheme (see
@@ -1206,8 +1206,8 @@ pub(super) fn embedding_key(
     }
 }
 
-/// Embeds `passages` with `embedder`, as `model`'s embeddings. None for no
-/// passages at all, without calling `embedder`.
+/// Embeds `passages` with `embedder`, as `model`'s embeddings. No chunks
+/// for no passages at all, without calling `embedder`.
 async fn embed(
     embedder: &dyn Embedder,
     model: String,
