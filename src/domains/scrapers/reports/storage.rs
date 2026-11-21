@@ -4,7 +4,9 @@ use mockall::automock;
 
 use crate::{ErrorCode, ErrorKind, Result};
 
-use super::models::{Report, ReportSummary, ScraperRunOutcome};
+use uuid::Uuid;
+
+use super::models::{Report, ReportCursor, ReportSummary, ScraperRunOutcome};
 
 /// Persists scraper runs' reports. Implementations are injected into
 /// [`super::service::ReportsClient`] at construction.
@@ -19,6 +21,23 @@ pub(crate) trait Storage: Send + Sync {
     /// Each scraper's latest report (the one that started last), without
     /// its log, in no particular order.
     async fn list_latest(&self) -> Result<Vec<ReportSummary>>;
+}
+
+/// Keeps track of which reports were uploaded to the server (see
+/// `super::service::ReportUploader`). Only the local SQLite database
+/// implements it: `crate::init_dev_scrapers`' reports, kept as files, are
+/// never uploaded.
+#[cfg_attr(test, automock)]
+#[async_trait]
+pub(crate) trait UploadStorage: Send + Sync {
+    /// Up to `limit` reports not uploaded yet of runs that ended and whose
+    /// script is known, with their log, by when they started then by id
+    /// (oldest first), after `after` if given.
+    async fn list_to_upload(&self, after: Option<ReportCursor>, limit: u32) -> Result<Vec<Report>>;
+
+    /// Notes that the report `id` was uploaded, so it's never listed by
+    /// [`Self::list_to_upload`] again. Saving its run again doesn't undo it.
+    async fn mark_uploaded(&self, id: Uuid) -> Result<()>;
 }
 
 /// `outcome` as the `outcome` and `error_code` a stored report keeps.

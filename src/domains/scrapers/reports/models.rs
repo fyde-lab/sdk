@@ -99,6 +99,49 @@ pub(crate) struct ReportedScript {
     pub(crate) version: u64,
 }
 
+/// Where a listing of reports left off: the last one it returned, by when
+/// its run started then its id (see
+/// [`super::storage::UploadStorage::list_to_upload`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReportCursor {
+    pub(crate) started_at_ms: i64,
+    pub(crate) id: Uuid,
+}
+
+impl From<&Report> for ReportCursor {
+    fn from(report: &Report) -> Self {
+        Self {
+            started_at_ms: report.run.started_at_ms,
+            id: report.id,
+        }
+    }
+}
+
+/// The kind of device reports are uploaded from: the one the SDK was built
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeviceType {
+    Android,
+    Ios,
+    Desktop,
+}
+
+/// A [`Report`] as it's uploaded to the server's `reports.v1`, which links
+/// it to no user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReportUpload {
+    /// The report itself, a JSON object (see
+    /// `super::service::report_json`).
+    pub(crate) report: String,
+    pub(crate) device_type: DeviceType,
+    /// The client application it comes from (`ClientConfig::client_name`,
+    /// as the server accepts it).
+    pub(crate) client_id: String,
+    pub(crate) script_id: Uuid,
+    pub(crate) script_version: u64,
+    pub(crate) duration_ms: u64,
+}
+
 /// A [`Report`] without its log, as [`super::storage::Storage::list_latest`]
 /// returns it.
 #[derive(Debug, Clone, PartialEq, Eq)]
