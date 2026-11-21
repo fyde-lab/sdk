@@ -35,8 +35,9 @@ impl Storage for SqliteStorage {
         sqlx::query(
             "INSERT INTO scraper_reports
                  (id, scraper_name, started_at_ms, ended_at_ms, outcome, error_code, step,
-                  update_current, update_total, found, saved, entries)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                  update_current, update_total, found, saved, script_id, script_version,
+                  entries)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
                  scraper_name = excluded.scraper_name,
                  started_at_ms = excluded.started_at_ms,
@@ -48,6 +49,8 @@ impl Storage for SqliteStorage {
                  update_total = excluded.update_total,
                  found = excluded.found,
                  saved = excluded.saved,
+                 script_id = excluded.script_id,
+                 script_version = excluded.script_version,
                  entries = excluded.entries",
         )
         .bind(report.id.to_string())
@@ -62,6 +65,13 @@ impl Storage for SqliteStorage {
         .bind(run.found)
         // SQLite has no unsigned integers; no run saves 2^63 documents.
         .bind(i64::try_from(run.saved).unwrap_or(i64::MAX))
+        .bind(report.script.map(|script| script.id.to_string()))
+        // A script's version never reaches 2^63 either.
+        .bind(
+            report
+                .script
+                .map(|script| i64::try_from(script.version).unwrap_or(i64::MAX)),
+        )
         .bind(entries)
         .execute(&self.pool)
         .await
@@ -132,7 +142,7 @@ fn summary_from_row(row: &SqliteRow) -> Result<ReportSummary> {
 mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use super::super::models::{FakeReport, ReportEntry, ScraperRunOutcome};
+    use super::super::models::{FakeReport, ReportEntry, ReportedScript, ScraperRunOutcome};
     use super::*;
     use crate::ErrorCode;
     use crate::domains::scrapers::ProgressStep;
@@ -147,6 +157,16 @@ mod tests {
         sqlx::migrate!().run(&pool).await.unwrap();
 
         SqliteStorage::new(pool)
+    }
+
+    async fn saved_script(storage: &SqliteStorage, id: Uuid) -> (Option<String>, Option<i64>) {
+        let row =
+            sqlx::query("SELECT script_id, script_version FROM scraper_reports WHERE id = ?1")
+                .bind(id.to_string())
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap();
+        (row.get("script_id"), row.get("script_version"))
     }
 
     async fn saved_entries(storage: &SqliteStorage, scraper_name: &str) -> Vec<Vec<ReportEntry>> {
@@ -201,6 +221,26 @@ mod tests {
             storage.list_latest().await.unwrap(),
             vec![ReportSummary::from(&report)]
         );
+    }
+
+    #[tokio::test]
+    async fn save_keeps_the_script_that_ran_if_known() {
+        let storage = setup().await;
+        let script = ReportedScript {
+            id: Uuid::new_v4(),
+            version: 7,
+        };
+        let installed = FakeReport::new().with_script(Some(script)).build();
+        let bare = FakeReport::new().with_script(None).build();
+
+        storage.save(&installed).await.unwrap();
+        storage.save(&bare).await.unwrap();
+
+        assert_eq!(
+            saved_script(&storage, installed.id).await,
+            (Some(script.id.to_string()), Some(7))
+        );
+        assert_eq!(saved_script(&storage, bare.id).await, (None, None));
     }
 
     #[tokio::test]

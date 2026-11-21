@@ -8,7 +8,9 @@ use uuid::Uuid;
 use crate::{ErrorCode, ErrorContext as _, Result};
 
 use super::Service;
-use super::models::{Report, ReportSummary, ScraperRun, ScraperRunOutcome, ScraperRunUpdate};
+use super::models::{
+    Report, ReportSummary, ReportedScript, ScraperRun, ScraperRunOutcome, ScraperRunUpdate,
+};
 use super::recorder::{Recorder, now_ms};
 use super::storage::Storage;
 use crate::domains::scrapers::{ProgressEvent, ProgressStep};
@@ -38,6 +40,7 @@ impl<S: Storage> ReportsClient<S> {
 /// finished (the run's future was dropped), the run reads as interrupted.
 pub(in crate::domains::scrapers) struct RunTracker {
     id: Uuid,
+    script: Option<ReportedScript>,
     recorder: Arc<Recorder>,
     progress: Arc<RunProgress>,
     going_on: Arc<Mutex<HashSet<Uuid>>>,
@@ -129,6 +132,7 @@ impl RunTracker {
                 found: progress.found,
                 saved: progress.saved,
             },
+            script: self.script,
             entries: self.recorder.entries(),
         }
     }
@@ -136,9 +140,10 @@ impl RunTracker {
 
 #[async_trait]
 impl<S: Storage> Service for ReportsClient<S> {
-    async fn start(&self, name: &str) -> Result<RunTracker> {
+    async fn start(&self, name: &str, script: Option<ReportedScript>) -> Result<RunTracker> {
         let tracker = RunTracker {
             id: Uuid::now_v7(),
+            script,
             recorder: Arc::new(Recorder::new(name)),
             progress: Arc::default(),
             going_on: self.going_on.clone(),
@@ -228,7 +233,7 @@ mod tests {
     async fn start_opens_a_running_report_and_records_the_start() {
         let client = client();
 
-        let tracker = client.start("alice").await.unwrap();
+        let tracker = client.start("alice", None).await.unwrap();
 
         let saved = client.storage.reports();
         assert_eq!(saved.len(), 1);
@@ -239,6 +244,21 @@ mod tests {
         let runs = client.last_runs().await.unwrap();
         assert_eq!(runs[0].outcome, ScraperRunOutcome::Running);
         drop(tracker);
+    }
+
+    #[tokio::test]
+    async fn the_report_keeps_the_script_that_ran_from_start_to_finish() {
+        let client = client();
+        let script = ReportedScript {
+            id: Uuid::new_v4(),
+            version: 3,
+        };
+
+        let tracker = client.start("alice", Some(script)).await.unwrap();
+        assert_eq!(client.storage.reports()[0].script, Some(script));
+        client.finish(tracker, &Ok(())).await.unwrap();
+
+        assert_eq!(client.storage.reports()[0].script, Some(script));
     }
 
     #[tokio::test]
@@ -260,7 +280,7 @@ mod tests {
         ];
         for (result, expected, last_event) in cases {
             let client = client();
-            let tracker = client.start("alice").await.unwrap();
+            let tracker = client.start("alice", None).await.unwrap();
             tracker.recorder().record("log", json!({ "message": "hi" }));
 
             client.finish(tracker, &result).await.unwrap();
@@ -278,7 +298,7 @@ mod tests {
     #[tokio::test]
     async fn finish_saves_the_last_step_update_found_and_saved_counts() {
         let client = client();
-        let tracker = client.start("alice").await.unwrap();
+        let tracker = client.start("alice", None).await.unwrap();
         let progress = tracker.progress();
 
         progress.record(&ProgressEvent::Step {
@@ -351,7 +371,7 @@ mod tests {
     async fn a_run_dropped_without_finishing_reads_as_interrupted() {
         let client = client();
 
-        drop(client.start("alice").await.unwrap());
+        drop(client.start("alice", None).await.unwrap());
 
         let run = client.last_runs().await.unwrap().remove(0);
         assert_eq!(run.outcome, ScraperRunOutcome::Interrupted);
@@ -410,10 +430,10 @@ mod tests {
     #[tokio::test]
     async fn each_run_keeps_its_own_report() {
         let client = client();
-        let first = client.start("alice").await.unwrap();
+        let first = client.start("alice", None).await.unwrap();
         client.finish(first, &Ok(())).await.unwrap();
 
-        let second = client.start("alice").await.unwrap();
+        let second = client.start("alice", None).await.unwrap();
 
         assert_eq!(client.storage.reports().len(), 2);
         let runs = client.last_runs().await.unwrap();
@@ -430,7 +450,7 @@ mod tests {
             .returning(|_| Err(std::io::Error::other("disk full").into()));
         let client = ReportsClient::new(storage);
 
-        let err = client.start("alice").await.err().unwrap();
+        let err = client.start("alice", None).await.err().unwrap();
 
         assert!(err.has_context());
         assert!(client.going_on.lock().unwrap().is_empty());
