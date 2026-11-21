@@ -73,7 +73,9 @@ async fn encoded_master_key(secrets: &dyn SecretsService) -> Result<Zeroizing<St
 /// attempting unrelated authenticated work (see
 /// `changelog::Service::ensure_master_key`).
 pub(super) async fn ensure_master_key(secrets: &dyn SecretsService) -> Result<()> {
-    encoded_master_key(secrets).await?;
+    encoded_master_key(secrets)
+        .await
+        .context("no master key to encrypt changelog events with")?;
     Ok(())
 }
 
@@ -87,7 +89,9 @@ pub(super) async fn ensure_master_key(secrets: &dyn SecretsService) -> Result<()
 /// [`crate::ErrorCode::Encryption`] if no master key is on hand yet — i.e. before any
 /// account has been created or logged into on this device.
 async fn derive_kek(secrets: &dyn SecretsService) -> Result<Zeroizing<[u8; KEY_LEN]>> {
-    let encoded_master_key = encoded_master_key(secrets).await?;
+    let encoded_master_key = encoded_master_key(secrets)
+        .await
+        .context("failed to read the master key the changelog KEK derives from")?;
     let master_key = decode_master_key(&encoded_master_key)
         .context("failed to decode master key from the credential store")?;
 
@@ -167,7 +171,9 @@ pub(super) async fn encrypt_event(
     let encrypted_payload =
         aead_encrypt(&dek, &bytes).context("failed to encrypt changelog event")?;
 
-    let kek = derive_kek(secrets).await?;
+    let kek = derive_kek(secrets)
+        .await
+        .context("failed to derive the changelog KEK")?;
     let wrapped_dek =
         aead_encrypt(&kek, dek.as_slice()).context("failed to wrap changelog event DEK")?;
 
@@ -191,7 +197,9 @@ pub(super) async fn decrypt_event(
     }
     let (wrapped_dek, encrypted_payload) = encrypted_content.split_at(WRAPPED_KEY_LEN);
 
-    let kek = derive_kek(secrets).await?;
+    let kek = derive_kek(secrets)
+        .await
+        .context("failed to derive the changelog KEK")?;
     let dek = aead_decrypt(&kek, wrapped_dek).context("failed to unwrap changelog event DEK")?;
     let dek: Zeroizing<[u8; KEY_LEN]> = Zeroizing::new(
         dek.as_slice()
@@ -301,6 +309,20 @@ mod tests {
         let secrets = secrets_with_master_key();
 
         assert!(decrypt_event(&secrets, b"too short").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ensure_master_key_fails_with_context_without_a_master_key() {
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == MASTER_KEY_SECRET)
+            .returning(|_| Ok(None));
+
+        let err = ensure_master_key(&secrets).await.unwrap_err();
+
+        assert!(matches!(err.kind(), ErrorKind::Encryption(_)));
+        assert!(err.has_context());
     }
 
     #[tokio::test]
