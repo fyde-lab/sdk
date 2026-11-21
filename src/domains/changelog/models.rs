@@ -69,13 +69,36 @@ impl SyncProgress {
 /// event type carries all of them: `content` is `None` for a metadata-only
 /// update, and both `content` and `metadata` are `None` for a deletion
 /// (only `subject_id` is meaningful then).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Its `Debug` output shows only the content's size and whether metadata is
+/// present: the content is a document's bytes or an installation's JSON
+/// (its label and parameters' values, credentials included), and the
+/// metadata carries the document's transcript.
+#[derive(Clone, PartialEq)]
 pub struct ChangelogEvent {
     pub(super) id: Uuid,
     pub(super) event_type: EventType,
     pub(super) subject_id: Uuid,
     pub(super) content: Option<Vec<u8>>,
     pub(super) metadata: Option<Metadata>,
+}
+
+impl std::fmt::Debug for ChangelogEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChangelogEvent")
+            .field("id", &self.id)
+            .field("event_type", &self.event_type)
+            .field("subject_id", &self.subject_id)
+            .field(
+                "content",
+                &self
+                    .content
+                    .as_ref()
+                    .map(|content| format!("[{} bytes redacted]", content.len())),
+            )
+            .field("metadata", &self.metadata.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
 }
 
 impl ChangelogEvent {
@@ -187,6 +210,23 @@ mod tests {
         assert_eq!(event.event_type, EventType::SaveDocument);
         assert!(event.content.is_some());
         assert!(event.metadata.is_some());
+    }
+
+    #[test]
+    fn debug_never_shows_the_content_or_metadata() {
+        let event = FakeChangelogEvent::new()
+            .with_event_type(EventType::InstallScript)
+            .with_content(br#"{"parameters":{"password":"hunter2"}}"#.to_vec())
+            .build();
+        let metadata = format!("{:?}", event.metadata);
+
+        let debug = format!("{event:?}");
+
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(!debug.contains(&format!("{:?}", event.content)), "{debug}");
+        assert!(!debug.contains(&metadata), "{debug}");
+        assert!(debug.contains("[37 bytes redacted]"), "{debug}");
+        assert!(debug.contains(&event.subject_id.to_string()), "{debug}");
     }
 
     #[test]
