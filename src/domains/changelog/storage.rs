@@ -7,20 +7,21 @@ use crate::Result;
 
 /// Tracks the SDK's progress through the server's changelog (see
 /// [`super::storage_settings::LocalCursorStorage`]): the cursor, so
-/// [`super::Service::consume`] can resume from where it left off across
-/// restarts instead of requiring the caller to track an id itself, and the
+/// the consume job ([`super::Service::start_consume_job`]) can resume from
+/// where it left off across restarts instead of requiring the caller to
+/// track an id itself, and the
 /// events already applied, so a replayed one is recognised.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(crate) trait CursorStorage: Send + Sync {
     /// Returns the last cursor persisted by [`Self::save_cursor`], or
     /// [`Uuid::nil`] if the changelog has never been consumed — the id
-    /// [`super::Service::consume`] passes to `ConsumeSince` to mean "from
-    /// the beginning".
+    /// the consume job passes to `ConsumeSince` to mean "from the
+    /// beginning".
     async fn get_cursor(&self) -> Result<Uuid>;
 
-    /// Persists `id` as the cursor to resume from on the next
-    /// [`super::Service::consume`] call.
+    /// Persists `id` as the cursor the consume job's next pass resumes
+    /// from.
     async fn save_cursor(&self, id: Uuid) -> Result<()>;
 
     /// Whether an event whose encrypted content hashes to `digest` (SHA-256)

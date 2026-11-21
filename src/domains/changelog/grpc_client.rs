@@ -29,7 +29,7 @@ pub(super) type EventStream =
 /// A gRPC transport for talking to the fyde server's changelog service.
 /// Knows nothing about changelog events themselves beyond the raw proto
 /// types; just sends/receives raw messages. Abstracted as a trait so
-/// callers can be tested against [`MockFydeClient`] instead of a live
+/// callers can be tested against `MockFydeClient` instead of a live
 /// server.
 #[cfg_attr(test, automock)]
 #[async_trait]
@@ -50,7 +50,7 @@ pub(super) trait FydeClient: Send + Sync {
 
 /// The production [`FydeClient`] implementation, backed by a tonic
 /// [`Channel`] shared with every other domain's gRPC client (see
-/// [`crate::Client::connect`]), so they all reuse the same underlying
+/// `Client::init`), so they all reuse the same underlying
 /// connection instead of each opening one of their own. The channel is
 /// typically opened lazily (via `Endpoint::connect_lazy`), so the SDK can be
 /// used offline for anything that doesn't reach this client; a call that

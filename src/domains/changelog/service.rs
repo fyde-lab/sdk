@@ -107,7 +107,7 @@ const CONSUME_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_s
 const POISON_PILL_PASSES: u32 = 5;
 
 /// A client for the fyde server's changelog service. Generic over the
-/// [`DocumentStorage`] implementation used by [`Service::consume`] to spot
+/// [`DocumentStorage`] implementation used by the consume job to spot
 /// documents already cached, the [`ScriptStorage`]
 /// implementation it saves and deletes script installations in, the
 /// [`ScraperStateStorage`] it clears an installation's scraper session in
@@ -146,7 +146,7 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
     ChangelogClient<D, S, P, O>
 {
     /// Creates a client for the changelog service over `grpc`, using
-    /// `document_storage` to spot documents [`Service::consume`] already
+    /// `document_storage` to spot documents the consume job already
     /// cached, `indexer` to cache (and index) the ones it materializes,
     /// `script_storage` to save and delete the script installations it
     /// materializes, `scraper_state_storage` to clear the saved session
@@ -440,9 +440,8 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
     /// One pass of the consume loop spawned by [`Service::start_consume_job`]:
     /// opens a stream from the persisted
     /// cursor and processes events until the stream ends or an error
-    /// occurs. Split out as an inherent method (rather than inlined in
-    /// `consume`) so it can be retried in a loop without re-implementing
-    /// the retry itself, and so tests can exercise a single pass directly.
+    /// occurs. Split out of [`Self::run_consume_loop`], which retries it, so
+    /// tests can exercise a single pass directly.
     async fn consume_once(&self, callback: &mut (dyn FnMut(ChangelogEvent) + Send)) -> Result<()> {
         let cursor = self
             .cursor_storage
