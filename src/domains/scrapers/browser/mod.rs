@@ -1,4 +1,6 @@
 mod driver;
+mod engine;
+mod wry_engine;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +12,7 @@ use mockall::automock;
 use super::cookies::Cookie;
 use crate::Result;
 
-/// Drives a real, embedded webview (`wry`, windowed via `tao`) so a scraper
+/// Drives a real, embedded webview (see [`engine`]) so a scraper
 /// script can get past a site a plain `fyde.http` request can't: a
 /// client-rendered SPA with no plain-HTML fallback (e.g. `scaleway`'s
 /// invoices table — see the `scripts` repo's `CLAUDE.md`), or a
@@ -39,12 +41,16 @@ use crate::Result;
 /// incognito with a data store of its own, so concurrent runs never share
 /// cookies, storage or cache.
 ///
-/// **Caveat verified only on Linux/WebKitGTK**: a real webview needs a live
-/// window-system connection (X11/Wayland on Linux; the OS-native webview
-/// framework elsewhere) that a headless server or CI runner may simply not
-/// have — see [`init`]/`driver::BrowserDriver::ensure_started` for why
-/// that's deferred to first use rather than failing every scraper run that
-/// never touches `fyde.browser`.
+/// The driver holds every rule (allowed navigations, popups and downloads,
+/// the JS it runs, the cookies it keeps); the [`engine::WebviewEngine`] it
+/// runs on only hosts webviews. Today that's always
+/// [`wry_engine::WryEngine`], verified only on Linux/WebKitGTK: a real
+/// webview needs a live window-system connection (X11/Wayland on Linux; the
+/// OS-native webview framework elsewhere) that a headless server or CI
+/// runner may simply not have — see [`init`]/
+/// `driver::BrowserDriver::with_session` for why that's deferred to first
+/// use rather than failing every scraper run that never touches
+/// `fyde.browser`.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(super) trait Service: Send + Sync {
@@ -112,16 +118,16 @@ pub(super) trait Service: Send + Sync {
     async fn cookies(&self) -> Result<Vec<Cookie>>;
 }
 
-/// Builds the real, `wry`-backed browser service. Never fails on its own —
+/// Builds the real browser service. Never fails on its own —
 /// creating the actual window/webview is deferred to first use (see
-/// `driver::BrowserDriver::ensure_started`), so a scraper run that never
+/// `driver::BrowserDriver::with_session`), so a scraper run that never
 /// calls into `fyde.browser` never pays the cost, or the risk, of touching
 /// a display at all. `allowed_domains` is the same list `host::install`
 /// enforces on `fyde.browser:open`'s own URL — here it also bounds every
 /// navigation the webview makes on its own afterwards (a link click, a form
 /// submit that does a real navigation, a JS `location` change, a `target`
-/// attribute or `window.open` popup), via `driver::BrowserDriver`'s
-/// `with_navigation_handler`/`with_new_window_req_handler`.
+/// attribute or `window.open` popup), via the [`engine::WebviewHandler`] the
+/// driver hands its engine.
 ///
 /// `visible` toggles whether the window this run's webview is embedded in
 /// is actually shown, so a scraper run only pops up a real window when a
@@ -137,6 +143,7 @@ pub(super) fn init(
     cookies: Vec<Cookie>,
 ) -> Arc<dyn Service> {
     Arc::new(driver::BrowserDriver::new(
+        Arc::new(wry_engine::WryEngine),
         allowed_domains,
         visible,
         cookies,

@@ -107,9 +107,11 @@ encrypts/decrypts, storage adapters (`storage_sqlite.rs`, `SqliteClient`) only r
 - Adapters test themselves for real: `grpc_client.rs`, `crypto.rs`, `storage_sqlite.rs`,
   `tools/sql/sqlite.rs`, `tools/client_dir.rs`, `tools/models` (a local HTTP server),
   `tools/onnx`, `documents/{embedder,gliner}.rs`, `documents/transcript/` (PDFs built with
-  `lopdf`), `secrets/storage_keystore.rs`, `changelog/storage_settings.rs`. Real-model tests are
-  `#[ignore]`. `changelog::Service` can't be automocked (its `start_consume_job` takes a boxed
-  `FnMut`), so use `RecordingChangelog`-style fakes.
+  `lopdf`), `secrets/storage_keystore.rs`, `changelog/storage_settings.rs`,
+  `scrapers/browser/wry_engine.rs` (needs a display: `xvfb-run`). Real-model and real-webview
+  tests are `#[ignore]`. `browser/driver.rs` tests against mocked engines (its engine traits are
+  sync: an engine answers from its UI thread). `changelog::Service` can't be automocked (its
+  `start_consume_job` takes a boxed `FnMut`), so use `RecordingChangelog`-style fakes.
 - Fixtures: every entity a domain returns has a `#[cfg(test)]` `Fake*` builder in its
   `models.rs` (`FakeDocument::new().with_x(..).build()`) using `tools::testing`. Use those builders,
   not struct literals. Keep the builders `pub(crate)`, and re-export one only where another file
@@ -165,8 +167,11 @@ methods, used behind `Arc<dyn Service>`), `models.rs`, `service.rs` and adapters
   never moves threads. Blocking host calls use `StopSignal::block_on`, never a bare
   `Handle::block_on`. `fyde.http` is `reqwest` with a `cookie_store` jar, and redirects are
   checked hop by hop against `allowed_domains`. Reports' rules live in `reports/service.rs`.
-  `browser/` runs every `wry` webview on one process-wide thread (GTK);
-  forms are submitted with `click`, never an in-page `fetch`, and downloads never touch the disk.
+  `browser/`: `driver.rs` holds every rule (allowed navigations, popups and downloads, the JS,
+  the cookies kept); a `WebviewEngine` (`engine.rs`, whose module doc is the contract) only hosts
+  webviews: one isolated, ephemeral data store per session, decisions asked of the driver's
+  `WebviewHandler`. `wry_engine.rs` runs every `wry` webview on one process-wide thread (GTK).
+  Forms are submitted with `click`, never an in-page `fetch`, and downloads never touch the disk.
   `crate::init_dev_scrapers` (for `../scripts`) runs scrapers without a `Client`.
 - **icons** (read-through cache, never revalidated), **settings** (callers' keys are prefixed
   `app.`), **server_state** (never fails), **usage** (never cached).
