@@ -28,7 +28,7 @@ Requirements:
 
 - Rust 1.98 or later.
 - `protoc`.
-- On Linux, the WebKitGTK/GTK/D-Bus development packages used by the scrapers' embedded browser and the Secret Service keyring.
+- On Linux, the D-Bus development package used by the Secret Service keyring, and the WebKitGTK/GTK ones `browser-wry/` (the desktop webview the scrapers' embedded browser runs on) needs.
 
 `../shell.nix` provisions all of these.
 
@@ -45,9 +45,9 @@ FYDE_PROTO_DIR=../server/protos cargo build  # protos from a local checkout
 ## Testing
 
 ```sh
-cargo test       # unit tests
-cargo clippy --all-targets
-cargo fmt --check
+cargo test --workspace       # unit tests
+cargo clippy --workspace --all-targets
+cargo fmt --all --check
 ```
 
 The end-to-end suites, which drive a real `Client` against a real server, live in the [`server`](https://github.com/fyde-lab/server) repository's `tests/`.
