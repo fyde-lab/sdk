@@ -150,9 +150,10 @@ pub struct Client {
     /// The on-device models' background loading started by `init`. Never
     /// read: it only exists so dropping the `Client` stops it.
     _model_loading: domains::documents::ModelLoading,
-    /// The documents' thumbnails' background drawing started by `init`.
+    /// The documents' thumbnails' background drawing started by `init`
+    /// (`None` on mobile: see `documents::BACKGROUND_THUMBNAILS`).
     /// Never read: it only exists so dropping the `Client` stops it.
-    _thumbnail_job: domains::documents::ThumbnailJob,
+    _thumbnail_job: Option<domains::documents::ThumbnailJob>,
     /// The locked handle to [`instance_lock_path`] (see [`lock_instance`]),
     /// held for as long as this `Client` lives. Never read: it only exists
     /// so dropping the `Client` releases the lock.
@@ -196,10 +197,12 @@ impl Client {
         let embedding_cache = domains::documents::init_embedding_cache();
         // Woken by the indexer each time the sync job caches a document.
         // Started right away, so documents cached before thumbnails were
-        // stored (or while the job was stopped) get theirs too.
+        // stored (or while the job was stopped) get theirs too. Not on
+        // mobile, where `thumbnail` draws each one when it's first shown.
         let thumbnail_wake = Arc::new(domains::documents::ThumbnailWake::new());
-        let thumbnail_job =
-            domains::documents::start_thumbnail_job(sqlite.pool().clone(), thumbnail_wake.clone());
+        let thumbnail_job = domains::documents::BACKGROUND_THUMBNAILS.then(|| {
+            domains::documents::start_thumbnail_job(sqlite.pool().clone(), thumbnail_wake.clone())
+        });
         let indexer = domains::documents::init_indexer(
             sqlite.pool().clone(),
             embedder.clone(),
