@@ -153,6 +153,9 @@ pub struct Client {
     /// The documents' thumbnails' background drawing started by `init`.
     /// Never read: it only exists so dropping the `Client` stops it.
     _thumbnail_job: domains::documents::ThumbnailJob,
+    /// The scraper reports' background upload started by `init`. Never
+    /// read: it only exists so dropping the `Client` stops it.
+    _report_upload_job: domains::scrapers::ReportUploadJob,
     /// The locked handle to [`instance_lock_path`] (see [`lock_instance`]),
     /// held for as long as this `Client` lives. Never read: it only exists
     /// so dropping the `Client` releases the lock.
@@ -260,12 +263,24 @@ impl Client {
         )
         .await
         .context("failed to initialize users service")?;
+        // Woken each time a scraper run's report is completed. Started
+        // right away, so reports left from before (or that failed to
+        // upload) go too.
+        let report_upload_wake = Arc::new(domains::scrapers::ReportUploadWake::new());
+        let report_upload_job = domains::scrapers::start_report_upload_job(
+            sqlite.pool().clone(),
+            channel.clone(),
+            sessions.clone(),
+            &config.client_name,
+            report_upload_wake.clone(),
+        );
         let scrapers = domains::scrapers::init(
             domains::scrapers::StorageConfig::Sqlite(sqlite.pool().clone()),
             documents.clone(),
             Some(span_finder),
             config.on_scraper_progress,
             config.on_scraper_question,
+            Some(report_upload_wake),
         );
 
         // A session may already be open from a previous run (the token is
@@ -293,6 +308,7 @@ impl Client {
             users,
             _model_loading: model_loading,
             _thumbnail_job: thumbnail_job,
+            _report_upload_job: report_upload_job,
             _instance_lock: instance_lock,
         })
     }
@@ -705,6 +721,8 @@ pub async fn init_dev_scrapers(
         None,
         on_progress,
         on_question,
+        // Reports kept as files are never uploaded.
+        None,
     ))
 }
 

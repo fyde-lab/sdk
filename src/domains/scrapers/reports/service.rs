@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -7,12 +8,14 @@ use uuid::Uuid;
 
 use crate::{ErrorCode, ErrorContext as _, Result};
 
-use super::Service;
+use super::grpc_client::FydeClient;
 use super::models::{
-    Report, ReportSummary, ReportedScript, ScraperRun, ScraperRunOutcome, ScraperRunUpdate,
+    DeviceType, Report, ReportCursor, ReportSummary, ReportUpload, ReportedScript, ScraperRun,
+    ScraperRunOutcome, ScraperRunUpdate,
 };
 use super::recorder::{Recorder, now_ms};
-use super::storage::Storage;
+use super::storage::{Storage, UploadStorage, outcome_columns};
+use super::{Service, UploadWake};
 use crate::domains::scrapers::{ProgressEvent, ProgressStep};
 
 /// The default [`Service`] implementation, delegating persistence to an
@@ -23,6 +26,10 @@ use crate::domains::scrapers::{ProgressEvent, ProgressStep};
 pub(super) struct ReportsClient<S: Storage> {
     storage: S,
     going_on: Arc<Mutex<HashSet<Uuid>>>,
+    /// Notified each time a run's report is completed, for the uploads
+    /// (see [`upload_reports`]) to look for it. `None` where reports are
+    /// never uploaded.
+    upload_wake: Option<Arc<UploadWake>>,
 }
 
 impl<S: Storage> ReportsClient<S> {
@@ -30,7 +37,14 @@ impl<S: Storage> ReportsClient<S> {
         Self {
             storage,
             going_on: Arc::new(Mutex::new(HashSet::new())),
+            upload_wake: None,
         }
+    }
+
+    /// Notifies `wake` each time a run's report is completed.
+    pub(super) fn waking(mut self, wake: Arc<UploadWake>) -> Self {
+        self.upload_wake = Some(wake);
+        self
     }
 }
 
@@ -190,7 +204,11 @@ impl<S: Storage> Service for ReportsClient<S> {
                     "failed to save the report of scraper {:?}'s run",
                     tracker.recorder.scraper_name()
                 )
-            })
+            })?;
+        if let Some(wake) = &self.upload_wake {
+            wake.notify_one();
+        }
+        Ok(())
     }
 
     async fn last_runs(&self) -> Result<Vec<ScraperRun>> {
@@ -218,10 +236,280 @@ impl<S: Storage> Service for ReportsClient<S> {
     }
 }
 
+/// The most a report's JSON may weigh: the server refuses one over 1 MiB.
+pub(super) const MAX_REPORT_BYTES: usize = 1024 * 1024;
+
+/// The longest run duration the server accepts. A longer run is uploaded
+/// as lasting this long.
+const MAX_DURATION_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// How many reports [`ReportUploader::upload_pending`] reads from storage
+/// at a time.
+const UPLOAD_BATCH: u32 = 16;
+
+/// How long [`upload_reports`] waits after a pass failed (the server
+/// unreachable, no session...) before trying again, unless a run ends
+/// first.
+pub(super) const UPLOAD_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Uploads finished runs' reports to the server's `reports.v1`, which
+/// links them to no user, each once. Only runs of a known script are
+/// uploaded (the server needs its id and version), as
+/// [`report_json`] words them.
+pub(super) struct ReportUploader<S: UploadStorage, C: FydeClient> {
+    storage: S,
+    client: C,
+    device_type: DeviceType,
+    client_id: String,
+}
+
+impl<S: UploadStorage, C: FydeClient> ReportUploader<S, C> {
+    /// Uploads through `client` the reports `storage` holds, from the
+    /// client application named `client_name` (see
+    /// [`crate::ClientConfig::client_name`]), running on this device.
+    pub(super) fn new(storage: S, client: C, client_name: &str) -> Self {
+        Self {
+            storage,
+            client,
+            device_type: this_device(),
+            client_id: client_id(client_name),
+        }
+    }
+
+    /// Uploads every report not uploaded yet, oldest first, and returns how
+    /// many it uploaded. One the server refuses as invalid is left to try
+    /// again on the next pass, and the pass goes on with the others. Any
+    /// other failure to upload (the server unreachable, no session...)
+    /// would fail the next ones too, so ends the pass with it.
+    pub(super) async fn upload_pending(&self) -> Result<usize> {
+        let mut uploaded = 0;
+        let mut after = None;
+        loop {
+            let batch = self
+                .storage
+                .list_to_upload(after, UPLOAD_BATCH)
+                .await
+                .context("failed to list the scraper reports to upload")?;
+            let Some(last) = batch.last() else {
+                return Ok(uploaded);
+            };
+            after = Some(ReportCursor::from(last));
+            let complete = batch.len() < UPLOAD_BATCH as usize;
+
+            for report in &batch {
+                let Some(upload) = self.upload_of(report)? else {
+                    continue;
+                };
+                match self.client.upload_report(upload).await {
+                    Ok(()) => {}
+                    Err(err) if err.code() == ErrorCode::InvalidRequest => {
+                        tracing::warn!(
+                            report = %report.id,
+                            "the server refused scraper report, keeping it to try again: {err}"
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!("failed to upload scraper report {}", report.id)
+                        });
+                    }
+                }
+                self.storage
+                    .mark_uploaded(report.id)
+                    .await
+                    .with_context(|| {
+                        format!("failed to note scraper report {} uploaded", report.id)
+                    })?;
+                uploaded += 1;
+            }
+
+            if complete {
+                return Ok(uploaded);
+            }
+        }
+    }
+
+    /// `report` as it's uploaded, `None` if its script isn't known (never
+    /// listed to upload).
+    fn upload_of(&self, report: &Report) -> Result<Option<ReportUpload>> {
+        let Some(script) = report.script else {
+            return Ok(None);
+        };
+        let run = &report.run;
+        let duration_ms = run.ended_at_ms.map_or(0, |ended_at_ms| {
+            ended_at_ms.saturating_sub(run.started_at_ms)
+        });
+        Ok(Some(ReportUpload {
+            report: report_json(report, MAX_REPORT_BYTES)
+                .with_context(|| format!("failed to encode scraper report {}", report.id))?,
+            device_type: self.device_type,
+            client_id: self.client_id.clone(),
+            script_id: script.id,
+            script_version: script.version,
+            duration_ms: u64::try_from(duration_ms).unwrap_or(0).min(MAX_DURATION_MS),
+        }))
+    }
+}
+
+/// Runs `uploader`'s passes forever: one now, then one each time `wake` is
+/// notified (a run's report was completed). After a failed pass, tries
+/// again after [`UPLOAD_RETRY_AFTER`], or once woken.
+pub(super) async fn upload_reports<S: UploadStorage, C: FydeClient>(
+    uploader: ReportUploader<S, C>,
+    wake: Arc<UploadWake>,
+) {
+    loop {
+        match uploader.upload_pending().await {
+            Ok(uploaded) => {
+                if uploaded > 0 {
+                    tracing::debug!("uploaded {uploaded} scraper reports");
+                }
+                wake.notified().await;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    code = ?err.code(),
+                    "failed to upload the scraper reports, trying again in {}s: {err}",
+                    UPLOAD_RETRY_AFTER.as_secs()
+                );
+                tokio::select! {
+                    () = wake.notified() => {}
+                    () = tokio::time::sleep(UPLOAD_RETRY_AFTER) => {}
+                }
+            }
+        }
+    }
+}
+
+/// `report` as the JSON object uploaded, of at most `max_bytes`: how the
+/// run ended and how far it got, then its log, each entry timed from the
+/// run's start. Neither the name it ran under (an installation's id,
+/// replaced by `[run]` wherever the log mentions it) nor when it ran is
+/// sent. A log too long to fit loses entries from its
+/// middle, keeping its start and its end (where a failure is), and says
+/// how many it lost as `omitted_entries`.
+pub(super) fn report_json(report: &Report, max_bytes: usize) -> Result<String> {
+    let run = &report.run;
+    let (outcome, error_code) = outcome_columns(run.outcome);
+    let mut body = json!({
+        "outcome": outcome,
+        "error_code": error_code,
+        "step": run.step.map(|step| step.as_str()),
+        "update": run.update.map(|update| json!({
+            "current": update.current,
+            "total": update.total,
+        })),
+        "found": run.found,
+        "saved": run.saved,
+        "omitted_entries": 0,
+        "entries": [],
+    });
+    let entries = report
+        .entries
+        .iter()
+        .map(|entry| {
+            let mut value = entry.value.clone();
+            scrub(&mut value, &run.name);
+            json!({
+                "at_ms": entry.ts_ms.saturating_sub(run.started_at_ms),
+                "event": entry.event,
+                "value": value,
+            })
+        })
+        .collect::<Vec<_>>();
+    let sizes = entries
+        .iter()
+        .map(|entry| serde_json::to_string(entry).map(|text| text.len()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to encode a scraper report's log")?;
+
+    // Room left for the entries once the rest is written, keeping enough
+    // for `omitted_entries` to grow to any count.
+    let rest = serde_json::to_string(&body)
+        .context("failed to encode a scraper report")?
+        .len();
+    let mut budget = max_bytes.saturating_sub(rest + u64::MAX.to_string().len());
+    // Taken in turn from the start and from the end, each side stopping
+    // at its first entry that doesn't fit. Each entry but the first costs
+    // a comma too.
+    let (mut front, mut back) = (0, entries.len());
+    // Whether the start (0) and the end (1) still take entries.
+    let mut open = [true, true];
+    while front < back && open.contains(&true) {
+        for side in [0, 1] {
+            if front == back || !open[side] {
+                continue;
+            }
+            let index = if side == 0 { front } else { back - 1 };
+            let kept = front + (entries.len() - back);
+            let cost = sizes[index] + usize::from(kept > 0);
+            if cost > budget {
+                open[side] = false;
+                continue;
+            }
+            budget -= cost;
+            if side == 0 {
+                front += 1;
+            } else {
+                back -= 1;
+            }
+        }
+    }
+
+    let omitted = back - front;
+    let mut kept = entries;
+    kept.drain(front..back);
+    body["omitted_entries"] = json!(omitted);
+    body["entries"] = serde_json::Value::Array(kept);
+    serde_json::to_string(&body).context("failed to encode a scraper report")
+}
+
+/// Replaces `name` by `[run]` in every string within `value`.
+fn scrub(value: &mut serde_json::Value, name: &str) {
+    use serde_json::Value;
+
+    if name.is_empty() {
+        return;
+    }
+    match value {
+        Value::String(text) if text.contains(name) => *text = text.replace(name, "[run]"),
+        Value::Array(items) => items.iter_mut().for_each(|item| scrub(item, name)),
+        Value::Object(fields) => fields.values_mut().for_each(|field| scrub(field, name)),
+        _ => {}
+    }
+}
+
+/// The kind of device the SDK was built for.
+fn this_device() -> DeviceType {
+    if cfg!(target_os = "android") {
+        DeviceType::Android
+    } else if cfg!(target_os = "ios") {
+        DeviceType::Ios
+    } else {
+        DeviceType::Desktop
+    }
+}
+
+/// `client_name` (1 to 64 ASCII letters, digits, `-`, `_` or `.`; see
+/// [`crate::ClientConfig::client_name`]) as the client id the server
+/// accepts: lowercase, `_` and `.` turned into `-`.
+fn client_id(client_name: &str) -> String {
+    client_name
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | '0'..='9' | '-' => c,
+            'A'..='Z' => c.to_ascii_lowercase(),
+            _ => '-',
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::models::FakeReport;
-    use super::super::storage::{MemoryStorage, MockStorage};
+    use super::super::grpc_client::MockFydeClient;
+    use super::super::models::{FakeReport, ReportEntry};
+    use super::super::storage::{MemoryStorage, MockStorage, MockUploadStorage};
     use super::*;
     use crate::{Error, ErrorKind};
 
@@ -454,5 +742,366 @@ mod tests {
 
         assert!(err.has_context());
         assert!(client.going_on.lock().unwrap().is_empty());
+    }
+
+    fn uploader(
+        storage: MockUploadStorage,
+        client: MockFydeClient,
+    ) -> ReportUploader<MockUploadStorage, MockFydeClient> {
+        ReportUploader::new(storage, client, "Desktop_app.2")
+    }
+
+    fn parsed(upload: &ReportUpload) -> serde_json::Value {
+        serde_json::from_str(&upload.report).unwrap()
+    }
+
+    #[tokio::test]
+    async fn finish_wakes_the_uploads() {
+        let wake = Arc::new(UploadWake::new());
+        let client = ReportsClient::new(MemoryStorage::default()).waking(wake.clone());
+        let tracker = client.start("alice", None).await.unwrap();
+
+        client.finish(tracker, &Ok(())).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), wake.notified())
+            .await
+            .expect("finishing a run should wake the uploads");
+    }
+
+    #[tokio::test]
+    async fn upload_pending_uploads_each_report_once_and_notes_it_uploaded() {
+        let script = ReportedScript {
+            id: Uuid::new_v4(),
+            version: 4,
+        };
+        let report = FakeReport::new()
+            .with_started_at_ms(10_000)
+            .with_script(Some(script))
+            .build();
+        let id = report.id;
+        let mut storage = MockUploadStorage::new();
+        storage
+            .expect_list_to_upload()
+            .withf(|after, limit| after.is_none() && *limit == UPLOAD_BATCH)
+            .times(1)
+            .return_once(move |_, _| Ok(vec![report]));
+        storage
+            .expect_mark_uploaded()
+            .withf(move |marked| *marked == id)
+            .times(1)
+            .returning(|_| Ok(()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let mut client = MockFydeClient::new();
+        let capture = sent.clone();
+        client
+            .expect_upload_report()
+            .times(1)
+            .returning(move |upload| {
+                capture.lock().unwrap().push(upload);
+                Ok(())
+            });
+
+        let uploaded = uploader(storage, client).upload_pending().await.unwrap();
+
+        assert_eq!(uploaded, 1);
+        let sent = sent.lock().unwrap();
+        let upload = &sent[0];
+        assert_eq!(upload.script_id, script.id);
+        assert_eq!(upload.script_version, 4);
+        assert_eq!(upload.client_id, "desktop-app-2");
+        assert_eq!(upload.device_type, DeviceType::Desktop);
+        assert_eq!(upload.duration_ms, 60_000);
+        assert_eq!(parsed(upload)["outcome"], "succeeded");
+    }
+
+    #[tokio::test]
+    async fn upload_pending_pages_through_every_report_to_upload() {
+        let first: Vec<Report> = (0..UPLOAD_BATCH)
+            .map(|_| FakeReport::new().build())
+            .collect();
+        let cursor = ReportCursor::from(first.last().unwrap());
+        let last = FakeReport::new().build();
+        let mut storage = MockUploadStorage::new();
+        let mut sequence = mockall::Sequence::new();
+        storage
+            .expect_list_to_upload()
+            .withf(|after, _| after.is_none())
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(move |_, _| Ok(first));
+        storage
+            .expect_list_to_upload()
+            .withf(move |after, _| *after == Some(cursor))
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(move |_, _| Ok(vec![last]));
+        storage
+            .expect_mark_uploaded()
+            .times(UPLOAD_BATCH as usize + 1)
+            .returning(|_| Ok(()));
+        let mut client = MockFydeClient::new();
+        client
+            .expect_upload_report()
+            .times(UPLOAD_BATCH as usize + 1)
+            .returning(|_| Ok(()));
+
+        let uploaded = uploader(storage, client).upload_pending().await.unwrap();
+
+        assert_eq!(uploaded, UPLOAD_BATCH as usize + 1);
+    }
+
+    #[tokio::test]
+    async fn a_report_the_server_refuses_is_kept_and_the_others_still_go() {
+        let refused = FakeReport::new().build();
+        let accepted = FakeReport::new().build();
+        let (refused_script, accepted_id) = (refused.script.unwrap().id, accepted.id);
+        let mut storage = MockUploadStorage::new();
+        storage
+            .expect_list_to_upload()
+            .times(1)
+            .return_once(move |_, _| Ok(vec![refused, accepted]));
+        storage
+            .expect_mark_uploaded()
+            .withf(move |marked| *marked == accepted_id)
+            .times(1)
+            .returning(|_| Ok(()));
+        let mut client = MockFydeClient::new();
+        client
+            .expect_upload_report()
+            .times(2)
+            .returning(move |upload| {
+                if upload.script_id == refused_script {
+                    Err(tonic::Status::invalid_argument("report: too large").into())
+                } else {
+                    Ok(())
+                }
+            });
+
+        let uploaded = uploader(storage, client).upload_pending().await.unwrap();
+
+        assert_eq!(uploaded, 1);
+    }
+
+    #[tokio::test]
+    async fn any_other_upload_failure_ends_the_pass_with_context() {
+        let mut storage = MockUploadStorage::new();
+        storage
+            .expect_list_to_upload()
+            .times(1)
+            .return_once(|_, _| Ok(vec![FakeReport::new().build(), FakeReport::new().build()]));
+        storage.expect_mark_uploaded().never();
+        let mut client = MockFydeClient::new();
+        client
+            .expect_upload_report()
+            .times(1)
+            .returning(|_| Err(tonic::Status::unavailable("down").into()));
+
+        let err = uploader(storage, client)
+            .upload_pending()
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::ServerUnavailable);
+        assert!(err.has_context());
+    }
+
+    #[tokio::test]
+    async fn a_run_longer_than_the_server_accepts_is_sent_as_its_longest() {
+        let mut report = FakeReport::new().with_started_at_ms(0).build();
+        report.run.ended_at_ms = Some(i64::try_from(MAX_DURATION_MS).unwrap() * 2);
+        let mut storage = MockUploadStorage::new();
+        storage
+            .expect_list_to_upload()
+            .return_once(move |_, _| Ok(vec![report]));
+        storage.expect_mark_uploaded().returning(|_| Ok(()));
+        let mut client = MockFydeClient::new();
+        client
+            .expect_upload_report()
+            .withf(|upload| upload.duration_ms == MAX_DURATION_MS)
+            .times(1)
+            .returning(|_| Ok(()));
+
+        uploader(storage, client).upload_pending().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_upload_job_tries_again_a_while_after_a_failed_pass() {
+        let mut storage = MockUploadStorage::new();
+        let mut sequence = mockall::Sequence::new();
+        storage
+            .expect_list_to_upload()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_, _| Err(std::io::Error::other("disk gone").into()));
+        let (passed, mut second_pass) = tokio::sync::mpsc::unbounded_channel();
+        storage
+            .expect_list_to_upload()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(move |_, _| {
+                passed.send(()).unwrap();
+                Ok(Vec::new())
+            });
+        let job = tokio::spawn(upload_reports(
+            uploader(storage, MockFydeClient::new()),
+            Arc::new(UploadWake::new()),
+        ));
+
+        tokio::time::sleep(UPLOAD_RETRY_AFTER - Duration::from_secs(1)).await;
+        assert!(second_pass.try_recv().is_err(), "tried again too soon");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        second_pass.recv().await.unwrap();
+        job.abort();
+    }
+
+    #[tokio::test]
+    async fn the_upload_job_looks_again_each_time_it_is_woken() {
+        let (passed, mut passes) = tokio::sync::mpsc::unbounded_channel();
+        let mut storage = MockUploadStorage::new();
+        storage
+            .expect_list_to_upload()
+            .times(2)
+            .returning(move |_, _| {
+                passed.send(()).unwrap();
+                Ok(Vec::new())
+            });
+        let wake = Arc::new(UploadWake::new());
+        let job = tokio::spawn(upload_reports(
+            uploader(storage, MockFydeClient::new()),
+            wake.clone(),
+        ));
+
+        passes.recv().await.unwrap();
+        wake.notify_one();
+        passes.recv().await.unwrap();
+        job.abort();
+    }
+
+    #[test]
+    fn report_json_says_how_the_run_went_without_its_name_or_when_it_ran() {
+        let report = FakeReport::new()
+            .with_scraper_name("installation-id")
+            .with_started_at_ms(1_000_000)
+            .with_outcome(ScraperRunOutcome::Failed {
+                code: ErrorCode::ScraperCredentialsRejected,
+            })
+            .with_progress(
+                ProgressStep::LoggingIn,
+                Some(ScraperRunUpdate {
+                    current: 1,
+                    total: 2,
+                }),
+                None,
+                0,
+            )
+            .with_entries(vec![ReportEntry {
+                ts_ms: 1_000_250,
+                event: "log".to_string(),
+                value: json!({ "message": "hi" }),
+            }])
+            .build();
+
+        let text = report_json(&report, MAX_REPORT_BYTES).unwrap();
+
+        assert!(!text.contains("installation-id"));
+        assert!(!text.contains("1000000"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            json!({
+                "outcome": "failed",
+                "error_code": ErrorCode::ScraperCredentialsRejected.as_u32(),
+                "step": "logging_in",
+                "update": { "current": 1, "total": 2 },
+                "found": null,
+                "saved": 0,
+                "omitted_entries": 0,
+                "entries": [{ "at_ms": 250, "event": "log", "value": { "message": "hi" } }],
+            })
+        );
+    }
+
+    #[test]
+    fn report_json_scrubs_the_runs_name_from_its_log() {
+        let name = Uuid::new_v4().to_string();
+        let report = FakeReport::new()
+            .with_scraper_name(name.clone())
+            .with_entries(vec![
+                ReportEntry {
+                    ts_ms: 0,
+                    event: "run_started".to_string(),
+                    value: json!({ "script": name }),
+                },
+                ReportEntry {
+                    ts_ms: 1,
+                    event: "error".to_string(),
+                    value: json!({ "messages": [format!("failed to run scraper {name:?}")] }),
+                },
+            ])
+            .build();
+
+        let text = report_json(&report, MAX_REPORT_BYTES).unwrap();
+
+        assert!(!text.contains(&name));
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["entries"][0]["value"], json!({ "script": "[run]" }));
+        assert_eq!(
+            body["entries"][1]["value"],
+            json!({ "messages": ["failed to run scraper \"[run]\""] })
+        );
+    }
+
+    #[test]
+    fn report_json_drops_the_middle_of_a_log_too_long_to_fit() {
+        let entries: Vec<ReportEntry> = (0..100)
+            .map(|i| ReportEntry {
+                ts_ms: i,
+                event: "log".to_string(),
+                value: json!({ "message": format!("{i:03}{}", "x".repeat(100)) }),
+            })
+            .collect();
+        let report = FakeReport::new()
+            .with_started_at_ms(0)
+            .with_entries(entries)
+            .build();
+        let max_bytes = 3_000;
+
+        let text = report_json(&report, max_bytes).unwrap();
+
+        assert!(text.len() <= max_bytes);
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let kept: Vec<i64> = body["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["at_ms"].as_i64().unwrap())
+            .collect();
+        assert!(kept.len() > 2);
+        assert_eq!(body["omitted_entries"], 100 - kept.len());
+        assert_eq!(kept[0], 0, "the log's start is kept");
+        assert_eq!(*kept.last().unwrap(), 99, "the log's end is kept");
+        assert!(kept.windows(2).all(|pair| pair[0] < pair[1]), "in order");
+    }
+
+    #[test]
+    fn report_json_leaves_out_an_entry_bigger_than_the_whole_report_may_be() {
+        let report = FakeReport::new()
+            .with_entries(vec![ReportEntry {
+                ts_ms: 0,
+                event: "http_response".to_string(),
+                value: json!({ "body": "x".repeat(10_000) }),
+            }])
+            .build();
+
+        let text = report_json(&report, 1_000).unwrap();
+
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["entries"], json!([]));
+        assert_eq!(body["omitted_entries"], 1);
+    }
+
+    #[test]
+    fn client_id_is_the_client_name_as_the_server_accepts_it() {
+        assert_eq!(client_id("android"), "android");
+        assert_eq!(client_id("My_Client.1-b"), "my-client-1-b");
     }
 }
