@@ -88,6 +88,38 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallbackLayer {
     }
 }
 
+/// The target panics are logged under (see [`install_panic_hook`]).
+const PANIC_TARGET: &str = "fyde_sdk::panic";
+
+/// Logs every panic, on any thread, as an ERROR under [`PANIC_TARGET`]
+/// before handing it to the hook that was installed before (by default,
+/// the one printing it to stderr). Without it a panic only reaches stderr,
+/// which Android sends nowhere: a background thread dying there (the
+/// scrapers' browser thread, say) left no trace in the app's logs. Carries
+/// the thread, the location and the message, plus a backtrace when
+/// `RUST_BACKTRACE` asks for one (logcat cuts long entries short).
+///
+/// Process-wide, like the `tracing` subscriber it logs through: installed
+/// once, by [`crate::Client::init`] when it installs that subscriber.
+pub(crate) fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let thread = thread.name().unwrap_or("<unnamed>");
+        let location = info
+            .location()
+            .map_or_else(|| "<unknown location>".to_string(), ToString::to_string);
+        let message = info.payload_as_str().unwrap_or("Box<dyn Any>");
+        let backtrace = std::backtrace::Backtrace::capture();
+        if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+            tracing::error!(target: PANIC_TARGET, "thread '{thread}' panicked at {location}: {message}\n{backtrace}");
+        } else {
+            tracing::error!(target: PANIC_TARGET, "thread '{thread}' panicked at {location}: {message}");
+        }
+        previous(info);
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -176,6 +208,35 @@ mod tests {
                 LogLevel::Trace,
             ]
         );
+    }
+
+    #[test]
+    fn logs_a_panic_with_its_thread_location_and_message() {
+        install_panic_hook();
+
+        let lines = forwarded(|| {
+            let dispatch = tracing::dispatcher::get_default(Clone::clone);
+            let thread = std::thread::Builder::new()
+                .name("fyde-test-panic".to_string())
+                .spawn(move || {
+                    tracing::dispatcher::with_default(&dispatch, || panic!("boom {}", 42));
+                })
+                .unwrap();
+            assert!(thread.join().is_err());
+        });
+
+        let (level, line) = lines
+            .into_iter()
+            .find(|(_, line)| line.starts_with(PANIC_TARGET))
+            .expect("the panic must be logged");
+        assert_eq!(level, LogLevel::Error);
+        assert!(
+            line.starts_with(&format!(
+                "{PANIC_TARGET}: thread 'fyde-test-panic' panicked at src/tools/log/mod.rs:"
+            )),
+            "{line}"
+        );
+        assert!(line.contains(": boom 42"), "{line}");
     }
 
     #[test]
