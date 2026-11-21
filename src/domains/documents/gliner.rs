@@ -173,7 +173,10 @@ impl OnnxGliner {
             .ensure(&GLINER_X_SMALL_TOKENIZER)
             .await
             .context("failed to fetch the GLiNER model's tokenizer")?;
-        let loaded = self.open(model, tokenizer).await?;
+        let loaded = self
+            .open(model, tokenizer)
+            .await
+            .context("failed to open the GLiNER model")?;
         self.slot().loaded = Some(loaded.clone());
         tracing::debug!("the GLiNER model is loaded");
         Ok(loaded)
@@ -259,7 +262,10 @@ impl SpanFinder for OnnxGliner {
             return Ok(Vec::new());
         }
         let _hold = self.hold();
-        let loaded = self.loaded().await?;
+        let loaded = self
+            .loaded()
+            .await
+            .context("failed to load the GLiNER model to find spans")?;
 
         tokio::task::spawn_blocking(move || loaded.spans(&text, &labels, threshold, max_words))
             .await
@@ -358,7 +364,8 @@ impl Loaded {
                     .context("failed to build the GLiNER model's span_mask input")?,
             ),
         ];
-        let inputs = select_inputs(&self.inputs, built)?;
+        let inputs = select_inputs(&self.inputs, built)
+            .context("failed to match the GLiNER model's inputs")?;
 
         let mut session = self.session.lock().unwrap_or_else(PoisonError::into_inner);
         let outputs = session

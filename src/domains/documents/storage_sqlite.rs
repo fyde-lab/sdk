@@ -54,12 +54,17 @@ impl Storage for SqliteStorage {
         .bind(&document.metadata.transcript)
         .bind(type_to_column(document.metadata.r#type))
         .bind(document.metadata.folder_id.map(|id| id.to_string()))
-        .bind(attributes_to_column(&document.metadata.attributes)?)
+        .bind(
+            attributes_to_column(&document.metadata.attributes)
+                .with_context(|| format!("failed to save document {}", document.id))?,
+        )
         .execute(&mut *tx)
         .await
         .with_context(|| format!("failed to save document {} to local database", document.id))?;
 
-        insert_embeddings(&mut tx, document.id, embeddings).await?;
+        insert_embeddings(&mut tx, document.id, embeddings)
+            .await
+            .with_context(|| format!("failed to save document {}'s embeddings", document.id))?;
 
         tx.commit()
             .await
@@ -81,6 +86,7 @@ impl Storage for SqliteStorage {
 
         let content: Vec<u8> = row.get("content");
 
+        let context = || format!("invalid document {id} in local database");
         Ok(Some(Document {
             id,
             metadata: Metadata {
@@ -92,9 +98,9 @@ impl Storage for SqliteStorage {
                 size: content.len() as u64,
                 checksum: row.get("checksum"),
                 transcript: row.get("transcript"),
-                r#type: type_from_column(row.get("type"))?,
-                folder_id: folder_from_column(row.get("folder_id"))?,
-                attributes: attributes_from_column(row.get("attributes"))?,
+                r#type: type_from_column(row.get("type")).with_context(context)?,
+                folder_id: folder_from_column(row.get("folder_id")).with_context(context)?,
+                attributes: attributes_from_column(row.get("attributes")).with_context(context)?,
             },
             content,
         }))
@@ -294,8 +300,9 @@ impl Storage for SqliteStorage {
 
         let mut ranked = best
             .into_iter()
-            .map(|(id, similarity)| Ok((id_from_column(id)?, similarity)))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|(id, similarity)| id_from_column(id).map(|id| (id, similarity)))
+            .collect::<Result<Vec<_>>>()
+            .context("failed to rank documents by their similarity")?;
         ranked.sort_by(|(a_id, a), (b_id, b)| b.total_cmp(a).then(a_id.cmp(b_id)));
         ranked.truncate(limit);
         Ok(ranked)
@@ -315,7 +322,7 @@ impl Storage for SqliteStorage {
              WHERE e.model = ?1 AND d.folder_id IN (SELECT value FROM json_each(?2))",
         )
         .bind(model)
-        .bind(ids_to_json(folders)?)
+        .bind(ids_to_json(folders).context("failed to compare documents by folder")?)
         .fetch(&self.pool);
 
         let mut best = HashMap::<String, (String, f32)>::new();
@@ -370,7 +377,7 @@ impl Storage for SqliteStorage {
             "SELECT id, name, original_name, content_type, length(content) AS size, checksum, created_at, transcript, type, folder_id, attributes FROM documents
              WHERE id IN (SELECT value FROM json_each(?1))",
         )
-        .bind(ids_to_json(ids)?)
+        .bind(ids_to_json(ids).context("failed to fetch the metadata of documents")?)
         .fetch_all(&self.pool)
         .await
         .with_context(|| format!("failed to fetch the metadata of {} documents", ids.len()))?;
@@ -388,7 +395,8 @@ impl Storage for SqliteStorage {
             "SELECT {column} AS value, COUNT(*) AS count FROM documents
              WHERE id IN (SELECT value FROM json_each("
         ));
-        query.push_bind(ids_to_json(ids)?).push(format!(
+        let ids = ids_to_json(ids).context("failed to count listed documents")?;
+        query.push_bind(ids).push(format!(
             ")) AND {column} IS NOT NULL AND {column} != ''
              GROUP BY {column} ORDER BY count DESC, value ASC"
         ));
@@ -406,7 +414,7 @@ impl Storage for SqliteStorage {
             "SELECT MIN(created_at) AS earliest, MAX(created_at) AS latest FROM documents
              WHERE id IN (SELECT value FROM json_each(?1))",
         )
-        .bind(ids_to_json(ids)?)
+        .bind(ids_to_json(ids).context("failed to date listed documents")?)
         .fetch_one(&self.pool)
         .await
         .context("failed to find the creation date range of listed documents")?;
@@ -453,7 +461,10 @@ impl Storage for SqliteStorage {
         .bind(&metadata.transcript)
         .bind(type_to_column(metadata.r#type))
         .bind(metadata.folder_id.map(|id| id.to_string()))
-        .bind(attributes_to_column(&metadata.attributes)?)
+        .bind(
+            attributes_to_column(&metadata.attributes)
+                .with_context(|| format!("failed to update document {id} metadata"))?,
+        )
         .bind(id.to_string())
         .execute(&mut *tx)
         .await
@@ -465,7 +476,9 @@ impl Storage for SqliteStorage {
                 .execute(&mut *tx)
                 .await
                 .with_context(|| format!("failed to delete document {id}'s previous embeddings"))?;
-            insert_embeddings(&mut tx, id, &embeddings).await?;
+            insert_embeddings(&mut tx, id, &embeddings)
+                .await
+                .with_context(|| format!("failed to save document {id}'s new embeddings"))?;
         }
 
         tx.commit()
@@ -491,7 +504,7 @@ impl Storage for SqliteStorage {
              WHERE folder_id IN (SELECT value FROM json_each(?2))",
         )
         .bind(to.map(|id| id.to_string()))
-        .bind(ids_to_json(folders)?)
+        .bind(ids_to_json(folders).context("failed to move the documents of folders")?)
         .execute(&self.pool)
         .await
         .with_context(|| format!("failed to move the documents of {} folders", folders.len()))?;
@@ -503,7 +516,7 @@ impl Storage for SqliteStorage {
         // Their embeddings cascade, and the `documents_fts` triggers drop
         // them from the full-text index.
         sqlx::query("DELETE FROM documents WHERE folder_id IN (SELECT value FROM json_each(?1))")
-            .bind(ids_to_json(folders)?)
+            .bind(ids_to_json(folders).context("failed to delete the documents of folders")?)
             .execute(&self.pool)
             .await
             .with_context(|| {
@@ -714,6 +727,7 @@ fn metadata_from_row(row: &SqliteRow) -> Result<Metadata> {
     let id = Uuid::parse_str(&id)
         .with_context(|| format!("invalid document id in local database: {id}"))?;
     let size: i64 = row.get("size");
+    let context = || format!("invalid document {id} in local database");
 
     Ok(Metadata {
         id,
@@ -724,9 +738,9 @@ fn metadata_from_row(row: &SqliteRow) -> Result<Metadata> {
         size: size as u64,
         checksum: row.get("checksum"),
         transcript: row.get("transcript"),
-        r#type: type_from_column(row.get("type"))?,
-        folder_id: folder_from_column(row.get("folder_id"))?,
-        attributes: attributes_from_column(row.get("attributes"))?,
+        r#type: type_from_column(row.get("type")).with_context(context)?,
+        folder_id: folder_from_column(row.get("folder_id")).with_context(context)?,
+        attributes: attributes_from_column(row.get("attributes")).with_context(context)?,
     })
 }
 

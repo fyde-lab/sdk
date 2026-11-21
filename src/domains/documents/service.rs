@@ -192,7 +192,8 @@ impl<S: Storage> DocumentsClient<S> {
             let content = content.clone();
             tokio::task::spawn_blocking(move || transcript::text_layers(&content))
                 .await
-                .context("the text layer task failed")??
+                .context("the text layer task failed")?
+                .context("failed to read the text layer of its pages")?
         };
         let scanned: Vec<usize> = (0..pages.len())
             .filter(|&index| !pages[index].is_usable())
@@ -235,7 +236,8 @@ impl<S: Storage> DocumentsClient<S> {
         let Some(image) =
             tokio::task::spawn_blocking(move || transcript::render_page(&content, index))
                 .await
-                .context("the page rendering task failed")??
+                .context("the page rendering task failed")?
+                .with_context(|| format!("failed to render page {index}"))?
         else {
             return Ok(None);
         };
@@ -364,7 +366,10 @@ impl<S: Storage> DocumentsClient<S> {
     /// that folder and every folder below it, or any folder (see
     /// [`Filing::Anywhere`]) if it isn't synced here (deleted since, say).
     async fn filing_within(&self, folder_id: Uuid) -> Result<Filing> {
-        let folders = self.folders().await?;
+        let folders = self
+            .folders()
+            .await
+            .with_context(|| format!("failed to find folder {folder_id}'s subfolders"))?;
         if !folders.iter().any(|folder| folder.id == folder_id) {
             tracing::info!(
                 "folder {folder_id} to file a document within isn't synced here, filing it automatically"
@@ -435,19 +440,21 @@ impl<S: Storage> DocumentsClient<S> {
 
         let filed = match filing {
             Filing::Given => Vec::new(),
-            Filing::Within(folders) => {
-                self.filed_documents(&centroid, &embeddings.model, folders)
-                    .await?
-            }
+            Filing::Within(folders) => self
+                .filed_documents(&centroid, &embeddings.model, folders)
+                .await
+                .context("failed to compare it with the documents filed within its folder")?,
             Filing::Anywhere => {
                 let folders: Vec<Uuid> = self
                     .folders()
-                    .await?
+                    .await
+                    .context("failed to list the folders it may be filed in")?
                     .iter()
                     .map(|folder| folder.id)
                     .collect();
                 self.filed_documents(&centroid, &embeddings.model, &folders)
-                    .await?
+                    .await
+                    .context("failed to compare it with the documents already filed")?
             }
         };
         self.classifier
@@ -538,7 +545,11 @@ impl<S: Storage> DocumentsClient<S> {
         vector: &[f32],
         filters: &SearchFilters,
     ) -> Result<Vec<Uuid>> {
-        let mut ids = self.rank(terms, vector, filters).await?.concat();
+        let mut ids = self
+            .rank(terms, vector, filters)
+            .await
+            .context("failed to rank the documents a search could return")?
+            .concat();
         ids.sort_unstable();
         ids.dedup();
         Ok(ids)
@@ -563,7 +574,10 @@ impl<S: Storage> DocumentsClient<S> {
 
         match vector {
             Some(vector) => {
-                let ids = self.hybrid_matches(terms, vector, &filters).await?;
+                let ids = self
+                    .hybrid_matches(terms, vector, &filters)
+                    .await
+                    .context("failed to find the documents to count")?;
                 self.storage.count_documents_among(&ids, field).await
             }
             None => {
@@ -592,7 +606,10 @@ impl<S: Storage> DocumentsClient<S> {
 
         match vector {
             Some(vector) => {
-                let ids = self.hybrid_matches(terms, vector, &filters).await?;
+                let ids = self
+                    .hybrid_matches(terms, vector, &filters)
+                    .await
+                    .context("failed to find the documents to date")?;
                 self.storage.created_at_range_among(&ids).await
             }
             None => self.storage.created_at_range(terms, &filters).await,
@@ -626,7 +643,8 @@ impl<S: Storage> Service for DocumentsClient<S> {
 
         let (content, original_name) = match request.source {
             UploadSource::Path(path) => {
-                check_extension(&path)?;
+                check_extension(&path)
+                    .with_context(|| format!("cannot upload {}", path.display()))?;
                 let content = tokio::fs::read(&path)
                     .instrument(tracing::debug_span!("read_document"))
                     .await
@@ -639,7 +657,8 @@ impl<S: Storage> Service for DocumentsClient<S> {
                 (content, original_name)
             }
             UploadSource::Raw { name, content } => {
-                check_extension(std::path::Path::new(&name))?;
+                check_extension(std::path::Path::new(&name))
+                    .with_context(|| format!("cannot upload {name:?}"))?;
                 (content, name)
             }
         };
@@ -768,7 +787,10 @@ impl<S: Storage> Service for DocumentsClient<S> {
             Some(StoredThumbnail::Stored(png)) => png,
             // Not reached by the background job yet: shown now, so drawn
             // now rather than after every document ahead of it.
-            Some(StoredThumbnail::Missing) => match draw_thumbnail(&self.storage, id).await? {
+            Some(StoredThumbnail::Missing) => match draw_thumbnail(&self.storage, id)
+                .await
+                .with_context(|| format!("failed to draw document {id}'s missing thumbnail"))?
+            {
                 Some(png) => png,
                 None => return Ok(None),
             },
@@ -803,7 +825,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
             ))
             .into());
         }
-        check_created_range(&query.filters)?;
+        check_created_range(&query.filters).context("invalid search filters")?;
 
         let terms = search_terms(&query.text);
 
@@ -811,7 +833,10 @@ impl<S: Storage> Service for DocumentsClient<S> {
             && !terms.is_empty()
             && let Some(vector) = self.embed_query(&query.text).await
         {
-            let rankings = self.rank(&terms, &vector, &query.filters).await?;
+            let rankings = self
+                .rank(&terms, &vector, &query.filters)
+                .await
+                .context("failed to rank the documents matching the search")?;
             let fused = fuse(&rankings);
             let page = page(&fused, query.offset, query.limit);
 
@@ -839,7 +864,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
     }
 
     async fn search_facets(&self, text: &str, filters: &SearchFilters) -> Result<SearchFacets> {
-        check_created_range(filters)?;
+        check_created_range(filters).context("invalid search filters")?;
 
         let terms = search_terms(text);
         // Counting what a hybrid search finds whenever there's text, as
@@ -859,21 +884,31 @@ impl<S: Storage> Service for DocumentsClient<S> {
         // field narrows to what's left under the picked ones.
         let folders = self
             .count_documents_by(&terms, vector, filters, FacetField::Folder)
-            .await?;
+            .await
+            .context("failed to count the folder facets")?;
         let types = self
             .count_documents_by(&terms, vector, filters, FacetField::Type)
-            .await?;
+            .await
+            .context("failed to count the type facets")?;
         let content_types = self
             .count_documents_by(&terms, vector, filters, FacetField::ContentType)
-            .await?;
-        let created_at_range = self.created_at_range(&terms, vector, filters).await?;
+            .await
+            .context("failed to count the content type facets")?;
+        let created_at_range = self
+            .created_at_range(&terms, vector, filters)
+            .await
+            .context("failed to find the creation date facets")?;
 
-        let (folders, unfiled) = folder_facets(&self.folders().await?, folders);
+        let all_folders = self
+            .folders()
+            .await
+            .context("failed to list the folders to count documents in")?;
+        let (folders, unfiled) = folder_facets(&all_folders, folders);
 
         Ok(SearchFacets {
             folders,
             unfiled,
-            types: parse_facet(types, "document type")?,
+            types: parse_facet(types, "document type").context("failed to read the type facets")?,
             content_types,
             earliest_created_at: created_at_range.map(|(earliest, _)| earliest),
             latest_created_at: created_at_range.map(|(_, latest)| latest),
@@ -1685,7 +1720,9 @@ async fn draw_thumbnail_batch(storage: &impl Storage) -> Result<usize> {
         .await
         .context("failed to list the documents with no thumbnail")?;
     for &id in &ids {
-        draw_thumbnail(storage, id).await?;
+        draw_thumbnail(storage, id).await.with_context(|| {
+            format!("failed to draw document {id}'s thumbnail in the background")
+        })?;
     }
     Ok(ids.len())
 }

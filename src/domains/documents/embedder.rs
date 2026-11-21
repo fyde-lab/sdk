@@ -139,7 +139,10 @@ impl Embedder for OnnxEmbedder {
     }
 
     async fn embed_passages(&self, passages: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        let loaded = self.loaded().await?;
+        let loaded = self
+            .loaded()
+            .await
+            .context("failed to load the embedding model to embed passages")?;
 
         tokio::task::spawn_blocking(move || {
             passages
@@ -157,7 +160,10 @@ impl Embedder for OnnxEmbedder {
     }
 
     async fn embed_query(&self, query: String) -> Result<Vec<f32>> {
-        let loaded = self.loaded_if_downloaded().await?;
+        let loaded = self
+            .loaded_if_downloaded()
+            .await
+            .context("failed to load the embedding model to embed a query")?;
         let input = query_input(&query);
 
         tokio::task::spawn_blocking(move || loaded.embed(&input))
