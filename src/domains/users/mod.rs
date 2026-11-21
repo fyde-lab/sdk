@@ -321,7 +321,8 @@ pub trait Service: Send + Sync {
     /// [`crate::ErrorCode::AlreadyLoggedIn`] — before contacting the server — if a
     /// session is already open on this device. Once the session and master
     /// key are persisted, starts changelog consumption via
-    /// [`DocumentsService::start_sync`]. Fails with
+    /// [`DocumentsService::start_sync`], unless
+    /// [`crate::BackgroundJobs::sync`] is off. Fails with
     /// [`crate::ErrorCode::WeakPassword`], before anything else, if
     /// `password` isn't [`PasswordAnalysis::is_accepted`].
     async fn create(
@@ -355,7 +356,8 @@ pub trait Service: Send + Sync {
     /// [`crate::ErrorCode::SecureStorageUnavailable`] (also before contacting
     /// the server) if it isn't; the flag is ignored whenever a credential
     /// store is usable. Once the session and master key are persisted,
-    /// starts changelog consumption via [`DocumentsService::start_sync`]. A
+    /// starts changelog consumption via [`DocumentsService::start_sync`],
+    /// unless [`crate::BackgroundJobs::sync`] is off. A
     /// session restored on a later start reads its secrets from the
     /// credential store first, then from the local database
     /// `create`/`login` may have put them in.
@@ -514,7 +516,7 @@ pub trait Service: Send + Sync {
 /// `secrets` and `embedding_cache` are cleared, `local_db` wiped and
 /// `local_files` deleted by `logout`. `documents`'
 /// [`DocumentsService::start_sync`] is called by `create`/`login` once a
-/// session is open, and [`DocumentsService::stop_sync`] is called by
+/// session is open (unless `auto_sync` is off), and [`DocumentsService::stop_sync`] is called by
 /// `logout` to stop that consumption again. The returned service is also
 /// registered with `sessions` to log out locally once the server rejects
 /// the session (see [`crate::domains::sessions::Service::check_response`]).
@@ -528,6 +530,7 @@ pub(crate) async fn init(
     local_files: Arc<dyn LocalFiles>,
     documents: Arc<dyn DocumentsService>,
     embedding_cache: Arc<dyn EmbeddingCache>,
+    auto_sync: bool,
 ) -> Result<Arc<dyn Service>> {
     let users = Arc::new(
         UsersClient::new(
@@ -539,6 +542,7 @@ pub(crate) async fn init(
             local_files,
             documents,
             embedding_cache,
+            auto_sync,
         )
         .await?,
     );

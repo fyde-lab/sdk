@@ -63,6 +63,42 @@ pub enum Storage {
 pub const DEFAULT_ATTRIBUTE_MODEL_IDLE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(60);
 
+/// Which of the SDK's background jobs a [`Client`] runs, in
+/// [`ClientConfig::background_jobs`]. Every one is on by default
+/// ([`Self::default`]); turning one off only moves its work to when it's
+/// needed (or to the caller), it never disables a feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackgroundJobs {
+    /// Whether the changelog sync job (see `DocumentsService::start_sync`)
+    /// starts by itself: in `Client::init` when a session is already open,
+    /// and in `UsersService::create`/`login`. Off, nothing is synced until
+    /// the caller calls `DocumentsService::start_sync` (`logout` still stops
+    /// it).
+    pub sync: bool,
+    /// Whether `Client::init` starts downloading and loading the embedding
+    /// and OCR models (see [`ClientConfig::models_dir`]) in the background.
+    /// Off, each one is downloaded and loaded the first time it's needed (an
+    /// upload or sync for the embedding model, a scanned upload for OCR),
+    /// which then waits for it.
+    pub model_preloading: bool,
+    /// Whether `Client::init` starts drawing every cached document's
+    /// thumbnail in the background. Off, `DocumentsService::thumbnail` draws
+    /// each one (and stores it) the first time it's asked for: fit for
+    /// devices where battery and CPU matter more (mobile).
+    pub thumbnails: bool,
+}
+
+impl Default for BackgroundJobs {
+    /// Every background job on.
+    fn default() -> Self {
+        Self {
+            sync: true,
+            model_preloading: true,
+            thumbnails: true,
+        }
+    }
+}
+
 /// Configuration for [`Client::init`].
 pub struct ClientConfig {
     /// The `http://` or `https://` base URL of the fyde server to connect
@@ -77,7 +113,8 @@ pub struct ClientConfig {
     pub storage: Storage,
     /// Where the on-device models' files are downloaded to, created if
     /// missing. `Client::init` starts downloading every model there and
-    /// loading it in memory, in the background and in parallel (stopped
+    /// loading it in memory (unless [`BackgroundJobs::model_preloading`] is
+    /// off), in the background and in parallel (stopped
     /// when the `Client` is dropped; a failure is only logged, and retried
     /// when the model is first needed), but the one reading documents'
     /// attributes (see [`Self::attribute_model_idle_timeout`]). Never inside
@@ -95,6 +132,9 @@ pub struct ClientConfig {
     /// upload loads it if it isn't. `None` for
     /// [`DEFAULT_ATTRIBUTE_MODEL_IDLE_TIMEOUT`].
     pub attribute_model_idle_timeout: Option<std::time::Duration>,
+    /// Which background jobs the `Client` runs: see [`BackgroundJobs`]
+    /// (`BackgroundJobs::default()` for all of them).
+    pub background_jobs: BackgroundJobs,
     /// The verbosity of the SDK's internal logs.
     pub log_level: LogLevel,
     /// Called once for every log line emitted by the SDK, in addition to the
@@ -147,12 +187,13 @@ pub struct Client {
     settings: Arc<dyn SettingsService>,
     usage: Arc<dyn UsageService>,
     users: Arc<dyn UsersService>,
-    /// The on-device models' background loading started by `init`. Never
-    /// read: it only exists so dropping the `Client` stops it.
-    _model_loading: domains::documents::ModelLoading,
+    /// The on-device models' background loading started by `init` (unless
+    /// [`BackgroundJobs::model_preloading`] is off). Never read: it only
+    /// exists so dropping the `Client` stops it.
+    _model_loading: Option<domains::documents::ModelLoading>,
     /// The documents' thumbnails' background drawing started by `init`
-    /// (`None` on mobile: see `documents::BACKGROUND_THUMBNAILS`).
-    /// Never read: it only exists so dropping the `Client` stops it.
+    /// (unless [`BackgroundJobs::thumbnails`] is off). Never read: it only
+    /// exists so dropping the `Client` stops it.
     _thumbnail_job: Option<domains::documents::ThumbnailJob>,
     /// The locked handle to [`instance_lock_path`] (see [`lock_instance`]),
     /// held for as long as this `Client` lives. Never read: it only exists
@@ -188,19 +229,22 @@ impl Client {
                 .attribute_model_idle_timeout
                 .unwrap_or(DEFAULT_ATTRIBUTE_MODEL_IDLE_TIMEOUT),
         );
-        // Downloaded and loaded as soon as the app starts, so their first
-        // use (an upload or sync for the embedding model, a scanned upload
-        // for OCR) doesn't wait for them.
-        let model_loading = domains::documents::start_model_loading(embedder.clone(), ocr.clone());
+        // Downloaded and loaded as soon as the app starts (unless turned
+        // off), so their first use (an upload or sync for the embedding
+        // model, a scanned upload for OCR) doesn't wait for them.
+        let jobs = config.background_jobs;
+        let model_loading = jobs
+            .model_preloading
+            .then(|| domains::documents::start_model_loading(embedder.clone(), ocr.clone()));
         // Shared by uploads (which fill it), the sync job (which empties
         // it) and logout (which clears it).
         let embedding_cache = domains::documents::init_embedding_cache();
         // Woken by the indexer each time the sync job caches a document.
-        // Started right away, so documents cached before thumbnails were
-        // stored (or while the job was stopped) get theirs too. Not on
-        // mobile, where `thumbnail` draws each one when it's first shown.
+        // Started right away (unless turned off), so documents cached before
+        // thumbnails were stored (or while the job was stopped) get theirs
+        // too.
         let thumbnail_wake = Arc::new(domains::documents::ThumbnailWake::new());
-        let thumbnail_job = domains::documents::BACKGROUND_THUMBNAILS.then(|| {
+        let thumbnail_job = jobs.thumbnails.then(|| {
             domains::documents::start_thumbnail_job(sqlite.pool().clone(), thumbnail_wake.clone())
         });
         let indexer = domains::documents::init_indexer(
@@ -260,6 +304,7 @@ impl Client {
             Arc::new(client_directory(&location)),
             documents.clone(),
             embedding_cache,
+            jobs.sync,
         )
         .await
         .context("failed to initialize users service")?;
@@ -275,7 +320,7 @@ impl Client {
         // persisted in `secrets`, not just held in memory — see
         // `users::mod`'s doc comment) — in that case `create`/`login` won't
         // run again to start it, so start it here instead.
-        if sessions.is_connected().await? {
+        if jobs.sync && sessions.is_connected().await? {
             documents
                 .start_sync()
                 .await
@@ -730,6 +775,7 @@ mod tests {
             storage: Storage::Memory,
             models_dir: std::env::temp_dir().join("fyde-sdk-test-models"),
             attribute_model_idle_timeout: None,
+            background_jobs: BackgroundJobs::default(),
             log_level: LogLevel::Off,
             on_log: None,
             on_document_change: None,
@@ -866,6 +912,7 @@ mod tests {
             storage: Storage::Disk(data_dir.clone()),
             models_dir: models_dir.path().to_path_buf(),
             attribute_model_idle_timeout: None,
+            background_jobs: BackgroundJobs::default(),
             log_level: LogLevel::Off,
             on_log: None,
             on_document_change: None,
@@ -949,6 +996,7 @@ mod tests {
             storage: Storage::Disk(root.path().to_path_buf()),
             models_dir: root.path().join("desktop").join("models"),
             attribute_model_idle_timeout: None,
+            background_jobs: BackgroundJobs::default(),
             log_level: LogLevel::Off,
             on_log: None,
             on_document_change: None,
