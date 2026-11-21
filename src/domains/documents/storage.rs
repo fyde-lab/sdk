@@ -34,8 +34,10 @@ pub(crate) enum StoredThumbnail {
 /// Caches documents, unencrypted, locally, with their embeddings.
 /// Implementations are injected into [`super::service::DocumentsClient`]
 /// (to read cached documents back), [`super::service::DocumentIndexer`] (to
-/// cache documents materialized from consumed events) and
-/// `changelog::ChangelogClient` (to spot duplicates) at construction.
+/// cache documents materialized from consumed events),
+/// `changelog::ChangelogClient` (to spot duplicates) and `folders`'
+/// `FolderApplier` (to move or delete a deleted folder's documents) at
+/// construction.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(crate) trait Storage: Send + Sync {
