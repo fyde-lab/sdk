@@ -267,7 +267,8 @@ impl<S: Storage> DocumentsClient<S> {
         if let Some(folder_id) = folder_id
             && !self
                 .folders()
-                .await?
+                .await
+                .with_context(|| format!("failed to look for folder {folder_id}"))?
                 .iter()
                 .any(|folder| folder.id == folder_id)
         {
