@@ -254,7 +254,17 @@ impl<S: Storage> DocumentsClient<S> {
     /// Rejects metadata filed in a folder this device doesn't know, or whose
     /// attributes aren't valid (see [`AttributesService::check`]).
     async fn check_metadata(&self, metadata: &Metadata) -> Result<()> {
-        if let Some(folder_id) = metadata.folder_id
+        self.check_folder(metadata.folder_id).await?;
+        self.attributes
+            .check(&metadata.attributes)
+            .await
+            .context("invalid document attributes")
+    }
+
+    /// Rejects a `folder_id` this device doesn't know (`None`, the root,
+    /// always exists).
+    async fn check_folder(&self, folder_id: Option<Uuid>) -> Result<()> {
+        if let Some(folder_id) = folder_id
             && !self
                 .folders()
                 .await?
@@ -263,10 +273,7 @@ impl<S: Storage> DocumentsClient<S> {
         {
             return Err(ErrorKind::FolderNotFound(folder_id).into());
         }
-        self.attributes
-            .check(&metadata.attributes)
-            .await
-            .context("invalid document attributes")
+        Ok(())
     }
 
     /// Embeds an uploaded document's text exactly as [`DocumentIndexer`]
@@ -989,8 +996,19 @@ impl<S: Storage> Service for DocumentsClient<S> {
         if metadata.folder_id == folder_id {
             return Ok(());
         }
+        // Only the folder changes: the attributes were valid when published,
+        // and checking them again (which lists their definitions from the
+        // server) would refuse to move a document whose attribute has been
+        // redefined since.
+        self.check_folder(folder_id)
+            .await
+            .with_context(|| format!("cannot move document {id}"))?;
         metadata.folder_id = folder_id;
-        self.update_metadata(metadata).await
+
+        self.changelog
+            .send(EventType::UpdateMetadata, id, None, Some(&metadata))
+            .await
+            .with_context(|| format!("failed to publish changelog event for document {id}"))
     }
 
     async fn delete(&self, id: Uuid) -> Result<()> {
@@ -2223,7 +2241,8 @@ mod tests {
             storage,
             changelog,
             None,
-            accepting_attributes(),
+            // Moving never checks the attributes it leaves as they are.
+            Arc::new(MockAttributesService::new()),
             unused_indexer(),
             unused_embedder(),
             unused_cache(),
@@ -2232,6 +2251,26 @@ mod tests {
             no_ocr(),
             finding_no_attributes(),
         )
+    }
+
+    #[tokio::test]
+    async fn move_document_keeps_attributes_without_checking_them_again() {
+        let folder = FakeFolder::new().build();
+        let attributes = BTreeMap::from([("price".to_string(), Attribute::Integer(1))]);
+        let metadata = super::super::FakeMetadata::new()
+            .with_folder(None)
+            .with_attributes(attributes.clone())
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_moving(metadata.clone(), vec![folder.clone()], changelog.clone());
+
+        client
+            .move_document(metadata.id, Some(folder.id))
+            .await
+            .unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(sent[0].3.as_ref().unwrap().attributes, attributes);
     }
 
     #[tokio::test]

@@ -248,10 +248,10 @@ pub trait Service: Send + Sync {
 
     /// Moves the document `id` into the folder `folder_id` (`None` for the
     /// root, À classer), publishing its metadata as [`Self::update_metadata`]
-    /// does. Fails with [`crate::ErrorCode::DocumentNotFound`] for a
-    /// document not synced here, and [`crate::ErrorCode::FolderNotFound`]
-    /// for a folder not synced here. Moving it where it already is
-    /// publishes nothing.
+    /// does, but without checking its attributes again: they don't change.
+    /// Fails with [`crate::ErrorCode::DocumentNotFound`] for a document not
+    /// synced here, and [`crate::ErrorCode::FolderNotFound`] for a folder
+    /// not synced here. Moving it where it already is publishes nothing.
     async fn move_document(&self, id: Uuid, folder_id: Option<Uuid>) -> Result<()>;
 
     /// Publishes a "deleted" changelog event for the document `id`. Like
