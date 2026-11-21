@@ -68,7 +68,8 @@ impl FydeClient for GrpcClient {
         let request = self
             .sessions
             .authenticated_request(ListAttributesRequest {})
-            .await?;
+            .await
+            .context("failed to authenticate the ListAttributes request")?;
 
         let response = self
             .sessions
@@ -77,7 +78,12 @@ impl FydeClient for GrpcClient {
             .context("failed to list attributes")?
             .into_inner();
 
-        response.attributes.into_iter().map(into_domain).collect()
+        response
+            .attributes
+            .into_iter()
+            .map(into_domain)
+            .collect::<Result<_>>()
+            .context("failed to read the listed attributes")
     }
 
     async fn set_attribute(&self, request: SetAttributeRequest) -> Result<AttributeDefinition> {
@@ -88,7 +94,8 @@ impl FydeClient for GrpcClient {
                 r#type: type_into_proto(request.r#type) as i32,
                 description: request.description,
             })
-            .await?;
+            .await
+            .context("failed to authenticate the SetAttribute request")?;
 
         let response = self
             .sessions
@@ -97,9 +104,10 @@ impl FydeClient for GrpcClient {
             .context("failed to set attribute")?
             .into_inner();
 
-        into_domain(response.attribute.ok_or_else(|| {
+        let attribute = response.attribute.ok_or_else(|| {
             ErrorKind::InvalidResponse("set attribute response had no attribute".to_string())
-        })?)
+        })?;
+        into_domain(attribute).context("failed to read the set attribute")
     }
 }
 
@@ -135,7 +143,9 @@ fn into_domain(attribute: proto::Attribute) -> Result<AttributeDefinition> {
     Ok(AttributeDefinition {
         id: Uuid::from_str(&attribute.id)
             .with_context(|| format!("server sent an invalid attribute id {:?}", attribute.id))?,
-        r#type: type_into_domain(attribute.r#type)?,
+        r#type: type_into_domain(attribute.r#type).with_context(|| {
+            format!("failed to read the type of attribute {:?}", attribute.name)
+        })?,
         name: attribute.name,
         description: attribute.description,
         is_default: attribute.is_default,

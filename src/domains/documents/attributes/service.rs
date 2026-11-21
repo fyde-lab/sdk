@@ -36,7 +36,7 @@ impl<C: FydeClient> Service for AttributesClient<C> {
     async fn set(&self, request: SetAttributeRequest) -> Result<AttributeDefinition> {
         // Checked here too, so an invalid request fails with
         // `InvalidAttribute` before reaching the server.
-        check_attribute_name(&request.name)?;
+        check_attribute_name(&request.name).context("failed to check the attribute's name")?;
         if request.description.len() > MAX_DESCRIPTION_LEN {
             return Err(ErrorKind::InvalidAttribute(format!(
                 "the description of attribute {:?} is longer than {MAX_DESCRIPTION_LEN} bytes",
@@ -53,7 +53,7 @@ impl<C: FydeClient> Service for AttributesClient<C> {
     }
 
     async fn check(&self, attributes: &BTreeMap<String, Attribute>) -> Result<()> {
-        check_values(attributes)?;
+        check_values(attributes).context("failed to check the attributes' values")?;
         // Nothing to look up: spares a round trip for the many documents
         // carrying no attribute at all.
         if attributes.is_empty() {
@@ -99,7 +99,9 @@ fn check_against_definitions(
     definitions: &[AttributeDefinition],
 ) -> Result<()> {
     for (name, attribute) in attributes {
-        check_against_definition(name, attribute, definitions)?;
+        check_against_definition(name, attribute, definitions).with_context(|| {
+            format!("failed to check attribute {name:?} against its definition")
+        })?;
     }
 
     Ok(())
@@ -154,8 +156,9 @@ pub(crate) fn check_values(attributes: &BTreeMap<String, Attribute>) -> Result<(
         .into());
     }
     for (name, attribute) in attributes {
-        check_attribute_name(name)?;
-        check_attribute_value(name, attribute)?;
+        check_attribute_name(name).context("failed to check an attribute's name")?;
+        check_attribute_value(name, attribute)
+            .with_context(|| format!("failed to check the value of attribute {name:?}"))?;
     }
 
     Ok(())
