@@ -145,7 +145,8 @@ impl UploadStorage for SqliteStorage {
 
 /// A row with every column of `scraper_reports` as the [`Report`] it holds.
 fn report_from_row(row: &SqliteRow) -> Result<Report> {
-    let ReportSummary { id, run } = summary_from_row(row)?;
+    let ReportSummary { id, run } =
+        summary_from_row(row).context("failed to read a scraper report's run")?;
     let script = match (
         row.get::<Option<String>, _>("script_id"),
         row.get::<Option<i64>, _>("script_version"),
