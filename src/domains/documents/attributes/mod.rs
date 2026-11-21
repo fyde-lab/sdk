@@ -36,7 +36,8 @@ pub trait Service: Send + Sync {
     /// Defines an attribute for the signed-in user, or redefines (type and
     /// description) the one it already has under `request.name`. Fails with
     /// [`crate::ErrorCode::InvalidAttribute`] for a name that isn't
-    /// `snake_case` or a description longer than 1024 bytes; the server
+    /// `snake_case` or is longer than 64 bytes, or a description longer
+    /// than 1024 bytes; the server
     /// also refuses a default attribute's name and more than 100
     /// attributes of the user's own.
     async fn set(&self, request: SetAttributeRequest) -> Result<AttributeDefinition>;
