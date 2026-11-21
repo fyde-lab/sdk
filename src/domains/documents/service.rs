@@ -783,17 +783,9 @@ impl<S: Storage> Service for DocumentsClient<S> {
             .await
             .with_context(|| format!("failed to load document {id}'s thumbnail"))?;
         let png = match stored {
-            None => return Ok(None),
+            // Never drawn here: only what the background job stored is read.
+            None | Some(StoredThumbnail::Missing) => return Ok(None),
             Some(StoredThumbnail::Stored(png)) => png,
-            // Not reached by the background job yet: shown now, so drawn
-            // now rather than after every document ahead of it.
-            Some(StoredThumbnail::Missing) => match draw_thumbnail(&self.storage, id)
-                .await
-                .with_context(|| format!("failed to draw document {id}'s missing thumbnail"))?
-            {
-                Some(png) => png,
-                None => return Ok(None),
-            },
         };
 
         if png == UNDRAWABLE_THUMBNAIL {
@@ -5481,33 +5473,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thumbnail_not_drawn_yet_is_drawn_and_stored_at_once() {
-        let document = pdf_document();
-        let id = document.id;
-        let mut storage = MockStorage::new();
-        expect_stored_thumbnail(&mut storage, id, Some(StoredThumbnail::Missing));
-        expect_document(&mut storage, document);
-        let stored = expect_set_thumbnail(&mut storage, id, false);
-
-        let thumbnail = thumbnailing_client(storage)
-            .thumbnail(id)
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert_eq!((thumbnail.width, thumbnail.height), (362, 512));
-        assert_eq!(stored.lock().unwrap().as_ref(), Some(&thumbnail.png));
-    }
-
-    #[tokio::test]
-    async fn thumbnail_not_drawn_yet_of_a_document_deleted_meanwhile_is_none() {
+    async fn thumbnail_not_drawn_yet_is_none_and_draws_nothing() {
         let id = Uuid::now_v7();
         let mut storage = MockStorage::new();
+        // Neither `get_document` nor `set_thumbnail` is expected.
         expect_stored_thumbnail(&mut storage, id, Some(StoredThumbnail::Missing));
-        storage
-            .expect_get_document()
-            .times(1)
-            .returning(|_| Ok(None));
 
         assert_eq!(
             thumbnailing_client(storage).thumbnail(id).await.unwrap(),
@@ -5532,23 +5502,6 @@ mod tests {
 
         assert_eq!(err.code(), ErrorCode::UnreadablePdf);
         assert!(err.to_string().contains(&id.to_string()), "{err}");
-    }
-
-    #[tokio::test]
-    async fn thumbnail_not_drawn_yet_of_content_it_cannot_draw_is_stored_as_undrawable() {
-        let document = unreadable_document();
-        let id = document.id;
-        let mut storage = MockStorage::new();
-        expect_stored_thumbnail(&mut storage, id, Some(StoredThumbnail::Missing));
-        expect_document(&mut storage, document);
-        expect_set_thumbnail(&mut storage, id, true);
-
-        let err = thumbnailing_client(storage)
-            .thumbnail(id)
-            .await
-            .unwrap_err();
-
-        assert_eq!(err.code(), ErrorCode::UnreadablePdf);
     }
 
     #[tokio::test]

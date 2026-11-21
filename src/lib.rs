@@ -93,9 +93,10 @@ pub struct BackgroundJobs {
     /// which then waits for it.
     pub model_preloading: bool,
     /// Whether `Client::init` starts drawing every cached document's
-    /// thumbnail in the background. Off, `DocumentsService::thumbnail` draws
-    /// each one (and stores it) the first time it's asked for: fit for
-    /// devices where battery and CPU matter more (mobile).
+    /// thumbnail in the background, the only thing that draws them. Off,
+    /// none is drawn and `DocumentsService::thumbnail` (which only reads
+    /// the stored ones) returns `None`: for devices that show no previews,
+    /// where battery and CPU matter more (mobile).
     pub thumbnails: bool,
 }
 

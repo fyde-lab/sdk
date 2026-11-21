@@ -45,10 +45,10 @@
 //! upload that doesn't publish drops its entry (`CachedUntilPublished`).
 //!
 //! **Thumbnails.** `thumbnail(id)` reads the first page back as a PNG stored in
-//! `documents.thumbnail` (NULL = not drawn yet, empty = undrawable), drawing it
-//! if needed. The background job (`start_thumbnail_job`) draws the missing
-//! ones, newest first, and sleeps until the indexer wakes it, unless
-//! `BackgroundJobs::thumbnails` is off (then `thumbnail(id)` draws them all).
+//! `documents.thumbnail` (NULL = not drawn yet, empty = undrawable), and never
+//! draws one. Only the background job (`start_thumbnail_job`) draws them, the
+//! missing ones newest first, sleeping until the indexer wakes it; with
+//! `BackgroundJobs::thumbnails` off nothing draws them, so there are none.
 
 pub(crate) mod attributes;
 mod chunk;
@@ -175,11 +175,10 @@ pub trait Service: Send + Sync {
     /// [`THUMBNAIL_SIDE`] x [`THUMBNAIL_SIDE`] pixels, its aspect ratio
     /// kept, on a white background; `None` if the document doesn't exist.
     /// Drawn in the background once the document is cached, and stored
-    /// beside it, so this only reads it back; one not drawn yet is drawn
-    /// (and stored) right away instead of waiting its turn (about 10 ms,
-    /// rarely over 100). With [`crate::BackgroundJobs::thumbnails`] off,
-    /// nothing draws them in the background: each is drawn by its first
-    /// call here.
+    /// beside it: this only reads the stored one back and never draws one,
+    /// so it's also `None` for one not drawn yet. With
+    /// [`crate::BackgroundJobs::thumbnails`] off nothing draws them, so it's
+    /// always `None` (bar ones stored while the job ran).
     ///
     /// Fails with [`crate::ErrorCode::UnreadablePdf`] for a document whose
     /// first page can't be drawn.
