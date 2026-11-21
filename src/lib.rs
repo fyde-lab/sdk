@@ -157,7 +157,7 @@ pub struct ClientConfig {
     /// Called once for every changelog event consumed by the background
     /// sync job that `UsersService::create`/`login` start automatically
     /// (replaying persisted history, then continuing with the live tail —
-    /// see `DocumentsService::start_sync`). Each `SaveDocument`/`UpdateMetadata`
+    /// see `DocumentsService::start_sync`). Each changelog
     /// event is already reflected in local storage (readable via
     /// `DocumentsService::get`/`list`) by the time this is called; use it
     /// to react to changes rather than to populate the cache. `None` if the

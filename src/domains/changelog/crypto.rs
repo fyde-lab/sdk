@@ -250,7 +250,7 @@ mod tests {
 
         let encrypted = encrypt_event(
             &secrets,
-            EventType::SaveDocument,
+            EventType::DocumentUploaded,
             subject_id,
             Some(b"body"),
             Some(&metadata),
@@ -261,7 +261,7 @@ mod tests {
         let (event_type, decrypted_id, content, decrypted_metadata) =
             decrypt_event(&secrets, &encrypted).await.unwrap();
 
-        assert_eq!(event_type, EventType::SaveDocument);
+        assert_eq!(event_type, EventType::DocumentUploaded);
         assert_eq!(decrypted_id, subject_id);
         assert_eq!(content, Some(b"body".to_vec()));
         assert_eq!(decrypted_metadata, Some(metadata));
@@ -272,14 +272,14 @@ mod tests {
         let secrets = secrets_with_master_key();
         let subject_id = Uuid::now_v7();
 
-        let encrypted = encrypt_event(&secrets, EventType::Deleted, subject_id, None, None)
+        let encrypted = encrypt_event(&secrets, EventType::DocumentDeleted, subject_id, None, None)
             .await
             .unwrap();
 
         let (event_type, decrypted_id, content, metadata) =
             decrypt_event(&secrets, &encrypted).await.unwrap();
 
-        assert_eq!(event_type, EventType::Deleted);
+        assert_eq!(event_type, EventType::DocumentDeleted);
         assert_eq!(decrypted_id, subject_id);
         assert_eq!(content, None);
         assert_eq!(metadata, None);
@@ -291,7 +291,7 @@ mod tests {
         let subject_id = Uuid::now_v7();
         let mut encrypted = encrypt_event(
             &secrets,
-            EventType::SaveDocument,
+            EventType::DocumentUploaded,
             subject_id,
             Some(b"body"),
             None,
@@ -336,7 +336,7 @@ mod tests {
 
         let err = encrypt_event(
             &secrets,
-            EventType::SaveDocument,
+            EventType::DocumentUploaded,
             subject_id,
             Some(b"body"),
             None,

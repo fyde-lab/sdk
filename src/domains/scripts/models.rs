@@ -318,7 +318,7 @@ impl std::fmt::Debug for InstallScriptRequest {
 }
 
 /// One installation of a script for the authenticated user, as persisted
-/// locally once its `InstallScript` changelog event has been consumed (see
+/// locally once its changelog events have been consumed (see
 /// [`super::Service::list_installed_scripts`]): its own id, its label, the
 /// full script, plus the parameter values it was installed with, so it can
 /// be run without asking for them again, and the folder its documents go

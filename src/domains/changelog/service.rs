@@ -281,10 +281,10 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
     /// it installs.
     async fn apply(&self, event: &ChangelogEvent) -> Result<()> {
         match event.event_type {
-            EventType::SaveDocument => {
+            EventType::DocumentUploaded => {
                 let (Some(content), Some(metadata)) = (&event.content, &event.metadata) else {
                     return Err(ErrorKind::InvalidChangelogEvent(format!(
-                        "created event {} for document {} is missing content or metadata",
+                        "upload event {} for document {} is missing content or metadata",
                         event.id, event.subject_id
                     ))
                     .into());
@@ -328,11 +328,13 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
                     .await
                     .with_context(|| format!("failed to apply changelog event {}", event.id))
             }
-            EventType::UpdateMetadata => {
+            EventType::DocumentRenamed
+            | EventType::DocumentAttributesUpdated
+            | EventType::DocumentMoved => {
                 let Some(metadata) = &event.metadata else {
                     return Err(ErrorKind::InvalidChangelogEvent(format!(
-                        "update metadata event {} for document {} is missing metadata",
-                        event.id, event.subject_id
+                        "{:?} event {} for document {} is missing metadata",
+                        event.event_type, event.id, event.subject_id
                     ))
                     .into());
                 };
@@ -342,17 +344,22 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
                     .await
                     .with_context(|| format!("failed to apply changelog event {}", event.id))
             }
-            EventType::Deleted => self
+            EventType::DocumentDeleted => self
                 .indexer
                 .delete_document(event.subject_id)
                 .await
                 .with_context(|| format!("failed to apply changelog event {}", event.id)),
-            EventType::InstallScript => {
-                let installed: InstalledScript = decode_content(event, "install script")
+            EventType::ScriptInstalled
+            | EventType::InstallationCredentialsUpdated
+            | EventType::InstallationRenamed
+            | EventType::InstallationFolderChanged
+            | EventType::InstallationUpgraded => {
+                let installed: InstalledScript = decode_content(event, "installation")
                     .with_context(|| format!("failed to apply changelog event {}", event.id))?;
                 if installed.installation_id() != event.subject_id {
                     return Err(ErrorKind::InvalidChangelogEvent(format!(
-                        "install script event {} for installation {} carries installation {}",
+                        "{:?} event {} for installation {} carries installation {}",
+                        event.event_type,
                         event.id,
                         event.subject_id,
                         installed.installation_id()
@@ -370,7 +377,7 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
                         format!("failed to save installation {} locally", event.subject_id)
                     })
             }
-            EventType::UninstallScript => {
+            EventType::ScriptUninstalled => {
                 let installation_id = event.subject_id;
                 self.script_storage
                     .delete_installed_script(installation_id)
@@ -387,13 +394,16 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
                         )
                     })
             }
-            EventType::SaveFolder => {
-                let folder: Folder = decode_content(event, "save folder")
+            EventType::FolderCreated
+            | EventType::FolderRenamed
+            | EventType::FolderAppearanceChanged
+            | EventType::FolderMoved => {
+                let folder: Folder = decode_content(event, "folder")
                     .with_context(|| format!("failed to apply changelog event {}", event.id))?;
                 if folder.id != event.subject_id {
                     return Err(ErrorKind::InvalidChangelogEvent(format!(
-                        "save folder event {} for folder {} carries folder {}",
-                        event.id, event.subject_id, folder.id
+                        "{:?} event {} for folder {} carries folder {}",
+                        event.event_type, event.id, event.subject_id, folder.id
                     ))
                     .into());
                 }
@@ -402,8 +412,8 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
                     .await
                     .with_context(|| format!("failed to apply changelog event {}", event.id))
             }
-            EventType::DeleteFolder => {
-                let deletion: DeleteFolderEvent = decode_content(event, "delete folder")
+            EventType::FolderDeleted => {
+                let deletion: DeleteFolderEvent = decode_content(event, "folder deletion")
                     .with_context(|| format!("failed to apply changelog event {}", event.id))?;
                 self.folders
                     .apply_delete(event.subject_id, deletion.contents)
@@ -529,12 +539,7 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
 
             // A model that can't be fetched isn't the event's fault, so isn't
             // counted against it.
-            if !indexing_ready
-                && matches!(
-                    event.event_type,
-                    EventType::SaveDocument | EventType::UpdateMetadata
-                )
-            {
+            if !indexing_ready && event.event_type.writes_document() {
                 self.indexer.prepare().await.with_context(|| {
                     format!(
                         "cannot apply changelog event {} before the indexing model is available",
@@ -771,7 +776,7 @@ mod tests {
     }
 
     fn proto_event(id: Uuid, document_id: Uuid) -> ProtoChangelogEvent {
-        proto_event_with_type(id, document_id, EventType::SaveDocument)
+        proto_event_with_type(id, document_id, EventType::DocumentUploaded)
     }
 
     fn proto_event_with_type(
@@ -858,7 +863,7 @@ mod tests {
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].id, event_id);
         assert_eq!(received[0].subject_id, document_id);
-        assert_eq!(received[0].event_type, EventType::SaveDocument);
+        assert_eq!(received[0].event_type, EventType::DocumentUploaded);
     }
 
     #[tokio::test]
@@ -925,7 +930,7 @@ mod tests {
         let document_id = metadata.id;
         let encrypted_content = futures::executor::block_on(crypto::encrypt_event(
             &*fake_secrets(),
-            EventType::SaveDocument,
+            EventType::DocumentUploaded,
             document_id,
             Some(b"content"),
             Some(&metadata),
@@ -1228,14 +1233,14 @@ mod tests {
         assert_eq!(reachability_checks.load(Ordering::SeqCst), 3);
     }
 
-    /// A `InstallScript` proto event for `installation_id` carrying
+    /// A `ScriptInstalled` proto event for `installation_id` carrying
     /// `content` as its (encrypted) payload.
     fn install_script_proto_event(
         id: Uuid,
         installation_id: Uuid,
         content: &[u8],
     ) -> ProtoChangelogEvent {
-        content_proto_event(id, EventType::InstallScript, installation_id, content)
+        content_proto_event(id, EventType::ScriptInstalled, installation_id, content)
     }
 
     /// A cursor storage expecting a single pass from the very beginning of
@@ -1293,7 +1298,7 @@ mod tests {
         )
     }
 
-    /// Consumes one `InstallScript` event installing `new` over the locally
+    /// Consumes one `ScriptInstalled` event installing `new` over the locally
     /// saved `previous`, with `state_storage` as the scraper state.
     async fn consume_reinstall(
         previous: InstalledScript,
@@ -1368,47 +1373,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_saves_the_installation_for_an_install_script_event() {
-        let installed = FakeInstalledScript::new().build();
-        let installation_id = installed.installation_id();
-        let event_id = Uuid::now_v7();
-        let content = serde_json::to_vec(&installed).unwrap();
+    async fn consume_saves_the_installation_for_every_installation_event() {
+        for event_type in [
+            EventType::ScriptInstalled,
+            EventType::InstallationCredentialsUpdated,
+            EventType::InstallationRenamed,
+            EventType::InstallationFolderChanged,
+            EventType::InstallationUpgraded,
+        ] {
+            let installed = FakeInstalledScript::new().build();
+            let installation_id = installed.installation_id();
+            let event_id = Uuid::now_v7();
+            let content = serde_json::to_vec(&installed).unwrap();
 
-        let mut script_storage = MockScriptStorage::new();
-        script_storage
-            .expect_find_installed_script()
-            .withf(move |id| *id == installation_id)
-            .returning(|_| Ok(None));
-        let expected = installed.clone();
-        script_storage
-            .expect_save_installed_script()
-            .withf(move |saved| *saved == expected)
-            .times(1)
-            .returning(|_| Ok(()));
+            let mut script_storage = MockScriptStorage::new();
+            script_storage
+                .expect_find_installed_script()
+                .withf(move |id| *id == installation_id)
+                .returning(|_| Ok(None));
+            let expected = installed.clone();
+            script_storage
+                .expect_save_installed_script()
+                .withf(move |saved| *saved == expected)
+                .times(1)
+                .returning(|_| Ok(()));
 
-        let mut state_storage = MockStateStorage::new();
-        state_storage
-            .expect_delete_session()
-            .withf(move |name| name == installation_id.to_string())
-            .times(1)
-            .returning(|_| Ok(()));
+            let mut state_storage = MockStateStorage::new();
+            state_storage
+                .expect_delete_session()
+                .withf(move |name| name == installation_id.to_string())
+                .times(1)
+                .returning(|_| Ok(()));
 
-        let client = client_applying_scripts(
-            install_script_proto_event(event_id, installation_id, &content),
-            cursor_storage_consuming(event_id),
-            script_storage,
-            state_storage,
-        );
+            let client = client_applying_scripts(
+                content_proto_event(event_id, event_type, installation_id, &content),
+                cursor_storage_consuming(event_id),
+                script_storage,
+                state_storage,
+            );
 
-        let received = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let received_in_callback = received.clone();
-        let mut callback = move |event| received_in_callback.lock().unwrap().push(event);
-        client.consume_once(&mut callback).await.unwrap();
+            let received = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let received_in_callback = received.clone();
+            let mut callback = move |event| received_in_callback.lock().unwrap().push(event);
+            client.consume_once(&mut callback).await.unwrap();
 
-        let received = received.lock().unwrap();
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].event_type, EventType::InstallScript);
-        assert_eq!(received[0].subject_id, installation_id);
+            let received = received.lock().unwrap();
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].event_type, event_type);
+            assert_eq!(received[0].subject_id, installation_id);
+        }
     }
 
     #[tokio::test]
@@ -1455,7 +1468,7 @@ mod tests {
         let event_id = Uuid::now_v7();
         let encrypted_content = futures::executor::block_on(crypto::encrypt_event(
             &*fake_secrets(),
-            EventType::UninstallScript,
+            EventType::ScriptUninstalled,
             installation_id,
             None,
             None,
@@ -1538,33 +1551,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_applies_a_save_folder_event() {
-        let folder = FakeFolder::new().build();
-        let event_id = Uuid::now_v7();
-        let event = content_proto_event(
-            event_id,
-            EventType::SaveFolder,
-            folder.id,
-            &serde_json::to_vec(&folder).unwrap(),
-        );
-        let mut folders = MockApplier::new();
-        let expected = folder.clone();
-        folders
-            .expect_apply_save()
-            .withf(move |saved| *saved == expected)
-            .times(1)
-            .returning(|_| Ok(()));
-        let client = client_applying_folders(event, cursor_storage_consuming(event_id), folders);
+    async fn consume_applies_every_folder_saving_event() {
+        for event_type in [
+            EventType::FolderCreated,
+            EventType::FolderRenamed,
+            EventType::FolderAppearanceChanged,
+            EventType::FolderMoved,
+        ] {
+            let folder = FakeFolder::new().build();
+            let event_id = Uuid::now_v7();
+            let event = content_proto_event(
+                event_id,
+                event_type,
+                folder.id,
+                &serde_json::to_vec(&folder).unwrap(),
+            );
+            let mut folders = MockApplier::new();
+            let expected = folder.clone();
+            folders
+                .expect_apply_save()
+                .withf(move |saved| *saved == expected)
+                .times(1)
+                .returning(|_| Ok(()));
+            let client =
+                client_applying_folders(event, cursor_storage_consuming(event_id), folders);
 
-        let received = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let received_in_callback = received.clone();
-        let mut callback = move |event| received_in_callback.lock().unwrap().push(event);
-        client.consume_once(&mut callback).await.unwrap();
+            let received = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let received_in_callback = received.clone();
+            let mut callback = move |event| received_in_callback.lock().unwrap().push(event);
+            client.consume_once(&mut callback).await.unwrap();
 
-        let received = received.lock().unwrap();
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].event_type, EventType::SaveFolder);
-        assert_eq!(received[0].subject_id, folder.id);
+            let received = received.lock().unwrap();
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].event_type, event_type);
+            assert_eq!(received[0].subject_id, folder.id);
+        }
     }
 
     #[tokio::test]
@@ -1573,7 +1594,7 @@ mod tests {
         let event_id = Uuid::now_v7();
         let event = content_proto_event(
             event_id,
-            EventType::DeleteFolder,
+            EventType::FolderDeleted,
             folder_id,
             &serde_json::to_vec(&DeleteFolderEvent {
                 contents: FolderContents::Keep,
@@ -1613,7 +1634,7 @@ mod tests {
         let folder = FakeFolder::new().build();
         let event = content_proto_event(
             Uuid::now_v7(),
-            EventType::SaveFolder,
+            EventType::FolderCreated,
             Uuid::now_v7(),
             &serde_json::to_vec(&folder).unwrap(),
         );
@@ -1629,7 +1650,7 @@ mod tests {
 
     #[tokio::test]
     async fn consume_rejects_a_folder_event_with_an_invalid_payload() {
-        for event_type in [EventType::SaveFolder, EventType::DeleteFolder] {
+        for event_type in [EventType::FolderCreated, EventType::FolderDeleted] {
             let event =
                 content_proto_event(Uuid::now_v7(), event_type, Uuid::now_v7(), b"not json");
             let client =
@@ -1654,7 +1675,7 @@ mod tests {
             Ok(futures::stream::iter(vec![Ok(proto_event_with_type(
                 event_id,
                 document_id,
-                EventType::Deleted,
+                EventType::DocumentDeleted,
             ))])
             .boxed())
         });
@@ -1708,7 +1729,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(received.len(), 1);
-        assert_eq!(received[0].event_type, EventType::Deleted);
+        assert_eq!(received[0].event_type, EventType::DocumentDeleted);
         assert_eq!(received[0].subject_id, document_id);
     }
 
@@ -1721,7 +1742,7 @@ mod tests {
             Ok(futures::stream::iter(vec![Ok(proto_event_with_type(
                 event_id,
                 Uuid::now_v7(),
-                EventType::Deleted,
+                EventType::DocumentDeleted,
             ))])
             .boxed())
         });
@@ -1757,59 +1778,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_updates_the_cached_documents_metadata_for_an_update_metadata_event() {
-        let document_id = Uuid::now_v7();
-        let event_id = Uuid::now_v7();
+    async fn consume_updates_the_cached_documents_metadata_for_every_metadata_event() {
+        for event_type in [
+            EventType::DocumentRenamed,
+            EventType::DocumentAttributesUpdated,
+            EventType::DocumentMoved,
+        ] {
+            let document_id = Uuid::now_v7();
+            let event_id = Uuid::now_v7();
 
-        let mut mock_grpc = counting_grpc();
-        mock_grpc.expect_consume_since().returning(move |_| {
-            Ok(futures::stream::iter(vec![Ok(proto_event_with_type(
-                event_id,
-                document_id,
-                EventType::UpdateMetadata,
-            ))])
-            .boxed())
-        });
+            let mut mock_grpc = counting_grpc();
+            mock_grpc.expect_consume_since().returning(move |_| {
+                Ok(futures::stream::iter(vec![Ok(proto_event_with_type(
+                    event_id,
+                    document_id,
+                    event_type,
+                ))])
+                .boxed())
+            });
 
-        let document_storage = MockStorage::new();
-        let mut indexer = ready_indexer();
-        indexer
-            .expect_update_metadata()
-            .withf(move |id, _metadata| *id == document_id)
-            .times(1)
-            .returning(|_, _| Ok(()));
+            let document_storage = MockStorage::new();
+            let mut indexer = ready_indexer();
+            indexer
+                .expect_update_metadata()
+                .withf(move |id, _metadata| *id == document_id)
+                .times(1)
+                .returning(|_, _| Ok(()));
 
-        let mut cursor_storage = MockCursorStorage::new();
-        cursor_storage
-            .expect_is_applied()
-            .times(1)
-            .returning(|_| Ok(false));
-        cursor_storage
-            .expect_mark_applied()
-            .times(1)
-            .returning(|_| Ok(()));
-        cursor_storage
-            .expect_get_cursor()
-            .returning(|| Ok(Uuid::nil()));
-        cursor_storage
-            .expect_save_cursor()
-            .withf(move |id| *id == event_id)
-            .times(1)
-            .returning(|_| Ok(()));
+            let mut cursor_storage = MockCursorStorage::new();
+            cursor_storage
+                .expect_is_applied()
+                .times(1)
+                .returning(|_| Ok(false));
+            cursor_storage
+                .expect_mark_applied()
+                .times(1)
+                .returning(|_| Ok(()));
+            cursor_storage
+                .expect_get_cursor()
+                .returning(|| Ok(Uuid::nil()));
+            cursor_storage
+                .expect_save_cursor()
+                .withf(move |id| *id == event_id)
+                .times(1)
+                .returning(|_| Ok(()));
 
-        let client = ChangelogClient::new(
-            mock_grpc,
-            document_storage,
-            Arc::new(indexer),
-            MockScriptStorage::new(),
-            MockStateStorage::new(),
-            Arc::new(MockApplier::new()),
-            cursor_storage,
-            reachable_server_state(),
-            fake_secrets(),
-        );
+            let client = ChangelogClient::new(
+                mock_grpc,
+                document_storage,
+                Arc::new(indexer),
+                MockScriptStorage::new(),
+                MockStateStorage::new(),
+                Arc::new(MockApplier::new()),
+                cursor_storage,
+                reachable_server_state(),
+                fake_secrets(),
+            );
 
-        client.consume_once(&mut |_| {}).await.unwrap();
+            client.consume_once(&mut |_| {}).await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -1819,7 +1846,7 @@ mod tests {
 
         let encrypted_content = futures::executor::block_on(crypto::encrypt_event(
             &*fake_secrets(),
-            EventType::SaveDocument,
+            EventType::DocumentUploaded,
             document_id,
             None,
             None,
@@ -1928,7 +1955,7 @@ mod tests {
     }
 
     /// A client streaming `events` from the beginning (nil cursor), caching
-    /// every `SaveDocument` event that gets that far as a new document.
+    /// every `DocumentUploaded` event that gets that far as a new document.
     fn client_streaming(
         events: Vec<ProtoChangelogEvent>,
     ) -> ChangelogClient<MockStorage, MockScriptStorage, MockStateStorage, MockCursorStorage> {
@@ -2527,7 +2554,7 @@ mod tests {
                     crypto::decrypt_event(&*fake_secrets(), encrypted_content),
                 )
                 .unwrap();
-                event_type == EventType::SaveDocument
+                event_type == EventType::DocumentUploaded
                     && id == document_id
                     && content == Some(b"body".to_vec())
                     && decrypted_metadata == Some(expected_metadata.clone())
@@ -2548,7 +2575,7 @@ mod tests {
 
         client
             .send(
-                EventType::SaveDocument,
+                EventType::DocumentUploaded,
                 document_id,
                 Some(b"body"),
                 Some(&metadata),
@@ -2575,7 +2602,7 @@ mod tests {
 
         let err = client
             .send(
-                EventType::SaveDocument,
+                EventType::DocumentUploaded,
                 Uuid::now_v7(),
                 Some(&vec![0; super::super::MAX_EVENT_BYTES]),
                 Some(&FakeMetadata::new().build()),
@@ -2626,7 +2653,7 @@ mod tests {
     #[tokio::test]
     async fn consume_prepares_the_indexing_model_once_per_pass_before_the_first_document() {
         let (first_id, second_id) = (Uuid::now_v7(), Uuid::now_v7());
-        let first = proto_event_with_type(first_id, Uuid::now_v7(), EventType::UpdateMetadata);
+        let first = proto_event_with_type(first_id, Uuid::now_v7(), EventType::DocumentRenamed);
         let second = ProtoChangelogEvent {
             previous_id: first_id.to_string(),
             ..proto_event(second_id, Uuid::now_v7())
@@ -2745,7 +2772,7 @@ mod tests {
             vec![proto_event_with_type(
                 Uuid::now_v7(),
                 Uuid::now_v7(),
-                EventType::UpdateMetadata,
+                EventType::DocumentRenamed,
             )],
             indexer,
         );

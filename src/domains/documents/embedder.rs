@@ -727,7 +727,7 @@ mod tests {
             content: Option<&[u8]>,
             metadata: Option<&Metadata>,
         ) -> Result<()> {
-            assert_eq!(event_type, EventType::SaveDocument);
+            assert_eq!(event_type, EventType::DocumentUploaded);
             self.sent.lock().unwrap().push((
                 subject_id,
                 content.unwrap().to_vec(),
