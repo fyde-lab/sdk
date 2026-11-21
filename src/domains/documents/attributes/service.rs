@@ -74,9 +74,6 @@ impl<C: FydeClient> Service for AttributesClient<C> {
         attributes.retain(|name, attribute| {
             check_attribute_name(name).is_ok() && check_attribute_value(name, attribute).is_ok()
         });
-        while attributes.len() > MAX_ATTRIBUTES {
-            attributes.pop_last();
-        }
         if attributes.is_empty() {
             return Ok(attributes);
         }
@@ -88,6 +85,11 @@ impl<C: FydeClient> Service for AttributesClient<C> {
         attributes.retain(|name, attribute| {
             check_against_definition(name, attribute, &definitions).is_ok()
         });
+        // Only once every invalid one is gone, so one dropped for its
+        // definition leaves room for a valid one after it.
+        while attributes.len() > MAX_ATTRIBUTES {
+            attributes.pop_last();
+        }
         Ok(attributes)
     }
 }
@@ -538,6 +540,33 @@ mod tests {
 
         assert_eq!(valid.len(), MAX_ATTRIBUTES);
         check_values(&valid).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retain_valid_caps_the_attributes_only_after_dropping_the_invalid_ones() {
+        // `attribute_000` is defined as an amount, so its integer is
+        // dropped, which leaves room for `attribute_064`.
+        let mut client = MockFydeClient::new();
+        client.expect_list_attributes().times(1).return_once(|| {
+            Ok(vec![
+                FakeAttributeDefinition::new()
+                    .with_name("attribute_000")
+                    .with_type(AttributeType::Amount)
+                    .build(),
+            ])
+        });
+        let attributes: BTreeMap<String, Attribute> = (0..=MAX_ATTRIBUTES)
+            .map(|i| (format!("attribute_{i:03}"), Attribute::Integer(1)))
+            .collect();
+
+        let valid = AttributesClient::new(client)
+            .retain_valid(attributes)
+            .await
+            .unwrap();
+
+        assert_eq!(valid.len(), MAX_ATTRIBUTES);
+        assert!(!valid.contains_key("attribute_000"));
+        assert!(valid.contains_key(&format!("attribute_{MAX_ATTRIBUTES:03}")));
     }
 
     #[tokio::test]
