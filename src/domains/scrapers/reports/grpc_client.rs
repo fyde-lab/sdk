@@ -80,6 +80,7 @@ impl FydeClient for GrpcClient {
                 script_id: upload.script_id.to_string(),
                 script_version: upload.script_version,
                 duration_ms: upload.duration_ms,
+                run_id: upload.run_id.to_string(),
             })
             .await
             .context("failed to authenticate the report upload")?;
@@ -118,6 +119,7 @@ mod tests {
                 script_id: Uuid::new_v4(),
                 script_version: 1,
                 duration_ms: 1_000,
+                run_id: Uuid::new_v4(),
             })
             .await
             .unwrap_err();

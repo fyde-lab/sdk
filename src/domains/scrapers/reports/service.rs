@@ -255,7 +255,9 @@ pub(super) const UPLOAD_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 /// Uploads finished runs' reports to the server's `reports.v1`, which
 /// links them to no user, each once. Only runs of a known script are
 /// uploaded (the server needs its id and version), as
-/// [`report_json`] words them.
+/// [`report_json`] words them. Each goes with its run's id, which the
+/// server stores once: a report sent again (uploaded, but not noted so
+/// before the process ended) isn't stored twice.
 pub(super) struct ReportUploader<S: UploadStorage, C: FydeClient> {
     storage: S,
     client: C,
@@ -350,6 +352,7 @@ impl<S: UploadStorage, C: FydeClient> ReportUploader<S, C> {
             client_id: self.client_id.clone(),
             script_id: script.id,
             script_version: script.version,
+            run_id: run_id(report.id),
             duration_ms: u64::try_from(duration_ms).unwrap_or(0).min(MAX_DURATION_MS),
         }))
     }
@@ -481,6 +484,17 @@ fn scrub(value: &mut serde_json::Value, name: &str) {
         Value::Object(fields) => fields.values_mut().for_each(|field| scrub(field, name)),
         _ => {}
     }
+}
+
+/// Namespace of [`run_id`]'s name-based UUIDs.
+const RUN_ID_NAMESPACE: Uuid = Uuid::from_u128(0x5f0b_2d4e_8c1a_4b7e_9d3f_6a2c_1e8b_7d40);
+
+/// The id a report with `report_id` is uploaded under, for the server to
+/// store each run's report once: derived from the run's own id, so the same
+/// on every try, but a hash of it, so it doesn't tell when the run started
+/// (`report_id` is a UUIDv7, which does).
+fn run_id(report_id: Uuid) -> Uuid {
+    Uuid::new_v5(&RUN_ID_NAMESPACE, report_id.as_bytes())
 }
 
 /// The kind of device the SDK was built for.
@@ -814,6 +828,7 @@ mod tests {
         assert_eq!(upload.client_id, "desktop-app-2");
         assert_eq!(upload.device_type, DeviceType::Desktop);
         assert_eq!(upload.duration_ms, 60_000);
+        assert_eq!(upload.run_id, run_id(id));
         assert_eq!(parsed(upload)["outcome"], "succeeded");
     }
 
@@ -1100,6 +1115,17 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(body["entries"], json!([]));
         assert_eq!(body["omitted_entries"], 1);
+    }
+
+    #[test]
+    fn a_runs_upload_id_is_its_own_and_tells_nothing_of_when_it_ran() {
+        let first = Uuid::now_v7();
+        let second = Uuid::now_v7();
+
+        assert_eq!(run_id(first), run_id(first), "the same on every try");
+        assert_ne!(run_id(first), run_id(second));
+        assert_eq!(run_id(first).get_version(), Some(uuid::Version::Sha1));
+        assert_eq!(run_id(first).get_timestamp(), None);
     }
 
     #[test]

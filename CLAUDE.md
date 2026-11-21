@@ -185,6 +185,8 @@ methods, used behind `Arc<dyn Service>`), `models.rs`, `service.rs` and adapters
   Forms are submitted with `click`, never an in-page `fetch`, and downloads never touch the disk.
   A finished run's report of a known script (an installation's) is uploaded once to the server's
   `reports.v1`, which links it to no user, by a background job (`reports::start_upload_job`),
+  with an id derived from its run's (`service::run_id`, a hash: the v7 id would tell when the
+  run started), which the server stores once,
   without the run's name (scrubbed from its log too) or start time
   (`reports::service::report_json`, at most 1 MiB).
   `crate::init_dev_scrapers` (for `../scripts`) runs scrapers without a `Client`.
