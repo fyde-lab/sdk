@@ -6,6 +6,7 @@ mod storage;
 mod storage_file;
 mod storage_sqlite;
 
+pub(super) use models::ReportedScript;
 pub use models::{ScraperRun, ScraperRunOutcome, ScraperRunUpdate};
 pub(super) use recorder::Recorder;
 pub(crate) use redact::redact_url;
@@ -31,9 +32,10 @@ use crate::Result;
 /// self`) so implementations can be shared behind `Arc<dyn Service>`.
 #[async_trait]
 pub(super) trait Service: Send + Sync {
-    /// Opens the report of a run of `name` starting now. Returns where to
-    /// record its log and progress, to hand to [`Self::finish`].
-    async fn start(&self, name: &str) -> Result<RunTracker>;
+    /// Opens the report of a run of `name` starting now, of `script` if
+    /// it's known (a run of an installation). Returns where to record its
+    /// log and progress, to hand to [`Self::finish`].
+    async fn start(&self, name: &str, script: Option<ReportedScript>) -> Result<RunTracker>;
 
     /// Completes `tracker`'s report with how its run ended — `result` is
     /// what it returned (`ScraperRunStopped` meaning it was stopped) — and

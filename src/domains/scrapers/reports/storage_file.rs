@@ -7,7 +7,9 @@ use uuid::Uuid;
 
 use crate::{ErrorContext as _, Result};
 
-use super::models::{Report, ReportEntry, ReportSummary, ScraperRun, ScraperRunUpdate};
+use super::models::{
+    Report, ReportEntry, ReportSummary, ReportedScript, ScraperRun, ScraperRunUpdate,
+};
 use super::storage::{Storage, outcome_columns, outcome_from_columns};
 
 /// A [`Storage`] backed by one JSON file per run under `dir`, the way
@@ -45,6 +47,9 @@ struct ReportFile {
     update: Option<(i64, i64)>,
     found: Option<i64>,
     saved: u64,
+    /// Absent from files written before reports kept their script.
+    #[serde(default)]
+    script: Option<ReportedScript>,
     entries: Vec<ReportEntry>,
 }
 
@@ -93,6 +98,7 @@ impl Storage for FileStorage {
             update: run.update.map(|update| (update.current, update.total)),
             found: run.found,
             saved: run.saved,
+            script: report.script,
             entries: report.entries.clone(),
         };
 
@@ -194,7 +200,28 @@ mod tests {
         let saved: ReportFile =
             serde_json::from_str(&tokio::fs::read_to_string(path).await.unwrap()).unwrap();
         assert_eq!(saved.entries, entries);
+        assert_eq!(saved.script, report.script);
         assert_eq!(saved.summary().unwrap(), ReportSummary::from(&report));
+    }
+
+    #[test]
+    fn a_file_written_before_reports_kept_their_script_still_reads() {
+        let file: ReportFile = serde_json::from_value(serde_json::json!({
+            "id": Uuid::now_v7(),
+            "scraper_name": "didaxis",
+            "started_at_ms": 1_000,
+            "ended_at_ms": 2_000,
+            "outcome": "succeeded",
+            "error_code": null,
+            "step": null,
+            "update": null,
+            "found": null,
+            "saved": 0,
+            "entries": [],
+        }))
+        .unwrap();
+
+        assert_eq!(file.script, None);
     }
 
     #[tokio::test]
