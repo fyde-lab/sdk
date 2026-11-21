@@ -115,6 +115,9 @@ pub struct UsersClient {
     local_files: Arc<dyn LocalFiles>,
     documents: Arc<dyn DocumentsService>,
     embedding_cache: Arc<dyn EmbeddingCache>,
+    /// Whether `create`/`login` start changelog consumption themselves
+    /// (see [`crate::BackgroundJobs::sync`]).
+    auto_sync: bool,
 }
 
 impl UsersClient {
@@ -124,8 +127,8 @@ impl UsersClient {
     /// persisted, and outgoing calls authenticated, via `sessions`;
     /// `secrets` and `embedding_cache` are cleared, `local_db` wiped and
     /// `local_files` deleted on `logout`; and changelog
-    /// consumption on `documents` is started by `create`/`login` and stopped
-    /// by `logout`.
+    /// consumption on `documents` is started by `create`/`login` (unless
+    /// `auto_sync` is off) and stopped by `logout`.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn new(
         channel: Channel,
@@ -136,6 +139,7 @@ impl UsersClient {
         local_files: Arc<dyn LocalFiles>,
         documents: Arc<dyn DocumentsService>,
         embedding_cache: Arc<dyn EmbeddingCache>,
+        auto_sync: bool,
     ) -> Result<Self> {
         Ok(Self {
             grpc: Box::new(GrpcClient::new(channel, sessions.clone())),
@@ -147,6 +151,7 @@ impl UsersClient {
             local_files,
             documents,
             embedding_cache,
+            auto_sync,
         })
     }
 
@@ -175,7 +180,14 @@ impl UsersClient {
             local_files,
             documents,
             embedding_cache: Arc::new(crate::domains::documents::MockEmbeddingCache::new()),
+            auto_sync: true,
         }
+    }
+
+    #[cfg(test)]
+    fn without_auto_sync(mut self) -> Self {
+        self.auto_sync = false;
+        self
     }
 
     #[cfg(test)]
@@ -316,7 +328,8 @@ impl UsersClient {
     }
 
     /// Persists everything a freshly opened session needs locally, at
-    /// `location`, then starts changelog consumption. The session token goes
+    /// `location`, then starts changelog consumption (unless `auto_sync` is
+    /// off). The session token goes
     /// last: it's what `is_connected` (and so `Client::init` on the next
     /// start) keys off, so a failure partway through never leaves a session
     /// that looks open but has no master key to decrypt anything with.
@@ -349,6 +362,9 @@ impl UsersClient {
 
         self.sessions.save_new_session(token, location).await?;
 
+        if !self.auto_sync {
+            return Ok(());
+        }
         self.documents
             .start_sync()
             .await
@@ -1342,6 +1358,115 @@ mod tests {
             LoginOutcome::LoggedIn {
                 session_token: "a-token".to_string()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn login_starts_the_sync() {
+        let opaque = opaque_for_login(b"the-request", b"the-upload");
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_login()
+            .times(1)
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        mock_grpc
+            .expect_finish_login()
+            .times(1)
+            .returning(|_, _, _, _| Ok(succeeded(login_master_key())));
+        let mut settings = MockSettingsService::new();
+        settings.expect_set().times(2).returning(|_, _| Ok(()));
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
+        secrets.expect_set().times(2).returning(|_, _, _| Ok(()));
+        let documents = Arc::new(RecordingDocuments::default());
+
+        let client = UsersClient::with_deps(
+            mock_grpc,
+            opaque,
+            Arc::new(settings),
+            Arc::new(secrets),
+            Arc::new(MockLocalDatabase::new()),
+            Arc::new(MockLocalFiles::new()),
+            documents.clone(),
+        );
+
+        client
+            .login(
+                "alice",
+                "correct horse battery staple",
+                "Pierre's iPhone",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            documents
+                .start_sync_called
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn login_leaves_the_sync_to_the_caller_without_auto_sync() {
+        let opaque = opaque_for_login(b"the-request", b"the-upload");
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_login()
+            .times(1)
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        mock_grpc
+            .expect_finish_login()
+            .times(1)
+            .returning(|_, _, _, _| Ok(succeeded(login_master_key())));
+        let mut settings = MockSettingsService::new();
+        settings.expect_set().times(2).returning(|_, _| Ok(()));
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
+        secrets.expect_set().times(2).returning(|_, _, _| Ok(()));
+        let documents = Arc::new(RecordingDocuments::default());
+
+        let client = UsersClient::with_deps(
+            mock_grpc,
+            opaque,
+            Arc::new(settings),
+            Arc::new(secrets),
+            Arc::new(MockLocalDatabase::new()),
+            Arc::new(MockLocalFiles::new()),
+            documents.clone(),
+        )
+        .without_auto_sync();
+
+        client
+            .login(
+                "alice",
+                "correct horse battery staple",
+                "Pierre's iPhone",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !documents
+                .start_sync_called
+                .load(std::sync::atomic::Ordering::SeqCst)
         );
     }
 

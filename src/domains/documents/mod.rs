@@ -47,9 +47,8 @@
 //! **Thumbnails.** `thumbnail(id)` reads the first page back as a PNG stored in
 //! `documents.thumbnail` (NULL = not drawn yet, empty = undrawable), drawing it
 //! if needed. The background job (`start_thumbnail_job`) draws the missing
-//! ones, newest first, and sleeps until the indexer wakes it. Mobile clients
-//! (Android, iOS) don't run it (`BACKGROUND_THUMBNAILS`), to spare battery
-//! and CPU: there, each thumbnail is drawn when `thumbnail(id)` first asks.
+//! ones, newest first, and sleeps until the indexer wakes it, unless
+//! `BackgroundJobs::thumbnails` is off (then `thumbnail(id)` draws them all).
 
 pub(crate) mod attributes;
 mod chunk;
@@ -178,8 +177,9 @@ pub trait Service: Send + Sync {
     /// Drawn in the background once the document is cached, and stored
     /// beside it, so this only reads it back; one not drawn yet is drawn
     /// (and stored) right away instead of waiting its turn (about 10 ms,
-    /// rarely over 100). On Android and iOS nothing draws them in the
-    /// background, so each is drawn by its first call here.
+    /// rarely over 100). With [`crate::BackgroundJobs::thumbnails`] off,
+    /// nothing draws them in the background: each is drawn by its first
+    /// call here.
     ///
     /// Fails with [`crate::ErrorCode::UnreadablePdf`] for a document whose
     /// first page can't be drawn.
@@ -444,12 +444,6 @@ pub(crate) fn init_indexer(
         thumbnails,
     ))
 }
-
-/// Whether `Client::init` starts [`start_thumbnail_job`]: not on mobile
-/// (Android, iOS), where drawing every document's thumbnail in the
-/// background costs too much battery and CPU, so `thumbnail` draws each one
-/// (and stores it) only when it's first asked for.
-pub(crate) const BACKGROUND_THUMBNAILS: bool = !cfg!(any(target_os = "android", target_os = "ios"));
 
 /// Wakes the job [`start_thumbnail_job`] starts when a document is cached.
 pub(crate) type ThumbnailWake = tokio::sync::Notify;

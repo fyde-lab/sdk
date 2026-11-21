@@ -124,7 +124,8 @@ encrypts/decrypts, storage adapters (`storage_sqlite.rs`, `SqliteClient`) only r
 `Client::init(ClientConfig)` (`src/lib.rs`) opens a lazy gRPC channel (rustls + webpki roots),
 opens the SQLite DB (`Storage::Disk(dir)` → `<dir>/<client_name>/fyde.db`, or `Storage::Memory`),
 wires every domain and starts the background jobs (changelog consumer, thumbnails, model
-loading), which are aborted when the `Client` drops. A disk DB is guarded by an exclusive `flock`
+loading; each can be turned off in `ClientConfig::background_jobs`, which only defers its work,
+never disables a feature), which are aborted when the `Client` drops. A disk DB is guarded by an exclusive `flock`
 (`ClientAlreadyRunning`), so every domain may write local storage freely. `ClientConfig` also
 carries the caller's callbacks (`on_log`, `on_document_change`, `on_scraper_*`).
 
