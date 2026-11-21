@@ -115,12 +115,12 @@ pub(crate) trait Service: Send + Sync {
     /// `SaveDocument` event must carry both, or if an `InstallScript` event's
     /// `content` is missing, isn't a valid installation or names another
     /// installation than its subject — the error is logged and
-    /// consumption is retried immediately from the persisted cursor: the
-    /// next pass's wait for
-    /// [`crate::domains::server_state::Service::is_server_reachable`]
-    /// naturally paces the retries if the failure was caused by the server
-    /// being unreachable. If a pass ends cleanly (the server closes the
-    /// stream), it's also retried immediately.
+    /// consumption is retried from the persisted cursor after a backoff
+    /// that doubles with each failure in a row (500 ms up to 30 s), the
+    /// next pass also waiting for
+    /// [`crate::domains::server_state::Service::is_server_reachable`]. If a
+    /// pass ends cleanly (the server closes the stream), the stream is
+    /// reopened after a 1 s pause, never at once.
     async fn start_consume_job(
         self: Arc<Self>,
         callback: Box<dyn FnMut(ChangelogEvent) + Send>,
