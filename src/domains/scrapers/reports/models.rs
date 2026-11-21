@@ -140,6 +140,9 @@ pub(crate) struct ReportUpload {
     pub(crate) script_id: Uuid,
     pub(crate) script_version: u64,
     pub(crate) duration_ms: u64,
+    /// The run's id (derived from [`Report::id`]): the server stores one
+    /// report per run, so uploading it again is harmless.
+    pub(crate) run_id: Uuid,
 }
 
 /// A [`Report`] without its log, as [`super::storage::Storage::list_latest`]
