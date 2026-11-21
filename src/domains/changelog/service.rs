@@ -262,9 +262,12 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
         proto: ProtoChangelogEvent,
         offset: Option<Uuid>,
     ) -> Result<(ChangelogEvent, [u8; 32])> {
-        check_follows(&proto, offset)?;
+        check_follows(&proto, offset)
+            .with_context(|| format!("changelog event {:?} is out of sequence", proto.id))?;
         let digest: [u8; 32] = Sha256::digest(&proto.encrypted_content).into();
-        let event = ChangelogEvent::from_proto(proto, &*self.secrets).await?;
+        let event = ChangelogEvent::from_proto(proto, &*self.secrets)
+            .await
+            .context("failed to decode changelog event")?;
 
         Ok((event, digest))
     }
@@ -341,7 +344,8 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
                 .await
                 .with_context(|| format!("failed to apply changelog event {}", event.id)),
             EventType::InstallScript => {
-                let installed: InstalledScript = decode_content(event, "install script")?;
+                let installed: InstalledScript = decode_content(event, "install script")
+                    .with_context(|| format!("failed to apply changelog event {}", event.id))?;
                 if installed.installation_id() != event.subject_id {
                     return Err(ErrorKind::InvalidChangelogEvent(format!(
                         "install script event {} for installation {} carries installation {}",
@@ -353,7 +357,8 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
                 }
 
                 self.reset_scraper_session_on_new_version(&installed)
-                    .await?;
+                    .await
+                    .with_context(|| format!("failed to apply changelog event {}", event.id))?;
                 self.script_storage
                     .save_installed_script(&installed)
                     .await
@@ -379,7 +384,8 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
                     })
             }
             EventType::SaveFolder => {
-                let folder: Folder = decode_content(event, "save folder")?;
+                let folder: Folder = decode_content(event, "save folder")
+                    .with_context(|| format!("failed to apply changelog event {}", event.id))?;
                 if folder.id != event.subject_id {
                     return Err(ErrorKind::InvalidChangelogEvent(format!(
                         "save folder event {} for folder {} carries folder {}",
@@ -393,7 +399,8 @@ impl<D: DocumentStorage, S: ScriptStorage, P: ScraperStateStorage, O: CursorStor
                     .with_context(|| format!("failed to apply changelog event {}", event.id))
             }
             EventType::DeleteFolder => {
-                let deletion: DeleteFolderEvent = decode_content(event, "delete folder")?;
+                let deletion: DeleteFolderEvent = decode_content(event, "delete folder")
+                    .with_context(|| format!("failed to apply changelog event {}", event.id))?;
                 self.folders
                     .apply_delete(event.subject_id, deletion.contents)
                     .await

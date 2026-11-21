@@ -88,7 +88,8 @@ impl FydeClient for GrpcClient {
         let request = self
             .sessions
             .authenticated_request(RecordEventRequest { encrypted_content })
-            .await?;
+            .await
+            .context("failed to authenticate the RecordEvent request")?;
 
         let response = self
             .sessions
@@ -111,7 +112,8 @@ impl FydeClient for GrpcClient {
             .authenticated_request(ConsumeSinceRequest {
                 id: id.map(|id| id.to_string()).unwrap_or_default(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the ConsumeSince request")?;
 
         let response = self
             .sessions
@@ -127,7 +129,8 @@ impl FydeClient for GrpcClient {
             .authenticated_request(CountSinceRequest {
                 id: id.map(|id| id.to_string()).unwrap_or_default(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the CountSince request")?;
 
         let response = self
             .sessions
