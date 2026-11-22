@@ -102,7 +102,10 @@ impl Ocr for OnnxOcr {
     }
 
     async fn read(&self, page: PageImage) -> Result<String> {
-        let ocr = self.loaded().await?;
+        let ocr = self
+            .loaded()
+            .await
+            .context("failed to prepare the OCR pipeline")?;
 
         tokio::task::spawn_blocking(move || read(&ocr, page))
             .await
