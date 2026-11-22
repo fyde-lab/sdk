@@ -26,11 +26,42 @@ const AVAILABILITY_PROBE: &str = "availability_probe";
 pub(super) struct SecretsClient<S: Storage, D: Storage> {
     secure: Option<S>,
     database: D,
+    cache: Mutex<Cache>,
+}
+
+#[derive(Default)]
+struct Cache {
     /// `None` cached for a key means "known absent", so an unauthenticated
     /// client doesn't hit the store on every call either. Values are wiped
     /// from memory when replaced, removed or dropped; callers wrap the copy
     /// `get` hands them in a `Zeroizing` too.
-    cache: Mutex<HashMap<String, Option<Zeroizing<String>>>>,
+    values: HashMap<String, Option<Zeroizing<String>>>,
+    /// Bumped by every `set` and `delete` as it starts. What a `get` or a
+    /// `set`/`delete` learned is cached only if no other write started in
+    /// the meantime: a `get` that read the stores before `logout`'s
+    /// `clear` deleted a secret must not cache it again afterwards, nor one
+    /// that read the old value before a `set` cache it over the new one.
+    writes: u64,
+}
+
+impl Cache {
+    /// Records that a write of `key` is starting, returning the value of
+    /// [`Self::writes`] it must still find to cache its outcome.
+    fn start_write(&mut self, key: &str) -> u64 {
+        self.values.remove(key);
+        self.writes += 1;
+        self.writes
+    }
+
+    /// Caches `value` for `key`, unless a write started after `writes`.
+    fn insert_unless_written(&mut self, key: &str, writes: u64, value: Option<&str>) {
+        if self.writes == writes {
+            self.values.insert(
+                key.to_string(),
+                value.map(|value| Zeroizing::new(value.to_string())),
+            );
+        }
+    }
 }
 
 impl<S: Storage, D: Storage> SecretsClient<S, D> {
@@ -38,11 +69,11 @@ impl<S: Storage, D: Storage> SecretsClient<S, D> {
         Self {
             secure,
             database,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(Cache::default()),
         }
     }
 
-    fn cache(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<Zeroizing<String>>>> {
+    fn cache(&self) -> std::sync::MutexGuard<'_, Cache> {
         self.cache.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
@@ -50,9 +81,13 @@ impl<S: Storage, D: Storage> SecretsClient<S, D> {
 #[async_trait]
 impl<S: Storage, D: Storage> Service for SecretsClient<S, D> {
     async fn get(&self, key: &str) -> Result<Option<String>> {
-        if let Some(cached) = self.cache().get(key) {
-            return Ok(cached.as_deref().cloned());
-        }
+        let writes = {
+            let cache = self.cache();
+            if let Some(cached) = cache.values.get(key) {
+                return Ok(cached.as_deref().cloned());
+            }
+            cache.writes
+        };
 
         // A credential store that fails to answer is treated like one that
         // doesn't hold `key`: on a device without a usable one, that's every
@@ -62,7 +97,7 @@ impl<S: Storage, D: Storage> Service for SecretsClient<S, D> {
             match secure.get(key).await {
                 Ok(Some(value)) => {
                     self.cache()
-                        .insert(key.to_string(), Some(Zeroizing::new(value.clone())));
+                        .insert_unless_written(key, writes, Some(&value));
                     return Ok(Some(value));
                 }
                 Ok(None) => {}
@@ -84,14 +119,14 @@ impl<S: Storage, D: Storage> Service for SecretsClient<S, D> {
         // store that comes back later is read again.
         if value.is_some() || !secure_failed {
             self.cache()
-                .insert(key.to_string(), value.clone().map(Zeroizing::new));
+                .insert_unless_written(key, writes, value.as_deref());
         }
         Ok(value)
     }
 
     async fn set(&self, key: &str, value: &str, location: SecretLocation) -> Result<()> {
         // Dropped first, so a failed write never leaves a stale cached value.
-        self.cache().remove(key);
+        let writes = self.cache().start_write(key);
         match location {
             SecretLocation::SecureStorage => match &self.secure {
                 Some(secure) => secure.set(key, value).await,
@@ -100,13 +135,12 @@ impl<S: Storage, D: Storage> Service for SecretsClient<S, D> {
             SecretLocation::Database => self.database.set(key, value).await,
         }
         .with_context(|| format!("failed to store secret {key:?}"))?;
-        self.cache()
-            .insert(key.to_string(), Some(Zeroizing::new(value.to_string())));
+        self.cache().insert_unless_written(key, writes, Some(value));
         Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        self.cache().remove(key);
+        let writes = self.cache().start_write(key);
         let from_database =
             self.database.delete(key).await.with_context(|| {
                 format!("failed to delete secret {key:?} from the local database")
@@ -125,7 +159,7 @@ impl<S: Storage, D: Storage> Service for SecretsClient<S, D> {
             None => Ok(()),
         };
         from_database.and(from_secure)?;
-        self.cache().insert(key.to_string(), None);
+        self.cache().insert_unless_written(key, writes, None);
         Ok(())
     }
 
@@ -151,6 +185,8 @@ impl<S: Storage, D: Storage> Service for SecretsClient<S, D> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use mockall::predicate::eq;
 
     use super::super::storage::MockStorage;
@@ -367,6 +403,89 @@ mod tests {
         );
 
         assert_eq!(client.get(MASTER_KEY_SECRET).await.unwrap(), None);
+    }
+
+    /// A `get` whose credential store read blocks until `release` is
+    /// called, returning `value` then; `started` is signalled once the read
+    /// has begun, so the test can write the key meanwhile.
+    fn blocked_read(
+        secure: &mut MockStorage,
+        value: &str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let value = value.to_string();
+        secure
+            .expect_get()
+            .with(eq(SESSION_TOKEN_SECRET))
+            .times(1)
+            .return_once(move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(Some(value))
+            });
+        (started_rx, release_tx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_racing_a_delete_does_not_cache_what_it_read() {
+        let mut secure = MockStorage::new();
+        let (started, release) = blocked_read(&mut secure, "a-token");
+        secure.expect_delete().times(1).return_once(|_| Ok(()));
+        let mut database = MockStorage::new();
+        database.expect_delete().times(1).return_once(|_| Ok(()));
+        let client = Arc::new(SecretsClient::new(Some(secure), database));
+        let reader = tokio::spawn({
+            let client = client.clone();
+            async move { client.get(SESSION_TOKEN_SECRET).await }
+        });
+        tokio::task::spawn_blocking(move || started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        client.delete(SESSION_TOKEN_SECRET).await.unwrap();
+        release.send(()).unwrap();
+        reader.await.unwrap().unwrap();
+
+        // Answered from the cache: the mocks expect no other read.
+        assert_eq!(client.get(SESSION_TOKEN_SECRET).await.unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_racing_a_set_does_not_cache_the_old_value() {
+        let mut secure = MockStorage::new();
+        let (started, release) = blocked_read(&mut secure, "old-token");
+        secure
+            .expect_set()
+            .with(eq(SESSION_TOKEN_SECRET), eq("new-token"))
+            .times(1)
+            .return_once(|_, _| Ok(()));
+        let client = Arc::new(SecretsClient::new(Some(secure), MockStorage::new()));
+        let reader = tokio::spawn({
+            let client = client.clone();
+            async move { client.get(SESSION_TOKEN_SECRET).await }
+        });
+        tokio::task::spawn_blocking(move || started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        client
+            .set(
+                SESSION_TOKEN_SECRET,
+                "new-token",
+                SecretLocation::SecureStorage,
+            )
+            .await
+            .unwrap();
+        release.send(()).unwrap();
+        reader.await.unwrap().unwrap();
+
+        assert_eq!(
+            client.get(SESSION_TOKEN_SECRET).await.unwrap(),
+            Some("new-token".to_string())
+        );
     }
 
     #[tokio::test]
