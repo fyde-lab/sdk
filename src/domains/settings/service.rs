@@ -125,7 +125,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_call_the_storage() {
+    async fn set_stores_the_value() {
         let mut storage = MockStorage::new();
         storage
             .expect_set()
