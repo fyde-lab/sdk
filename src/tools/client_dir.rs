@@ -27,7 +27,8 @@ pub(crate) enum ClientDirectory {
         /// for the rest of the process's lifetime, which deleting would
         /// orphan rather than free — the database (emptied by its own
         /// `wipe` instead, see [`crate::tools::sql::SqliteClient::wipe`])
-        /// and the changelog lock other processes may be holding.
+        /// with its journal files, and the instance lock file the `Client`
+        /// holds (`fyde.db.lock`, see `crate::lock_instance`).
         keep: Vec<PathBuf>,
     },
     Memory,
