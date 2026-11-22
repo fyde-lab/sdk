@@ -77,12 +77,17 @@ pub trait Service: Send + Sync {
     /// `request.installation_id` is `None` (a user can install the same
     /// script several times, once per account on its site), else replacing
     /// that installation, which is how its parameters, label or folder
-    /// change. Fetches the script (see
-    /// [`Self::fetch_script`]), then serializes it together with the
-    /// installation's id, label, parameters and folder as an
-    /// [`InstalledScript`] JSON document and publishes it, encrypted, as an
-    /// `InstallScript` changelog event whose subject is the installation id,
-    /// which it returns. Fails with [`crate::ErrorCode::FolderNotFound`] for
+    /// change. Fetches the script (see [`Self::fetch_script`]), then
+    /// publishes, encrypted, changelog events whose subject is the
+    /// installation id, which it returns: a `ScriptInstalled` event
+    /// carrying the script with the installation's label, parameters and
+    /// folder for a new installation (or one not synced here yet); else one
+    /// event per change to the installation synced here, in turn, each
+    /// carrying only what it changes (`InstallationUpgraded` for another
+    /// script version,
+    /// `InstallationCredentialsUpdated` for new parameters,
+    /// `InstallationRenamed` for a new label, `InstallationFolderChanged`
+    /// for a new folder), and none if nothing changed. Fails with [`crate::ErrorCode::FolderNotFound`] for
     /// a folder not synced here (one deleted later only makes runs file
     /// automatically), with
     /// [`crate::ErrorCode::MissingScriptParameter`] if a parameter the script
@@ -102,8 +107,8 @@ pub trait Service: Send + Sync {
     /// script on the server: callers do, with [`Self::enable_script`].
     async fn install_script(&self, request: InstallScriptRequest) -> Result<Uuid>;
 
-    /// Uninstalls installation `installation_id`: publishes an
-    /// `UninstallScript` changelog event. Consuming it deletes the
+    /// Uninstalls installation `installation_id`: publishes a
+    /// `ScriptUninstalled` changelog event. Consuming it deletes the
     /// installation and every scraper state kept under it (session,
     /// cookies, debug reports) on each device. No local check, so an
     /// installation that hasn't synced here yet can be uninstalled. Doesn't

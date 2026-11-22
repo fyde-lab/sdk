@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::domains::changelog::{EventType, Service as ChangelogService};
+use crate::domains::changelog::{Change, Service as ChangelogService};
 use crate::domains::folders::Service as FoldersService;
 use crate::{ErrorContext as _, ErrorKind, Result};
 
@@ -27,7 +27,9 @@ where
     let mut scripts = Vec::new();
     let mut page_token = None;
     loop {
-        let page = list_page(page_token).await?;
+        let page = list_page(page_token)
+            .await
+            .context("failed to list a page of scripts")?;
         scripts.extend(page.scripts);
         match page.next_page_token {
             Some(next_page_token) => page_token = Some(next_page_token),
@@ -64,26 +66,55 @@ impl<S: Storage> ScriptsClient<S> {
     }
 }
 
+impl<S: Storage> ScriptsClient<S> {
+    /// Publishes `change` to installation `installation_id` of script
+    /// `script_id`.
+    async fn publish(&self, installation_id: Uuid, script_id: Uuid, change: Change) -> Result<()> {
+        let event_type = change.event_type();
+        self.changelog
+            .send(installation_id, &change)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to publish {event_type:?} for installation {installation_id} of script {script_id}"
+                )
+            })
+    }
+}
+
 #[async_trait]
 impl<S: Storage> Service for ScriptsClient<S> {
     async fn fetch_script(&self, id: Uuid) -> Result<Script> {
-        self.grpc.fetch_script(id).await
+        self.grpc
+            .fetch_script(id)
+            .await
+            .with_context(|| format!("failed to fetch script {id}"))
     }
 
     async fn enable_script(&self, script_id: Uuid) -> Result<()> {
-        self.grpc.enable_script(script_id).await
+        self.grpc
+            .enable_script(script_id)
+            .await
+            .with_context(|| format!("failed to enable script {script_id}"))
     }
 
     async fn disable_script(&self, script_id: Uuid) -> Result<()> {
-        self.grpc.disable_script(script_id).await
+        self.grpc
+            .disable_script(script_id)
+            .await
+            .with_context(|| format!("failed to disable script {script_id}"))
     }
 
     async fn list_user_scripts(&self) -> Result<Vec<ScriptMetadata>> {
-        all_pages(|page_token| self.grpc.list_user_scripts(page_token)).await
+        all_pages(|page_token| self.grpc.list_user_scripts(page_token))
+            .await
+            .context("failed to list the user's scripts")
     }
 
     async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>> {
-        all_pages(|page_token| self.grpc.list_public_scripts(page_token)).await
+        all_pages(|page_token| self.grpc.list_public_scripts(page_token))
+            .await
+            .context("failed to list the public scripts")
     }
 
     async fn install_script(&self, request: InstallScriptRequest) -> Result<Uuid> {
@@ -146,38 +177,79 @@ impl<S: Storage> Service for ScriptsClient<S> {
         let label = match label.trim() {
             "" => default_label(&script, &parameters),
             label => {
-                check_label(label)?;
+                check_label(label).context("refused the installation's label")?;
                 label.to_string()
             }
         };
-        let installation_id = installation_id.unwrap_or_else(Uuid::now_v7);
+        let previous = match installation_id {
+            Some(installation_id) => self
+                .storage
+                .find_installed_script(installation_id)
+                .await
+                .with_context(|| {
+                    format!("failed to load installation {installation_id} to replace it")
+                })?,
+            None => None,
+        };
 
-        let content = serde_json::to_vec(&InstalledScript {
-            installation_id,
-            label,
-            script,
-            parameters,
-            folder_id,
-        })
-        .with_context(|| format!("failed to serialize installation {installation_id}"))?;
-
-        self.changelog
-            .send(
-                EventType::InstallScript,
+        let Some(current) = previous else {
+            // A new installation, or one not synced here yet: published
+            // whole.
+            let installation_id = installation_id.unwrap_or_else(Uuid::now_v7);
+            self.publish(
                 installation_id,
-                Some(&content),
-                None,
+                script_id,
+                Change::ScriptInstalled {
+                    label,
+                    script,
+                    parameters,
+                    folder_id,
+                },
             )
-            .await
-            .with_context(|| {
-                format!("failed to publish installation {installation_id} of script {script_id}")
-            })?;
+            .await?;
+            return Ok(installation_id);
+        };
+
+        // One event per action, each carrying only what it changes.
+        let installation_id = current.installation_id;
+        if current.script.id() != script.id() || current.script.version() != script.version() {
+            self.publish(
+                installation_id,
+                script_id,
+                Change::InstallationUpgraded { script },
+            )
+            .await?;
+        }
+        if current.parameters != parameters {
+            self.publish(
+                installation_id,
+                script_id,
+                Change::InstallationCredentialsUpdated { parameters },
+            )
+            .await?;
+        }
+        if current.label != label {
+            self.publish(
+                installation_id,
+                script_id,
+                Change::InstallationRenamed { label },
+            )
+            .await?;
+        }
+        if current.folder_id != folder_id {
+            self.publish(
+                installation_id,
+                script_id,
+                Change::InstallationFolderChanged { folder_id },
+            )
+            .await?;
+        }
         Ok(installation_id)
     }
 
     async fn uninstall_script(&self, installation_id: Uuid) -> Result<()> {
         self.changelog
-            .send(EventType::UninstallScript, installation_id, None, None)
+            .send(installation_id, &Change::ScriptUninstalled)
             .await
             .with_context(|| format!("failed to publish uninstallation {installation_id}"))
     }
@@ -265,7 +337,6 @@ mod tests {
 
     use super::*;
     use crate::domains::changelog::ChangelogEvent;
-    use crate::domains::documents::Metadata;
     use crate::domains::folders::{
         FakeFolder, MockService as MockFoldersService, folders_listing, no_folders,
     };
@@ -277,7 +348,7 @@ mod tests {
     };
 
     /// A single `send` call recorded by [`RecordingChangelog`].
-    type SentEvent = (EventType, Uuid, Option<Vec<u8>>, Option<Metadata>);
+    type SentEvent = (Uuid, Change);
 
     /// A [`ChangelogService`] fake recording every event passed to
     /// [`ChangelogService::send`]. Hand-written rather than `automock`ed
@@ -294,19 +365,8 @@ mod tests {
             unimplemented!("not used by the scripts service")
         }
 
-        async fn send(
-            &self,
-            event_type: EventType,
-            subject_id: Uuid,
-            content: Option<&[u8]>,
-            metadata: Option<&Metadata>,
-        ) -> Result<()> {
-            self.sent.lock().unwrap().push((
-                event_type,
-                subject_id,
-                content.map(<[u8]>::to_vec),
-                metadata.cloned(),
-            ));
+        async fn send(&self, subject_id: Uuid, change: &Change) -> Result<()> {
+            self.sent.lock().unwrap().push((subject_id, change.clone()));
             Ok(())
         }
 
@@ -362,15 +422,22 @@ mod tests {
     }
 
     /// The installation `changelog` recorded as the one event it was sent,
-    /// an `InstallScript` for `installation_id` without metadata.
+    /// a `ScriptInstalled` for `installation_id` without metadata.
     fn sent_installation(changelog: &RecordingChangelog, installation_id: Uuid) -> InstalledScript {
         let sent = changelog.sent.lock().unwrap();
         assert_eq!(sent.len(), 1);
-        let (event_type, id, content, metadata) = &sent[0];
-        assert_eq!(*event_type, EventType::InstallScript);
+        let (id, change) = &sent[0];
         assert_eq!(*id, installation_id);
-        assert_eq!(*metadata, None);
-        serde_json::from_slice(content.as_deref().unwrap()).unwrap()
+        let Change::ScriptInstalled {
+            label,
+            script,
+            parameters,
+            folder_id,
+        } = change.clone()
+        else {
+            panic!("not an installation: {change:?}");
+        };
+        InstalledScript::new(*id, label, script, parameters, folder_id)
     }
 
     #[tokio::test]
@@ -434,14 +501,29 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    /// A storage holding `installed`, found by its installation id.
+    fn storage_holding(installed: InstalledScript) -> MockStorage {
+        let mut storage = MockStorage::new();
+        let id = installed.installation_id();
+        storage
+            .expect_find_installed_script()
+            .withf(move |queried| *queried == id)
+            .returning(move |_| Ok(Some(installed.clone())));
+        storage
+    }
+
     #[tokio::test]
-    async fn install_script_replaces_the_given_installation() {
+    async fn install_script_publishes_an_installation_not_synced_here_whole() {
         let script = FakeScript::new().build();
         let existing = Uuid::now_v7();
+        let mut storage = MockStorage::new();
+        storage
+            .expect_find_installed_script()
+            .returning(|_| Ok(None));
         let changelog = Arc::new(RecordingChangelog::default());
         let client = ScriptsClient::new(
             grpc_fetching(script.clone()),
-            MockStorage::new(),
+            storage,
             changelog.clone(),
             unused_folders(),
         );
@@ -462,6 +544,141 @@ mod tests {
             sent_installation(&changelog, existing).installation_id(),
             existing
         );
+    }
+
+    #[tokio::test]
+    async fn install_script_publishes_one_event_per_change_to_an_installation() {
+        let old_script = FakeScript::new().with_version(1).build();
+        let new_script = FakeScript::new()
+            .with_id(old_script.id())
+            .with_version(2)
+            .build();
+        let folder = FakeFolder::new().build();
+        let installed = FakeInstalledScript::new()
+            .with_script(old_script)
+            .with_label("Marie")
+            .with_parameters(HashMap::from([("username".to_string(), json!("marie"))]))
+            .build();
+        let installation_id = installed.installation_id();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = ScriptsClient::new(
+            grpc_fetching(new_script.clone()),
+            storage_holding(installed.clone()),
+            changelog.clone(),
+            folders_listing(vec![folder.clone()]),
+        );
+        let parameters = HashMap::from([("username".to_string(), json!("marie.dupont"))]);
+
+        let returned = client
+            .install_script(InstallScriptRequest {
+                installation_id: Some(installation_id),
+                script_id: new_script.id(),
+                label: "Marie D.".to_string(),
+                parameters: parameters.clone(),
+                folder_id: Some(folder.id),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(returned, installation_id);
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(
+            *sent,
+            vec![
+                (
+                    installation_id,
+                    Change::InstallationUpgraded { script: new_script }
+                ),
+                (
+                    installation_id,
+                    Change::InstallationCredentialsUpdated { parameters }
+                ),
+                (
+                    installation_id,
+                    Change::InstallationRenamed {
+                        label: "Marie D.".to_string()
+                    }
+                ),
+                (
+                    installation_id,
+                    Change::InstallationFolderChanged {
+                        folder_id: Some(folder.id)
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn install_script_publishes_only_what_changed_in_an_installation() {
+        let script = FakeScript::new().build();
+        let installed = FakeInstalledScript::new()
+            .with_script(script.clone())
+            .with_label("Marie")
+            .with_parameters(HashMap::new())
+            .build();
+        let installation_id = installed.installation_id();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = ScriptsClient::new(
+            grpc_fetching(script.clone()),
+            storage_holding(installed.clone()),
+            changelog.clone(),
+            unused_folders(),
+        );
+
+        client
+            .install_script(InstallScriptRequest {
+                installation_id: Some(installation_id),
+                script_id: script.id(),
+                label: "Compte pro".to_string(),
+                parameters: HashMap::new(),
+                folder_id: installed.folder_id(),
+            })
+            .await
+            .unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(
+            *sent,
+            vec![(
+                installation_id,
+                Change::InstallationRenamed {
+                    label: "Compte pro".to_string()
+                }
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn install_script_changing_nothing_publishes_nothing() {
+        let script = FakeScript::new().build();
+        let installed = FakeInstalledScript::new()
+            .with_script(script.clone())
+            .with_label("Marie")
+            .with_parameters(HashMap::new())
+            .build();
+        let installation_id = installed.installation_id();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = ScriptsClient::new(
+            grpc_fetching(script.clone()),
+            storage_holding(installed.clone()),
+            changelog.clone(),
+            unused_folders(),
+        );
+
+        let returned = client
+            .install_script(InstallScriptRequest {
+                installation_id: Some(installation_id),
+                script_id: script.id(),
+                label: "Marie".to_string(),
+                parameters: HashMap::new(),
+                folder_id: installed.folder_id(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(returned, installation_id);
+        assert!(changelog.sent.lock().unwrap().is_empty());
     }
 
     /// Installs a script with `parameters` declared as `declared`, under a
@@ -659,10 +876,7 @@ mod tests {
         client.uninstall_script(installation_id).await.unwrap();
 
         let sent = changelog.sent.lock().unwrap();
-        assert_eq!(
-            *sent,
-            vec![(EventType::UninstallScript, installation_id, None, None)]
-        );
+        assert_eq!(*sent, vec![(installation_id, Change::ScriptUninstalled)]);
     }
 
     #[tokio::test]

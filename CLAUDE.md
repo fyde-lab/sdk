@@ -48,8 +48,11 @@ encrypts/decrypts, storage adapters (`storage_sqlite.rs`, `SqliteClient`) only r
   because older clients then fail to decode the whole metadata.
 - `Metadata` is positional MessagePack (`MetadataWire`, which keeps slots for removed fields):
   never remove a field, and give new fields `#[serde(default)]`.
-- Changelog event payloads must keep decoding forever, e.g. never add `deny_unknown_fields` to
-  `Folder` (old `SaveFolder` events carry a `description`).
+- Changelog event payloads must keep decoding forever. `EventType` has one variant per action
+  (`DocumentUploaded`, `FolderRenamed`, `InstallationCredentialsUpdated`...), and each event's
+  `changelog::Change` carries only the fields its action changes (positional MessagePack: never
+  reorder a variant's fields), so the consumer patches local state; a call doing several actions
+  publishes one event per action.
 
 **Security invariants:**
 - Every authenticated gRPC call goes through `sessions::authenticated_request` **and**
@@ -168,7 +171,7 @@ methods, used behind `Arc<dyn Service>`), `models.rs`, `service.rs` and adapters
   server, where the plan quota is also enforced. Writing scripts and icons is admin-only and not
   in this SDK. A script can be installed several times (one *installation* per site account,
   each with its own id, label and optional `folder_id`), published as
-  `InstallScript`/`UninstallScript` events. A string `ScriptParameter` may carry `choices`, and
+  `ScriptInstalled`/`Installation*`/`ScriptUninstalled` events. A string `ScriptParameter` may carry `choices`, and
   `install_script` refuses a value outside them (`InvalidScriptParameterChoice` 5013). Callers
   enable a script on install and disable it once its last installation is gone.
 - **scrapers**: Lua runs. `mlua::Lua` is `!Send`, so a VM is built inside `spawn_blocking` and

@@ -2,8 +2,8 @@
 //! Latin recognition, Apache-2.0, ONNX) through `oar-ocr`, on the SDK's
 //! ONNX Runtime: the [`Ocr`] adapter. Ported from the POC's
 //! `pdf-ocr-core` (`fast_ocr.rs`), whose settings it keeps. Recognized lines
-//! are laid out with the text layer's grid ([`super::layout_boxes`]). What to
-//! OCR is up to the caller.
+//! are laid out with the text layer's grid
+//! ([`super::text_layer::layout_boxes`]). What to OCR is up to the caller.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -102,7 +102,10 @@ impl Ocr for OnnxOcr {
     }
 
     async fn read(&self, page: PageImage) -> Result<String> {
-        let ocr = self.loaded().await?;
+        let ocr = self
+            .loaded()
+            .await
+            .context("failed to prepare the OCR pipeline")?;
 
         tokio::task::spawn_blocking(move || read(&ocr, page))
             .await

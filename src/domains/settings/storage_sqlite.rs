@@ -78,18 +78,18 @@ mod tests {
     async fn get_returns_none_when_never_set() {
         let storage = setup().await;
 
-        assert_eq!(storage.get("auth_token").await.unwrap(), None);
+        assert_eq!(storage.get("theme").await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn set_then_get_returns_the_stored_value() {
         let storage = setup().await;
 
-        storage.set("auth_token", "a-token").await.unwrap();
+        storage.set("theme", "dark").await.unwrap();
 
         assert_eq!(
-            storage.get("auth_token").await.unwrap(),
-            Some("a-token".to_string())
+            storage.get("theme").await.unwrap(),
+            Some("dark".to_string())
         );
     }
 
@@ -97,12 +97,12 @@ mod tests {
     async fn set_overwrites_a_previously_stored_value() {
         let storage = setup().await;
 
-        storage.set("auth_token", "old-token").await.unwrap();
-        storage.set("auth_token", "new-token").await.unwrap();
+        storage.set("theme", "light").await.unwrap();
+        storage.set("theme", "dark").await.unwrap();
 
         assert_eq!(
-            storage.get("auth_token").await.unwrap(),
-            Some("new-token".to_string())
+            storage.get("theme").await.unwrap(),
+            Some("dark".to_string())
         );
     }
 
@@ -110,35 +110,35 @@ mod tests {
     async fn distinct_keys_are_stored_independently() {
         let storage = setup().await;
 
-        storage.set("auth_token", "a-token").await.unwrap();
-        storage.set("master_key", "a-key").await.unwrap();
+        storage.set("theme", "dark").await.unwrap();
+        storage.set("language", "fr").await.unwrap();
 
         assert_eq!(
-            storage.get("auth_token").await.unwrap(),
-            Some("a-token".to_string())
+            storage.get("theme").await.unwrap(),
+            Some("dark".to_string())
         );
         assert_eq!(
-            storage.get("master_key").await.unwrap(),
-            Some("a-key".to_string())
+            storage.get("language").await.unwrap(),
+            Some("fr".to_string())
         );
     }
 
     #[tokio::test]
     async fn delete_removes_the_stored_value() {
         let storage = setup().await;
-        storage.set("auth_token", "a-token").await.unwrap();
+        storage.set("theme", "dark").await.unwrap();
 
-        storage.delete("auth_token").await.unwrap();
+        storage.delete("theme").await.unwrap();
 
-        assert_eq!(storage.get("auth_token").await.unwrap(), None);
+        assert_eq!(storage.get("theme").await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn delete_is_a_no_op_when_never_set() {
         let storage = setup().await;
 
-        storage.delete("auth_token").await.unwrap();
+        storage.delete("theme").await.unwrap();
 
-        assert_eq!(storage.get("auth_token").await.unwrap(), None);
+        assert_eq!(storage.get("theme").await.unwrap(), None);
     }
 }

@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::{ErrorCode, ErrorContext as _, ErrorKind, Result};
 
 use crate::domains::changelog::{
-    ChangelogEvent, EventType, MAX_EVENT_BYTES, Service as ChangelogService, SyncProgress,
+    Change, ChangelogEvent, MAX_EVENT_BYTES, Service as ChangelogService, SyncProgress,
 };
 use crate::domains::folders::{Folder, Service as FoldersService};
 
@@ -269,6 +269,15 @@ impl<S: Storage> DocumentsClient<S> {
             .check(&metadata.attributes)
             .await
             .context("invalid document attributes")
+    }
+
+    /// Publishes `change` to document `id`.
+    async fn publish(&self, id: Uuid, change: Change) -> Result<()> {
+        let event_type = change.event_type();
+        self.changelog
+            .send(id, &change)
+            .await
+            .with_context(|| format!("failed to publish {event_type:?} for document {id}"))
     }
 
     /// Embeds an uploaded document's text exactly as [`DocumentIndexer`]
@@ -760,7 +769,7 @@ impl<S: Storage> Service for DocumentsClient<S> {
         });
 
         self.changelog
-            .send(EventType::SaveDocument, id, Some(&content), Some(&metadata))
+            .send(id, &Change::DocumentUploaded { content, metadata })
             .instrument(tracing::debug_span!("publish_event"))
             .await
             .with_context(|| format!("failed to publish changelog event for document {id}"))?;
@@ -997,12 +1006,42 @@ impl<S: Storage> Service for DocumentsClient<S> {
         self.check_metadata(&metadata)
             .await
             .with_context(|| format!("invalid metadata for document {id}"))?;
-
-        self.changelog
-            .send(EventType::UpdateMetadata, id, None, Some(&metadata))
+        let current = self
+            .storage
+            .get_metadata(id)
             .await
-            .with_context(|| format!("failed to publish changelog event for document {id}"))?;
+            .with_context(|| format!("failed to load document {id}'s metadata"))?
+            .ok_or(ErrorKind::DocumentNotFound(id))?;
 
+        // One event per action, each carrying only what it changes.
+        if current.name != metadata.name {
+            self.publish(
+                id,
+                Change::DocumentRenamed {
+                    name: metadata.name,
+                },
+            )
+            .await?;
+        }
+        if current.r#type != metadata.r#type || current.attributes != metadata.attributes {
+            self.publish(
+                id,
+                Change::DocumentAttributesUpdated {
+                    r#type: metadata.r#type,
+                    attributes: metadata.attributes,
+                },
+            )
+            .await?;
+        }
+        if current.folder_id != metadata.folder_id {
+            self.publish(
+                id,
+                Change::DocumentMoved {
+                    folder_id: metadata.folder_id,
+                },
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -1017,12 +1056,15 @@ impl<S: Storage> Service for DocumentsClient<S> {
             return Ok(());
         }
         metadata.folder_id = folder_id;
-        self.update_metadata(metadata).await
+        self.check_metadata(&metadata)
+            .await
+            .with_context(|| format!("invalid metadata for document {id}"))?;
+        self.publish(id, Change::DocumentMoved { folder_id }).await
     }
 
     async fn delete(&self, id: Uuid) -> Result<()> {
         self.changelog
-            .send(EventType::Deleted, id, None, None)
+            .send(id, &Change::DocumentDeleted)
             .await
             .with_context(|| format!("failed to publish the deletion of document {id}"))
     }
@@ -1859,8 +1901,21 @@ mod tests {
         );
     }
 
-    /// A single `send` call recorded by [`RecordingChangelog`].
-    type SentEvent = (EventType, Uuid, Option<Vec<u8>>, Option<Metadata>);
+    /// A single `send` call recorded by [`RecordingChangelog`]:
+    /// `(subject_id, change)`.
+    type SentEvent = (Uuid, Change);
+
+    impl RecordingChangelog {
+        /// The one upload published: its document's id, content and
+        /// metadata.
+        fn upload(&self) -> (Uuid, Vec<u8>, Metadata) {
+            let sent = self.sent.lock().unwrap();
+            let [(id, Change::DocumentUploaded { content, metadata })] = &sent[..] else {
+                panic!("not one upload: {sent:?}");
+            };
+            (*id, content.clone(), metadata.clone())
+        }
+    }
 
     /// A [`ChangelogService`] fake recording every event passed to
     /// [`ChangelogService::send`], and replaying `to_consume` through
@@ -1897,19 +1952,8 @@ mod tests {
             Ok(())
         }
 
-        async fn send(
-            &self,
-            event_type: EventType,
-            subject_id: Uuid,
-            content: Option<&[u8]>,
-            metadata: Option<&Metadata>,
-        ) -> Result<()> {
-            self.sent.lock().unwrap().push((
-                event_type,
-                subject_id,
-                content.map(<[u8]>::to_vec),
-                metadata.cloned(),
-            ));
+        async fn send(&self, subject_id: Uuid, change: &Change) -> Result<()> {
+            self.sent.lock().unwrap().push((subject_id, change.clone()));
             if self.fail_send {
                 return Err(ErrorKind::InvalidChangelogEvent("refused".to_string()).into());
             }
@@ -1991,13 +2035,9 @@ mod tests {
             .await
             .unwrap();
 
-        let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        let (event_type, document_id, content, sent_metadata) = &sent[0];
-        assert_eq!(*event_type, EventType::SaveDocument);
-        assert_eq!(*document_id, id);
-        assert_eq!(content.as_deref(), Some(pdf.as_slice()));
-        let sent_metadata = sent_metadata.as_ref().unwrap();
+        let (document_id, content, sent_metadata) = changelog.upload();
+        assert_eq!(document_id, id);
+        assert_eq!(content, pdf);
         assert_eq!(sent_metadata.id, id);
         assert_eq!(sent_metadata.original_name, file_name);
         assert_eq!(sent_metadata.name, file_name.strip_suffix(".pdf").unwrap());
@@ -2148,10 +2188,7 @@ mod tests {
 
         client.upload(request).await.unwrap();
 
-        let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        let (_, _, _, sent_metadata) = &sent[0];
-        let sent_metadata = sent_metadata.as_ref().unwrap();
+        let (_, _, sent_metadata) = changelog.upload();
         assert_eq!(sent_metadata.original_name, "raw.pdf");
         assert_eq!(sent_metadata.name, "overridden.pdf");
     }
@@ -2184,9 +2221,162 @@ mod tests {
 
     #[tokio::test]
     async fn update_metadata_publishes_the_given_attributes() {
+        let cached = super::super::FakeMetadata::new()
+            .with_attributes(BTreeMap::new())
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_moving(cached.clone(), Vec::new(), changelog.clone());
+        let attributes = BTreeMap::from([("price".to_string(), Attribute::Float(32.3))]);
+
+        client
+            .update_metadata(Metadata {
+                attributes: attributes.clone(),
+                ..cached
+            })
+            .await
+            .unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(
+            *sent,
+            vec![(
+                cached.id,
+                Change::DocumentAttributesUpdated {
+                    r#type: cached.r#type,
+                    attributes,
+                }
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_metadata_publishes_a_type_change_as_an_attributes_update() {
+        let cached = super::super::FakeMetadata::new()
+            .with_type(DocumentType::Invoice)
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_moving(cached.clone(), Vec::new(), changelog.clone());
+
+        client
+            .update_metadata(Metadata {
+                r#type: Some(DocumentType::Payslip),
+                ..cached.clone()
+            })
+            .await
+            .unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(
+            *sent,
+            vec![(
+                cached.id,
+                Change::DocumentAttributesUpdated {
+                    r#type: Some(DocumentType::Payslip),
+                    attributes: cached.attributes,
+                }
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_metadata_publishes_one_event_per_action_each_with_the_metadata_so_far() {
+        let folder = FakeFolder::new().build();
+        let cached = super::super::FakeMetadata::new()
+            .with_name("old.pdf")
+            .with_attributes(BTreeMap::new())
+            .with_folder(None)
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_moving(cached.clone(), vec![folder.clone()], changelog.clone());
+        let attributes =
+            BTreeMap::from([("reference".to_string(), Attribute::String("F-42".into()))]);
+
+        client
+            .update_metadata(Metadata {
+                name: "new.pdf".to_string(),
+                attributes: attributes.clone(),
+                folder_id: Some(folder.id),
+                ..cached.clone()
+            })
+            .await
+            .unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(
+            *sent,
+            vec![
+                (
+                    cached.id,
+                    Change::DocumentRenamed {
+                        name: "new.pdf".to_string()
+                    }
+                ),
+                (
+                    cached.id,
+                    Change::DocumentAttributesUpdated {
+                        r#type: cached.r#type,
+                        attributes,
+                    }
+                ),
+                (
+                    cached.id,
+                    Change::DocumentMoved {
+                        folder_id: Some(folder.id)
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_metadata_keeps_the_cached_documents_other_fields() {
+        let cached = super::super::FakeMetadata::new()
+            .with_name("old.pdf")
+            .with_transcript("cached text")
+            .build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_moving(cached.clone(), Vec::new(), changelog.clone());
+
+        client
+            .update_metadata(Metadata {
+                name: "new.pdf".to_string(),
+                transcript: "other text".to_string(),
+                size: cached.size + 1,
+                ..cached.clone()
+            })
+            .await
+            .unwrap();
+
+        let sent = changelog.sent.lock().unwrap();
+        assert_eq!(
+            *sent,
+            vec![(
+                cached.id,
+                Change::DocumentRenamed {
+                    name: "new.pdf".to_string()
+                }
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_metadata_with_nothing_changed_publishes_nothing() {
+        let cached = super::super::FakeMetadata::new().with_folder(None).build();
+        let changelog = Arc::new(RecordingChangelog::default());
+        let client = client_moving(cached.clone(), Vec::new(), changelog.clone());
+
+        client.update_metadata(cached).await.unwrap();
+
+        assert!(changelog.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_metadata_rejects_a_document_not_synced_here() {
+        let mut storage = MockStorage::new();
+        storage.expect_get_metadata().returning(|_| Ok(None));
         let changelog = Arc::new(RecordingChangelog::default());
         let client = DocumentsClient::new(
-            MockStorage::new(),
+            storage,
             changelog.clone(),
             None,
             accepting_attributes(),
@@ -2198,15 +2388,12 @@ mod tests {
             no_ocr(),
             finding_no_attributes(),
         );
-        let attributes = BTreeMap::from([("price".to_string(), Attribute::Float(32.3))]);
-        let metadata = super::super::FakeMetadata::new()
-            .with_attributes(attributes.clone())
-            .build();
+        let metadata = super::super::FakeMetadata::new().with_folder(None).build();
 
-        client.update_metadata(metadata).await.unwrap();
+        let err = client.update_metadata(metadata).await.unwrap_err();
 
-        let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent[0].3.as_ref().unwrap().attributes, attributes);
+        assert_eq!(err.code(), crate::ErrorCode::DocumentNotFound);
+        assert!(changelog.sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2276,14 +2463,14 @@ mod tests {
             .unwrap();
 
         let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].0, EventType::UpdateMetadata);
         assert_eq!(
-            sent[0].3.as_ref().unwrap(),
-            &Metadata {
-                folder_id: Some(folder.id),
-                ..metadata
-            }
+            *sent,
+            vec![(
+                metadata.id,
+                Change::DocumentMoved {
+                    folder_id: Some(folder.id)
+                }
+            )]
         );
     }
 
@@ -2299,12 +2486,8 @@ mod tests {
         client.move_document(metadata.id, None).await.unwrap();
 
         assert_eq!(
-            changelog.sent.lock().unwrap()[0]
-                .3
-                .as_ref()
-                .unwrap()
-                .folder_id,
-            None
+            *changelog.sent.lock().unwrap(),
+            vec![(metadata.id, Change::DocumentMoved { folder_id: None })]
         );
     }
 
@@ -3416,37 +3599,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_metadata_publishes_an_update_metadata_event_with_the_given_metadata() {
-        let metadata = super::super::FakeMetadata::new()
-            .with_name("new.pdf")
+    async fn update_metadata_publishes_a_new_name_as_a_document_renamed_event() {
+        let cached = super::super::FakeMetadata::new()
+            .with_name("old.pdf")
             .build();
-        let id = metadata.id;
-
+        let id = cached.id;
         let changelog = Arc::new(RecordingChangelog::default());
-        let client = DocumentsClient::new(
-            MockStorage::new(),
-            changelog.clone(),
-            None,
-            accepting_attributes(),
-            unused_indexer(),
-            unused_embedder(),
-            unused_cache(),
-            unused_classifier(),
-            no_folders(),
-            no_ocr(),
-            finding_no_attributes(),
-        );
+        let client = client_moving(cached.clone(), Vec::new(), changelog.clone());
 
-        client.update_metadata(metadata).await.unwrap();
+        client
+            .update_metadata(Metadata {
+                name: "new.pdf".to_string(),
+                ..cached
+            })
+            .await
+            .unwrap();
 
         let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        let (event_type, document_id, content, metadata) = &sent[0];
-        assert_eq!(*event_type, EventType::UpdateMetadata);
-        assert_eq!(*document_id, id);
-        assert_eq!(*content, None);
-        let metadata = metadata.as_ref().unwrap();
-        assert_eq!(metadata.name, "new.pdf");
+        assert_eq!(
+            *sent,
+            vec![(
+                id,
+                Change::DocumentRenamed {
+                    name: "new.pdf".to_string()
+                }
+            )]
+        );
     }
 
     #[tokio::test]
@@ -3571,7 +3749,7 @@ mod tests {
         client.delete(id).await.unwrap();
 
         let sent = changelog.sent.lock().unwrap();
-        assert_eq!(*sent, vec![(EventType::Deleted, id, None, None)]);
+        assert_eq!(*sent, vec![(id, Change::DocumentDeleted)]);
     }
 
     #[tokio::test]
@@ -4247,17 +4425,14 @@ mod tests {
             .await
             .unwrap();
 
-        let sent = changelog.sent.lock().unwrap();
-        let [(EventType::SaveDocument, sent_id, Some(content), Some(metadata))] = &sent[..] else {
-            panic!("unexpected events: {sent:?}");
-        };
-        assert_eq!((*sent_id, metadata.id), (id, id));
-        assert_eq!(*content, pdf);
-        let expected = passages(metadata);
+        let (sent_id, content, metadata) = changelog.upload();
+        assert_eq!((sent_id, metadata.id), (id, id));
+        assert_eq!(content, pdf);
+        let expected = passages(&metadata);
         assert!(!expected.texts.is_empty());
         assert_eq!(*given.lock().unwrap(), expected.texts);
         let put = put.lock().unwrap().clone().unwrap();
-        assert_eq!(put.key, key_for(metadata, "e5.onnx", CHUNKER_VERSION));
+        assert_eq!(put.key, key_for(&metadata, "e5.onnx", CHUNKER_VERSION));
         assert_eq!(
             put.embeddings,
             embeddings(
@@ -4298,9 +4473,7 @@ mod tests {
             .await
             .unwrap();
 
-        let sent = changelog.sent.lock().unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].1, id);
+        assert_eq!(changelog.upload().0, id);
     }
 
     #[tokio::test]
@@ -4326,8 +4499,7 @@ mod tests {
             .await
             .unwrap();
 
-        let sent = changelog.sent.lock().unwrap();
-        assert!(sent[0].3.as_ref().unwrap().transcript.trim().is_empty());
+        assert!(changelog.upload().2.transcript.trim().is_empty());
     }
 
     #[tokio::test]
@@ -4369,7 +4541,7 @@ mod tests {
         assert!(err.to_string().contains("failed to publish"), "{err}");
         let put = put.lock().unwrap().clone().unwrap();
         assert_eq!(*removed.lock().unwrap(), Some(put.key.document_id));
-        assert_eq!(put.key.document_id, changelog.sent.lock().unwrap()[0].1);
+        assert_eq!(put.key.document_id, changelog.sent.lock().unwrap()[0].0);
     }
 
     #[tokio::test]
@@ -4523,11 +4695,7 @@ mod tests {
 
     /// The metadata of the only document `changelog` published.
     fn published_metadata(changelog: &RecordingChangelog) -> Metadata {
-        let sent = changelog.sent.lock().unwrap();
-        let [(EventType::SaveDocument, _, _, Some(metadata))] = &sent[..] else {
-            panic!("unexpected events: {sent:?}");
-        };
-        metadata.clone()
+        changelog.upload().2
     }
 
     /// An embedder for `"e5.onnx"` embedding every passage as
@@ -5078,8 +5246,8 @@ mod tests {
             .await
             .unwrap();
         let put = put.lock().unwrap().clone().unwrap();
-        let (_, subject_id, content, metadata) = changelog.sent.lock().unwrap()[0].clone();
-        let document = Document::new(subject_id, content.unwrap(), metadata.unwrap());
+        let (subject_id, content, metadata) = changelog.upload();
+        let document = Document::new(subject_id, content, metadata);
 
         let mut cache = MockEmbeddingCache::new();
         let cached = put.clone();

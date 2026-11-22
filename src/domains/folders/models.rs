@@ -108,10 +108,17 @@ pub enum FolderContents {
     Delete,
 }
 
-/// The content of a `DeleteFolder` changelog event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DeleteFolderEvent {
-    pub(crate) contents: FolderContents,
+/// A change to a folder synced here, as a `FolderRenamed`,
+/// `FolderAppearanceChanged` or `FolderMoved` event carries it (see
+/// [`super::Applier::apply_patch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FolderPatch {
+    Rename(String),
+    Appearance(FolderAppearance),
+    Move {
+        parent_id: Option<Uuid>,
+        appearance: Option<FolderAppearance>,
+    },
 }
 
 /// Builds a [`Folder`] with random-but-plausible data, overridable field by
@@ -172,33 +179,5 @@ impl FakeFolder {
 
     pub fn build(self) -> Folder {
         self.folder
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_folder_saved_with_a_description_still_deserializes() {
-        // How `SaveFolder` events carried a folder while folders had a
-        // description: those events stay in the changelog.
-        let id = Uuid::now_v7();
-        let parent_id = Uuid::now_v7();
-        let json = format!(
-            r#"{{"id":"{id}","parent_id":"{parent_id}","name":"Énergie","description":"Factures d'électricité","appearance":null}}"#
-        );
-
-        let folder: Folder = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(
-            folder,
-            Folder {
-                id,
-                parent_id: Some(parent_id),
-                name: "Énergie".to_string(),
-                appearance: None,
-            }
-        );
     }
 }

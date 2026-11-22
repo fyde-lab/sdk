@@ -5,7 +5,7 @@
 //! `changelog::MAX_EVENT_BYTES` (`DocumentTooLarge`) or with a known checksum
 //! (`DuplicateDocument`), both before parsing. It then transcribes
 //! (`transcript`), embeds, classifies (`classification`), extracts attributes
-//! (`extraction`) and publishes an encrypted `SaveDocument`. None of these
+//! (`extraction`) and publishes an encrypted `DocumentUploaded`. None of these
 //! steps but the transcript's parsing fails the upload, and none ever runs on
 //! consumption. The document reaches the local cache only when the sync job
 //! consumes it back. `delete` only publishes a `Deleted` (id only, no local
@@ -36,7 +36,7 @@
 //! `UNRELATED_SIMILARITY` so callers never handle e5 numbers.
 //!
 //! **Indexing.** A document is never cached without its embeddings: the
-//! changelog consumer applies `SaveDocument`/`UpdateMetadata` through
+//! changelog consumer applies every event writing a document through
 //! [`Indexer`], which embeds then writes document and embeddings in one
 //! transaction. `upload` already embedded the same passages before publishing
 //! and parked the vectors in the in-memory [`EmbeddingCache`] (never in the
@@ -237,23 +237,28 @@ pub trait Service: Send + Sync {
         limit: i64,
     ) -> Result<Vec<SimilarDocument>>;
 
-    /// Encrypts `metadata` as given and publishes it as an "update metadata"
-    /// changelog event, replacing whatever metadata was previously
-    /// associated with `metadata.id`. The caller is responsible for
-    /// constructing the full replacement `Metadata` (its fields are public
-    /// for this purpose), `attributes` included: an attribute left out of
-    /// it is removed. Rejects invalid attributes like [`Self::upload`].
+    /// Changes the cached document `metadata.id`'s name, type, attributes
+    /// and folder to `metadata`'s, publishing one changelog event per
+    /// action, in turn, each carrying only what it changes:
+    /// `DocumentRenamed` for a new name, `DocumentAttributesUpdated`
+    /// for a new type or attributes (an attribute left out of `metadata`
+    /// is removed), `DocumentMoved` for a new folder (as
+    /// [`Self::move_document`]). `metadata`'s other fields are ignored: the
+    /// cached document's are kept. Publishes nothing if none of those
+    /// changed. Fails with [`crate::ErrorCode::DocumentNotFound`] for a
+    /// document not synced here, and rejects invalid attributes and a
+    /// folder not synced here like [`Self::upload`].
     async fn update_metadata(&self, metadata: Metadata) -> Result<()>;
 
     /// Moves the document `id` into the folder `folder_id` (`None` for the
-    /// root, À classer), publishing its metadata as [`Self::update_metadata`]
-    /// does. Fails with [`crate::ErrorCode::DocumentNotFound`] for a
+    /// root, À classer), publishing a `DocumentMoved` changelog event
+    /// carrying the new folder. Fails with [`crate::ErrorCode::DocumentNotFound`] for a
     /// document not synced here, and [`crate::ErrorCode::FolderNotFound`]
     /// for a folder not synced here. Moving it where it already is
     /// publishes nothing.
     async fn move_document(&self, id: Uuid, folder_id: Option<Uuid>) -> Result<()>;
 
-    /// Publishes a "deleted" changelog event for the document `id`. Like
+    /// Publishes a `DocumentDeleted` changelog event for the document `id`. Like
     /// [`Self::upload`]'s, its effect is local only once the sync job
     /// consumes it back (on this device as on every other): the document
     /// then disappears from local storage, embeddings and search index
@@ -269,7 +274,7 @@ pub trait Service: Send + Sync {
     /// history, then continuing with the live tail). Resumes from the
     /// cursor persisted locally by a previous call, or from the beginning
     /// of the changelog if it's never been consumed before. For each
-    /// "created"/"update metadata"/"deleted" event, updates local storage, indexing
+    /// document event (see [`EventType`]), updates local storage, indexing
     /// the document's text along the way (about a second per document on a
     /// desktop CPU), before invoking the `on_document_change` callback
     /// configured on the client (see [`crate::ClientConfig`]), so it's

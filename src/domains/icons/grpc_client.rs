@@ -63,7 +63,8 @@ impl FydeClient for GrpcClient {
         let request = self
             .sessions
             .authenticated_request(FetchIconRequest { id: id.to_string() })
-            .await?;
+            .await
+            .context("failed to authenticate the FetchIcon request")?;
 
         let response = self
             .sessions

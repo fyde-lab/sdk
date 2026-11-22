@@ -272,11 +272,6 @@ impl UsersClient {
         cleared.and(wiped).and(deleted)
     }
 
-    /// Fails with [`crate::ErrorCode::AlreadyLoggedIn`] if a session is already open on
-    /// this device. Checked by `create`/`login` before anything else: the
-    /// local cache isn't partitioned per account, so opening a second
-    /// account's session on top of the first would hand it the first
-    /// account's cached documents, changelog cursor and scraper cookies.
     /// Closes the server's pending exchange for `login_id`, which this
     /// client won't finish for real, by sending it a finalization that can
     /// never verify ([`abandoned_login_finalization`]): `login_id` is
@@ -299,8 +294,19 @@ impl UsersClient {
         }
     }
 
+    /// Fails with [`crate::ErrorCode::AlreadyLoggedIn`] if a session is
+    /// already open on this device. Checked by `create`, `login` and
+    /// `recover_account` before contacting the server: the local cache isn't
+    /// partitioned per account, so opening a second account's session on top
+    /// of the first would hand it the first account's cached documents,
+    /// changelog cursor and scraper cookies.
     async fn ensure_no_open_session(&self) -> Result<()> {
-        if self.sessions.is_connected().await? {
+        if self
+            .sessions
+            .is_connected()
+            .await
+            .context("failed to read the session token")?
+        {
             return Err(ErrorKind::AlreadyLoggedIn.into());
         }
         Ok(())
@@ -397,8 +403,13 @@ impl Service for UsersClient {
         allow_insecure_storage: bool,
     ) -> Result<String> {
         ensure_strong_enough(password).context("refused the new account's password")?;
-        self.ensure_no_open_session().await?;
-        let location = self.secret_location(allow_insecure_storage).await?;
+        self.ensure_no_open_session()
+            .await
+            .context("failed to check that no session is open")?;
+        let location = self
+            .secret_location(allow_insecure_storage)
+            .await
+            .context("failed to choose where to keep the session's secrets")?;
 
         let (state, opaque_request) = self
             .opaque
@@ -433,7 +444,8 @@ impl Service for UsersClient {
             .context("failed to finish registration")?;
 
         self.open_session(username, &token, &raw_master_key, role, location)
-            .await?;
+            .await
+            .context("failed to open the new session locally")?;
 
         Ok(token)
     }
@@ -446,8 +458,13 @@ impl Service for UsersClient {
         allow_insecure_storage: bool,
         replace_session_id: Option<&str>,
     ) -> Result<LoginOutcome> {
-        self.ensure_no_open_session().await?;
-        let location = self.secret_location(allow_insecure_storage).await?;
+        self.ensure_no_open_session()
+            .await
+            .context("failed to check that no session is open")?;
+        let location = self
+            .secret_location(allow_insecure_storage)
+            .await
+            .context("failed to choose where to keep the session's secrets")?;
 
         let (state, opaque_request) = self
             .opaque
@@ -502,7 +519,8 @@ impl Service for UsersClient {
             .context("failed to unwrap master key returned by the server")?;
 
         self.open_session(username, &token, &raw_master_key, role, location)
-            .await?;
+            .await
+            .context("failed to open the new session locally")?;
 
         Ok(LoginOutcome::LoggedIn {
             session_token: token,
@@ -585,7 +603,10 @@ impl Service for UsersClient {
             .context("failed to finish OPAQUE registration")?;
         let new_export_key = Zeroizing::new(new_export_key);
 
-        let raw_master_key = self.read_master_key().await?;
+        let raw_master_key = self
+            .read_master_key()
+            .await
+            .context("failed to read the master key to wrap under the new password")?;
 
         let new_wrapped_master_key = wrap_master_key(&raw_master_key, &new_export_key)
             .context("failed to wrap master key under the new export key")?;
@@ -599,7 +620,10 @@ impl Service for UsersClient {
     }
 
     async fn generate_recovery_key(&self) -> Result<String> {
-        let raw_master_key = self.read_master_key().await?;
+        let raw_master_key = self
+            .read_master_key()
+            .await
+            .context("failed to read the master key to wrap under the recovery key")?;
 
         let recovery_key = generate_recovery_key().context("failed to generate recovery key")?;
         let recovery_keys =
@@ -638,8 +662,13 @@ impl Service for UsersClient {
         allow_insecure_storage: bool,
     ) -> Result<String> {
         ensure_strong_enough(new_password).context("refused the new password")?;
-        self.ensure_no_open_session().await?;
-        let location = self.secret_location(allow_insecure_storage).await?;
+        self.ensure_no_open_session()
+            .await
+            .context("failed to check that no session is open")?;
+        let location = self
+            .secret_location(allow_insecure_storage)
+            .await
+            .context("failed to choose where to keep the session's secrets")?;
         let recovery_keys =
             derive_recovery_keys(recovery_key).context("failed to read recovery key")?;
 
@@ -683,7 +712,8 @@ impl Service for UsersClient {
             .context("failed to finish recovery")?;
 
         self.open_session(username, &token, &raw_master_key, role, location)
-            .await?;
+            .await
+            .context("failed to open the new session locally")?;
 
         Ok(token)
     }
@@ -755,7 +785,12 @@ impl Service for UsersClient {
 #[async_trait]
 impl ExpiredSessionHandler for UsersClient {
     async fn end_expired_session(&self) -> Result<()> {
-        if !self.sessions.is_connected().await? {
+        if !self
+            .sessions
+            .is_connected()
+            .await
+            .context("failed to check for the rejected session's token")?
+        {
             return Ok(());
         }
 

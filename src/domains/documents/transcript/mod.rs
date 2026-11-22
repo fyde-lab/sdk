@@ -54,10 +54,10 @@ pub(crate) fn render_page(content: &[u8], index: usize) -> Result<Option<PageIma
         .pages()
         .get(index)
         .ok_or(ErrorKind::Pdf("it has no such page"))
-        .with_context(|| format!("failed to find page {index}"))?;
+        .context("failed to find the page")?;
     catch_unwind(AssertUnwindSafe(|| render::render_for_ocr(page)))
         .map_err(|_| ErrorKind::Pdf("rendering it panicked"))
-        .with_context(|| format!("failed to render page {index}"))
+        .context("failed to draw the page")
 }
 
 /// Parses `content` (decrypting it if it's only protected by an owner

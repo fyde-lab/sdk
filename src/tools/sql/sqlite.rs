@@ -39,7 +39,12 @@ impl SqliteClient {
     }
 
     pub(crate) async fn connect_at(path: PathBuf) -> Result<Self> {
-        create_owner_only(&path)?;
+        create_owner_only(&path).with_context(|| {
+            format!(
+                "failed to create the local database file {}",
+                path.display()
+            )
+        })?;
 
         let options = SqliteConnectOptions::new()
             .filename(path)
@@ -65,7 +70,9 @@ impl SqliteClient {
             .await
             .context("failed to open in-memory local database")?;
 
-        let mut client = Self::connect_with_options(options).await?;
+        let mut client = Self::connect_with_options(options)
+            .await
+            .context("failed to connect to the in-memory local database")?;
         client._in_memory_keeper = Some(Mutex::new(keeper));
         Ok(client)
     }

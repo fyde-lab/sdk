@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use zeroize::Zeroizing;
 
 use crate::Result;
 
@@ -9,14 +10,15 @@ use super::storage::Storage;
 
 /// A [`Storage`] kept in process memory only, for clients backed by an
 /// in-memory database (`Storage::Memory`), which must never leave anything
-/// behind in the OS's credential store.
+/// behind in the OS's credential store. Values are wiped from memory when
+/// replaced, removed or dropped.
 #[derive(Default)]
 pub(super) struct MemoryStorage {
-    values: Mutex<HashMap<String, String>>,
+    values: Mutex<HashMap<String, Zeroizing<String>>>,
 }
 
 impl MemoryStorage {
-    fn values(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+    fn values(&self) -> std::sync::MutexGuard<'_, HashMap<String, Zeroizing<String>>> {
         self.values.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
@@ -24,11 +26,12 @@ impl MemoryStorage {
 #[async_trait]
 impl Storage for MemoryStorage {
     async fn get(&self, key: &str) -> Result<Option<String>> {
-        Ok(self.values().get(key).cloned())
+        Ok(self.values().get(key).map(|value| value.to_string()))
     }
 
     async fn set(&self, key: &str, value: &str) -> Result<()> {
-        self.values().insert(key.to_string(), value.to_string());
+        self.values()
+            .insert(key.to_string(), Zeroizing::new(value.to_string()));
         Ok(())
     }
 

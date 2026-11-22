@@ -1,8 +1,9 @@
 //! A PDF page's own text layer, laid out like the page, through `hayro`'s
 //! interpreter (pure Rust): a [`Device`] records every glyph it's asked to
 //! draw (its Unicode text, position, size and advance) instead of drawing it,
-//! invisible text included (a scan's OCR layer). Rebuilt after `pdf-ocr-core`'s
-//! `text_layer.rs` (`paddleocr-vl-cli`, the POC `doc-ai-poc` used):
+//! invisible text included (a scan's OCR layer), glyphs drawn off the page
+//! left out. Rebuilt after `pdf-ocr-core`'s `text_layer.rs`
+//! (`paddleocr-vl-cli`, the POC `doc-ai-poc` used):
 //!
 //! 1. Reading frames: each glyph's baseline direction is snapped to a quarter
 //!    turn and laid out in its own frame, so a rotated page reads normally and
@@ -56,6 +57,11 @@ const CHUNK_GAP: f64 = 1.2;
 /// A glyph drawn again within this distance (in ems) of the same glyph is a
 /// duplicate (fake bold, a shadow) and dropped.
 const DUPLICATE_DISTANCE: f64 = 0.15;
+
+/// The grid's column is at least this wide (in ems of the frame's letters):
+/// narrower than any real font's letters, so it only matters for a font whose
+/// widths are wrong, which would otherwise pad a line with millions of spaces.
+const MIN_COLUMN_WIDTH: f64 = 0.2;
 
 /// Most blank lines a vertical gap becomes.
 const MAX_BLANK_LINES: usize = 2;
@@ -180,22 +186,29 @@ impl Glyph {
 /// Runs `page` through `hayro`'s interpreter, recording its glyphs.
 fn collect_glyphs(page: &Page<'_>) -> Collector {
     let (width, height) = page.render_dimensions();
+    let bounds = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
     let cache = InterpreterCache::new();
     let mut context = Context::new(
         // Top-left origin, `y` down, the page's `/Rotate` applied.
         page.initial_transform(true).to_kurbo(),
-        Rect::new(0.0, 0.0, f64::from(width), f64::from(height)),
+        bounds,
         &cache,
         page.xref(),
         InterpreterSettings::default(),
     );
-    let mut collector = Collector::default();
+    let mut collector = Collector {
+        bounds,
+        glyphs: Vec::new(),
+        drawn: 0,
+        unreadable: 0,
+    };
     interpret_page(page, &mut context, &mut collector);
     collector
 }
 
-#[derive(Default)]
 struct Collector {
+    /// The page, in the space glyphs are drawn in.
+    bounds: Rect,
     glyphs: Vec<Glyph>,
     /// Glyphs drawn, spaces aside, readable or not.
     drawn: usize,
@@ -226,7 +239,12 @@ impl<'a> Device<'a> for Collector {
             }
             .map(f64::from)
             .unwrap_or(FALLBACK_ADVANCE * UNITS_PER_EM);
-            if let Some(glyph) = place(text, props.transform * positioned.transform(), advance) {
+            if let Some(glyph) = place(
+                text,
+                props.transform * positioned.transform(),
+                advance,
+                self.bounds,
+            ) {
                 self.glyphs.push(glyph);
             }
         }
@@ -284,12 +302,18 @@ fn readable_text(unicode: Option<BfString>) -> Readable {
 }
 
 /// Places a glyph drawn with `transform` (glyph space to page space) and
-/// `advance` (glyph space units) in its reading frame.
-fn place(text: String, transform: Affine, advance: f64) -> Option<Glyph> {
+/// `advance` (glyph space units) in its reading frame; `None` for a glyph too
+/// small to read or whose origin is more than an em off the page `bounds`
+/// (it isn't shown, and laying it out would pad its line up to it).
+fn place(text: String, transform: Affine, advance: f64, bounds: Rect) -> Option<Glyph> {
     let origin = transform * Point::ZERO;
     let along = transform * Point::new(UNITS_PER_EM, 0.0) - origin;
     let size = (transform * Point::new(0.0, UNITS_PER_EM) - origin).hypot();
-    if size < MIN_GLYPH_SIZE || !size.is_finite() || along.hypot() == 0.0 {
+    if size < MIN_GLYPH_SIZE
+        || !size.is_finite()
+        || along.hypot() == 0.0
+        || !bounds.inflate(size, size).contains(origin)
+    {
         return None;
     }
     let turn = (along.y.atan2(along.x) / FRAC_PI_2).round().rem_euclid(4.0) as u8;
@@ -478,23 +502,25 @@ fn chunks(line: &Line) -> Vec<Chunk> {
 
 /// The grid's column width: the median width of the frame's letters and
 /// digits (punctuation is narrower, and a form's dot leaders would make the
-/// grid far too wide), half their median size if none has a width. An OCR'd
-/// line counts as one glyph, its width shared by its characters.
+/// grid far too wide), but at least [`MIN_COLUMN_WIDTH`] of their median
+/// size; half that size if none has a width. An OCR'd line counts as one
+/// glyph, its width shared by its characters.
 fn column_width(glyphs: &[Glyph]) -> f64 {
     let letters = || {
         glyphs
             .iter()
             .filter(|glyph| glyph.text.chars().any(char::is_alphanumeric))
     };
+    let size = median(letters().map(|glyph| glyph.size));
     let width = median(
         letters()
             .map(|glyph| (glyph.end - glyph.x) / glyph.text.chars().count() as f64)
             .filter(|width| *width > 0.0),
     );
     if width > 0.0 {
-        width
+        width.max(MIN_COLUMN_WIDTH * size)
     } else {
-        (median(letters().map(|glyph| glyph.size)) / 2.0).max(1.0)
+        (size / 2.0).max(1.0)
     }
 }
 
@@ -624,14 +650,19 @@ mod tests {
         assert_eq!(layout_boxes(Vec::new()), "");
     }
 
+    /// An A4 page, in points.
+    const PAGE: Rect = Rect::new(0.0, 0.0, 595.0, 842.0);
+
     #[test]
     fn place_snaps_the_reading_direction_to_a_quarter_turn() {
-        let upright = place("a".into(), Affine::scale(0.01), 600.0).unwrap();
+        let at = Affine::translate((100.0, 100.0));
+        let upright = place("a".into(), at * Affine::scale(0.01), 600.0, PAGE).unwrap();
         // Reading top to bottom: the baseline points down the page.
         let down = place(
             "a".into(),
-            Affine::rotate(FRAC_PI_2) * Affine::scale(0.01),
+            at * Affine::rotate(FRAC_PI_2) * Affine::scale(0.01),
             600.0,
+            PAGE,
         );
 
         assert_eq!(upright.turn, 0);
@@ -642,7 +673,28 @@ mod tests {
 
     #[test]
     fn place_drops_degenerate_glyphs() {
-        assert!(place("a".into(), Affine::scale(0.0001), 600.0).is_none());
+        let at = Affine::translate((100.0, 100.0));
+
+        assert!(place("a".into(), at * Affine::scale(0.0001), 600.0, PAGE).is_none());
+    }
+
+    #[test]
+    fn place_drops_glyphs_off_the_page() {
+        let place_at = |x: f64, y: f64| {
+            place(
+                "a".into(),
+                Affine::translate((x, y)) * Affine::scale(0.01),
+                600.0,
+                PAGE,
+            )
+        };
+
+        assert!(place_at(1e9, 100.0).is_none());
+        assert!(place_at(-50.0, 100.0).is_none());
+        assert!(place_at(100.0, 900.0).is_none());
+        // Within an em of the edge: a glyph the crop box cuts.
+        assert!(place_at(-5.0, 100.0).is_some());
+        assert!(place_at(590.0, 845.0).is_some());
     }
 
     #[test]
@@ -724,6 +776,29 @@ mod tests {
         glyphs.extend(word("Bold", 100.3, 100.0, 10.0));
 
         assert_eq!(layout(glyphs), "Bold");
+    }
+
+    #[test]
+    fn layout_does_not_pad_lines_out_to_a_font_with_wrong_widths() {
+        // Glyphs a thousandth of their real width, as from a font's widths
+        // in the wrong unit.
+        let mut glyphs = Vec::new();
+        for (x, text) in [(100.0, "Name"), (400.0, "Value")] {
+            for (i, c) in text.chars().enumerate() {
+                // Placed by those widths: piled up.
+                let mut glyph = glyph(&c.to_string(), x + 0.006 * i as f64, 100.0, 10.0);
+                glyph.end = glyph.x + 0.006;
+                glyphs.push(glyph);
+            }
+        }
+
+        let text = layout(glyphs);
+
+        assert!(
+            text.starts_with("Name ") && text.ends_with("Value"),
+            "{text:?}"
+        );
+        assert!(text.len() < 200, "{} characters", text.len());
     }
 
     #[test]

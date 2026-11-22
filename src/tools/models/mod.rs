@@ -271,7 +271,8 @@ impl ModelStore {
     async fn download(&self, model: &Model, to: &Path) -> Result<()> {
         let response = self
             .http()
-            .await?
+            .await
+            .context("failed to get the model download HTTP client")?
             .get(model.url)
             .send()
             .await

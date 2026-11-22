@@ -5,10 +5,11 @@
 //!
 //! The consume job replays from the persisted cursor, then tails live,
 //! materializing documents (through `documents::Indexer`), folders (through
-//! `folders::Applier`) and script installations. An `InstallScript` for
-//! another script version first deletes that installation's saved scraper
-//! session, so the new version refetches everything; an `UninstallScript`
-//! deletes its sessions, cookies and reports too.
+//! `folders::Applier`) and script installations, one event per action (see
+//! [`EventType`]). An installation event for another script version than
+//! the one saved first deletes that installation's saved scraper session,
+//! so the new version refetches everything; a `ScriptUninstalled` deletes
+//! its sessions, cookies and reports too.
 //!
 //! Each event's `previous_id` (the server chains a user's events) must equal
 //! the last event the pass went through, checked before decrypting: otherwise
@@ -33,6 +34,7 @@ mod service;
 mod storage;
 mod storage_settings;
 
+pub(crate) use models::Change;
 #[cfg(any(test, feature = "testing"))]
 pub use models::FakeChangelogEvent;
 pub use models::{ChangelogEvent, EventType, SyncProgress};
@@ -51,7 +53,7 @@ use sqlx::SqlitePool;
 use tonic::transport::Channel;
 
 use crate::Result;
-use crate::domains::documents::{self, Metadata};
+use crate::domains::documents;
 use crate::domains::secrets::Service as SecretsService;
 use crate::domains::server_state::Service as ServerStateService;
 use crate::domains::sessions::SessionsClient;
@@ -60,8 +62,8 @@ use crate::domains::{folders, scrapers, scripts};
 
 /// Publishes and consumes the fyde server's changelog: a blind relay for
 /// opaque, client-encrypted write events — document writes, plus script
-/// installations (see [`EventType::InstallScript`]/
-/// [`EventType::UninstallScript`]). `send`/`stop_consume_job`
+/// installations and folders, one event per action (see [`EventType`]).
+/// `send`/`stop_consume_job`
 /// take `&self` so implementations can be shared behind `Arc<dyn Service>`;
 /// `start_consume_job` takes `self: Arc<Self>` since it spawns the consume
 /// loop onto its own background task, which needs an owned, `'static`
@@ -80,31 +82,26 @@ pub(crate) trait Service: Send + Sync {
     /// whatever that other work happens to fail with first.
     async fn ensure_master_key(&self) -> Result<()>;
 
-    /// Encrypts and publishes a new event about `subject_id` — a document
-    /// or script id depending on `event_type` (see [`ChangelogEvent`]).
-    /// `content`/`metadata` are `None` for event types that don't carry
-    /// them (e.g. a `Deleted` event only carries `subject_id`).
-    async fn send(
-        &self,
-        event_type: EventType,
-        subject_id: uuid::Uuid,
-        content: Option<&[u8]>,
-        metadata: Option<&Metadata>,
-    ) -> Result<()>;
+    /// Encrypts and publishes `change` as a new event about `subject_id`:
+    /// a document, folder or installation id depending on its event type
+    /// (see [`ChangelogEvent`]).
+    async fn send(&self, subject_id: uuid::Uuid, change: &Change) -> Result<()>;
 
     /// Spawns a background task that streams and decrypts every event since
     /// the last consumed id, oldest first (replaying persisted history,
     /// then continuing with the live tail — see `ConsumeSince` in
     /// `changelog.proto`), resuming from the cursor persisted locally in
     /// the settings store (from the very beginning of the changelog if it's
-    /// never been consumed before). For each `SaveDocument` event, caches the
+    /// never been consumed before). For each `DocumentUploaded` event, caches the
     /// resulting document in local storage before invoking `callback`
-    /// (removes it for a `Deleted` event, and
-    /// likewise saves the installation for an `InstallScript` event,
+    /// (replaces its metadata for a `DocumentRenamed`,
+    /// `DocumentAttributesUpdated` or `DocumentMoved` event, removes it for
+    /// a `DocumentDeleted` one, and likewise saves the installation for
+    /// `ScriptInstalled` and the other `Installation*` events,
     /// via the `scripts` domain's local storage, first clearing that
     /// installation's saved scraper session if the event installs another
     /// version of the script than the one installed so far, and deletes the
-    /// installation and all its scraper state for an `UninstallScript`); the
+    /// installation and all its scraper state for a `ScriptUninstalled`); the
     /// cursor is persisted as each event is processed, so a later call
     /// resumes right after the last event seen.
     ///
@@ -112,8 +109,8 @@ pub(crate) trait Service: Send + Sync {
     /// The spawned task never exits on its own; starting a job ends any job
     /// still running, so only one task ever consumes. If a pass over the stream
     /// fails — including with [`crate::ErrorCode::InvalidChangelogEvent`] if a
-    /// `SaveDocument` event is missing its `content` or `metadata`, since a
-    /// `SaveDocument` event must carry both, or if an `InstallScript` event's
+    /// `DocumentUploaded` event is missing its `content` or `metadata`, since a
+    /// `DocumentUploaded` event must carry both, or if an installation event's
     /// `content` is missing, isn't a valid installation or names another
     /// installation than its subject — the error is logged and
     /// consumption is retried from the persisted cursor after a backoff

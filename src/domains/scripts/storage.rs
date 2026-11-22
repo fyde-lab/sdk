@@ -11,7 +11,7 @@ use super::InstalledScript;
 /// Persists script installations, unencrypted, locally, keyed by
 /// installation id. Injected into [`super::service::ScriptsClient`] (to read
 /// them) and into `changelog::ChangelogClient` (to save and delete the ones
-/// materialized from consumed `InstallScript`/`UninstallScript` events) at
+/// materialized from consumed installation events) at
 /// construction.
 #[cfg_attr(test, automock)]
 #[async_trait]

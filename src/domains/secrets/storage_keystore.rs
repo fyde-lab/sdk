@@ -2,8 +2,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use keyring_core::{CredentialStore, Entry};
+use zeroize::Zeroizing;
 
-use crate::{Error, ErrorContext as _, Result};
+use crate::{ErrorContext as _, Result};
 
 use super::storage::Storage;
 
@@ -72,7 +73,8 @@ impl Storage for KeystoreStorage {
     }
 
     async fn set(&self, key: &str, value: &str) -> Result<()> {
-        let value = value.to_string();
+        // Moved to the blocking thread, and wiped once written.
+        let value = Zeroizing::new(value.to_string());
         self.with_entry(key, move |entry| entry.set_password(&value))
             .await
     }
@@ -99,7 +101,8 @@ static STORE: Mutex<Option<Arc<CredentialStore>>> = Mutex::new(None);
 /// keychain. Only for tests (see
 /// `../server/tests/reconnect_lifecycle_test.rs`).
 pub(crate) fn use_in_process_store() -> Result<()> {
-    let store: Arc<CredentialStore> = keyring_core::mock::Store::new()?;
+    let store: Arc<CredentialStore> = keyring_core::mock::Store::new()
+        .context("failed to create the in-process credential store")?;
     *STORE.lock().unwrap_or_else(|p| p.into_inner()) = Some(store);
     Ok(())
 }
@@ -111,7 +114,7 @@ fn native_store() -> Result<Arc<CredentialStore>> {
     if let Some(store) = store.as_ref() {
         return Ok(store.clone());
     }
-    let created = new_native_store().map_err(Error::from)?;
+    let created = new_native_store().context("failed to open the OS credential store")?;
     *store = Some(created.clone());
     Ok(created)
 }

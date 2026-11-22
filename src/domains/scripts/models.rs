@@ -318,7 +318,7 @@ impl std::fmt::Debug for InstallScriptRequest {
 }
 
 /// One installation of a script for the authenticated user, as persisted
-/// locally once its `InstallScript` changelog event has been consumed (see
+/// locally once its changelog events have been consumed (see
 /// [`super::Service::list_installed_scripts`]): its own id, its label, the
 /// full script, plus the parameter values it was installed with, so it can
 /// be run without asking for them again, and the folder its documents go
@@ -397,6 +397,44 @@ impl InstalledScript {
     /// `None`, without failing: install again to pick another folder.
     pub fn folder_id(&self) -> Option<Uuid> {
         self.folder_id
+    }
+
+    /// Replaces its parameters, as an `InstallationCredentialsUpdated`
+    /// event says.
+    pub(crate) fn set_parameters(&mut self, parameters: HashMap<String, Value>) {
+        self.parameters = parameters;
+    }
+
+    /// Replaces its label, as an `InstallationRenamed` event says.
+    pub(crate) fn set_label(&mut self, label: String) {
+        self.label = label;
+    }
+
+    /// Replaces its folder, as an `InstallationFolderChanged` event says.
+    pub(crate) fn set_folder_id(&mut self, folder_id: Option<Uuid>) {
+        self.folder_id = folder_id;
+    }
+
+    /// Replaces its script, as an `InstallationUpgraded` event says.
+    pub(crate) fn set_script(&mut self, script: Script) {
+        self.script = script;
+    }
+
+    /// An installation as a `ScriptInstalled` event carries it.
+    pub(crate) fn new(
+        installation_id: Uuid,
+        label: String,
+        script: Script,
+        parameters: HashMap<String, Value>,
+        folder_id: Option<Uuid>,
+    ) -> Self {
+        Self {
+            installation_id,
+            label,
+            script,
+            parameters,
+            folder_id,
+        }
     }
 }
 

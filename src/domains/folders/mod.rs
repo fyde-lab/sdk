@@ -2,8 +2,10 @@
 //! folders only. No description: documents are filed by what folders hold.
 //!
 //! No gRPC transport: the service validates each change against the folders
-//! synced so far, then publishes a `SaveFolder` (the whole folder) or
-//! `DeleteFolder` (keep or delete its contents) changelog event; `list` reads
+//! synced so far, then publishes one changelog event per action:
+//! `FolderCreated`, `FolderRenamed`, `FolderAppearanceChanged` or
+//! `FolderMoved` (each carrying only what it changes), or `FolderDeleted`
+//! (keep or delete its contents); `list` reads
 //! the local table. The consumer applies them through [`Applier`], which
 //! resolves concurrent edits identically on every device: a missing parent or
 //! a cycle puts the folder at the top level, a sibling name clash gets a
@@ -28,9 +30,9 @@ use mockall::automock;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-pub(crate) use models::DeleteFolderEvent;
 #[cfg(any(test, feature = "testing"))]
 pub use models::FakeFolder;
+pub(crate) use models::FolderPatch;
 pub use models::{
     CreateFolderRequest, Folder, FolderAppearance, FolderColor, FolderContents, FolderIcon,
     MAX_FOLDER_NAME_CHARS, UpdateFolderRequest,
@@ -42,7 +44,7 @@ use crate::domains::changelog::Service as ChangelogService;
 /// The vault's folders: each holds documents, subfolders, or both, nested
 /// to any depth. Every change is checked against the folders synced to this
 /// device so far, then published as an encrypted changelog event
-/// (`SaveFolder`, `DeleteFolder`): like documents, it only shows up in
+/// (one per action, see [`crate::domains::changelog::EventType`]): like documents, it only shows up in
 /// [`Service::list`] once the sync job consumes it back, on every device.
 /// New documents are filed in them by what each already holds (see
 /// [`crate::domains::documents::Service::upload`]), never by their names.
@@ -62,7 +64,10 @@ pub trait Service: Send + Sync {
     /// exist ([`crate::ErrorCode::FolderNotFound`]).
     async fn create(&self, request: CreateFolderRequest) -> Result<Folder>;
 
-    /// Renames or recolours a folder, with [`Self::create`]'s rules.
+    /// Renames or recolours a folder, with [`Self::create`]'s rules,
+    /// checking both before publishing either: a `FolderRenamed` event for
+    /// a new name, then a `FolderAppearanceChanged` one for a new
+    /// appearance. A name or appearance it already has publishes nothing.
     async fn update(&self, request: UpdateFolderRequest) -> Result<()>;
 
     /// Moves a folder, with everything it holds, under `parent_id` (`None`
@@ -88,10 +93,16 @@ pub trait Service: Send + Sync {
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(crate) trait Applier: Send + Sync {
-    /// Saves `folder` as a `SaveFolder` event carries it.
+    /// Saves `folder` as a `FolderCreated` event carries it.
     async fn apply_save(&self, folder: Folder) -> Result<()>;
 
-    /// Deletes folder `id` as a `DeleteFolder` event says: moving its
+    /// Changes folder `id` as a `FolderRenamed`, `FolderAppearanceChanged`
+    /// or `FolderMoved` event says, resolving what that leaves inconsistent
+    /// as [`Self::apply_save`] does. A folder that isn't there (deleted
+    /// meanwhile) is ignored.
+    async fn apply_patch(&self, id: Uuid, patch: FolderPatch) -> Result<()>;
+
+    /// Deletes folder `id` as a `FolderDeleted` event says: moving its
     /// subfolders and documents up to its parent, or deleting every folder
     /// below it and every document in them, on this device only (every
     /// device applies the same event). A folder that isn't there is

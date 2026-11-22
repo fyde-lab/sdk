@@ -339,7 +339,8 @@ pub(super) fn generate_and_wrap_master_key(
     export_key: &[u8],
 ) -> Result<(Zeroizing<Vec<u8>>, String)> {
     let master_key = generate_master_key();
-    let wrapped = wrap_master_key(master_key.as_slice(), export_key)?;
+    let wrapped = wrap_master_key(master_key.as_slice(), export_key)
+        .context("failed to wrap the new master key")?;
     Ok((Zeroizing::new(master_key.to_vec()), wrapped))
 }
 

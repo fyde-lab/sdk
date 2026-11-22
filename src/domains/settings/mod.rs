@@ -12,11 +12,14 @@ use sqlx::SqlitePool;
 use crate::Result;
 
 /// Persists arbitrary key/value settings in the SDK's local SQLite
-/// database — used both by other SDK modules for their own state (the
-/// session auth token, the local master key, the changelog consumption
-/// offset — see `changelog::storage_settings`) and, later, for
-/// user-facing settings. Trait methods take `&self` (not `&mut self`) so
-/// implementations can be shared behind `Arc<dyn Service>`.
+/// database — used both by other SDK modules for their own non-secret
+/// state (the cached username, role and language — see `users` — and the
+/// changelog cursor — see `changelog::storage_settings`) and by callers
+/// for their own settings, through `Client::settings` (under `app.`).
+/// Values are stored in clear: secrets (the session token, the master
+/// key, ...) never go here, but in the `secrets` domain. Trait methods
+/// take `&self` (not `&mut self`) so implementations can be shared behind
+/// `Arc<dyn Service>`.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Service: Send + Sync {

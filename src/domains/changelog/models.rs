@@ -1,37 +1,178 @@
+use std::collections::{BTreeMap, HashMap};
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
-use crate::domains::documents::Metadata;
+use crate::domains::documents::{Attribute, DocumentType, Metadata};
+use crate::domains::folders::{FolderAppearance, FolderContents};
+use crate::domains::scripts::Script;
 
-/// The kind of write recorded by a [`ChangelogEvent`].
-///
-/// Variants are serialized by name inside each encrypted event, so the
-/// `alias`es keep events recorded under their former names decodable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The kind of write recorded by a [`ChangelogEvent`]: one per action a
+/// user (or a scraper run) takes. What each carries is its `Change`'s
+/// variant of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
-    #[serde(alias = "Created")]
-    SaveDocument,
-    UpdateMetadata,
+    /// A document was uploaded, by the user or a scraper run (see
+    /// `documents::Service::upload`). Carries its content and metadata.
+    DocumentUploaded,
+    /// A document's name changed (see `documents::Service::update_metadata`).
+    DocumentRenamed,
+    /// A document's attributes changed (see
+    /// `documents::Service::update_metadata`).
+    DocumentAttributesUpdated,
+    /// A document moved to another folder, or to À classer (see
+    /// `documents::Service::move_document`).
+    DocumentMoved,
     /// A document was deleted (see `documents::Service::delete`). Carries
     /// only the document's id as `subject_id`.
-    Deleted,
-    /// A script was installed for the account, or one of its installations
-    /// replaced (see `scripts::Service::install_script`). The event's
-    /// `subject_id` is the installation's id, and its `content` the
-    /// JSON-serialized `scripts::InstalledScript` (no `metadata`).
-    InstallScript,
+    DocumentDeleted,
+    /// A folder was created (see `folders::Service::create`).
+    FolderCreated,
+    /// A folder's name changed (see `folders::Service::update`).
+    FolderRenamed,
+    /// A top-level folder's colour or icon changed (see
+    /// `folders::Service::update`).
+    FolderAppearanceChanged,
+    /// A folder moved under another one, or to the top level (see
+    /// `folders::Service::move_folder`).
+    FolderMoved,
+    /// A folder was deleted (see `folders::Service::delete`), saying
+    /// whether what it held was kept or deleted too.
+    FolderDeleted,
+    /// A script was installed for the account: a new installation (see
+    /// `scripts::Service::install_script`).
+    ScriptInstalled,
+    /// An installation's parameters (its credentials) changed.
+    InstallationCredentialsUpdated,
+    /// An installation's label changed.
+    InstallationRenamed,
+    /// An installation now files its documents into another folder (or
+    /// lets them be filed automatically).
+    InstallationFolderChanged,
+    /// An installation moved to another version of its script.
+    InstallationUpgraded,
     /// An installation was removed (see
     /// `scripts::Service::uninstall_script`). Carries only the
     /// installation's id as `subject_id`.
-    UninstallScript,
-    /// A folder was created or changed (see `folders::Service`). The
-    /// event's `subject_id` is the folder's id, and its `content` the
-    /// JSON-serialized `folders::Folder`.
-    SaveFolder,
-    /// A folder was deleted (see `folders::Service::delete`). The event's
-    /// `subject_id` is the folder's id, and its `content` the
-    /// JSON-serialized `folders::DeleteFolderEvent`.
-    DeleteFolder,
+    ScriptUninstalled,
+}
+
+impl EventType {
+    /// Whether this event caches or changes a document (and so needs the
+    /// indexing model to be applied).
+    pub(crate) fn writes_document(self) -> bool {
+        matches!(
+            self,
+            Self::DocumentUploaded
+                | Self::DocumentRenamed
+                | Self::DocumentAttributesUpdated
+                | Self::DocumentMoved
+        )
+    }
+}
+
+/// What a [`ChangelogEvent`] records, encrypted in it: one variant per
+/// [`EventType`], each carrying only the fields its action changes (the
+/// event's `subject_id` says which document, folder or installation), so
+/// applying it patches what's saved locally. MessagePack-encoded,
+/// positionally: never reorder a variant's fields.
+///
+/// Its `Debug` output is only its event type: the fields carry a
+/// document's bytes and transcript, names, and an installation's
+/// parameters (credentials included).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) enum Change {
+    /// The document's content and metadata.
+    DocumentUploaded {
+        #[serde(with = "serde_bytes")]
+        content: Vec<u8>,
+        metadata: Metadata,
+    },
+    DocumentRenamed {
+        name: String,
+    },
+    /// Its type and every attribute it now has: one left out is removed.
+    DocumentAttributesUpdated {
+        r#type: Option<DocumentType>,
+        attributes: BTreeMap<String, Attribute>,
+    },
+    /// `None` for À classer.
+    DocumentMoved {
+        folder_id: Option<Uuid>,
+    },
+    DocumentDeleted,
+    FolderCreated {
+        parent_id: Option<Uuid>,
+        name: String,
+        appearance: Option<FolderAppearance>,
+    },
+    FolderRenamed {
+        name: String,
+    },
+    FolderAppearanceChanged {
+        appearance: FolderAppearance,
+    },
+    /// `appearance` is the one it has once moved: none under another
+    /// folder, at the top level the one it showed.
+    FolderMoved {
+        parent_id: Option<Uuid>,
+        appearance: Option<FolderAppearance>,
+    },
+    FolderDeleted {
+        contents: FolderContents,
+    },
+    ScriptInstalled {
+        label: String,
+        script: Script,
+        parameters: HashMap<String, Value>,
+        folder_id: Option<Uuid>,
+    },
+    InstallationCredentialsUpdated {
+        parameters: HashMap<String, Value>,
+    },
+    InstallationRenamed {
+        label: String,
+    },
+    /// `None` to let its documents be filed automatically.
+    InstallationFolderChanged {
+        folder_id: Option<Uuid>,
+    },
+    InstallationUpgraded {
+        script: Script,
+    },
+    ScriptUninstalled,
+}
+
+impl Change {
+    pub(crate) fn event_type(&self) -> EventType {
+        match self {
+            Self::DocumentUploaded { .. } => EventType::DocumentUploaded,
+            Self::DocumentRenamed { .. } => EventType::DocumentRenamed,
+            Self::DocumentAttributesUpdated { .. } => EventType::DocumentAttributesUpdated,
+            Self::DocumentMoved { .. } => EventType::DocumentMoved,
+            Self::DocumentDeleted => EventType::DocumentDeleted,
+            Self::FolderCreated { .. } => EventType::FolderCreated,
+            Self::FolderRenamed { .. } => EventType::FolderRenamed,
+            Self::FolderAppearanceChanged { .. } => EventType::FolderAppearanceChanged,
+            Self::FolderMoved { .. } => EventType::FolderMoved,
+            Self::FolderDeleted { .. } => EventType::FolderDeleted,
+            Self::ScriptInstalled { .. } => EventType::ScriptInstalled,
+            Self::InstallationCredentialsUpdated { .. } => {
+                EventType::InstallationCredentialsUpdated
+            }
+            Self::InstallationRenamed { .. } => EventType::InstallationRenamed,
+            Self::InstallationFolderChanged { .. } => EventType::InstallationFolderChanged,
+            Self::InstallationUpgraded { .. } => EventType::InstallationUpgraded,
+            Self::ScriptUninstalled => EventType::ScriptUninstalled,
+        }
+    }
+}
+
+impl std::fmt::Debug for Change {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} {{ [redacted] }}", self.event_type())
+    }
 }
 
 /// How far the running sync job has got through the changelog since it
@@ -63,42 +204,18 @@ impl SyncProgress {
 
 /// A single recorded write, decrypted from the server's changelog.
 /// `subject_id` is the id of whatever the write is about, which depends on
-/// [`EventType`]: a document for `SaveDocument`/`UpdateMetadata`/`Deleted`, a
-/// script installation for `InstallScript`/`UninstallScript`, a folder for `SaveFolder`/`DeleteFolder`. Inlines a document's fields rather than
-/// wrapping a [`crate::domains::documents::Document`], since not every
-/// event type carries all of them: `content` is `None` for a metadata-only
-/// update, and both `content` and `metadata` are `None` for a deletion
-/// (only `subject_id` is meaningful then).
+/// [`EventType`]: a document for the `Document*` events, a folder for the
+/// `Folder*` ones, a script installation for the others. Only a
+/// `DocumentUploaded` event has a [`Self::content`] and [`Self::metadata`]:
+/// every other one carries just what its action changed.
 ///
-/// Its `Debug` output shows only the content's size and whether metadata is
-/// present: the content is a document's bytes or an installation's JSON
-/// (its label and parameters' values, credentials included), and the
-/// metadata carries the document's transcript.
-#[derive(Clone, PartialEq)]
+/// Its `Debug` output shows none of what the event carries (see
+/// `Change`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChangelogEvent {
     pub(super) id: Uuid,
-    pub(super) event_type: EventType,
     pub(super) subject_id: Uuid,
-    pub(super) content: Option<Vec<u8>>,
-    pub(super) metadata: Option<Metadata>,
-}
-
-impl std::fmt::Debug for ChangelogEvent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChangelogEvent")
-            .field("id", &self.id)
-            .field("event_type", &self.event_type)
-            .field("subject_id", &self.subject_id)
-            .field(
-                "content",
-                &self
-                    .content
-                    .as_ref()
-                    .map(|content| format!("[{} bytes redacted]", content.len())),
-            )
-            .field("metadata", &self.metadata.as_ref().map(|_| "[redacted]"))
-            .finish()
-    }
+    pub(super) change: Change,
 }
 
 impl ChangelogEvent {
@@ -107,19 +224,27 @@ impl ChangelogEvent {
     }
 
     pub fn event_type(&self) -> EventType {
-        self.event_type
+        self.change.event_type()
     }
 
     pub fn subject_id(&self) -> Uuid {
         self.subject_id
     }
 
+    /// The uploaded document's content, for a `DocumentUploaded` event.
     pub fn content(&self) -> Option<&[u8]> {
-        self.content.as_deref()
+        match &self.change {
+            Change::DocumentUploaded { content, .. } => Some(content),
+            _ => None,
+        }
     }
 
+    /// The uploaded document's metadata, for a `DocumentUploaded` event.
     pub fn metadata(&self) -> Option<&Metadata> {
-        self.metadata.as_ref()
+        match &self.change {
+            Change::DocumentUploaded { metadata, .. } => Some(metadata),
+            _ => None,
+        }
     }
 }
 
@@ -139,14 +264,16 @@ impl Default for FakeChangelogEvent {
 
 #[cfg(any(test, feature = "testing"))]
 impl FakeChangelogEvent {
+    /// A `DocumentUploaded` event.
     pub fn new() -> Self {
         Self {
             event: ChangelogEvent {
                 id: Uuid::now_v7(),
-                event_type: EventType::SaveDocument,
                 subject_id: Uuid::now_v7(),
-                content: Some(crate::tools::testing::random_bytes(64)),
-                metadata: Some(crate::domains::documents::FakeMetadata::new().build()),
+                change: Change::DocumentUploaded {
+                    content: crate::tools::testing::random_bytes(64),
+                    metadata: crate::domains::documents::FakeMetadata::new().build(),
+                },
             },
         }
     }
@@ -156,8 +283,15 @@ impl FakeChangelogEvent {
         self
     }
 
-    pub fn with_event_type(mut self, event_type: EventType) -> Self {
-        self.event.event_type = event_type;
+    /// Makes it a `DocumentDeleted` event, which carries nothing.
+    pub fn deleting(mut self) -> Self {
+        self.event.change = Change::DocumentDeleted;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_change(mut self, change: Change) -> Self {
+        self.event.change = change;
         self
     }
 
@@ -173,24 +307,30 @@ impl FakeChangelogEvent {
         self
     }
 
+    /// Sets the uploaded document's content (making it a
+    /// `DocumentUploaded` event if it wasn't).
     pub fn with_content(mut self, content: Vec<u8>) -> Self {
-        self.event.content = Some(content);
+        let metadata = self.uploaded_metadata();
+        self.event.change = Change::DocumentUploaded { content, metadata };
         self
     }
 
-    pub fn without_content(mut self) -> Self {
-        self.event.content = None;
-        self
-    }
-
+    /// Sets the uploaded document's metadata (making it a
+    /// `DocumentUploaded` event if it wasn't).
     pub fn with_metadata(mut self, metadata: Metadata) -> Self {
-        self.event.metadata = Some(metadata);
+        let content = match &self.event.change {
+            Change::DocumentUploaded { content, .. } => content.clone(),
+            _ => crate::tools::testing::random_bytes(64),
+        };
+        self.event.change = Change::DocumentUploaded { content, metadata };
         self
     }
 
-    pub fn without_metadata(mut self) -> Self {
-        self.event.metadata = None;
-        self
+    fn uploaded_metadata(&self) -> Metadata {
+        match &self.event.change {
+            Change::DocumentUploaded { metadata, .. } => metadata.clone(),
+            _ => crate::domains::documents::FakeMetadata::new().build(),
+        }
     }
 
     pub fn build(self) -> ChangelogEvent {
@@ -201,42 +341,154 @@ impl FakeChangelogEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domains::documents::FakeDocument;
+    use crate::domains::documents::{FakeDocument, FakeMetadata};
+    use crate::domains::folders::{FolderColor, FolderIcon};
+    use crate::domains::scripts::FakeScript;
 
-    #[test]
-    fn fake_changelog_event_builds_with_plausible_defaults() {
-        let event = FakeChangelogEvent::new().build();
+    const APPEARANCE: FolderAppearance = FolderAppearance {
+        color: FolderColor::Teal,
+        icon: FolderIcon::Briefcase,
+    };
 
-        assert_eq!(event.event_type, EventType::SaveDocument);
-        assert!(event.content.is_some());
-        assert!(event.metadata.is_some());
+    /// One change of each event type.
+    fn every_change() -> Vec<Change> {
+        let parameters = HashMap::from([("username".to_string(), Value::from("marie"))]);
+        vec![
+            Change::DocumentUploaded {
+                content: b"%PDF".to_vec(),
+                metadata: FakeMetadata::new().build(),
+            },
+            Change::DocumentRenamed {
+                name: "Facture.pdf".to_string(),
+            },
+            Change::DocumentAttributesUpdated {
+                r#type: Some(DocumentType::Invoice),
+                attributes: BTreeMap::from([("amount".to_string(), Attribute::Integer(42))]),
+            },
+            Change::DocumentMoved {
+                folder_id: Some(Uuid::now_v7()),
+            },
+            Change::DocumentDeleted,
+            Change::FolderCreated {
+                parent_id: None,
+                name: "Travail".to_string(),
+                appearance: Some(APPEARANCE),
+            },
+            Change::FolderRenamed {
+                name: "Emploi".to_string(),
+            },
+            Change::FolderAppearanceChanged {
+                appearance: APPEARANCE,
+            },
+            Change::FolderMoved {
+                parent_id: Some(Uuid::now_v7()),
+                appearance: None,
+            },
+            Change::FolderDeleted {
+                contents: FolderContents::Keep,
+            },
+            Change::ScriptInstalled {
+                label: "Marie".to_string(),
+                script: FakeScript::new().build(),
+                parameters: parameters.clone(),
+                folder_id: None,
+            },
+            Change::InstallationCredentialsUpdated { parameters },
+            Change::InstallationRenamed {
+                label: "Compte pro".to_string(),
+            },
+            Change::InstallationFolderChanged {
+                folder_id: Some(Uuid::now_v7()),
+            },
+            Change::InstallationUpgraded {
+                script: FakeScript::new().build(),
+            },
+            Change::ScriptUninstalled,
+        ]
     }
 
     #[test]
-    fn debug_never_shows_the_content_or_metadata() {
+    fn every_change_roundtrips_through_messagepack() {
+        for change in every_change() {
+            let bytes = rmp_serde::to_vec(&change).unwrap();
+
+            assert_eq!(rmp_serde::from_slice::<Change>(&bytes).unwrap(), change);
+        }
+    }
+
+    #[test]
+    fn every_event_type_has_its_own_change() {
+        let event_types: Vec<EventType> = every_change().iter().map(Change::event_type).collect();
+
+        assert_eq!(
+            event_types,
+            vec![
+                EventType::DocumentUploaded,
+                EventType::DocumentRenamed,
+                EventType::DocumentAttributesUpdated,
+                EventType::DocumentMoved,
+                EventType::DocumentDeleted,
+                EventType::FolderCreated,
+                EventType::FolderRenamed,
+                EventType::FolderAppearanceChanged,
+                EventType::FolderMoved,
+                EventType::FolderDeleted,
+                EventType::ScriptInstalled,
+                EventType::InstallationCredentialsUpdated,
+                EventType::InstallationRenamed,
+                EventType::InstallationFolderChanged,
+                EventType::InstallationUpgraded,
+                EventType::ScriptUninstalled,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rename_carries_only_the_new_name() {
+        let rename = Change::DocumentRenamed {
+            name: "Facture.pdf".to_string(),
+        };
+
+        // The variant's name, then the one field.
+        assert!(rmp_serde::to_vec(&rename).unwrap().len() < 40);
+    }
+
+    #[test]
+    fn fake_changelog_event_builds_an_upload_by_default() {
+        let event = FakeChangelogEvent::new().build();
+
+        assert_eq!(event.event_type(), EventType::DocumentUploaded);
+        assert!(event.content().is_some());
+        assert!(event.metadata().is_some());
+    }
+
+    #[test]
+    fn debug_never_shows_what_the_event_carries() {
         let event = FakeChangelogEvent::new()
-            .with_event_type(EventType::InstallScript)
-            .with_content(br#"{"parameters":{"password":"hunter2"}}"#.to_vec())
+            .with_change(Change::InstallationCredentialsUpdated {
+                parameters: HashMap::from([("password".to_string(), Value::from("hunter2"))]),
+            })
             .build();
-        let metadata = format!("{:?}", event.metadata);
 
         let debug = format!("{event:?}");
 
         assert!(!debug.contains("hunter2"), "{debug}");
-        assert!(!debug.contains(&format!("{:?}", event.content)), "{debug}");
-        assert!(!debug.contains(&metadata), "{debug}");
-        assert!(debug.contains("[37 bytes redacted]"), "{debug}");
+        assert!(!debug.contains("password"), "{debug}");
+        assert!(debug.contains("InstallationCredentialsUpdated"), "{debug}");
         assert!(debug.contains(&event.subject_id.to_string()), "{debug}");
     }
 
     #[test]
-    fn event_type_deserializes_its_former_variant_names() {
-        let created = rmp_serde::to_vec("Created").unwrap();
+    fn debug_never_shows_an_uploaded_documents_content_or_metadata() {
+        let metadata = FakeMetadata::new().with_transcript("secret text").build();
+        let event = FakeChangelogEvent::new()
+            .with_content(b"secret bytes".to_vec())
+            .with_metadata(metadata)
+            .build();
 
-        assert_eq!(
-            rmp_serde::from_slice::<EventType>(&created).unwrap(),
-            EventType::SaveDocument
-        );
+        let debug = format!("{event:?}");
+
+        assert!(!debug.contains("secret"), "{debug}");
     }
 
     #[test]
@@ -249,41 +501,30 @@ mod tests {
     }
 
     #[test]
-    fn with_content_overrides_the_default_content() {
-        let event = FakeChangelogEvent::new()
-            .with_content(vec![1, 2, 3])
-            .build();
-
-        assert_eq!(event.content, Some(vec![1, 2, 3]));
-    }
-
-    #[test]
-    fn with_methods_override_every_other_field() {
+    fn with_methods_override_every_field() {
         let id = Uuid::now_v7();
         let subject_id = Uuid::now_v7();
-        let metadata = crate::domains::documents::FakeMetadata::new().build();
+        let metadata = FakeMetadata::new().build();
 
         let event = FakeChangelogEvent::new()
             .with_id(id)
-            .with_event_type(EventType::Deleted)
             .with_subject_id(subject_id)
+            .with_content(vec![1, 2, 3])
             .with_metadata(metadata.clone())
             .build();
 
-        assert_eq!(event.id, id);
-        assert_eq!(event.event_type, EventType::Deleted);
-        assert_eq!(event.subject_id, subject_id);
-        assert_eq!(event.metadata, Some(metadata));
+        assert_eq!(event.id(), id);
+        assert_eq!(event.subject_id(), subject_id);
+        assert_eq!(event.content(), Some(&[1, 2, 3][..]));
+        assert_eq!(event.metadata(), Some(&metadata));
     }
 
     #[test]
-    fn without_content_and_without_metadata_clear_those_fields() {
-        let event = FakeChangelogEvent::new()
-            .without_content()
-            .without_metadata()
-            .build();
+    fn only_an_upload_has_content_and_metadata() {
+        let event = FakeChangelogEvent::new().deleting().build();
 
-        assert_eq!(event.content, None);
-        assert_eq!(event.metadata, None);
+        assert_eq!(event.event_type(), EventType::DocumentDeleted);
+        assert_eq!(event.content(), None);
+        assert_eq!(event.metadata(), None);
     }
 }

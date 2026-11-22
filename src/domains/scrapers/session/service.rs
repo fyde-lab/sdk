@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::Result;
+use crate::{ErrorContext as _, Result};
 
 use super::Service;
 use super::storage::Storage;
@@ -25,12 +25,18 @@ impl<S: Storage> Service for SessionClient<S> {
         // — defaulting to an empty object here (rather than `Null`) means a
         // script's `fyde.session` is always a table it can freely read/write
         // fields on, on both a first run and every run after.
-        let data = self.storage.get(scraper_name).await?;
+        let data =
+            self.storage.get(scraper_name).await.with_context(|| {
+                format!("failed to load session data for scraper {scraper_name:?}")
+            })?;
         Ok(data.unwrap_or_else(|| Value::Object(serde_json::Map::new())))
     }
 
     async fn save(&self, scraper_name: &str, data: Value) -> Result<()> {
-        self.storage.set(scraper_name, data).await
+        self.storage
+            .set(scraper_name, data)
+            .await
+            .with_context(|| format!("failed to save session data for scraper {scraper_name:?}"))
     }
 }
 
@@ -85,5 +91,31 @@ mod tests {
             .save("didaxis", json!({"cursor": "def"}))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn load_wraps_a_storage_failure_with_context() {
+        let mut storage = MockStorage::new();
+        storage
+            .expect_get()
+            .return_once(|_| Err(std::io::Error::other("disk gone").into()));
+        let client = SessionClient::new(storage);
+
+        let err = client.load("didaxis").await.unwrap_err();
+
+        assert!(err.has_context());
+    }
+
+    #[tokio::test]
+    async fn save_wraps_a_storage_failure_with_context() {
+        let mut storage = MockStorage::new();
+        storage
+            .expect_set()
+            .return_once(|_, _| Err(std::io::Error::other("disk gone").into()));
+        let client = SessionClient::new(storage);
+
+        let err = client.save("didaxis", json!({})).await.unwrap_err();
+
+        assert!(err.has_context());
     }
 }
