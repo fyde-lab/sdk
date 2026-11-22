@@ -12,11 +12,12 @@ use crate::domains::secrets::{SecretLocation, Service as SecretsService};
 pub(crate) use service::SessionsClient;
 
 /// Session-token attachment, shared by every service's gRPC transport so
-/// authenticated calls attach it automatically. The token itself has no
-/// in-memory copy: it is the one persisted by
+/// authenticated calls attach it automatically. This service keeps no copy
+/// of the token: it reads, on every call, the one persisted by
 /// `users::Service::create`/`login` in the secrets store (under
-/// [`crate::domains::secrets::SESSION_TOKEN_SECRET`]), so a session survives
-/// across process restarts without extra plumbing.
+/// [`crate::domains::secrets::SESSION_TOKEN_SECRET`], which caches it in
+/// memory), so a session survives across process restarts without extra
+/// plumbing.
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub(crate) trait Service: Send + Sync {
@@ -39,8 +40,10 @@ pub(crate) trait Service: Send + Sync {
 
     /// Returns whether a session token is currently persisted (i.e. a
     /// [`Service::save_new_session`] call happened since
-    /// `users::Service::logout` last cleared it). Called by
-    /// `users::Service::create`/`login`/`logout`.
+    /// `users::Service::logout` last cleared it). Called by `users` (before
+    /// opening a session, on logout and when ending a rejected one), by
+    /// `Client::init` and `Client::is_connected`, and by
+    /// [`Service::check_response`].
     async fn is_connected(&self) -> Result<bool>;
 
     /// Checks the outcome of a call sent with
