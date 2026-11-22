@@ -187,28 +187,12 @@ fn table_to_string_map(table: &Table) -> LuaResult<HashMap<String, String>> {
     Ok(map)
 }
 
-fn response_to_table(
-    lua: &Lua,
-    runtime: &Handle,
-    stop: &StopSignal,
-    resp: reqwest::Response,
-) -> LuaResult<Table> {
-    let status = resp.status().as_u16();
-    // The final URL after following any redirects - scripts need this to
-    // know where they actually landed (e.g. to use as a Referer on a later
-    // request, mimicking a real browser submitting a form from the page it
-    // was just redirected to).
-    let url = resp.url().to_string();
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let body =
-        read_body(runtime, stop, resp, super::MAX_BODY_BYTES).map_err(mlua::Error::external)?;
-    let body = decode_text(&content_type, &body);
-
+/// The `{status, url, body}` table `get`/`post_form`/`post_json` return:
+/// `url` is the final URL after following any redirects (scripts need it to
+/// know where they actually landed, e.g. to use as a Referer on a later
+/// request, as a browser submitting a form from the page it was redirected
+/// to would), `body` the response decoded as text.
+fn text_table(lua: &Lua, status: u16, url: String, body: String) -> LuaResult<Table> {
     let out = lua.create_table()?;
     out.set("status", status)?;
     out.set("url", url)?;
@@ -424,12 +408,7 @@ pub(super) fn table(
             let status = resp.status().as_u16();
             record_redirects(&download.recorder, "DOWNLOAD", &hops);
             track_redirects(&download.visited_urls, &hops, resp.url().as_str());
-            let content_type = resp
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
+            let content_type = content_type_of(&resp);
             let bytes = read_body(
                 &download.runtime,
                 &download.stop,
@@ -463,6 +442,15 @@ pub(super) fn table(
     )?;
 
     Ok(http)
+}
+
+/// `resp`'s `Content-Type`, empty when it has none (or one that isn't text).
+fn content_type_of(resp: &reqwest::Response) -> String {
+    resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Reads `resp`'s whole body, failing as soon as it grows past `max_bytes`
@@ -666,7 +654,13 @@ impl HttpHost {
         let status = resp.status().as_u16();
         record_redirects(&self.recorder, method, &hops);
         track_redirects(&self.visited_urls, &hops, resp.url().as_str());
-        let out = response_to_table(lua, &self.runtime, &self.stop, resp)?;
+        let final_url = resp.url().to_string();
+        let content_type = content_type_of(&resp);
+        // Like `download`'s: a body cut off or over the limit is an `error`
+        // entry, not a request missing from the report.
+        let body = read_body(&self.runtime, &self.stop, resp, super::MAX_BODY_BYTES)
+            .map_err(|err| self.record_error(action, url, err))?;
+        let body = decode_text(&content_type, &body);
 
         let mut entry = json!({
             "method": method,
@@ -679,12 +673,11 @@ impl HttpHost {
                 fields.insert("form_fields".into(), json!(form_fields));
             }
             if self.debug_http_dump {
-                let body: String = out.get("body").unwrap_or_default();
-                fields.insert("response_body".into(), Value::String(body));
+                fields.insert("response_body".into(), Value::String(body.clone()));
             }
         }
         self.recorder.record("http_request", entry);
-        Ok(out)
+        text_table(lua, status, final_url, body)
     }
 
     /// Records `err` as an `error` entry for `action` on `url` and converts
@@ -956,6 +949,68 @@ mod tests {
         assert_eq!(redirect.value["status"], 302);
         assert_eq!(redirect.value["from"], redirect_url.as_str());
         assert_eq!(redirect.value["to"], target_url.as_str());
+    }
+
+    /// Spawns a tiny local server that announces a longer body than it
+    /// sends before closing the connection, and returns its URL.
+    fn spawn_truncating_server(runtime: &tokio::runtime::Runtime) -> String {
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        runtime.spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let response =
+                        "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nhello";
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        format!("http://127.0.0.1:{}/", addr.port())
+    }
+
+    #[test]
+    fn get_records_an_error_when_the_body_cannot_be_read() {
+        let runtime = runtime();
+        let url = spawn_truncating_server(&runtime);
+        let lua = Lua::new();
+        let recorder = Arc::new(Recorder::new("didaxis"));
+        let http_table = table(
+            &lua,
+            Arc::new(CookieJar::default()),
+            Arc::new(Mutex::new(HashSet::new())),
+            recorder.clone(),
+            runtime.handle().clone(),
+            StopSignal::new(),
+            &RunOptions {
+                debug_http_dump: false,
+                browser_emulation: false,
+                follow_redirects: true,
+                allowed_domains: vec!["127.0.0.1".to_string()],
+                browser_visible: false,
+            },
+        )
+        .unwrap();
+        lua.globals().set("http", http_table).unwrap();
+
+        let result: LuaResult<Table> = lua
+            .load(format!(r#"return http.get("{url}?token=secret")"#))
+            .eval();
+
+        assert!(result.is_err());
+        let entries = recorder.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event, "error");
+        assert_eq!(entries[0].value["action"], "http.get");
+        assert_eq!(entries[0].value["url"], format!("{url}?[redacted]"));
+        assert!(!entries[0].value.to_string().contains("secret"));
     }
 
     #[test]
