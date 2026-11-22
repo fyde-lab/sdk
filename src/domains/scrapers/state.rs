@@ -5,7 +5,7 @@ use sqlx::SqlitePool;
 
 use crate::{ErrorContext as _, Result};
 
-use super::session::{SqliteStorage as SessionSqliteStorage, Storage as SessionStorage};
+use super::session::SqliteStorage as SessionSqliteStorage;
 
 /// Forgets what scraper runs kept under a name (an installation's id, for
 /// `Service::run_installed`). Injected into `changelog::ChangelogClient`,
@@ -43,7 +43,10 @@ impl StateSqliteStorage {
 #[async_trait]
 impl StateStorage for StateSqliteStorage {
     async fn delete_session(&self, name: &str) -> Result<()> {
-        self.session.delete(name).await
+        self.session
+            .delete(name)
+            .await
+            .with_context(|| format!("failed to forget scraper {name:?}'s session"))
     }
 
     async fn delete_all(&self, name: &str) -> Result<()> {
@@ -73,6 +76,7 @@ mod tests {
     use serde_json::json;
     use sqlx::sqlite::SqlitePoolOptions;
 
+    use super::super::session::Storage as _;
     use super::*;
 
     async fn setup() -> (SqlitePool, StateSqliteStorage) {

@@ -31,18 +31,14 @@ impl Storage for FileStorage {
     async fn get(&self, scraper_name: &str) -> Result<Option<Value>> {
         let path = self.path(scraper_name);
 
-        if !tokio::fs::try_exists(&path).await.with_context(|| {
-            format!(
-                "failed to check for a saved session file at {}",
-                path.display()
-            )
-        })? {
-            return Ok(None);
-        }
-
-        let text = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("failed to read session file {}", path.display()))?;
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read session file {}", path.display()));
+            }
+        };
 
         let value = serde_json::from_str(&text)
             .with_context(|| format!("failed to parse session file {} as JSON", path.display()))?;
@@ -69,16 +65,6 @@ impl Storage for FileStorage {
 
         Ok(())
     }
-
-    async fn delete(&self, scraper_name: &str) -> Result<()> {
-        let path = self.path(scraper_name);
-
-        match tokio::fs::remove_file(&path).await {
-            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err)
-                .with_context(|| format!("failed to delete session file {}", path.display())),
-            _ => Ok(()),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -98,19 +84,6 @@ mod tests {
         let (_tmp, storage) = setup();
 
         assert_eq!(storage.get("didaxis").await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn delete_forgets_only_that_scrapers_data() {
-        let (_tmp, storage) = setup();
-        storage.set("didaxis", json!({"a": 1})).await.unwrap();
-        storage.set("impots", json!({"b": 2})).await.unwrap();
-
-        storage.delete("didaxis").await.unwrap();
-        storage.delete("never-saved").await.unwrap();
-
-        assert_eq!(storage.get("didaxis").await.unwrap(), None);
-        assert_eq!(storage.get("impots").await.unwrap(), Some(json!({"b": 2})));
     }
 
     #[tokio::test]

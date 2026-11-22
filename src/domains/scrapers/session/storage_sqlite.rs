@@ -16,6 +16,24 @@ impl SqliteStorage {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
+    /// Forgets the session data saved for `scraper_name`, so its next run
+    /// starts from an empty `fyde.session`. A no-op if none was saved. Only
+    /// `scrapers::state` forgets a session (and only the SQLite one), so this
+    /// isn't part of [`Storage`].
+    pub(crate) async fn delete(&self, scraper_name: &str) -> Result<()> {
+        sqlx::query("DELETE FROM scraper_sessions WHERE scraper_name = ?1")
+            .bind(scraper_name)
+            .execute(&self.pool)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to delete session data for scraper {scraper_name:?} from local database"
+                )
+            })?;
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -56,20 +74,6 @@ impl Storage for SqliteStorage {
         .with_context(|| {
             format!("failed to save session data for scraper {scraper_name:?} to local database")
         })?;
-
-        Ok(())
-    }
-
-    async fn delete(&self, scraper_name: &str) -> Result<()> {
-        sqlx::query("DELETE FROM scraper_sessions WHERE scraper_name = ?1")
-            .bind(scraper_name)
-            .execute(&self.pool)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to delete session data for scraper {scraper_name:?} from local database"
-                )
-            })?;
 
         Ok(())
     }
