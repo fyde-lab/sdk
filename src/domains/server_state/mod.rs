@@ -22,7 +22,8 @@ pub trait Service: Send + Sync {
     /// Returns whether the fyde server currently responds as reachable to
     /// a standard gRPC health check against its overall status (the
     /// well-known empty service name). Never fails: a transport failure
-    /// (server down, unreachable, etc.) is reported as `Ok(false)` rather
+    /// (server down, unreachable, no answer within 10 seconds, etc.) is
+    /// reported as `Ok(false)` rather
     /// than propagated, since the whole point of this method is to test
     /// reachability without erroring the caller.
     async fn is_server_reachable(&self) -> Result<bool>;
