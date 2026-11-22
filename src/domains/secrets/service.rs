@@ -39,8 +39,8 @@ struct Cache {
     /// Bumped by every `set` and `delete` as it starts. What a `get` or a
     /// `set`/`delete` learned is cached only if no other write started in
     /// the meantime: a `get` that read the stores before `logout`'s
-    /// `clear` deleted a secret must not cache it again after, nor one
-    /// that read the old value before a `set` the new one's place.
+    /// `clear` deleted a secret must not cache it again afterwards, nor one
+    /// that read the old value before a `set` cache it over the new one.
     writes: u64,
 }
 
