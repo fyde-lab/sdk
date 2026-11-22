@@ -82,22 +82,27 @@ const PASSWORD_CHECK_DEVICE_NAME: &str = "password check";
 /// The device's preferred interface language as a short code (e.g. "en",
 /// "fr"): the platform's own locale where it isn't in the environment
 /// (Android, see [`crate::tools::locale`]), otherwise the
-/// `LC_ALL`/`LC_MESSAGES`/`LANG` environment variables (checked in that
-/// order, matching POSIX locale precedence), falling back to `"en"` if
-/// none is set or parses to something unexpected (e.g. the POSIX default
+/// `LC_ALL`/`LC_MESSAGES`/`LANG` environment variables (see
+/// [`env_language`]), falling back to `"en"` if none is set or the one that
+/// wins parses to something unexpected (e.g. the POSIX default
 /// `"C"`/`"POSIX"`). Sent to the server by `create` so it doesn't need to
 /// be asked for, and used as the fallback language for
 /// [`crate::Client::user_message`] when the user hasn't picked one.
 pub fn system_language() -> String {
     crate::tools::locale::device_language()
         .and_then(|value| language_code(&value))
-        .or_else(|| {
-            ["LC_ALL", "LC_MESSAGES", "LANG"]
-                .into_iter()
-                .find_map(|var| std::env::var(var).ok())
-                .and_then(|value| language_code(&value))
-        })
+        .or_else(|| env_language(|var| std::env::var(var).ok()))
         .unwrap_or_else(|| "en".to_string())
+}
+
+/// The language of the first of `LC_ALL`, `LC_MESSAGES` and `LANG` that
+/// `var` reports set and non-empty, as POSIX picks a locale: a variable set
+/// to an empty string counts as unset (so `LC_ALL=` doesn't hide `LANG`).
+fn env_language(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .find_map(|name| var(name).filter(|value| !value.is_empty()))
+        .and_then(|value| language_code(&value))
 }
 
 /// The two-letter language code a locale string starts with
@@ -2735,6 +2740,37 @@ mod tests {
         assert_eq!(language_code("fr_FR.UTF-8"), Some("fr".to_string()));
         assert_eq!(language_code("fr-FR"), Some("fr".to_string()));
         assert_eq!(language_code("en_US"), Some("en".to_string()));
+    }
+
+    #[test]
+    fn env_language_skips_variables_set_to_an_empty_string() {
+        let env = |name: &str| match name {
+            "LC_ALL" => Some(String::new()),
+            "LANG" => Some("fr_FR.UTF-8".to_string()),
+            _ => None,
+        };
+        assert_eq!(env_language(env), Some("fr".to_string()));
+    }
+
+    #[test]
+    fn env_language_takes_the_first_non_empty_variable_in_posix_order() {
+        let env = |name: &str| match name {
+            "LC_ALL" => None,
+            "LC_MESSAGES" => Some("de_DE".to_string()),
+            "LANG" => Some("fr_FR.UTF-8".to_string()),
+            _ => None,
+        };
+        assert_eq!(env_language(env), Some("de".to_string()));
+    }
+
+    #[test]
+    fn env_language_keeps_a_non_empty_c_locale_from_falling_through() {
+        let env = |name: &str| match name {
+            "LC_ALL" => Some("C".to_string()),
+            "LANG" => Some("fr_FR.UTF-8".to_string()),
+            _ => None,
+        };
+        assert_eq!(env_language(env), None);
     }
 
     #[test]
