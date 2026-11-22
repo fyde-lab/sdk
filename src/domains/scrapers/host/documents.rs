@@ -104,9 +104,9 @@ fn apply_upload_fields(request: &mut UploadRequest, fields: &Table) -> mlua::Res
     Ok(())
 }
 
-/// Keeps `name` (and `scraper_name`) safe to use as a single path segment: no
-/// path separators (so a remote-sourced name can never escape `temp_dir`),
-/// no null bytes, and never empty/`.`/`..`.
+/// Keeps `name`, the file name a script gave `fyde.save_document` (its last
+/// path segment already), a plain file name for [`UploadRequest::from_raw`]:
+/// no path separators, no null bytes, and never empty/`.`/`..`.
 fn sanitize_path_segment(name: &str) -> String {
     let sanitized: String = name
         .chars()
