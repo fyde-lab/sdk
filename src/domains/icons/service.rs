@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::{ErrorContext as _, Result};
+use crate::{ErrorContext as _, ErrorKind, Result};
 
 use super::grpc_client::FydeClient;
 use super::storage::Storage;
@@ -38,6 +38,15 @@ impl<S: Storage> Service for IconsClient<S> {
         }
 
         let icon = self.grpc.fetch_icon(id).await?;
+        // Cached for good and never revalidated: an icon the server returned
+        // under another id would otherwise stay cached under that id forever.
+        if icon.id != id {
+            return Err(ErrorKind::InvalidResponse(format!(
+                "fetch icon {id} response carried icon {}",
+                icon.id
+            ))
+            .into());
+        }
         self.storage
             .save(&icon)
             .await
@@ -104,6 +113,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(fetched, icon);
+    }
+
+    #[tokio::test]
+    async fn fetch_icon_refuses_and_caches_nothing_when_the_server_returns_another_icon() {
+        let id = Uuid::new_v4();
+        let mut storage = MockStorage::new();
+        storage.expect_get().times(1).return_once(|_| Ok(None));
+        storage.expect_save().never();
+        let mut grpc = MockFydeClient::new();
+        grpc.expect_fetch_icon()
+            .with(eq(id))
+            .times(1)
+            .return_once(|_| Ok(FakeIcon::new().build()));
+
+        let err = IconsClient::new(grpc, storage)
+            .fetch_icon(id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err.kind(), crate::ErrorKind::InvalidResponse(_)));
     }
 
     #[tokio::test]
