@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -8,6 +7,7 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use rand::RngExt as _;
 use serde_json::Value;
+use tokio::sync::oneshot;
 
 use crate::{ErrorKind, Result};
 
@@ -20,11 +20,11 @@ use super::engine::{
 };
 
 /// One pending `call`'s reply slot, keyed by the id embedded in the JS it
-/// sent — see [`BrowserDriver::call`]. Shared between the calling thread
-/// (which inserts, then blocks on the receiving half) and
+/// sent — see [`BrowserDriver::call`]. Shared between the calling task
+/// (which inserts, then awaits the receiving half) and
 /// [`DriverHandler::on_message`] (which looks the id up and fills it in once
 /// the page posts a matching message back).
-type PendingReplies = Arc<Mutex<HashMap<u64, SyncSender<Value>>>>;
+type PendingReplies = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
 
 /// The single in-flight download's reply slot, if any — set by
 /// [`BrowserDriver::download`] right before it triggers the click that
@@ -36,7 +36,7 @@ type PendingReplies = Arc<Mutex<HashMap<u64, SyncSender<Value>>>>;
 /// just cancelled. Only one slot, not a map keyed by id like
 /// [`PendingReplies`], since nothing here runs more than one download at a
 /// time (see [`Service::download`]'s own doc comment).
-type PendingDownload = Arc<Mutex<Option<SyncSender<String>>>>;
+type PendingDownload = Arc<Mutex<Option<oneshot::Sender<String>>>>;
 
 /// What a run's webview asks its driver, from whatever thread its engine
 /// calls from: every rule `fyde.browser` enforces on a page lives here, not
@@ -252,60 +252,75 @@ impl BrowserDriver {
     /// Runs one round-trip: allocates an id, registers its reply slot in
     /// `PendingReplies` *before* evaluating the script (so the handler can
     /// never receive a reply for an id nothing is waiting on yet), builds
-    /// the script via `build_js`, evaluates it, and blocks on the reply (or
-    /// `timeout`). Used by `wait_for`/`fill`/`click`/`html` — `open` has no
+    /// the script via `build_js`, evaluates it, and awaits the reply (or
+    /// `timeout`) without blocking the thread, so a stopped run gives up on
+    /// it at once. Used by `wait_for`/`fill`/`click`/`html` — `open` has no
     /// reply to wait for, so it bypasses this.
-    fn call(&self, build_js: impl FnOnce(u64) -> String, timeout: Duration) -> Result<Value> {
+    async fn call(&self, build_js: impl FnOnce(u64) -> String, timeout: Duration) -> Result<Value> {
         self.ensure_started()?;
         let id = self.next_id();
         let pending = &self.handler.pending;
 
-        let (tx, rx) = sync_channel(1);
+        let (tx, rx) = oneshot::channel();
         pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(id, tx);
+        // Removes the slot however this call ends, its future dropped by a
+        // stopped run (see `StopSignal::block_on`) included.
+        let _slot = ReplySlot { pending, id };
         // The window may have closed since `ensure_started` checked, clearing
         // `pending` before this slot went in: nothing would ever answer it.
         if self.handler.closed.load(Ordering::SeqCst) {
-            pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&id);
             return Err(window_closed());
         }
 
         let script = build_js(id);
-        if let Err(err) = self.with_session(|session| session.evaluate_script(&script)) {
-            pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&id);
-            return Err(err);
-        }
+        self.with_session(|session| session.evaluate_script(&script))?;
 
-        match rx.recv_timeout(timeout) {
-            Ok(value) => Ok(value),
-            Err(RecvTimeoutError::Disconnected) => Err(window_closed()),
-            Err(RecvTimeoutError::Timeout) => {
-                pending
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&id);
-                Err(ErrorKind::Browser(format!(
-                    "timed out after {timeout:?} waiting for the browser"
-                ))
-                .into())
-            }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_)) => Err(window_closed()),
+            Err(_) => Err(ErrorKind::Browser(format!(
+                "timed out after {timeout:?} waiting for the browser"
+            ))
+            .into()),
         }
     }
 
-    fn set_pending_download(&self, slot: Option<SyncSender<String>>) {
+    fn set_pending_download(&self, slot: Option<oneshot::Sender<String>>) {
         *self
             .handler
             .pending_download
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = slot;
+    }
+}
+
+/// Removes a [`BrowserDriver::call`]'s reply slot from `pending` when
+/// dropped.
+struct ReplySlot<'a> {
+    pending: &'a PendingReplies,
+    id: u64,
+}
+
+impl Drop for ReplySlot<'_> {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// Empties a [`BrowserDriver::download`]'s slot in `pending_download` when
+/// dropped, so a download given up on (timed out, failed, or its future
+/// dropped by a stopped run) never takes a later popup.
+struct DownloadSlot<'a>(&'a BrowserDriver);
+
+impl Drop for DownloadSlot<'_> {
+    fn drop(&mut self) {
+        self.0.set_pending_download(None);
     }
 }
 
@@ -330,28 +345,34 @@ impl Service for BrowserDriver {
 
     async fn wait_for(&self, selector: &str, timeout: Duration) -> Result<()> {
         let timeout_ms = timeout.as_millis() as u64;
-        let value = self.call(
-            |id| wait_for_script(id, selector, timeout_ms),
-            timeout + Duration::from_secs(1),
-        )?;
+        let value = self
+            .call(
+                |id| wait_for_script(id, selector, timeout_ms),
+                timeout + Duration::from_secs(1),
+            )
+            .await?;
         parse_ack(value)
     }
 
     async fn fill(&self, selector: &str, value: &str) -> Result<()> {
-        let result = self.call(
-            |id| fill_script(id, selector, value),
-            Duration::from_secs(10),
-        )?;
+        let result = self
+            .call(
+                |id| fill_script(id, selector, value),
+                Duration::from_secs(10),
+            )
+            .await?;
         parse_ack(result)
     }
 
     async fn click(&self, selector: &str) -> Result<()> {
-        let result = self.call(|id| click_script(id, selector), Duration::from_secs(10))?;
+        let result = self
+            .call(|id| click_script(id, selector), Duration::from_secs(10))
+            .await?;
         parse_ack(result)
     }
 
     async fn html(&self) -> Result<String> {
-        let value = self.call(html_script, Duration::from_secs(10))?;
+        let value = self.call(html_script, Duration::from_secs(10)).await?;
         parse_html(value)
     }
 
@@ -377,18 +398,17 @@ impl Service for BrowserDriver {
         let deadline = Instant::now() + timeout;
         self.ensure_started()?;
 
-        let (tx, rx) = sync_channel(1);
+        let (tx, rx) = oneshot::channel();
         self.set_pending_download(Some(tx));
+        let _slot = DownloadSlot(self);
 
         // Reuses the same click path `Service::click` does — the download
         // is a side effect of this click, not a separate webview command.
-        if let Err(err) = self.click(selector).await {
-            self.set_pending_download(None);
-            return Err(err);
-        }
+        self.click(selector).await?;
 
-        let Ok(url) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
-            self.set_pending_download(None);
+        let Ok(Ok(url)) =
+            tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), rx).await
+        else {
             return Err(ErrorKind::Browser(format!(
                 "timed out after {timeout:?} waiting for a download to start"
             ))
@@ -402,10 +422,12 @@ impl Service for BrowserDriver {
             .into());
         }
 
-        let value = self.call(
-            |id| fetch_script(id, &url),
-            deadline.saturating_duration_since(Instant::now()),
-        )?;
+        let value = self
+            .call(
+                |id| fetch_script(id, &url),
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .await?;
         parse_fetched(value)
     }
 }
@@ -1133,6 +1155,44 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_wait_given_up_on_stops_waiting_at_once_and_frees_its_slot() {
+        let captured = Captured::default();
+        // Never answers: the page would take the whole timeout.
+        let session = answering_session(&captured, |_, _| None);
+        let driver = driver(engine_opening(session, &captured));
+
+        let started = Instant::now();
+        let given_up = tokio::time::timeout(
+            Duration::from_millis(50),
+            driver.wait_for("body", Duration::from_secs(60)),
+        )
+        .await;
+
+        assert!(given_up.is_err(), "the wait should still have been pending");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(driver.handler.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_download_given_up_on_leaves_later_popups_alone() {
+        let captured = Captured::default();
+        let session = answering_session(&captured, |_, _| Some(serde_json::json!({"ok": true})));
+        let driver = driver(engine_opening(session, &captured));
+
+        let given_up = tokio::time::timeout(
+            Duration::from_millis(50),
+            driver.download("#pdf", Duration::from_secs(60)),
+        )
+        .await;
+
+        assert!(
+            given_up.is_err(),
+            "the download should still have been pending"
+        );
+        assert!(handler_of(&captured).allow_new_window("https://www.example.com/popup"));
     }
 
     #[tokio::test]
