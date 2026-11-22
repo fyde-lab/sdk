@@ -1,8 +1,8 @@
 use uuid::Uuid;
 
 /// An image shown for another entity (e.g. a script's icon), as returned by
-/// [`super::Service::create_icon`]/[`super::Service::fetch_icon`]. Never
-/// changes once created.
+/// [`super::Service::fetch_icon`]. Never changes once created (creating one
+/// is admin-only, not in this SDK).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Icon {
     pub(super) id: Uuid,
