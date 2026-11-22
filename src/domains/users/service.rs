@@ -272,11 +272,6 @@ impl UsersClient {
         cleared.and(wiped).and(deleted)
     }
 
-    /// Fails with [`crate::ErrorCode::AlreadyLoggedIn`] if a session is already open on
-    /// this device. Checked by `create`/`login` before anything else: the
-    /// local cache isn't partitioned per account, so opening a second
-    /// account's session on top of the first would hand it the first
-    /// account's cached documents, changelog cursor and scraper cookies.
     /// Closes the server's pending exchange for `login_id`, which this
     /// client won't finish for real, by sending it a finalization that can
     /// never verify ([`abandoned_login_finalization`]): `login_id` is
@@ -299,6 +294,12 @@ impl UsersClient {
         }
     }
 
+    /// Fails with [`crate::ErrorCode::AlreadyLoggedIn`] if a session is
+    /// already open on this device. Checked by `create`, `login` and
+    /// `recover_account` before contacting the server: the local cache isn't
+    /// partitioned per account, so opening a second account's session on top
+    /// of the first would hand it the first account's cached documents,
+    /// changelog cursor and scraper cookies.
     async fn ensure_no_open_session(&self) -> Result<()> {
         if self.sessions.is_connected().await? {
             return Err(ErrorKind::AlreadyLoggedIn.into());
