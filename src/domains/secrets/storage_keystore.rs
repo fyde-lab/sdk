@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use keyring_core::{CredentialStore, Entry};
+use zeroize::Zeroizing;
 
 use crate::{Error, ErrorContext as _, Result};
 
@@ -72,7 +73,8 @@ impl Storage for KeystoreStorage {
     }
 
     async fn set(&self, key: &str, value: &str) -> Result<()> {
-        let value = value.to_string();
+        // Moved to the blocking thread, and wiped once written.
+        let value = Zeroizing::new(value.to_string());
         self.with_entry(key, move |entry| entry.set_password(&value))
             .await
     }
