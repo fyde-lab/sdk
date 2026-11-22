@@ -379,7 +379,8 @@ pub trait Service: Send + Sync {
     /// that's offline, or a server that's down, must never be what leaves
     /// the account's keys behind — in which case the server-side session is
     /// left to expire on its own and the failure is only logged. A no-op if
-    /// there is no open session.
+    /// there is no open session. A session token that can't be read counts
+    /// as an open one: local state is cleared, without telling the server.
     async fn logout(&self) -> Result<()>;
 
     /// Changes the password of the account behind the current session,
