@@ -231,14 +231,19 @@ impl Client {
     /// process or any other, is still alive on them.
     pub async fn init(config: ClientConfig) -> Result<Self> {
         install_tracing(config.log_level, config.on_log.clone());
-        let location = DatabaseLocation::resolve(&config.storage, &config.client_name)?;
-        check_models_dir(&config.models_dir, &location)?;
+        let location = DatabaseLocation::resolve(&config.storage, &config.client_name)
+            .context("failed to locate the local database")?;
+        check_models_dir(&config.models_dir, &location).context("refused the models directory")?;
         // Before touching the database at all, so a second instance never
         // migrates, reads or syncs into the one the first is using.
-        let instance_lock = lock_instance(&location)?;
-        let sqlite = open_database(&location).await?;
-        let secrets = open_secrets(&location, &sqlite)?;
-        let channel = lazy_channel(config.url)?;
+        let instance_lock =
+            lock_instance(&location).context("failed to lock the local database")?;
+        let sqlite = open_database(&location)
+            .await
+            .context("failed to open the local database")?;
+        let secrets =
+            open_secrets(&location, &sqlite).context("failed to open the secrets storage")?;
+        let channel = lazy_channel(config.url).context("failed to set up the server channel")?;
         let models = Arc::new(tools::models::ModelStore::new(config.models_dir));
         let embedder = domains::documents::init_embedder(models.clone());
         let ocr = domains::documents::init_ocr(models.clone());
@@ -354,7 +359,12 @@ impl Client {
         // persisted in `secrets`, not just held in memory — see
         // `users::mod`'s doc comment) — in that case `create`/`login` won't
         // run again to start it, so start it here instead.
-        if jobs.sync && sessions.is_connected().await? {
+        if jobs.sync
+            && sessions
+                .is_connected()
+                .await
+                .context("failed to check for a session to sync")?
+        {
             documents
                 .start_sync()
                 .await
@@ -538,7 +548,7 @@ enum DatabaseLocation {
 
 impl DatabaseLocation {
     fn resolve(storage: &Storage, client_name: &str) -> Result<Self> {
-        validate_client_name(client_name)?;
+        validate_client_name(client_name).context("refused the client name")?;
         Ok(match storage {
             Storage::Disk(data_dir) => Self::Disk(client_database_path(data_dir, client_name)?),
             Storage::Memory => Self::Memory,
