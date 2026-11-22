@@ -261,7 +261,8 @@ impl FydeClient for GrpcClient {
                 username: username.to_string(),
                 opaque_request: opaque_request.to_vec(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the StartRegistration request")?;
 
         let response = self
             .client()
@@ -290,7 +291,8 @@ impl FydeClient for GrpcClient {
                 encrypted_master_key: encrypted_master_key.to_vec(),
                 language: language.to_string(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the FinishRegistration request")?;
 
         let response = self
             .client()
@@ -313,7 +315,8 @@ impl FydeClient for GrpcClient {
                 username: username.to_string(),
                 opaque_request: opaque_request.to_vec(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the StartLogin request")?;
 
         let response = self
             .client()
@@ -343,7 +346,8 @@ impl FydeClient for GrpcClient {
                 // plan's session limit.
                 admin_session: false,
             })
-            .await?;
+            .await
+            .context("failed to authenticate the FinishLogin request")?;
 
         let response = self
             .client()
@@ -377,7 +381,8 @@ impl FydeClient for GrpcClient {
         let request = self
             .sessions
             .authenticated_request(LogoutRequest {})
-            .await?;
+            .await
+            .context("failed to authenticate the Logout request")?;
 
         self.client()
             .logout(request)
@@ -391,7 +396,8 @@ impl FydeClient for GrpcClient {
         let request = self
             .sessions
             .authenticated_request(ListSessionsRequest {})
-            .await?;
+            .await
+            .context("failed to authenticate the ListSessions request")?;
 
         let response = self
             .sessions
@@ -412,7 +418,8 @@ impl FydeClient for GrpcClient {
             .authenticated_request(RevokeSessionRequest {
                 session_id: session_id.to_string(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the RevokeSession request")?;
 
         self.sessions
             .check_response(self.client().revoke_session(request).await)
@@ -428,7 +435,8 @@ impl FydeClient for GrpcClient {
             .authenticated_request(StartChangePasswordRequest {
                 opaque_request: opaque_request.to_vec(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the StartChangePassword request")?;
 
         let response = self
             .sessions
@@ -451,7 +459,8 @@ impl FydeClient for GrpcClient {
                 opaque_upload: opaque_upload.to_vec(),
                 encrypted_master_key: encrypted_master_key.to_vec(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the FinishChangePassword request")?;
 
         self.sessions
             .check_response(self.client().finish_change_password(request).await)
@@ -472,7 +481,8 @@ impl FydeClient for GrpcClient {
                 recovery_auth_key: recovery_auth_key.to_vec(),
                 recovery_encrypted_master_key: recovery_encrypted_master_key.to_vec(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the SetRecoveryKey request")?;
 
         self.sessions
             .check_response(self.client().set_recovery_key(request).await)
@@ -486,7 +496,8 @@ impl FydeClient for GrpcClient {
         let request = self
             .sessions
             .authenticated_request(DeleteRecoveryKeyRequest {})
-            .await?;
+            .await
+            .context("failed to authenticate the DeleteRecoveryKey request")?;
 
         self.sessions
             .check_response(self.client().delete_recovery_key(request).await)
@@ -500,7 +511,8 @@ impl FydeClient for GrpcClient {
         let request = self
             .sessions
             .authenticated_request(GetRecoveryKeyStatusRequest {})
-            .await?;
+            .await
+            .context("failed to authenticate the GetRecoveryKeyStatus request")?;
 
         let response = self
             .sessions
@@ -525,7 +537,8 @@ impl FydeClient for GrpcClient {
                 recovery_auth_key: recovery_auth_key.to_vec(),
                 opaque_request: opaque_request.to_vec(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the StartRecovery request")?;
 
         let response = self
             .client()
@@ -557,7 +570,8 @@ impl FydeClient for GrpcClient {
                 encrypted_master_key: encrypted_master_key.to_vec(),
                 device_name: device_name.to_string(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the FinishRecovery request")?;
 
         let response = self
             .client()

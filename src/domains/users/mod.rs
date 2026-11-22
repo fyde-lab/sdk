@@ -544,7 +544,8 @@ pub(crate) async fn init(
             embedding_cache,
             auto_sync,
         )
-        .await?,
+        .await
+        .context("failed to build the users client")?,
     );
     let handler: Arc<dyn ExpiredSessionHandler> = users.clone();
     sessions.on_session_expired(Arc::downgrade(&handler));
