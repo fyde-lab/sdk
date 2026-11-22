@@ -361,4 +361,60 @@ mod tests {
         // finds no session: what matters is it's no longer reported expired.
         assert_eq!(after_new_session.code(), ErrorCode::Unauthenticated);
     }
+
+    #[tokio::test]
+    async fn authenticated_request_refuses_a_token_that_is_not_a_valid_header_value() {
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .returning(|_| Ok(Some("a\ntoken".to_string())));
+        let client = SessionsClient::new(Arc::new(secrets));
+
+        let err = client.authenticated_request(()).await.unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::InvalidServerResponse);
+    }
+
+    #[tokio::test]
+    async fn check_response_keeps_a_rejection_unauthenticated_when_the_session_cannot_be_read() {
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .returning(|_| Err(ErrorKind::Io(std::io::Error::other("keyring locked")).into()));
+        let client = SessionsClient::new(Arc::new(secrets));
+        // No expectation: a session that can't be read isn't ended.
+        let _handler = register(&client, MockExpiredSessionHandler::new());
+
+        let err = client.check_response(rejected()).await.unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn check_response_ends_the_session_once_for_concurrent_rejections() {
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .returning(|_| Ok(Some("a-token".to_string())));
+        let client = SessionsClient::new(Arc::new(secrets));
+        let mut handler = MockExpiredSessionHandler::new();
+        handler
+            .expect_end_expired_session()
+            .times(1)
+            .returning(|| Ok(()));
+        let _handler = register(&client, handler);
+
+        let (first, second, third) = tokio::join!(
+            client.check_response(rejected()),
+            client.check_response(rejected()),
+            client.check_response(rejected()),
+        );
+
+        for result in [first, second, third] {
+            assert_eq!(result.unwrap_err().code(), ErrorCode::SessionExpired);
+        }
+    }
 }
