@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::sync::Arc;
 
 use tracing_log::NormalizeEvent;
@@ -48,6 +49,13 @@ impl From<&tracing::Level> for LogLevel {
 /// [`crate::ClientConfig::on_log`] is set, so callers with no terminal to
 /// print to (in particular the Kotlin Multiplatform app) can observe SDK
 /// logs directly.
+///
+/// Never re-enters its callback: an event the callback itself causes on
+/// its thread, while it runs, is not forwarded to it (the `fmt` layer still
+/// prints it). That includes the ERROR [`install_panic_hook`] logs when the
+/// callback panics (a UniFFI callback does when its foreign implementation
+/// throws): calling it again from the hook would panic inside the hook,
+/// which aborts the process.
 pub(crate) struct CallbackLayer {
     pub(crate) callback: Arc<dyn Fn(LogLevel, String) + Send + Sync>,
 }
@@ -81,10 +89,35 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallbackLayer {
         let normalized = event.normalized_metadata();
         let metadata = normalized.as_ref().unwrap_or_else(|| event.metadata());
 
+        let Some(_guard) = CallbackGuard::enter() else {
+            return;
+        };
         (self.callback)(
             LogLevel::from(metadata.level()),
             format!("{}: {}", metadata.target(), visitor.0),
         );
+    }
+}
+
+thread_local! {
+    /// Whether this thread is running a [`CallbackLayer`]'s callback.
+    static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Marks this thread as running a [`CallbackLayer`]'s callback until it
+/// drops, unwinding included.
+struct CallbackGuard;
+
+impl CallbackGuard {
+    /// `None` when this thread already runs one.
+    fn enter() -> Option<Self> {
+        (!IN_CALLBACK.replace(true)).then_some(Self)
+    }
+}
+
+impl Drop for CallbackGuard {
+    fn drop(&mut self) {
+        IN_CALLBACK.set(false);
     }
 }
 
@@ -237,6 +270,58 @@ mod tests {
             "{line}"
         );
         assert!(line.contains(": boom 42"), "{line}");
+    }
+
+    /// Set for [`panicking_callback_under_the_global_subscriber`] when
+    /// [`a_panicking_callback_unwinds_instead_of_aborting`] runs it.
+    const PANICKING_CALLBACK_CHILD: &str = "FYDE_TEST_PANICKING_LOG_CALLBACK";
+
+    /// The global subscriber is the case that matters: a scoped one
+    /// (`with_default`, as in the other tests) already drops events raised
+    /// while it dispatches, so it needs its own process.
+    #[test]
+    fn a_panicking_callback_unwinds_instead_of_aborting() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::log::tests::panicking_callback_under_the_global_subscriber",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(PANICKING_CALLBACK_CHILD, "1")
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{}\n{stderr}", output.status);
+        assert!(stderr.contains("callback calls: 1"), "{stderr}");
+    }
+
+    #[test]
+    #[ignore = "run in its own process by a_panicking_callback_unwinds_instead_of_aborting"]
+    fn panicking_callback_under_the_global_subscriber() {
+        if std::env::var_os(PANICKING_CALLBACK_CHILD).is_none() {
+            return;
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let layer = CallbackLayer {
+            callback: Arc::new(move |_, _| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("the foreign logger threw");
+            }),
+        };
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
+            .unwrap();
+        install_panic_hook();
+
+        let thread = std::thread::spawn(|| tracing::info!("hello"));
+
+        assert!(thread.join().is_err());
+        eprintln!(
+            "callback calls: {}",
+            calls.load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 
     #[test]
