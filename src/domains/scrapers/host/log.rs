@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use mlua::{Lua, Result as LuaResult, Table};
 use serde_json::json;
+use tracing::Level;
 
 use super::super::reports::Recorder;
 
@@ -14,49 +15,35 @@ use super::super::reports::Recorder;
 /// this is ported from.
 pub(super) fn table(lua: &Lua, scraper_name: &str, recorder: Arc<Recorder>) -> LuaResult<Table> {
     let log = lua.create_table()?;
-
-    let scraper = scraper_name.to_string();
-    let debug_recorder = recorder.clone();
-    log.set(
-        "debug",
-        lua.create_function(move |_, message: String| {
-            tracing::debug!(target: "fyde::scrapers", scraper = %scraper, "{message}");
-            debug_recorder.record("log", json!({ "level": "debug", "message": message }));
-            Ok(())
-        })?,
-    )?;
-
-    let scraper = scraper_name.to_string();
-    let info_recorder = recorder.clone();
-    log.set(
-        "info",
-        lua.create_function(move |_, message: String| {
-            tracing::info!(target: "fyde::scrapers", scraper = %scraper, "{message}");
-            info_recorder.record("log", json!({ "level": "info", "message": message }));
-            Ok(())
-        })?,
-    )?;
-
-    let scraper = scraper_name.to_string();
-    let warn_recorder = recorder.clone();
-    log.set(
-        "warn",
-        lua.create_function(move |_, message: String| {
-            tracing::warn!(target: "fyde::scrapers", scraper = %scraper, "{message}");
-            warn_recorder.record("log", json!({ "level": "warn", "message": message }));
-            Ok(())
-        })?,
-    )?;
-
-    let scraper = scraper_name.to_string();
-    log.set(
-        "error",
-        lua.create_function(move |_, message: String| {
-            tracing::error!(target: "fyde::scrapers", scraper = %scraper, "{message}");
-            recorder.record("log", json!({ "level": "error", "message": message }));
-            Ok(())
-        })?,
-    )?;
+    for (name, level) in [
+        ("debug", Level::DEBUG),
+        ("info", Level::INFO),
+        ("warn", Level::WARN),
+        ("error", Level::ERROR),
+    ] {
+        let scraper = scraper_name.to_string();
+        let recorder = recorder.clone();
+        log.set(
+            name,
+            lua.create_function(move |_, message: String| {
+                // `tracing`'s macros need their level as a constant.
+                match level {
+                    Level::DEBUG => {
+                        tracing::debug!(target: "fyde::scrapers", scraper = %scraper, "{message}")
+                    }
+                    Level::INFO => {
+                        tracing::info!(target: "fyde::scrapers", scraper = %scraper, "{message}")
+                    }
+                    Level::WARN => {
+                        tracing::warn!(target: "fyde::scrapers", scraper = %scraper, "{message}")
+                    }
+                    _ => tracing::error!(target: "fyde::scrapers", scraper = %scraper, "{message}"),
+                }
+                recorder.record("log", json!({ "level": name, "message": message }));
+                Ok(())
+            })?,
+        )?;
+    }
 
     Ok(log)
 }
@@ -93,14 +80,21 @@ mod tests {
             .set("log", table(&lua, "didaxis", recorder.clone()).unwrap())
             .unwrap();
 
-        lua.load(r#"log.info("hello")"#).exec().unwrap();
+        lua.load(r#"log.debug("a") log.info("b") log.warn("c") log.error("d")"#)
+            .exec()
+            .unwrap();
 
         let entries = recorder.entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].event, "log");
+        assert!(entries.iter().all(|entry| entry.event == "log"));
+        let values: Vec<_> = entries.into_iter().map(|entry| entry.value).collect();
         assert_eq!(
-            entries[0].value,
-            serde_json::json!({ "level": "info", "message": "hello" })
+            values,
+            vec![
+                serde_json::json!({ "level": "debug", "message": "a" }),
+                serde_json::json!({ "level": "info", "message": "b" }),
+                serde_json::json!({ "level": "warn", "message": "c" }),
+                serde_json::json!({ "level": "error", "message": "d" }),
+            ]
         );
     }
 }
