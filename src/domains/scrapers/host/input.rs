@@ -13,9 +13,10 @@ use super::super::stop::StopSignal;
 /// real stdin), this forwards to `on_question` — see
 /// [`crate::ClientConfig::on_scraper_question`] — so the consuming
 /// application can ask directly on screen. Fails immediately, rather than
-/// blocking forever, if no handler is configured. Writes an `input_ask`
-/// entry (question and answer) to `recorder` either way, matching
-/// `demo-rust-fyde`'s own `host/input.rs`.
+/// blocking forever, if no handler is configured. Once answered, writes an
+/// `input_ask` entry to `recorder` holding only the question, never the
+/// answer (unlike `demo-rust-fyde`'s own `host/input.rs`, which records
+/// both): it's typically a one-time code.
 ///
 /// The handler runs on `runtime`'s blocking pool rather than on the run's own
 /// thread, so a stopped run (`stop`) stops waiting for the answer at once:
