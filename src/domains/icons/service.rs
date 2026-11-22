@@ -37,7 +37,11 @@ impl<S: Storage> Service for IconsClient<S> {
             return Ok(icon);
         }
 
-        let icon = self.grpc.fetch_icon(id).await?;
+        let icon = self
+            .grpc
+            .fetch_icon(id)
+            .await
+            .with_context(|| format!("failed to fetch icon {id} from the server"))?;
         self.storage
             .save(&icon)
             .await
