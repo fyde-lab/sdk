@@ -27,7 +27,9 @@ where
     let mut scripts = Vec::new();
     let mut page_token = None;
     loop {
-        let page = list_page(page_token).await?;
+        let page = list_page(page_token)
+            .await
+            .context("failed to list a page of scripts")?;
         scripts.extend(page.scripts);
         match page.next_page_token {
             Some(next_page_token) => page_token = Some(next_page_token),
@@ -67,23 +69,36 @@ impl<S: Storage> ScriptsClient<S> {
 #[async_trait]
 impl<S: Storage> Service for ScriptsClient<S> {
     async fn fetch_script(&self, id: Uuid) -> Result<Script> {
-        self.grpc.fetch_script(id).await
+        self.grpc
+            .fetch_script(id)
+            .await
+            .with_context(|| format!("failed to fetch script {id}"))
     }
 
     async fn enable_script(&self, script_id: Uuid) -> Result<()> {
-        self.grpc.enable_script(script_id).await
+        self.grpc
+            .enable_script(script_id)
+            .await
+            .with_context(|| format!("failed to enable script {script_id}"))
     }
 
     async fn disable_script(&self, script_id: Uuid) -> Result<()> {
-        self.grpc.disable_script(script_id).await
+        self.grpc
+            .disable_script(script_id)
+            .await
+            .with_context(|| format!("failed to disable script {script_id}"))
     }
 
     async fn list_user_scripts(&self) -> Result<Vec<ScriptMetadata>> {
-        all_pages(|page_token| self.grpc.list_user_scripts(page_token)).await
+        all_pages(|page_token| self.grpc.list_user_scripts(page_token))
+            .await
+            .context("failed to list the user's scripts")
     }
 
     async fn list_public_scripts(&self) -> Result<Vec<ScriptMetadata>> {
-        all_pages(|page_token| self.grpc.list_public_scripts(page_token)).await
+        all_pages(|page_token| self.grpc.list_public_scripts(page_token))
+            .await
+            .context("failed to list the public scripts")
     }
 
     async fn install_script(&self, request: InstallScriptRequest) -> Result<Uuid> {
@@ -146,7 +161,7 @@ impl<S: Storage> Service for ScriptsClient<S> {
         let label = match label.trim() {
             "" => default_label(&script, &parameters),
             label => {
-                check_label(label)?;
+                check_label(label).context("refused the installation's label")?;
                 label.to_string()
             }
         };

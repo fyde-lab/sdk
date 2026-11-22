@@ -107,7 +107,8 @@ impl FydeClient for GrpcClient {
         let request = self
             .sessions
             .authenticated_request(FetchScriptRequest { id: id.to_string() })
-            .await?;
+            .await
+            .context("failed to authenticate the FetchScript request")?;
 
         let response = self
             .sessions
@@ -127,7 +128,8 @@ impl FydeClient for GrpcClient {
             .authenticated_request(EnableScriptRequest {
                 script_id: script_id.to_string(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the EnableScript request")?;
 
         self.sessions
             .check_response(self.client().enable_script(request).await)
@@ -143,7 +145,8 @@ impl FydeClient for GrpcClient {
             .authenticated_request(DisableScriptRequest {
                 script_id: script_id.to_string(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the DisableScript request")?;
 
         self.sessions
             .check_response(self.client().disable_script(request).await)
@@ -160,7 +163,8 @@ impl FydeClient for GrpcClient {
                 page_size: LISTING_PAGE_SIZE,
                 page_token: page_token.unwrap_or_default(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the ListUserScripts request")?;
 
         let response = self
             .sessions
@@ -179,7 +183,8 @@ impl FydeClient for GrpcClient {
                 page_size: LISTING_PAGE_SIZE,
                 page_token: page_token.unwrap_or_default(),
             })
-            .await?;
+            .await
+            .context("failed to authenticate the ListPublicScripts request")?;
 
         let response = self
             .sessions
