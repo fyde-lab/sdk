@@ -220,9 +220,9 @@ impl UsersClient {
         state: RegistrationState,
         password: &str,
         response: Vec<u8>,
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
         let opaque = self.opaque.clone();
-        let password = password.to_string();
+        let password = Zeroizing::new(password.to_string());
         tokio::task::spawn_blocking(move || opaque.finish_registration(state, &password, &response))
             .await
             .context("OPAQUE registration task panicked")?
@@ -235,9 +235,9 @@ impl UsersClient {
         state: LoginState,
         password: &str,
         response: Vec<u8>,
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
         let opaque = self.opaque.clone();
-        let password = password.to_string();
+        let password = Zeroizing::new(password.to_string());
         tokio::task::spawn_blocking(move || opaque.finish_login(state, &password, &response))
             .await
             .context("OPAQUE login task panicked")?
@@ -338,6 +338,7 @@ impl UsersClient {
             .get(MASTER_KEY_SECRET)
             .await
             .context("failed to read current master key")?
+            .map(Zeroizing::new)
             .ok_or_else(|| {
                 ErrorKind::Encryption(
                     "no master key found in the credential store; log in or create an account first"
@@ -426,7 +427,6 @@ impl Service for UsersClient {
             .finish_registration(state, password, opaque_response)
             .await
             .context("failed to finish OPAQUE registration")?;
-        let export_key = Zeroizing::new(export_key);
 
         let (raw_master_key, wrapped_master_key) =
             generate_and_wrap_master_key(&export_key).context("failed to generate master key")?;
@@ -487,7 +487,6 @@ impl Service for UsersClient {
                     return Err(err).context("failed to finish OPAQUE login");
                 }
             };
-        let export_key = Zeroizing::new(export_key);
 
         let (token, encrypted_master_key, role) = match self
             .grpc
@@ -584,7 +583,7 @@ impl Service for UsersClient {
         self.abandon_login(&login_id, PASSWORD_CHECK_DEVICE_NAME)
             .await;
         let (_, old_export_key) = verified.context("failed to verify current password")?;
-        drop(Zeroizing::new(old_export_key));
+        drop(old_export_key);
 
         let (state, opaque_request) = self
             .opaque
@@ -601,7 +600,6 @@ impl Service for UsersClient {
             .finish_registration(state, new_password, opaque_response)
             .await
             .context("failed to finish OPAQUE registration")?;
-        let new_export_key = Zeroizing::new(new_export_key);
 
         let raw_master_key = self
             .read_master_key()
@@ -636,7 +634,7 @@ impl Service for UsersClient {
             .await
             .context("failed to set recovery key")?;
 
-        Ok(recovery_key)
+        Ok(recovery_key.to_string())
     }
 
     async fn delete_recovery_key(&self) -> Result<()> {
@@ -694,7 +692,6 @@ impl Service for UsersClient {
             .finish_registration(state, new_password, opaque_response)
             .await
             .context("failed to finish OPAQUE registration")?;
-        let export_key = Zeroizing::new(export_key);
         let new_wrapped_master_key = wrap_master_key(&raw_master_key, &export_key)
             .context("failed to wrap master key under the new export key")?;
 
@@ -962,7 +959,7 @@ mod tests {
         opaque
             .expect_finish_registration()
             .times(1)
-            .returning(move |_, _, _| Ok((upload.to_vec(), export_key.to_vec())));
+            .returning(move |_, _, _| Ok((upload.to_vec(), Zeroizing::new(export_key.to_vec()))));
         opaque
     }
 
@@ -980,7 +977,9 @@ mod tests {
         opaque
             .expect_finish_login()
             .times(1)
-            .returning(move |_, _, _| Ok((upload.to_vec(), LOGIN_EXPORT_KEY.to_vec())));
+            .returning(move |_, _, _| {
+                Ok((upload.to_vec(), Zeroizing::new(LOGIN_EXPORT_KEY.to_vec())))
+            });
         opaque
     }
 
@@ -2487,10 +2486,12 @@ mod tests {
             .expect_start_login()
             .times(1)
             .returning(|_| Ok((fake_login_state(), b"the-login-request".to_vec())));
-        opaque
-            .expect_finish_login()
-            .times(1)
-            .returning(|_, _, _| Ok((b"the-login-upload".to_vec(), OLD_EXPORT_KEY.to_vec())));
+        opaque.expect_finish_login().times(1).returning(|_, _, _| {
+            Ok((
+                b"the-login-upload".to_vec(),
+                Zeroizing::new(OLD_EXPORT_KEY.to_vec()),
+            ))
+        });
         opaque
             .expect_start_registration()
             .times(1)
@@ -2498,7 +2499,12 @@ mod tests {
         opaque
             .expect_finish_registration()
             .times(1)
-            .returning(|_, _, _| Ok((b"the-new-upload".to_vec(), NEW_EXPORT_KEY.to_vec())));
+            .returning(|_, _, _| {
+                Ok((
+                    b"the-new-upload".to_vec(),
+                    Zeroizing::new(NEW_EXPORT_KEY.to_vec()),
+                ))
+            });
         opaque
     }
 
