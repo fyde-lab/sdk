@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::io::AsyncWriteExt as _;
 
 use crate::{ErrorContext as _, Result};
 
@@ -63,7 +64,7 @@ impl Storage for FileStorage {
             format!("failed to serialize session data for scraper {scraper_name:?}")
         })?;
 
-        tokio::fs::write(&path, contents)
+        write_owner_only(&path, contents.as_bytes())
             .await
             .with_context(|| format!("failed to write session file {}", path.display()))?;
 
@@ -79,6 +80,51 @@ impl Storage for FileStorage {
             _ => Ok(()),
         }
     }
+}
+
+/// Writes `contents` to `path` through a sibling temporary file created
+/// readable and writable by its owner only, then renamed into place. A run
+/// interrupted mid-write then leaves the previous file whole: a truncated
+/// one would fail to parse in [`FileStorage::get`], failing every later run
+/// of that scraper until it's deleted by hand. The session data (saved
+/// document URLs, a script's cursors...) also mustn't inherit a
+/// umask-derived, typically world-readable mode (a file a previous version
+/// wrote that way is replaced by the rename). Off Unix only the atomic
+/// replace applies.
+async fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+
+    match tokio::fs::remove_file(&tmp).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to remove stale temporary file {}", tmp.display())
+            });
+        }
+    }
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&tmp)
+        .await
+        .with_context(|| format!("failed to create temporary file {}", tmp.display()))?;
+    file.write_all(contents)
+        .await
+        .with_context(|| format!("failed to write temporary file {}", tmp.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("failed to flush temporary file {}", tmp.display()))?;
+    drop(file);
+
+    tokio::fs::rename(&tmp, path)
+        .await
+        .with_context(|| format!("failed to move temporary file {} into place", tmp.display()))
 }
 
 #[cfg(test)]
@@ -176,5 +222,45 @@ mod tests {
         storage.set("didaxis", json!({})).await.unwrap();
 
         assert!(dir.join("didaxis.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn set_writes_a_file_only_its_owner_can_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (tmp, storage) = setup();
+        let path = tmp.path().join("didaxis.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        storage
+            .set("didaxis", json!({"cursor": "abc"}))
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn set_leaves_no_temporary_file_behind() {
+        let (tmp, storage) = setup();
+        std::fs::write(tmp.path().join("didaxis.json.tmp"), "stale").unwrap();
+
+        storage
+            .set("didaxis", json!({"cursor": "abc"}))
+            .await
+            .unwrap();
+
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("didaxis.json")]);
+        assert_eq!(
+            storage.get("didaxis").await.unwrap(),
+            Some(json!({"cursor": "abc"}))
+        );
     }
 }
