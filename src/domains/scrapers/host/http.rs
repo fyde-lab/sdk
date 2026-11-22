@@ -86,9 +86,10 @@ pub(crate) fn export_cookies(
     cookies
 }
 
-/// Records `url` (`scheme://host[:port]/path`, query and fragment dropped)
-/// into the shared set [`export_cookies`] later uses to know which hosts and
-/// paths to ask the cookie jar about when exporting cookies for the next run.
+/// Records `url` (`scheme://host[:port]/path`, userinfo, query and fragment
+/// dropped) into the shared set [`export_cookies`] later uses to know which
+/// hosts and paths to ask the cookie jar about when exporting cookies for the
+/// next run.
 fn track_url(urls: &Mutex<HashSet<String>>, url: &str) {
     if let Some(scope) = scope_of(url)
         && let Ok(mut urls) = urls.lock()
@@ -150,15 +151,18 @@ fn origin_of(url: &str) -> Option<String> {
     Some(format!("{}://{}", &url[..scheme_end], &rest[..host_end]))
 }
 
-/// `url`'s origin and path (`/` when it has none), without query or fragment.
+/// `url`'s origin and path (`/` when it has none), without userinfo, query
+/// or fragment: [`export_cookies`] saves its origin as the cookies', so a
+/// script's `https://user:password@host/` must never get that far. `None`
+/// for a URL that doesn't parse, or has no host.
 fn scope_of(url: &str) -> Option<String> {
-    let origin = origin_of(url)?;
-    let rest = &url[origin.len()..];
-    let path = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
-    Some(format!(
-        "{origin}{}",
-        if path.is_empty() { "/" } else { path }
-    ))
+    let mut parsed = url::Url::parse(url).ok()?;
+    parsed.host_str()?;
+    parsed.set_username("").ok()?;
+    parsed.set_password(None).ok()?;
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    Some(parsed.into())
 }
 
 fn to_header_map(headers: Option<Table>) -> LuaResult<HeaderMap> {
@@ -1159,5 +1163,26 @@ mod tests {
             Some("https://example.com/".to_string())
         );
         assert_eq!(scope_of("not a url"), None);
+    }
+
+    #[test]
+    fn scope_of_drops_the_urls_userinfo() {
+        assert_eq!(
+            scope_of("https://user:hunter2@example.com/login"),
+            Some("https://example.com/login".to_string())
+        );
+    }
+
+    #[test]
+    fn export_cookies_never_saves_a_visited_urls_userinfo() {
+        let jar = CookieJar::default();
+        jar.add("session=abc; Path=/", "https://example.com/");
+        let visited_urls = Mutex::new(HashSet::new());
+        track_url(&visited_urls, "https://user:hunter2@example.com/account");
+
+        let exported = export_cookies(&jar, &visited_urls);
+
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].origin, "https://example.com");
     }
 }
