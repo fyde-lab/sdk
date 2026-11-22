@@ -2,6 +2,11 @@
 //! (`fyde_sdk::ClientConfig::browser_engine`): `wry` webviews in `tao`
 //! windows, all on one process-wide browser thread. Pass
 //! `Arc::new(WryEngine)`.
+//!
+//! A popup the driver allows is built here, on Linux, as a webview of its
+//! own answered by the session's handler (see `build_popup`): `wry`'s
+//! default popup would have none of the session's handlers. Elsewhere,
+//! where that isn't written yet, every popup is refused.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Sender, SyncSender, sync_channel};
@@ -50,11 +55,49 @@ enum Command {
 
 /// One session's window and webview, owned by the browser thread.
 struct Session {
+    /// Every popup the session's webviews opened, closed with it.
+    #[cfg(target_os = "linux")]
+    popups: Popups,
     // Kept alive for as long as the session is: dropping it would close the
     // webview's window under it.
     window: Window,
     webview: WebView,
     handler: Arc<dyn WebviewHandler>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Session {
+    /// Closes the session's popups first. The webviews' own handlers hold
+    /// `popups` too, so it'd otherwise outlive the session.
+    fn drop(&mut self) {
+        self.popups.borrow_mut().clear();
+    }
+}
+
+/// The popups a session's webviews opened, on the browser thread.
+#[cfg(target_os = "linux")]
+type Popups = std::rc::Rc<std::cell::RefCell<Vec<Popup>>>;
+
+/// A popup [`build_popup`] opened: a webview held to the same rules as its
+/// session's own, in a plain GTK window.
+#[cfg(target_os = "linux")]
+struct Popup {
+    window: gtk::Window,
+    _webview: WebView,
+    /// Set once `window` is destroyed (closed by the user, or by the page's
+    /// `window.close()`), so dropping the popup doesn't close it again.
+    destroyed: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Popup {
+    fn drop(&mut self) {
+        use gtk::prelude::GtkWindowExt as _;
+
+        if !self.destroyed.get() {
+            self.window.close();
+        }
+    }
 }
 
 /// The proxy to the process-wide browser thread, once it's running. There
@@ -235,7 +278,15 @@ fn open_session(
     handler: Arc<dyn WebviewHandler>,
 ) -> Result<Session> {
     let window = build_window(target, config.visible).context("failed to open a session")?;
-    let webview = build_webview(&window, handler.clone()).context("failed to open a session")?;
+    #[cfg(target_os = "linux")]
+    let popups = Popups::default();
+    let builder = webview_builder(
+        handler.clone(),
+        #[cfg(target_os = "linux")]
+        popups.clone(),
+        config.visible,
+    );
+    let webview = build_webview(&window, builder).context("failed to open a session")?;
 
     for saved in &config.cookies {
         if let Err(err) = webview.set_cookie(&to_wry_cookie(saved)) {
@@ -247,6 +298,8 @@ fn open_session(
     }
 
     Ok(Session {
+        #[cfg(target_os = "linux")]
+        popups,
         window,
         webview,
         handler,
@@ -281,16 +334,18 @@ fn build_window(target: &EventLoopWindowTarget<Command>, visible: bool) -> Resul
         .map_err(|err| Error::browser(format!("failed to create browser window: {err}")))
 }
 
-/// Builds the webview inside `window`, every request of which `handler`
-/// answers.
-fn build_webview(window: &Window, handler: Arc<dyn WebviewHandler>) -> Result<WebView> {
-    let builder = WebViewBuilder::new()
-        // Ephemeral: without it wry uses the engine's default, persistent
-        // data store (on Linux, `$XDG_DATA_HOME`/`$XDG_CACHE_HOME/<prgname>`),
-        // leaving every site's localStorage, IndexedDB, service workers and
-        // HTTP cache on disk outside the client directory `logout` wipes,
-        // shared across runs, scrapers and accounts.
-        .with_incognito(true)
+/// The builder of a webview every request of which `handler` answers: the
+/// session's own, or one of its popups' (whose own popups are built the
+/// same way, into the same `popups`). `visible` is the session's.
+fn webview_builder<'a>(
+    handler: Arc<dyn WebviewHandler>,
+    #[cfg(target_os = "linux")] popups: Popups,
+    visible: bool,
+) -> WebViewBuilder<'a> {
+    // Only Linux shows popups, so only it needs to know.
+    #[cfg(not(target_os = "linux"))]
+    let _ = visible;
+    WebViewBuilder::new()
         .with_ipc_handler({
             let handler = handler.clone();
             move |request: wry::http::Request<String>| handler.on_message(request.into_body())
@@ -305,14 +360,32 @@ fn build_webview(window: &Window, handler: Arc<dyn WebviewHandler>) -> Result<We
         })
         // A `window.open(...)`/`target="_blank"` popup, which the navigation
         // handler doesn't see since it isn't a navigation of this webview.
-        // On Linux, `Allow` builds a separate, always-shown GTK window
-        // (ignoring `visible`).
+        // Never `Allow`: `wry` would build that popup's webview with none of
+        // these handlers, free to navigate anywhere and download to disk.
         .with_new_window_req_handler({
             let handler = handler.clone();
-            move |url, _features| {
-                if handler.allow_new_window(&url) {
-                    wry::NewWindowResponse::Allow
-                } else {
+            #[cfg(target_os = "linux")]
+            let popups = popups.clone();
+            move |url, features| {
+                if !handler.allow_new_window(&url) {
+                    return wry::NewWindowResponse::Deny;
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    open_popup(
+                        handler.clone(),
+                        popups.clone(),
+                        visible,
+                        features.opener.webview,
+                    )
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = features;
+                    tracing::warn!(
+                        "fyde.browser: refused a popup, which this platform can't hold to \
+                         the session's rules"
+                    );
                     wry::NewWindowResponse::Deny
                 }
             }
@@ -322,7 +395,17 @@ fn build_webview(window: &Window, handler: Arc<dyn WebviewHandler>) -> Result<We
         .with_download_started_handler(move |url, _path| {
             handler.on_download(&url);
             false
-        });
+        })
+}
+
+/// Builds `builder`'s webview inside `window`.
+fn build_webview(window: &Window, builder: WebViewBuilder<'_>) -> Result<WebView> {
+    // Ephemeral: without it wry uses the engine's default, persistent
+    // data store (on Linux, `$XDG_DATA_HOME`/`$XDG_CACHE_HOME/<prgname>`),
+    // leaving every site's localStorage, IndexedDB, service workers and
+    // HTTP cache on disk outside the client directory `logout` wipes,
+    // shared across runs, scrapers and accounts.
+    let builder = builder.with_incognito(true);
 
     #[cfg(target_os = "linux")]
     let webview = {
@@ -334,6 +417,76 @@ fn build_webview(window: &Window, handler: Arc<dyn WebviewHandler>) -> Result<We
     let webview = builder.build(&window);
 
     webview.map_err(|err| Error::browser(format!("failed to create webview: {err}")))
+}
+
+/// Answers an allowed popup request with one [`build_popup`] built, or
+/// refuses it if that fails.
+#[cfg(target_os = "linux")]
+fn open_popup(
+    handler: Arc<dyn WebviewHandler>,
+    popups: Popups,
+    visible: bool,
+    opener: webkit2gtk::WebView,
+) -> wry::NewWindowResponse {
+    match build_popup(handler, popups, visible, opener) {
+        Ok(webview) => wry::NewWindowResponse::Create { webview },
+        Err(err) => {
+            tracing::warn!("fyde.browser: refused a popup it failed to open: {err}");
+            wry::NewWindowResponse::Deny
+        }
+    }
+}
+
+/// Builds a popup of `opener` in a GTK window of its own, shown only if the
+/// session is `visible`, its webview answered by the session's `handler`
+/// like the session's own: its navigations, popups and downloads are held
+/// to the same rules, and it shares `opener`'s ephemeral data store (a
+/// related view, which WebKit requires). Kept in `popups` until the session
+/// closes, or until it's closed itself.
+#[cfg(target_os = "linux")]
+fn build_popup(
+    handler: Arc<dyn WebviewHandler>,
+    popups: Popups,
+    visible: bool,
+    opener: webkit2gtk::WebView,
+) -> Result<webkit2gtk::WebView> {
+    use gtk::prelude::{ContainerExt as _, GtkWindowExt as _, WidgetExt as _};
+    use webkit2gtk::WebViewExt as _;
+    use wry::{WebViewBuilderExtUnix as _, WebViewExtUnix as _};
+
+    let window = gtk::Window::new(gtk::WindowType::Toplevel);
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    window.add(&container);
+    let webview = webview_builder(handler, popups.clone(), visible)
+        .with_related_view(opener)
+        .build_gtk(&container)
+        .map_err(|err| Error::browser(format!("failed to create a popup's webview: {err}")))?;
+    let inner = webview.webview();
+
+    let destroyed = std::rc::Rc::new(std::cell::Cell::new(false));
+    window.connect_destroy({
+        let destroyed = destroyed.clone();
+        move |_| destroyed.set(true)
+    });
+    // The page's `window.close()`: `wry` destroys the webview, this its window.
+    inner.connect_close({
+        let window = window.clone();
+        move |_| window.close()
+    });
+    if visible {
+        window.set_title("fyde scraper");
+        window.set_default_size(1200, 900);
+        window.show_all();
+    } else {
+        container.show_all();
+    }
+
+    popups.borrow_mut().push(Popup {
+        window,
+        _webview: webview,
+        destroyed,
+    });
+    Ok(inner)
 }
 
 /// Carries out one [`Command`], on the browser thread, against the
@@ -532,6 +685,65 @@ mod tests {
         let cookies = session.cookies().unwrap();
         session.close();
         cookies
+    }
+
+    /// A handler allowing every popup and only `about:` navigations,
+    /// recording every navigation it's asked about.
+    struct Guarding(Mutex<Vec<String>>);
+
+    impl WebviewHandler for Guarding {
+        fn on_message(&self, _body: String) {}
+        fn allow_navigation(&self, url: &str) -> bool {
+            self.0.lock().unwrap().push(url.to_string());
+            url.starts_with("about:")
+        }
+        fn allow_new_window(&self, _url: &str) -> bool {
+            true
+        }
+        fn on_download(&self, _url: &str) {}
+        fn on_closed(&self) {}
+    }
+
+    /// Needs a display (X11/Wayland), so it only runs on demand:
+    /// `cargo test -- --ignored a_popup`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn a_popup_asks_the_sessions_handler_before_navigating() {
+        let handler = Arc::new(Guarding(Mutex::new(Vec::new())));
+        let session = WryEngine
+            .open_session(
+                WebviewConfig {
+                    visible: false,
+                    cookies: Vec::new(),
+                },
+                handler.clone(),
+            )
+            .unwrap();
+        session.load_url("about:blank").unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        session
+            .evaluate_script(
+                "var popup = window.open('about:blank'); \
+                 popup.location.href = 'https://blocked.invalid/';",
+            )
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let asked = || {
+            handler
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|url| url == "https://blocked.invalid/")
+        };
+        while !asked() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        session.close();
+
+        assert!(asked(), "{:?}", handler.0.lock().unwrap());
     }
 
     /// Needs a display (X11/Wayland), so it only runs on demand:

@@ -184,7 +184,9 @@ methods, used behind `Arc<dyn Service>`), `models.rs`, `service.rs` and adapters
   decisions asked of the driver's `WebviewHandler`. Callers pass one as
   `ClientConfig::browser_engine` / `init_dev_scrapers`'s `browser_engine` (`None`: `fyde.browser`
   fails with `BrowserFailed`): `fyde_browser_wry::WryEngine` on desktop (every `wry` webview on
-  one process-wide thread, for GTK), the app's native webviews on Android/iOS. Never put a rule
+  one process-wide thread, for GTK; it builds allowed popups itself on Linux, with the session's
+  handler, and refuses them elsewhere: never answer `NewWindowResponse::Allow`, whose popup
+  skips every handler), the app's native webviews on Android/iOS. Never put a rule
   in an engine. Engines raise errors with `fyde_sdk::Error::browser`.
   Forms are submitted with `click`, never an in-page `fetch`, and downloads never touch the disk.
   A finished run's report of a known script (an installation's) is uploaded once to the server's

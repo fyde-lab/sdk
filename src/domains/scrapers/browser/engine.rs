@@ -21,7 +21,12 @@
 //!   subframe navigation (link, form submit, POST included, script,
 //!   redirect), and block it on `false`;
 //! - ask [`WebviewHandler::allow_new_window`] before opening any popup
-//!   (`window.open`, `target="_blank"`), and never open it on `false`;
+//!   (`window.open`, `target="_blank"`), and never open it on `false`. A
+//!   popup it opens is held to every rule here, answered by the session's
+//!   own handler (its navigations, popups and downloads included), shares
+//!   the session's data store, is shown only if [`WebviewConfig::visible`],
+//!   and closes with the session. An engine that can't do all of that
+//!   refuses the popup, still asking first (the driver may take its URL);
 //! - cancel every native download before anything is written to disk,
 //!   reporting its URL to [`WebviewHandler::on_download`];
 //! - call [`WebviewHandler::on_closed`] once a session's webview goes away

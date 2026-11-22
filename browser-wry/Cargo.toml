@@ -20,3 +20,9 @@ rand = "0.10.2"
 tao = "0.37"
 tracing = "0.1.44"
 wry = "0.57"
+
+# Popups (`build_popup` in `src/lib.rs`): a guarded popup is a `wry` webview in a
+# plain GTK window, related to its opener's. The versions `wry` itself uses.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+webkit2gtk = "=2.0.2"
