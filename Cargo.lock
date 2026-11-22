@@ -2093,9 +2093,11 @@ version = "0.1.0"
 dependencies = [
  "cookie",
  "fyde-sdk",
+ "gtk",
  "rand 0.10.2",
  "tao",
  "tracing",
+ "webkit2gtk",
  "wry",
 ]
 

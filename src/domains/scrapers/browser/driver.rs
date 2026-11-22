@@ -110,8 +110,8 @@ impl WebviewHandler for DriverHandler {
     /// While a `Service::download` call is waiting, an allowed popup is
     /// denied and its URL handed to that call instead: a page that opens
     /// its PDF in a popup (cesu's `affichagePdf_<id>` buttons) would
-    /// otherwise just display it there (on Linux, in a separate, always
-    /// shown window) and `download` would time out.
+    /// otherwise just display it there, in a popup of its own, and
+    /// `download` would time out.
     fn allow_new_window(&self, url: &str) -> bool {
         if !is_navigation_allowed(url, &self.allowed_domains) {
             tracing::warn!(
