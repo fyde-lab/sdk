@@ -5,10 +5,26 @@ use serde::{Deserialize, Serialize};
 /// jar on a later run (via `host::CookieJar::add`), reproducing the same
 /// host-only-or-`Domain` scope it originally had. See
 /// `host::http::{build_jar, export_cookies}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Cookie {
     pub(crate) origin: String,
     pub(crate) set_cookie: String,
+}
+
+/// Cookies carry sessions: never print their values. Only the cookie's name
+/// (what precedes the first `=` of `set_cookie`) is shown.
+impl std::fmt::Debug for Cookie {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = self
+            .set_cookie
+            .split_once('=')
+            .map_or("", |(name, _)| name.trim());
+        f.debug_struct("Cookie")
+            .field("origin", &self.origin)
+            .field("name", &name)
+            .field("set_cookie", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Builds a [`Cookie`] filled with random-but-plausible data, overridable
@@ -68,5 +84,19 @@ mod tests {
 
         assert_eq!(cookie.origin, "https://example.com");
         assert_eq!(cookie.set_cookie, "PHPSESSID=abc; Path=/");
+    }
+
+    #[test]
+    fn debug_shows_the_cookies_name_but_never_its_value() {
+        let cookie = FakeCookie::new()
+            .with_origin("https://example.com")
+            .with_set_cookie("PHPSESSID=s3cr3t-token; Path=/; HttpOnly")
+            .build();
+
+        let printed = format!("{cookie:?}");
+
+        assert!(printed.contains("https://example.com"), "{printed}");
+        assert!(printed.contains("PHPSESSID"), "{printed}");
+        assert!(!printed.contains("s3cr3t-token"), "{printed}");
     }
 }
