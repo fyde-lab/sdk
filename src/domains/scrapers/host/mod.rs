@@ -114,7 +114,8 @@ fn ensure_domain_allowed(url: &str, allowed_domains: &[String]) -> std::result::
 
 /// The host-only half of [`ensure_domain_allowed`] — `host` must equal, or
 /// be a subdomain of, one of `allowed_domains`; an empty `allowed_domains`
-/// allows nothing. An IP-literal `host` (e.g. `127.0.0.1`, `[::1]`) only ever
+/// allows nothing, and so does an empty entry (as a suffix, it would match
+/// every fully qualified `host.` with its trailing dot). An IP-literal `host` (e.g. `127.0.0.1`, `[::1]`) only ever
 /// matches an identical entry, never by suffix — otherwise an entry like
 /// `0.1` would let `10.0.0.1` through as a "subdomain" — so loopback/private
 /// addresses are only reachable when a scraper lists that exact address.
@@ -133,7 +134,8 @@ pub(super) fn is_host_allowed(host: &str, allowed_domains: &[String]) -> bool {
 
     allowed_domains.iter().any(|domain| {
         let domain = domain.to_ascii_lowercase();
-        host == domain || (!is_ip_literal && host.ends_with(&format!(".{domain}")))
+        !domain.is_empty()
+            && (host == domain || (!is_ip_literal && host.ends_with(&format!(".{domain}"))))
     })
 }
 
@@ -320,6 +322,13 @@ mod domain_guard_tests {
     fn ensure_domain_allowed_allows_nothing_when_the_list_is_empty() {
         assert!(ensure_domain_allowed("https://anything.example/at/all", &[]).is_err());
         assert!(ensure_domain_allowed("http://127.0.0.1:8080/", &[]).is_err());
+    }
+
+    #[test]
+    fn ensure_domain_allowed_never_matches_an_empty_entry() {
+        let allowed = vec![String::new()];
+        assert!(ensure_domain_allowed("https://evil.com./", &allowed).is_err());
+        assert!(ensure_domain_allowed("https://evil.com/", &allowed).is_err());
     }
 
     #[test]
