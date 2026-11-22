@@ -2,8 +2,8 @@
 //! Latin recognition, Apache-2.0, ONNX) through `oar-ocr`, on the SDK's
 //! ONNX Runtime: the [`Ocr`] adapter. Ported from the POC's
 //! `pdf-ocr-core` (`fast_ocr.rs`), whose settings it keeps. Recognized lines
-//! are laid out with the text layer's grid ([`super::layout_boxes`]). What to
-//! OCR is up to the caller.
+//! are laid out with the text layer's grid
+//! ([`super::text_layer::layout_boxes`]). What to OCR is up to the caller.
 
 use std::path::Path;
 use std::sync::Arc;
