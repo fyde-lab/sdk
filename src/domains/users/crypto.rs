@@ -99,7 +99,7 @@ pub(super) trait OpaqueClient: Send + Sync {
         state: RegistrationState,
         password: &str,
         response: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>)>;
+    ) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)>;
 
     /// First step of OPAQUE login: derives an oblivious request from
     /// `password`, to send to the server's `StartLogin` RPC.
@@ -123,7 +123,7 @@ pub(super) trait OpaqueClient: Send + Sync {
         state: LoginState,
         password: &str,
         response: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>)>;
+    ) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)>;
 }
 
 /// The default [`OpaqueClient`] implementation, backed by real `opaque-ke`
@@ -149,7 +149,7 @@ impl OpaqueClient for DefaultOpaqueClient {
         state: RegistrationState,
         password: &str,
         response: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
         let response = RegistrationResponse::deserialize(response).map_err(|err| {
             ErrorKind::Encryption(format!(
                 "failed to parse OPAQUE registration response: {err}"
@@ -172,7 +172,7 @@ impl OpaqueClient for DefaultOpaqueClient {
 
         Ok((
             result.message.serialize().to_vec(),
-            result.export_key.to_vec(),
+            Zeroizing::new(result.export_key.to_vec()),
         ))
     }
 
@@ -192,7 +192,7 @@ impl OpaqueClient for DefaultOpaqueClient {
         state: LoginState,
         password: &str,
         response: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
         let response = CredentialResponse::deserialize(response).map_err(|err| {
             ErrorKind::Encryption(format!("failed to parse OPAQUE login response: {err}"))
         })?;
@@ -211,7 +211,7 @@ impl OpaqueClient for DefaultOpaqueClient {
 
         Ok((
             result.message.serialize().to_vec(),
-            result.export_key.to_vec(),
+            Zeroizing::new(result.export_key.to_vec()),
         ))
     }
 }
@@ -397,12 +397,12 @@ impl Drop for RecoveryKeys {
 
 /// Generates a fresh recovery key: 256 bits from the OS CSPRNG, encoded as a
 /// 24-word English BIP39 mnemonic, words separated by single spaces.
-pub(super) fn generate_recovery_key() -> Result<String> {
+pub(super) fn generate_recovery_key() -> Result<Zeroizing<String>> {
     let mut entropy = Zeroizing::new([0u8; RECOVERY_KEY_ENTROPY_LEN]);
     rand::rng().fill_bytes(entropy.as_mut_slice());
     let mnemonic = Mnemonic::from_entropy_in(Language::English, entropy.as_slice())
         .map_err(|err| ErrorKind::Encryption(format!("failed to encode recovery key: {err}")))?;
-    Ok(mnemonic.to_string())
+    Ok(Zeroizing::new(mnemonic.to_string()))
 }
 
 /// Parses `recovery_key` — as the user typed it back: case, surrounding and
@@ -413,7 +413,8 @@ pub(super) fn generate_recovery_key() -> Result<String> {
 /// [`crate::ErrorCode::InvalidRecoveryKey`] if it isn't a valid mnemonic, which
 /// catches most typos locally.
 pub(super) fn derive_recovery_keys(recovery_key: &str) -> Result<RecoveryKeys> {
-    let mnemonic = Mnemonic::parse_in(Language::English, recovery_key.to_lowercase())
+    let lowercase = Zeroizing::new(recovery_key.to_lowercase());
+    let mnemonic = Mnemonic::parse_in(Language::English, lowercase.as_str())
         .map_err(|err| ErrorKind::InvalidRecoveryKey(err.to_string()))?;
     if mnemonic.word_count() != RECOVERY_KEY_ENTROPY_LEN * 3 / 4 {
         return Err(ErrorKind::InvalidRecoveryKey(format!(
@@ -543,7 +544,7 @@ mod tests {
     fn register(
         server_setup: &opaque_ke::ServerSetup<FydeCipherSuite>,
         password: &str,
-    ) -> (Vec<u8>, Vec<u8>) {
+    ) -> (Vec<u8>, Zeroizing<Vec<u8>>) {
         use opaque_ke::{RegistrationRequest, RegistrationUpload, ServerRegistration};
 
         let client = DefaultOpaqueClient;
