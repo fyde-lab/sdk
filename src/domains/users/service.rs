@@ -348,6 +348,9 @@ impl UsersClient {
     /// last: it's what `is_connected` (and so `Client::init` on the next
     /// start) keys off, so a failure partway through never leaves a session
     /// that looks open but has no master key to decrypt anything with.
+    /// Neither does it leave the master key behind: `logout` does nothing
+    /// without a session token, so on a failure before the token is
+    /// persisted, the secrets already written are cleared again.
     async fn open_session(
         &self,
         username: &str,
@@ -356,12 +359,41 @@ impl UsersClient {
         role: Role,
         location: SecretLocation,
     ) -> Result<()> {
+        if let Err(err) = self
+            .persist_session(username, token, raw_master_key, role, location)
+            .await
+        {
+            if let Err(clear_err) = self.secrets.clear().await {
+                tracing::error!(
+                    error = %clear_err,
+                    "failed to clear the secrets of a session that couldn't be opened"
+                );
+            }
+            return Err(err);
+        }
+
+        if !self.auto_sync {
+            return Ok(());
+        }
+        self.documents
+            .start_sync()
+            .await
+            .context("failed to start changelog sync")
+    }
+
+    /// The writes [`Self::open_session`] makes, session token last.
+    async fn persist_session(
+        &self,
+        username: &str,
+        token: &str,
+        raw_master_key: &[u8],
+        role: Role,
+        location: SecretLocation,
+    ) -> Result<()> {
+        let encoded_master_key =
+            encode_master_key(raw_master_key).context("failed to encode master key")?;
         self.secrets
-            .set(
-                MASTER_KEY_SECRET,
-                &encode_master_key(raw_master_key)?,
-                location,
-            )
+            .set(MASTER_KEY_SECRET, &encoded_master_key, location)
             .await
             .context("failed to persist master key")?;
 
@@ -375,15 +407,10 @@ impl UsersClient {
             .await
             .context("failed to persist username")?;
 
-        self.sessions.save_new_session(token, location).await?;
-
-        if !self.auto_sync {
-            return Ok(());
-        }
-        self.documents
-            .start_sync()
+        self.sessions
+            .save_new_session(token, location)
             .await
-            .context("failed to start changelog sync")
+            .context("failed to persist session token")
     }
 }
 
@@ -510,23 +537,35 @@ impl Service for UsersClient {
     }
 
     async fn logout(&self) -> Result<()> {
-        if !self.sessions.is_connected().await? {
-            return Ok(());
-        }
+        // A token that can't be read says nothing of whether a session is
+        // open: local state is cleared all the same, only the server isn't
+        // told (the call couldn't carry the token).
+        let connected = match self.sessions.is_connected().await {
+            Ok(false) => return Ok(()),
+            Ok(true) => true,
+            Err(err) => {
+                tracing::warn!(
+                    "failed to read the session token, clearing local state anyway: {err}"
+                );
+                false
+            }
+        };
 
         self.documents.stop_sync();
 
         // Needs the session token, so it goes before local state is
         // cleared — but its outcome must not decide whether local state is
         // cleared at all.
-        match tokio::time::timeout(SERVER_LOGOUT_TIMEOUT, self.grpc.logout()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                tracing::warn!("server-side logout failed, clearing local state anyway: {err}")
+        if connected {
+            match tokio::time::timeout(SERVER_LOGOUT_TIMEOUT, self.grpc.logout()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!("server-side logout failed, clearing local state anyway: {err}")
+                }
+                Err(_) => tracing::warn!(
+                    "server-side logout timed out after {SERVER_LOGOUT_TIMEOUT:?}, clearing local state anyway"
+                ),
             }
-            Err(_) => tracing::warn!(
-                "server-side logout timed out after {SERVER_LOGOUT_TIMEOUT:?}, clearing local state anyway"
-            ),
         }
 
         self.clear_local_state().await
@@ -1374,6 +1413,64 @@ mod tests {
                 session_token: "a-token".to_string()
             }
         );
+    }
+
+    #[tokio::test]
+    async fn login_clears_the_master_key_again_when_the_session_token_cant_be_persisted() {
+        let opaque = opaque_for_login(b"the-request", b"the-upload");
+        let mut mock_grpc = MockFydeClient::new();
+        mock_grpc
+            .expect_start_login()
+            .returning(|_, _| Ok(("a-login-id".to_string(), b"the-response".to_vec())));
+        mock_grpc
+            .expect_finish_login()
+            .times(1)
+            .returning(|_, _, _, _| Ok(succeeded(login_master_key())));
+
+        let mut settings = MockSettingsService::new();
+        settings.expect_set().times(2).returning(|_, _| Ok(()));
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_is_secure_storage_available()
+            .returning(|| true);
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Ok(None));
+        let mut order = mockall::Sequence::new();
+        secrets
+            .expect_set()
+            .withf(|key, _, _| key == MASTER_KEY_SECRET)
+            .times(1)
+            .in_sequence(&mut order)
+            .returning(|_, _, _| Ok(()));
+        secrets
+            .expect_set()
+            .withf(|key, _, _| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .in_sequence(&mut order)
+            .returning(|_, _, _| Err(ErrorKind::Encryption("keychain locked".into()).into()));
+        secrets
+            .expect_clear()
+            .times(1)
+            .in_sequence(&mut order)
+            .returning(|| Ok(()));
+
+        let client = client_with_deps(mock_grpc, opaque, settings, secrets);
+
+        let err = client
+            .login(
+                "alice",
+                "correct horse battery staple",
+                "Pierre's iPhone",
+                false,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::Encryption);
     }
 
     #[tokio::test]
@@ -2301,6 +2398,35 @@ mod tests {
                 .stop_sync_called
                 .load(std::sync::atomic::Ordering::SeqCst)
         );
+    }
+
+    #[tokio::test]
+    async fn logout_clears_local_state_without_telling_the_server_when_the_token_cant_be_read() {
+        // No `expect_logout()`: the mock panics if the server is called.
+        let mut secrets = MockSecretsService::new();
+        secrets
+            .expect_get()
+            .withf(|key| key == SESSION_TOKEN_SECRET)
+            .times(1)
+            .returning(|_| Err(ErrorKind::Encryption("keychain locked".into()).into()));
+        secrets.expect_clear().times(1).returning(|| Ok(()));
+        let mut local_db = MockLocalDatabase::new();
+        local_db.expect_wipe().times(1).returning(|| Ok(()));
+        let mut local_files = MockLocalFiles::new();
+        local_files.expect_clear().times(1).returning(|| Ok(()));
+
+        let client = UsersClient::with_deps(
+            MockFydeClient::new(),
+            MockOpaqueClient::new(),
+            Arc::new(MockSettingsService::new()),
+            Arc::new(secrets),
+            Arc::new(local_db),
+            Arc::new(local_files),
+            Arc::new(RecordingDocuments::default()),
+        )
+        .with_embedding_cache(cleared_cache());
+
+        client.logout().await.unwrap();
     }
 
     #[tokio::test]
