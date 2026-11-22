@@ -801,6 +801,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_changing_nothing_publishes_nothing() {
+        let folder = FakeFolder::new()
+            .with_name("Travail")
+            .with_appearance(Some(APPEARANCE))
+            .build();
+        let (client, changelog) = client(storage_with(vec![folder.clone()]));
+
+        for request in [
+            UpdateFolderRequest {
+                id: folder.id,
+                ..UpdateFolderRequest::default()
+            },
+            UpdateFolderRequest {
+                id: folder.id,
+                name: Some(" Travail ".to_string()),
+                appearance: Some(APPEARANCE),
+            },
+        ] {
+            client.update(request).await.unwrap();
+        }
+
+        assert!(changelog.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn update_rejects_an_appearance_on_a_subfolder() {
         let parent = FakeFolder::new().build();
         let child = FakeFolder::new().with_parent(parent.id).build();
