@@ -76,7 +76,10 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CallbackLayer {
                 } else if field.name() == "message" {
                     let _ = write!(self.0, "{value:?}");
                 } else {
-                    let _ = write!(self.0, " {}={value:?}", field.name());
+                    if !self.0.is_empty() {
+                        self.0.push(' ');
+                    }
+                    let _ = write!(self.0, "{}={value:?}", field.name());
                 }
             }
         }
@@ -194,6 +197,20 @@ mod tests {
             vec![(
                 LogLevel::Warn,
                 "fyde_sdk::sync: retrying attempt=3 host=\"example.com\"".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn separates_the_fields_of_an_event_without_a_message_by_one_space() {
+        let lines =
+            forwarded(|| tracing::info!(target: "fyde_sdk::sync", attempt = 3, done = true));
+
+        assert_eq!(
+            lines,
+            vec![(
+                LogLevel::Info,
+                "fyde_sdk::sync: attempt=3 done=true".to_string()
             )]
         );
     }
