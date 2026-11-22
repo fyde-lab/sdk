@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use tokio::io::AsyncWriteExt as _;
 
 use crate::{ErrorContext as _, Result};
 
@@ -60,12 +61,55 @@ impl Storage for FileStorage {
         let contents = serde_json::to_string_pretty(&cookies)
             .with_context(|| format!("failed to serialize cookies for scraper {scraper_name:?}"))?;
 
-        tokio::fs::write(&path, contents)
+        write_owner_only(&path, contents.as_bytes())
             .await
             .with_context(|| format!("failed to write cookie file {}", path.display()))?;
 
         Ok(())
     }
+}
+
+/// Writes `contents` to `path` through a sibling temporary file created
+/// readable and writable by its owner only, then renamed into place. The
+/// cookies are live sessions, so the file must not inherit a umask-derived,
+/// typically world-readable mode (a file a previous version wrote that way
+/// is replaced by the rename), and a run interrupted mid-write leaves the
+/// previous file whole rather than a truncated one the next run can't parse.
+/// Off Unix only the atomic replace applies.
+async fn write_owner_only(path: &Path, contents: &[u8]) -> Result<()> {
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+
+    match tokio::fs::remove_file(&tmp).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to remove stale temporary file {}", tmp.display())
+            });
+        }
+    }
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&tmp)
+        .await
+        .with_context(|| format!("failed to create temporary file {}", tmp.display()))?;
+    file.write_all(contents)
+        .await
+        .with_context(|| format!("failed to write temporary file {}", tmp.display()))?;
+    file.sync_all()
+        .await
+        .with_context(|| format!("failed to flush temporary file {}", tmp.display()))?;
+    drop(file);
+
+    tokio::fs::rename(&tmp, path)
+        .await
+        .with_context(|| format!("failed to move temporary file {} into place", tmp.display()))
 }
 
 #[cfg(test)]
@@ -171,5 +215,45 @@ mod tests {
             .unwrap();
 
         assert!(dir.join("didaxis.cookies.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replace_all_writes_a_file_only_its_owner_can_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (tmp, storage) = setup();
+        let path = tmp.path().join("didaxis.cookies.json");
+        std::fs::write(&path, "[]").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        storage
+            .replace_all("didaxis", vec![FakeCookie::new().build()])
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[tokio::test]
+    async fn replace_all_leaves_no_temporary_file_behind() {
+        let (tmp, storage) = setup();
+        std::fs::write(tmp.path().join("didaxis.cookies.json.tmp"), "stale").unwrap();
+
+        storage
+            .replace_all("didaxis", vec![FakeCookie::new().build()])
+            .await
+            .unwrap();
+
+        let names: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![std::ffi::OsString::from("didaxis.cookies.json")]
+        );
+        assert_eq!(storage.list("didaxis").await.unwrap().len(), 1);
     }
 }
